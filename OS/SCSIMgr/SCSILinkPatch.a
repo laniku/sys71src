@@ -1,0 +1,662 @@
+;_______________________________________________________________________________________
+;
+;	File:		SCSILinkPatch.a
+;
+;	Contains:	New SCSI Manager linked patches.  These patches are in addition to the
+;				SCSI Manager patches in the CPU specific patch files.  The patches in
+;				this file are generally not CPU specific (except for perhaps the MacPlus).
+;
+;	Written by:	David Wong, December 11, 1990
+;
+;	Copyright:	© 1989-1992 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM6>	 11/3/92	SWC		Changed SCSIEqu.a->SCSI.a.
+;		 <SM4>	  8/11/92	CSS		Update from Reality:
+;									<16> 8/10/92 csd	#1035754 <gbm>: Added another cache flush to be more ’040 studly
+;														and locked out interrupts while changing code that could get
+;														called at interrupt time.
+;									<15> 8/1/92	csd		#1035754 <dty>: The delay patch in the previous version is not
+;														the best way to work around the problem. Instead, we change the
+;														number of blocks read so that we never read between 9 and 16
+;														blocks.
+;									<14> 7/31/92 csd	#1035754 <dty>: Patch the SCSI drivers in RAM to add a delay in
+;														order to avoid the Quantum cache bug.
+;		 <4>	  3/3/92	kc		Move TransactionFlag, and FreeHookPending into SCSIGlobals.
+;		 <3>	 2/12/92	RLM		change jsr to jmp
+;		 <2>	 2/12/92	RLM		InstallProc roll-in (SCSIC96Install & SCSIBusyPlusInstall). •
+;									Pre-SuperMario Comments Follow •
+;		<13>	11/25/91	DTY		Roll in the SCSIBusy fix from 7-Up. Based on Dave Wong’s
+;									original code.
+;		<12>	10/28/91	SAM/KSM	Rolled in Regatta changes.
+;										Put one of those semicolon things before a comment made in the
+;											last rev.
+;										(pdw,ag) Added SCSIC96Install proc to install 53c96 SCSIMgr
+;											changes.
+;		<11>	 9/16/91	JSM		Cleanup header.
+;		<10>	 6/12/91	LN		added #include 'InternalOnlyEqu.a'
+;		 <9>	 6/12/91	LN		removed #include 'HardwareEqu.a'
+;		 <8>	 3/13/91	djw		<wnm>(BRC #83534) I ignorantly did not know a TAS instruction
+;									does not work on all machines. Replaced it with a BSET.
+;		 <7>	 2/28/91	djw		<dnf>(BRC #83534) Modify "free hook" patch to only call freehook
+;									at the end of a SCSI transaction.  Fixed bug if out of range
+;									selector would crash.
+;		 <6>	 1/19/91	eh		(eva for djw) don't load this patch under AUX
+;		 <5>	12/20/90	djw		call "SCSIFreeHook" through _DeferUserFn to make it VM friendly.
+;									Delete check on *BSY for _SCSIBusy (unreliable).
+;		 <4>	12/15/90	djw		Fixing comments and changing SCSIBusy to access SCSI chip more
+;									efficiently.
+;		 <3>	12/14/90	dnf		(with djw) Call SCSIFreeHook when freeing the bus.  Fix stack
+;									problems in SCSIBusy.
+;		 <2>	12/13/90	djw		Added SCSIBusy and SCSIDispatch patches for file
+;									system/fileshare/CDROM problem.
+;		 <1>	 12/6/90	djw		first checked in
+;
+
+;_______________________________________________________________________________________
+;
+;	File Organization
+;
+;	Additions to this file should be grouped together by patch, that is install and
+;	resident code together.  Add newer patches to the end of the file.  Please include
+;	a DETAILED description of the problem and the solution the patch addresses.
+;_______________________________________________________________________________________
+
+			String	Asis
+			Print	Off
+			LOAD	'StandardEqu.d'
+			Include	'HardwarePrivateEqu.a'
+			Include	'SCSI.a'
+			Include	'SCSIPriv.a'
+			Include	'LinkedPatchMacros.a'
+			Include	'UniversalEqu.a'													;	<2> ag
+			Print	On
+
+;																						;	<2> ag
+; MACRO setTrapA0 &trapNumber
+;
+;	Install the patch pointed to by A0 as trap &trapNumber.
+;	This handles OS traps and Toolbox traps by checking the toolbox bit.
+;
+
+	MACRO
+	setTrapA0 &trapNumber
+		LCLA &realTrapNumber
+		&realTrapNumber: SETA &EVAL(&trapNumber)
+		IF (&realTrapNumber AND $800) = 0 THEN		; it is an OS trap
+			&realTrapNumber: SETA &realTrapNumber AND $FF
+			IF &realTrapNumber < 128 THEN
+				moveq #&realTrapNumber,d0			; move trap number (sometimes sign extended)
+			ELSE
+				moveq #&realTrapNumber-$100,d0		; move trap number (sometimes sign extended)
+			ENDIF
+			_SetTrapAddress newOS
+		ELSE
+			&realTrapNumber: SETA &realTrapNumber AND $3FF
+			IF &realTrapNumber < 128 THEN
+				moveq #&realTrapNumber,d0			; move trap number
+			ELSE
+				move.w #&realTrapNumber,d0			; move trap number
+			ENDIF
+			_SetTrapAddress	newTool
+		ENDIF
+	ENDM
+
+
+			Roms	Plus,SE,II,Portable,IIci,notAUX			;								<6> djw
+
+;=======================================================================================
+
+;_______________________________________________________________________________________	<2> pdw
+;	Installer for new scsi manager code on machines with c96
+;
+
+	export		SCSIC96Install			;<RLM>
+
+SCSIC96Install		InstallProc		(IIci,hasC96)
+			
+			TestFor	SCSI96_1Exists
+			beq.s	@exit							; if this box doesn't have a c96, exit
+
+			leaResident		SCSIMgr_96,a0			; addr of vector
+			setTrapA0		$a815					; patch SCSIDispatch to ROM
+
+			leaResident		SCSIInit96,a0
+			jsr				(a0)
+
+@exit		rts
+			Endp
+
+;_______________________________________________________________________________________	<2> djw
+;	SCSIDispatch  -  fixes for FileShare problem
+;
+;	Detailed description of the FileShare problem:
+;
+;	FileShare has a deadlock problem which is caused by the SCSI manager not being
+;	asynchronous.  The actual problem case was during system task time, the CDROM
+;	systemTask called the SCSI manager directly to polled the CDROM drive whether it
+;	has a disk insert event.  While the SCSI manager is busy with this transaction, a
+;	level 4 (SCC) interrupt occurs for fileshare.  At interrupt time, fileshare makes
+;	an async file system I/O call which is to a SCSI device (hard drive).  The SCSI
+;	driver calls _SCSIGet, and gets an error - SCSI manager busy.  The driver then
+;	loops waiting for the SCSI manager to become free.  This will never happen because
+;	the SCSI manager at event time has been interrupted and cannot complete until we
+;	return from interrupt - deadlock.
+;
+;	The solution (short of a real async SCSI manager) is for the file system to check
+;	that the SCSI manager is free before processing its I/O request.  If the SCSI
+;	manager is busy, then the file system will queue the request and defer it.  When
+;	the SCSI manager becomes free, it will call the file system to run its deferred
+;	I/O.  This solution has the undesirable effect of gating file system I/O on the
+;	SCSI manager whether or not the target device is SCSI.
+;
+;	SCSIDispatch will be patched for two reasons:  The addition of a new private
+;	selector routine _SCSIBusy to be called only by the file system;  and a call a new 
+;	"hook" vector "jSCSIFreeHook" at the end of a SCSI transaction when the SCSI Mgr
+;	is free.
+;
+;	The "jSCSIFreeHook" is defined to be called at the end of a SCSI transaction.  A
+;	normal SCSI transaction is defined to begin with SCSIGet and end with SCSIComplete.
+;	A SCSI transaction may be aborted and considered ended without calling SCSIComplete
+;	only when SCSISelect returns an error.  An error from SCSISelect means the you never
+;	got on the bus.
+;
+;_______________________________________________________________________________________
+;	Detailed description of the "jSCSIFreeHook and HDSC Setup problem
+;
+;	Calling "jSCSIFreeHook" in the FileShare problem case, will result in calling the
+;	file system.  The file system in turn may call the SCSI driver to do a deferred
+;	file I/O.  If the SCSI bus is busy when this happens, the driver will loop waiting
+;	for the bus to clear.  While the driver is looping, the system will hang.  We
+;	do not check for the bus being clear before calling "jSCSIFreeHook", because it may
+;	be some unknown number of milliseconds before this happens, and we would slow down
+;	every transaction.  The rule for calling "jSCSIFreeHook" is to only call at the END
+;	of a transaction because we know the bus is becoming free.
+;
+;	There is a problem in calling SCSIComplete multiple times.  Normally SCSIComplete
+;	signals an end to the transaction.  As long as the bus is free or is going to be
+;	free, calling SCSIComplete is ok.  However, there was a case where during a format,
+;	HDSC Setup called SCSIComplete multiple times to determine whether the drive was
+;	still formatting.  This meant the bus was still busy and the system hung.  The bus
+;	never became free because we were looping in the driver and HDSC Setup could not
+;	call SCSIComplete again to get the status.  The fix was to change HDSC Setup to
+;	not use SCSIComplete as its status call.  Until async SCSI operations, hopefully
+;	only formatting will cause this problem.
+;
+;_______________________________________________________________________________________
+;	Mac Plus SCSIBusy Installer  -  Install routine to get SCSIGlobals on MacPlus
+;
+
+	If not forRom then			; <4> kc.start
+
+SCSIBusyPlusInstall		InstallProc		(Plus)
+
+			leaResident		SCSIBusyVector,a0		; addr of vector
+			leaResident		SCSIBusyPlus,a1			; addr of routine valid on mac plus
+			move.l	a1,(a0)							; install vector
+			rts
+			Endp
+
+;_______________________________________________________________________________________
+;	Other Macs SCSIBusy Installer  -  Install routine to get SCSIGlobals on other Macs
+;
+
+SCSIBusyOtherInstall		InstallProc		(SE,Portable,II,IIci,notAUX)	;			<6> djw
+			
+			leaResident		SCSIBusyVector,a0		; addr of vector
+			leaResident		SCSIBusyOthers,a1		; addr of routine valid on all other macs
+			move.l	a1,(a0)							; install vector
+			rts
+			Endp
+	Endif						; <4> kc.end
+	
+;_______________________________________________________________________________________
+;	Common SCSIDispatch
+;
+;	Insert ourselve in the return chain so that after we call the existing SCSI
+;	manager, we will return here to check for busy.  Because the SCSI manager is
+;	stack based, we must shift the stack and insert our return address.
+
+SCSIDispatchCommon		PatchProc	_SCSIDispatch,(Plus,SE,Portable,II,IIci,notAUX)	;	<6> djw
+
+			Export	SCSIBusyPlus
+			Export	SCSIBusyOthers
+
+			with	ExpandMemRec
+
+;=====================================================
+;	Head patch to check for the new scsiBusy selector
+;=====================================================
+
+			cmpi.w	#scsiBusy,4(sp)				; check selector after the return addr
+			bne.s	@Continue					; not scsiBusy
+
+			movea.l	(sp)+,a0					; pop a0 = return addr
+			adda.w	#2,sp						; pop selector
+	If forRom then				; <4> kc.start
+			With	scsiGlobalRecord
+			movea.l	SCSIGlobals, a1				; addr of record
+			lea		TransactionFlag(a1),a1		; is the SCSI Mgr free?
+			EndWith
+	Else
+			lea		TransactionFlag(pc),a1		; is the SCSI Mgr free? 
+	Endif						; <4> kc.end
+			move.w	(a1),(sp)					; return transaction flag on stack
+			jmp		(a0)						; done
+
+;	Check for the selector being in range
+
+@Continue
+			moveq.l	#0,d0
+			move.w	4(sp),d0					; d0 = scsi selector
+			cmpi.w	#numSelectors,d0			; valid selector?
+			bhs.s	@CallOld					; out of range - let the ROM handle it
+
+;===================================================================================
+;	Head patch for "jSCSIFreeHook" and "TransactionFlag"
+;
+;	Only patch selectors indicated by the table "TransFlagTbl".  Call through to
+;	the ROM to handle the other selectors.
+;===================================================================================
+
+			lea		TransFlagTbl,a0				; get bit flag table address
+			tst.b	(a0,d0.w)					; any flags set?
+			bne.s	@SetUpPatch					; flags set - do the patch
+			
+@CallOld
+
+		if forROM then							;<RLM>
+			import	SCSIMgr						;<RLM>
+			jmp		SCSIMgr						;<RLM> <3>
+		else
+			jmpOld								; wrong selector - call old scsimgr
+		endif									;<RLM>
+
+;===================================================================================
+;	Setup for "jSCSIFreeHook" and "TransactionFlag" patches
+;
+;	"jsr" into the ROM to execute the SCSI selector and return to this patch.
+;	Because the SCSI manager is stack based, we must shift the parameters 6 bytes on
+;	the stack to make room for our return address and for saving the SCSI selector
+;	(while not disturbing the stack parameters).
+;===================================================================================
+
+@SetUpPatch
+			btst.b	#fSetTransFlag,(a0,d0.w)	; are we setting the transaction flag?
+			beq.s	@ContinueSetup				; no - just continue
+	If forRom then				; <4> kc.start
+			With	scsiGlobalRecord
+			movea.l	SCSIGlobals, a1				; addr of record 
+			lea		TransactionFlag(a1),a1		; is the SCSI Mgr free?
+			EndWith
+	Else
+			lea		TransactionFlag(pc),a1		; is the SCSI Mgr free?
+	Endif						; <4> kc.end
+			addq.w	#1,(a1)						; inc the transaction flag now
+
+@ContinueSetup
+			lea		ParamSizeTable,a0			; get table of paramblk sizes
+			add.l	d0,d0						; index words
+			move.w	(a0,d0),d0					; d0 = parameter block size
+
+			subq.l	#2,sp						; make room for saving scsi selector
+			movea.l	sp,a1						; a1 = destination reg
+			move.l	2(a1),d1					; d1 = original return addr
+			movea.l	a1,a0						; a0 = source reg
+			addq.w	#6,a0						; shift parameters (4byte ret_addr,2byte selector)
+
+@Loop
+			move.w	(a0)+,(a1)+					; shift the stack
+			dbra	d0,@Loop
+			move.l	d1,(a1)+					; orig return addr after params
+			move.w	(sp),(a1)					; save scsi selector above return addr
+
+;	Call the old _SCSIDispatch code and return
+
+
+		if forROM then							;<RLM>
+			import	SCSIMgr						;<RLM>
+			jsr		SCSIMgr						;<RLM>
+		else
+			jsrOld								; call the old _SCSIDispatch
+		endif									;<RLM>
+
+
+;	On return, the stack has the function result code, the original return address,
+;	and the saved selector.  Get the saved selector for later and move the result
+;	code to where the selector was.  The return address is in the right place.
+
+			move.w	6(sp),d0					; need SCSIDispatch selector for table lookup
+			move.w	(sp)+,4(sp)					; move function result code, ret addr is in place
+
+;========================================================================================
+;	Check if "TransactionFlag" should be cleared
+;========================================================================================
+
+			lea		TransFlagTbl,a0				; addr of bit flag table 
+			btst.b	#fClearTransFlag,(a0,d0)	; do we unconditionally clear the flag?
+			bne.s	@ClearFlag
+			btst.b	#fClearTransErr,(a0,d0)		; do we clear only on an error result?
+			beq.s	@CheckFreeHook				; no - check for executing the freehook
+			tst.w	4(sp)						; check the function result
+			beq.s	@CheckFreeHook				; just check the freehook
+@ClearFlag
+	If forRom then				; <4> kc.start
+			With	scsiGlobalRecord
+			movea.l	SCSIGlobals, a1				; addr of record
+			lea		TransactionFlag(a1),a1		; is the SCSI Mgr free?
+			EndWith
+	Else
+			lea		TransactionFlag(pc),a1		; is the SCSI Mgr free?
+	Endif						; <4> kc.end
+			tst.w	(a1)						; is it already zero?
+			beq.s	@alreadyZero
+			subq.w	#1,(a1)						; clear the transaction flag
+@alreadyZero
+
+;========================================================================================
+;	Check if "jSCSIFreeHook" should be called
+;
+;	Check if the SCSI manager is free (TransactionFlag).  The SCSI manager should only
+;	be free on error conditions during SCSISelect, or after SCSIComplete.  The SCSI bus
+;	is allowed to still be busy at this point, but should require no additional intervention
+;	from the processor (a device could just be slow getting off the bus).  SCSISelect
+;	with errors, and SCSIComplete should leave the bus in a condition of becoming free.
+;
+;	If SCSIComplete returns with a timeout error, then the SCSI manager will be free, but
+;	the bus may still be busy.  In this case, the "jSCSIFreeHook" will not be called.
+;========================================================================================
+
+@CheckFreeHook
+			btst.b	#fDoFreeHook,(a0,d0)		; do we execute the freehook?
+			beq.s	@Done						; no - we are done
+	If forRom then				; <4> kc.start
+			With	scsiGlobalRecord
+			movea.l	SCSIGlobals, a1				; addr of record
+			lea		TransactionFlag(a1),a1		; is the SCSI Mgr free?
+			EndWith
+	Else
+			lea		TransactionFlag(pc),a1		; is the SCSI Mgr free?
+	Endif						; <4> kc.end
+			tst.w	(a1)						; test flag
+			bne.s	@Done						; scsi mgr busy - done
+
+;========================================================================================
+;	SCSI manager is free - call the routine which runs "jSCSIFreeHook".
+;
+;	A routine is executed through _DeferUserFn (to allow VM page fault processing) which
+;	actually executes the "jSCSIFreeHook".  The reason why a routine is used instead of
+;	running "jSCSIFreeHook" directly, is so that we only have one outstanding call to
+;	"jSCSIFreeHook" at a time.  So the routine is after the _DeferUserFn so we know it
+;	has run.
+;========================================================================================
+
+	If forRom then				; <4> kc.start
+			With	scsiGlobalRecord
+			movea.l	SCSIGlobals, a0				; addr of record
+			lea		FreeHookPending(a0),a0		; get address of freehook pending flag
+			EndWith
+	Else
+			lea		FreeHookPending(pc),a0		; get address of freehook pending flag
+	Endif						; <4> kc.end
+			bset.b	#0,(a0)						; test and set the freehook pending flag	<8> djw
+			bne.s	@Done						; one already pending - done
+
+			lea		PostFreeHook,a0				; get addr of routine to execute
+			_DeferUserFn						; execute deferred
+
+@Done
+			rts
+
+;========================================================================================
+;	PostFreeHook routine
+;
+;	This routine is executed through _DeferUserFn to run the "jSCSIFreeHook".  This
+;	routine will clear the FreeHookPending flag so that other SCSI completions will
+;	generate calls to "jSCSIFreeHook".
+
+PostFreeHook
+			movea.l	ExpandMem,a0				; a0 = ptr to expand mem
+			move.l	jSCSIFreeHook(a0),d0		; d0 = SCSI free vector
+			beq.s	@Done						; no freehook to execute
+			movea.l	d0,a0
+			jsr		(a0)						; execute "jSCSIFreeHook"
+@Done
+	If forRom then				; <4> kc.start
+			With	scsiGlobalRecord
+			movea.l	SCSIGlobals, a0				; addr of record
+			lea		FreeHookPending(a0),a0		; get address of freehook pending flag
+			EndWith
+	Else
+			lea		FreeHookPending(pc),a0		; get address of freehook pending flag
+	Endif						; <4> kc.end
+			clr.b	(a0)						; clear pending flag
+			rts
+
+			endwith
+
+;_______________________________________________________________________________________
+;	SCSIBusyPlus  -  return G_State on a MacPlus
+;
+;	WARNING...WARNING...WARNING...	if the SCSIDispatch patch in the MacPlus patch file
+;									changes, then the equate @G_State may become invalid.
+;
+
+SCSIBusyPlus
+
+@G_State	Equ		$23						; offset in MacPlus SCSI dispatcher to G_State global
+@scsiRd		Equ		$580000					; read base addr of NCR5380 on Plus
+
+			leaOld	a0						; a0 = addr of patched _SCSIDispatch
+			move.b	@G_State(a0),d0			; d0 = G_State byte embedded in system patch
+			movea.l	#@scsiRd,a1				; hard coded read base addr for SCSI chip
+			bra		SCSIBusyCommon
+
+;_______________________________________________________________________________________
+;	SCSIBusyOthers  -  return G_State on Macs other than a Plus
+;
+			with	SCSIGlobalRecord
+
+SCSIBusyOthers
+			movea.l	SCSIGlobals,a0			; a0 = ptr to SCSI global record
+			move.b	G_State(a0),d0			; d0 = G_State byte
+			movea.l	SCSIBase,a1				; read base of SCSI hardware supported by lowmem
+											; fall through to SCSIBusyCommon
+
+;	SCSIBusy common routine  -  a1 = read base addr of SCSI chip, d0 = G_State busy bit
+
+SCSIBusyCommon
+			andi.w	#$01,d0					; mask only busy bit from G_State
+; <djw>		moveq.l	#$40,d1					; mask for current bus status
+; <djw>		and.b	sCSR(a1),d1				; read and mask current bus status register
+; <djw>		rol.b	#2,d1					; get BSY bit (bit 6) to bit 0
+; <djw>		or.b	d1,d0					; if either SCSI mgr or bus is busy then return busy
+			movea.l	(sp)+,a0				; pop a0 = return addr
+			adda.w	#2,sp					; pop selector
+			move.w	d0,(sp)					; result on stack
+			jmp		(a0)					; done
+
+			endwith
+
+	If not forRom then			; <4> kc.start
+;_______________________________________________________________________________________
+;	Pending freehook call flag, and ParamSizeTable
+;
+;	The ParamSizeTable contains the number of words of arguments passed to _SCSIDispatch
+;	for each of the various selectors.  The count includes any arguments, the result
+;	word, and the selector word.  The count does not include the return address on the
+;	stack.  The count is then adjusted for a "dbra" loop count.  The FreeHookPending
+;	flag is set if an outstanding "jSCSIFreeHook" call has been posted to _DeferUserFn.
+;	The flag is check before posting any calls to _DeferUserFn.  This prevents overflowing
+;	VM's defered function queue.
+;
+; 	In SuperMario, this is part of SCSIGlobals.
+
+FreeHookPending	dc.l	0					; location of pending free-hook flag
+SCSIBusyVector	dc.l	0
+
+	Endif						; <4> kc.end
+ParamSizeTable								; parameters on stack in words + selector + result - dbra
+				dc.w	2-1					; selector	0	SCSIReset
+				dc.w	2-1					; 			1	SCSIGet
+				dc.w	3-1					; 			2	SCSISelect
+				dc.w	5-1					; 			3	SCSICmd
+				dc.w	8-1					; 			4	SCSIComplete
+				dc.w	4-1					; 			5	SCSIRead
+				dc.w	4-1					; 			6	SCSIWrite
+				dc.w	2-1					;			7	SCSIInstall (unused)
+				dc.w	4-1					;			8	SCSIRBlind
+				dc.w	4-1					;			9	SCSIWBlind
+				dc.w	2-1					;			10	SCSIStat
+				dc.w	3-1					;			11	SCSISelAtn
+				dc.w	4-1					;			12	SCSIMsgIn
+				dc.w	3-1					;			13	SCSIMsgOut
+
+	If not forRom then			; <4> kc.start
+;_______________________________________________________________________________________
+;	SCSI Transaction Flag table and transaction flag
+;
+;	The TransFlagTbl is an array of bit flags which indicate whether: to execute
+;	the "jSCSIFreeHook" vector; to set the "TransactionFlag"; to clear the
+;	"TransactionFlag".
+;
+; 	In SuperMario, this is part of SCSIGlobals.
+
+TransactionFlag	dc.w	0					; location to store SCSI transaction flag
+
+	Endif						; <4> kc.end
+
+TransFlagTbl
+				dc.b	(1<<fDoFreeHook)+(1<<fClearTransFlag)		; 0		SCSIReset
+				dc.b	(1<<fSetTransFlag)+(1<<fClearTransErr)		; 1		SCSIGet
+				dc.b	(1<<fClearTransErr)+(1<<fDoFreeHook)		; 2		SCSISelect
+				dc.b	0											; 3		SCSICmd
+				dc.b	(1<<fDoFreeHook)+(1<<fClearTransFlag)		; 4		SCSIComplete
+				dc.b	0											; 5		SCSIRead
+				dc.b	0											; 6		SCSIWrite
+				dc.b	0											; 7		SCSIInstall (unused)
+				dc.b	0											; 8		SCSIRBlind
+				dc.b	0											; 9		SCSIWBlind
+				dc.b	0											; 10	SCSIStat
+				dc.b	(1<<fClearTransErr)+(1<<fDoFreeHook)		; 11	SCSISelAtn
+				dc.b	0											; 12	SCSIMsgIn
+				dc.b	0											; 13	SCSIMsgOut
+
+
+			Endp							; end SCSIDispatchCommon
+
+
+;_______________________________________________________________________________________	<2> djw
+;
+PatchSCSIDrivers	InstallProc		(Plus,SE,Portable,II,IIci)
+
+JSROpcode				equ		$4EB9
+NOPOpcode				equ		$4E714E71
+LowestDriverVersion		equ		$0026
+HighestDriverVersion	equ		$0029
+BlockPinningFirstLong	equ		$0C820000
+BlockPinning2ndLong		equ		$01006308
+scsiVersion				equ		-$E
+
+				leaResident	SCSIPatchToBlockIOInDriver, A2	; pointer to patch code
+				move.l	A2, D0						; so we can strip it
+				_StripAddress						; we might get called in 32-bit mode
+				move.l	D0, A2						; clean version of the address
+
+				move.l	UTableBase, A0				; pointer to unit table
+				add.l	#32 * 4, A0					; entry #32 * sizeof(DCEHandle)
+				
+				moveq	#7, D4						; 8 possible scsi drivers
+				
+@checkSCSIDriverLoop
+				move.l	(A0), D1					; get DCEHandle for this driver
+				bz.s	@nextSCSIDriver				; no driver here, try the next one
+				move.l	D1, A1						; DCEHandle for this driver
+				move.l	(A1),A1						; get the DCE
+				btst	#dRAMBased, dCtlFlags+1(A1)	; do we have a handle or pointer?
+				move.l	dCtlDriver(A1), A1			; handle or pointer
+				bz.s	@havePointer				; skip the deref if dRAMBased=0
+				move.l	(A1), A1					; get pointer to RAM driver
+@havePointer
+				move.w	scsiVersion(A1), D1			; version field for Apple’s SCSI driver
+				sub.w	#LowestDriverVersion, D1	; normalize $27-$29 => $0-$2
+				bmi.s	@nextSCSIDriver				; bail if earlier than $27
+				cmp.w	#HighestDriverVersion-LowestDriverVersion, D1	; check high end of supported versions
+				bgt.s	@nextSCSIDriver				; bail if later than $29
+				
+				add.w	D1, D1						; times 2 for sizeof(word)
+				move.w	OffsetsToBlockPinningInDriver(PC, D1), D2	; get offset to patch location
+
+				cmpi.l	#BlockPinningFirstLong, (A1, D2.w)	; is the data what we expect?
+				bne.s	@nextSCSIDriver
+				cmpi.l	#BlockPinning2ndLong, 4(A1, D2.w)	; is the second long correct?
+				bne.s	@nextSCSIDriver
+				
+; Change the driver to call our patch
+
+				add.w	D2, A1
+				move	SR, -(SP)					; save current state of the world
+				ori.w	#$0700, SR					; we’re not safe for page faults
+				move.w	#JSROpcode, (A1)+			; patch in a JSR
+				move.l	A2, (A1)+					; patch in operand
+
+; The patch does the entire block pinning that the driver did, so NOP out these instructions
+; after the JSR to our patch.
+
+				moveq	#2, D1
+@blastSomeInstructionsLoop
+				move.l	#NOPOpcode, (A1)+
+				dbra	D1, @blastSomeInstructionsLoop
+				_FlushDataCache						; we wrote into a copyback cache
+				_FlushInstructionCache				; we changed code
+				move	(SP)+, SR					; we’re safe for page faults again
+
+@nextSCSIDriver
+				addq	#4, A0						; point to next DCEPtr in the unit table
+				dbra	D4, @checkSCSIDriverLoop	; do the rest of the SCSI drivers
+				rts
+
+OffsetsToBlockPinningInDriver
+				dc.w	$0CA8						; Offset to offending code in driver version $26
+				dc.w	$0CA8						; Offset to offending code in driver version $27
+				dc.w	$0CA8						; Offset to offending code in driver version $28
+				dc.w	$1046						; Offset to offending code in driver version $29
+				EndProc
+
+; The Quantum firmware has a bug where the cache gets corrupt after a read of 10 to 15
+; blocks if another read comes in after a certain amount of time.  Our patch changes the
+; SCSI driver so that we never read 10 to 15 blocks.  If a read request in this range
+; comes in, break the read down into two reads of 9 blocks and change.
+;
+; Register usage:
+;	D2 -> count (number of blocks remaining to be read.  Could be > 256.)
+;	D3 -> wrflag (non zero if driver is doing a write.)
+;	D5 <- nb (number of blocks to be read in this pass.  Must be ≤ 256.)
+
+SCSIPatchToBlockIOInDriver	Proc	Export
+
+SCSISmallestSafeBlock	equ		9
+SCSILargestSafeBlock	equ		16
+SCSILargestIOBlockSize	equ		256
+
+				move.l	D2,D5								; Potential number of blocks to read in this pass
+				tst.w	D3									; Are we reading or writing?
+				bnz.s	@pinBlocksToReadOrWriteTo256		; If we’re writing, just pin the blocks to 256
+				cmp.l	#SCSISmallestSafeBlock, D2			; Are we reading less than 10 blocks?
+				bls.s	@rejoinDriver						; Yeah.  Go back to the driver
+				cmp.l	#SCSILargestSafeBlock, D2			; Are we reading more than 15 blocks?
+				bhs.s	@pinBlocksToReadOrWriteTo256		; Yes.  This read is safe.  Go make sure we’re not reading more than 256 blocks
+				move.l	#SCSISmallestSafeBlock, D5			; We’re reading 10 to 15 blocks.  Read only 9.  (We’ll get the rest on the next pass.)
+				bra.s	@rejoinDriver						; Go back to the driver
+@pinBlocksToReadOrWriteTo256								; Make sure we don’t operate on more than 256 blocks in a pass
+				cmp.l	#SCSILargestIOBlockSize, D2			; Are we operating on more than 256 blocks?
+				bls.s	@rejoinDriver						; No.  Get on with it.
+				move.l	#SCSILargestIOBlockSize, D5			; Pin the operation to 256 blocks.
+@rejoinDriver
+				rts											; Go back to the driver. (D5 = nb)
+			
+;=======================================================================================
+;=======================================================================================
+
+			End

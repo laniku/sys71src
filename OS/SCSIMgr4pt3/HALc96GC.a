@@ -1,0 +1,319 @@
+;
+;	File:		HALc96GC.a
+;
+;	Contains:	Grand Central SCSI HBA
+;
+;	Written by:	Craig Prouse
+;
+;	Copyright:	╘ 1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	11/19/93	chp		Add primitives for clearing, enabling, and disabling SCSI IRQ.
+;									Add a primitive for testing SCSI IE.
+;	  <SMG2>	10/26/93	chp		Adjust for changes in DBDMA and Grand Central header files.
+;
+;
+
+
+				case	on
+
+				print	push,off
+				include	'DBDMA.a'
+				include	'ACAM.a'
+				include	'HALc96equ.a'
+				print	pop
+
+				machine	mc68020
+
+
+
+;	ииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииии
+;	StartGC:
+;
+;	In:		A5		pointer to HALc96GlobalRecord
+;			(SP)	stack-based arguments
+;
+;	Initiate DMA.
+;	ииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииии
+
+StartGC			proc	export
+
+saveRegs		reg		d1-d3
+
+maxAtomicCount	equ		$FFF0						; maximum atomic DMA transfer count
+
+StackFrame		record	{a6Link},decrement
+dirRead			ds.w	1							; direction is read (16-bit Boolean)
+byteCount		ds.l	1							; number of bytes to transfer
+bufferAddr		ds.l	1							; source/destination buffer for transfer
+rtsAddr			ds.l	1
+a6Link			ds.l	1
+localSize		equ		*
+				endr
+
+				with	HALc96GlobalRecord, StackFrame
+
+				link	a6,#localSize
+				movem.l	saveRegs,-(sp)
+
+; A0 is set initially to the address of the first channel command descriptor.
+
+				movea.l	cclLogicalAddr(a5),a0		; pointer to DBDMA command list buffer
+
+; D3 will contain the command word for a list of input or output channel commands.
+
+				tst.w	dirRead(a6)
+				bne.b	@input
+@output			move.w	#OUTPUT_MORE,d3
+				bra.b	@ioCommon
+@input			move.w	#INPUT_MORE,d3
+
+; A single DB-DMA channel command can transfer at most $FFFF bytes since the count
+; field is 16 bits. The 53C9x can only DMA an even number of bytes, producing an
+; effective limit of $FFFE bytes. For the sake of roundness, this CCL shall not
+; contain any commands for more than $FFF0 bytes. The channel command list is
+; generated using as many descriptors as necessary to satisfy the request. The CCL
+; buffer is one physical page (8K) in length, allowing for up to 511 data transfer
+; descriptors, or nearly 32 MB in a single request. There is no range checking.
+
+@ioCommon
+				move.l	#maxAtomicCount,d0
+				movea.l	bufferAddr(a6),a1			; DMA address in A1
+				move.l	byteCount(a6),d2			; remaining DMA count in D2
+				bra.b	@loopTest
+
+@partialIOCmd	swap	d0
+				move.w	d3,d0						; command in high word of D0
+				swap	d0							; count in low word of D0
+				_MakeCCDescriptor
+				adda.w	#DBDMADescriptor.size,a0
+
+				move.l	#maxAtomicCount,d0
+				adda.l	d0,a1						; increment transfer address
+				sub.l	d0,d2						; decrement remaining transfer count
+
+@loopTest		beq.b	@stopCmd					; generate STOP immediately when count = 0
+				cmp.l	d0,d2
+				bhi.b	@partialIOCmd
+
+@lastIOCmd		move.w	d3,d0
+				swap	d0							; command in high word of D0
+				move.w	d2,d0						; remaining count in low word of D0
+				_MakeCCDescriptor
+				adda.w	#DBDMADescriptor.size,a0
+
+@stopCmd		move.l	#(STOP<<16) | $0000,d0		; stop command / count field is reserved
+				lea		0,a1						; address field is reserved
+				_MakeCCDescriptor
+
+; Point the DMA hardware at the new CCL.
+
+				movea.l	dmaCntrlAddr(a5),a0			; pointer to SCSIx DBDMAChannelRegisters in A0
+				move.l	cclPhysicalAddr(a5),d0		; pointer to channel command list in D0
+				_SetCommandPtr
+
+; Reset anything wrong with the channel status and start it running.
+
+				move.l	#	kdbdmaSetRun |\
+							kdbdmaClrPause |\
+							kdbdmaClrHalted |\
+							kdbdmaClrDead |\
+							kdbdmaSetActive, d0
+				_SetChannelControl					; A0 still points to DBDMAChannelRegisters
+
+				movem.l	(sp)+,saveRegs
+				unlk	a6
+				rts
+
+				endwith
+				endproc
+
+
+
+;	ииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииии
+;	StopGCRead:
+;	StopGCWrite:
+;	Wt4GCComplete:
+;
+;	In:		A5		pointer to HALc96GlobalRecord
+;	Out:	D0.L	residual count
+;	ииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииии
+
+StopGCDMA		func	entry
+				export	StopGCRead, StopGCWrite, Wt4GCComplete
+
+saveRegs		reg		d1/d2
+
+				with	HALc96GlobalRecord
+
+StopGCRead
+StopGCWrite
+				movea.l	dmaCntrlAddr(a5),a0			; pointer to SCSIx DBDMAChannelRegisters in A0
+				move.l	#kdbdmaClrRun,d0
+				_SetChannelControl					; abort the CCL
+
+Wt4GCComplete
+				movea.l	dmaCntrlAddr(a5),a0			; pointer to SCSIx DBDMAChannelRegisters in A0
+@waitInactive	_GetChannelStatus					; wait for last status writeback
+				andi.l	#kdbdmaActive,d0
+				bne.b	@waitInactive
+
+; For better or for worse, channel command execution has stopped. It is now time to
+; calculate the residual count. This is just a little bit complicated because it is
+; not known exactly how many command descriptors in the list completed execution.
+
+				movem.l	saveRegs,-(sp)
+
+				moveq	#0,d2						; accumulate residual count in D2
+				movea.l	cclLogicalAddr(a5),a0		; this is where CCL execution started
+
+@nextDescriptor
+				_GetCCOperation
+				cmpi.l	#(STOP<<16) | $0000,d0		; is this the end-of-list?
+				beq.b	@done
+
+				move.l	d0,d1						; save the request count
+				_GetCCResult
+				tst.l	d0							; did a status writeback occur?
+				bne.b	@addResidual				; yes, use residual count field
+				move.l	d1,d0						; no, use request count field
+
+@addResidual	and.l	#$0000FFFF,d0				; mask off xferStatus
+				add.l	d0,d2						; accumulate residual count
+
+				adda.w	#DBDMADescriptor.size,a0	; increment to next descriptor
+				bra.b	@nextDescriptor
+
+@done
+				move.l	d2,d0						; move total residual count to D0 result
+				movem.l	(sp)+,saveRegs
+				rts
+
+				endwith
+				endfunc
+
+
+
+;	ииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииии
+;	ClearGCSCSIIRQ:
+;
+;	In:		A5		pointer to HALc96GlobalRecord
+;
+;	This routine may not change any registers.
+;	ииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииии
+
+ClearGCSCSIIRQ	proc	entry
+
+intClearOffset	equ		gcInterruptClear - gcInterruptMask
+
+				with	HALc96GlobalRecord
+
+				align	8
+				export	ClearGCSCSI0IRQ
+ClearGCSCSI0IRQ:
+				ori.l	#1 << gcifDevSCSI0,([intEnableSCSIAddr,a5],intClearOffset)
+				rts
+
+				align	8
+				export	ClearGCSCSI1IRQ
+ClearGCSCSI1IRQ:
+				ori.l	#1 << gcifDevSCSI1,([intEnableSCSIAddr,a5],intClearOffset)
+				rts
+
+				endwith
+				endproc
+
+
+
+;	ииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииии
+;	EnableGCSCSIIRQ:
+;
+;	In:		A5		pointer to HALc96GlobalRecord
+;
+;	This routine may not change any registers.
+;	ииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииии
+
+EnableGCSCSIIRQ	proc	entry
+
+				with	HALc96GlobalRecord
+
+				align	8
+				export	EnableGCSCSI0IRQ
+EnableGCSCSI0IRQ:
+				ori.l	#1 << gcifDevSCSI0,([intEnableSCSIAddr,a5])
+				rts
+
+				align	8
+				export	EnableGCSCSI1IRQ
+EnableGCSCSI1IRQ:
+				ori.l	#1 << gcifDevSCSI1,([intEnableSCSIAddr,a5])
+				rts
+
+				endwith
+				endproc
+
+
+
+;	ииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииии
+;	DisableGCSCSIIRQ:
+;
+;	In:		A5		pointer to HALc96GlobalRecord
+;
+;	This routine may not change any registers.
+;	ииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииии
+
+DisableGCSCSIIRQ proc	entry
+
+				with	HALc96GlobalRecord
+
+				align	8
+				export	DisableGCSCSI0IRQ
+DisableGCSCSI0IRQ:
+				andi.l	#~(1 << gcifDevSCSI0),([intEnableSCSIAddr,a5])
+				rts
+
+				align	8
+				export	DisableGCSCSI1IRQ
+DisableGCSCSI1IRQ:
+				andi.l	#~(1 << gcifDevSCSI1),([intEnableSCSIAddr,a5])
+				rts
+
+				endwith
+				endproc
+
+
+
+;	ииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииии
+;	TestGCSCSIIE:
+;
+;	In:		A5		pointer to HALc96GlobalRecord
+;	Out:	CCR		Z flag indicates state of the SCSI interrupt enable
+;
+;	This routine may use D0.
+;	ииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииииии
+
+TestGCSCSIIE	proc	entry
+
+				with	HALc96GlobalRecord
+
+				align	8
+				export	TestGCSCSI0IE
+TestGCSCSI0IE:
+				move.l	#1 << gcifDevSCSI0,d0
+				and.l	([intEnableSCSIAddr,a5]),d0
+				rts
+
+				align	8
+				export	TestGCSCSI1IE
+TestGCSCSI1IE:
+				move.l	#1 << gcifDevSCSI1,d0
+				and.l	([intEnableSCSIAddr,a5]),d0
+				rts
+
+				endwith
+				endproc
+
+
+
+				end

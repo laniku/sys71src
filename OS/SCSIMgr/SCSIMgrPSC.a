@@ -1,0 +1,1535 @@
+;
+;	File:		SCSIMgrPSC.a
+;
+;	Contains:	SCSI Mgr for the 53c96/PSC
+;
+;	Written by:	Jonathan Abilay/Paul Wolf
+;
+;	Copyright:	© 1990-1992 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 11/3/92	SWC		Changed SCSIEqu.a->SCSI.a.
+;		 <1>	  6/2/92	kc		first checked in
+;	   <SM0>	 6/01/92	kc		Rolled in from Pandora.
+;		<P2>	 1/30/92	PDW		Fixed ID getting lost bug and eliminated unnecessary and
+;									ineffective MMU mode stuff.
+;		 <1>	 1/17/92	PDW		first checked in
+; ———————————————————————————————————————————————————————————————————————————————————————
+;	  Pre-Pandora ROM comments begin here.
+; ———————————————————————————————————————————————————————————————————————————————————————
+;		 <3>	 8/21/91	SAM		(PDW) Added a FlushCacheRange call of the BusErrVct (long word
+;									at 8) after replacing my BEH with the previous BEH.   This is to
+;									fix VM_On/BEHandler bug which is apparently a bug with MOVE16
+;									instructions that cause Access Errors (page faults).
+;		 <2>	 8/19/91	SAM		(PDW) SendCmd_96 did not correctly detect a premature end of
+;									command phase.  Added a wait for FIFO empty or phase change to
+;									detect this.  Turned slow_cable mode off after sending command
+;									(like we did before B2).
+;		 <1>	  8/8/91	SAM		(PDW) Checked into Regatta for the first time with lots of 
+;									changes over the TERROR sources.
+;		 <0>	  8/8/91	SAM		Split off from 7.0 GM sources.
+;
+;	Pre Regatta split-off change history:
+;
+;		 <T9>	 6/27/91	djw		(actually PDW) Removed all traces of SCSIBusy and FreeHook
+;									stuff. Made minimum CDB 1 byte instead of 2. Added slow cable
+;									mode to command phase to improve reliability. Added multi-stage
+;									select modeling to handle many more odd phase transitions.
+;									Rewrote CyclePhase to handle all phases instead of just data
+;									phases and also to handle new Select sequence flags.
+;									Jump-vectorized CyclePhase_96.
+;		 <T8>	 6/14/91	djw		(actually PDW) Made mods to Interrupt handling of Select to work
+;									with devices that go from Select to Status phz (like the
+;									LaserWriter SC). Also eliminated wait for Select complete
+;									interrupt at end of Command - we can do it in data phz or
+;									Complete. Changed Select watchdog to be longer than the timeout
+;									value used by the '96 (512mS vs 256mS).
+;		 <T7>	  6/9/91	BG		Rolled in Paul Wolf's SCSI changes: Rearranged headers to work
+;									more consistently between test INIT and ROM builds. (Should not
+;									affect ROM build).
+;		 <T6>	 5/24/91	CCH		Rolled in Paul Wolf's SCSI fixes: Reworked DoSCSISelect_D96
+;									procs: Disabled automatic redirection of select if a device
+;									disappears. Added 512mS delay after SCSIReset to fix Quantum
+;									Q250 bug and to be consistent with all old CPUs.
+;		 <T5>	 4/22/91	BG		(actually JMA) Reworked DoSCSIComplete proc and fix SendCmd.
+;		 <T4>	 3/30/91	BG		(actually JMA) Reworked SendCmd and DoSCSISelect procs; fixed
+;									SCSIStat bug; incorporated new FS hook fix but still is UNUSED.
+;		 <T3>	 2/17/91	BG		(actually JMA) Added Error calls, removed _Debugger calls, fixed
+;									CyclePhase bug, added DoSCSIBusy_96 support & move stuff around.
+;		 <T2>	  1/5/91	BG		(actually JMA) Added functionalities.
+;		 <T1>	 12/7/90	JMA		Checked into TERROR for the first time.
+;
+;==========================================================================								<T3>
+
+
+			MACHINE		MC68020			; '020-level
+			BLANKS		ON				; assembler accepts spaces & tabs in operand field
+			STRING		ASIS			; generate string as specified
+			PRINT		OFF				; do not send subsequent lines to the listing file
+										;	don't print includes
+
+
+			LOAD		'StandardEqu.d'			; from StandardEqu.a and for building ROMs
+			INCLUDE		'DebugMonEqu.a'
+			INCLUDE		'HardwarePrivateEqu.a'
+			INCLUDE		'SCSI.a'
+			INCLUDE 	'SCSIPriv.a'
+			INCLUDE		'UniversalEqu.a'		; for TestFor											<T2>
+			INCLUDE		'SCSIEqu96.a'
+
+			PRINT		ON				; do send subsequent lines to the listing files
+			
+SCSICyc96		PROC		EXPORT	
+
+			EXPORT	SCSIMgr_PSC
+			EXPORT	DoSCSICmd_PSC,		DoSCSIComplete_PSC
+			EXPORT	DoSCSISelect_sPSC,	DoSCSISelect_dPSC						;						<T2>
+			EXPORT	DoSCSISelAtn_sPSC,	DoSCSISelAtn_dPSC,	CyclePhase_PSC		;						<T9>
+			EXPORT	DoSCSIStat_PSC,		DoSCSIMsgOut_PSC
+			EXPORT	SCSIpcTo32Bit_PSC,	Error_PSC
+
+
+			EXPORT	Unimplemented_PSC
+			EXPORT	DoSCSIReset_PSC,	DoSCSIGet_PSC							;						<T2>
+			EXPORT	DoSCSIMsgIn_PSC												;						<T2>
+			EXPORT	NewSCSIRead_PSC,	NewSCSIWrite_PSC	
+			EXPORT	NewSCSIWBlind_PSC,	NewSCSIRBlind_PSC
+			EXPORT	SCSIErr_PSC										;						<T9>
+			
+
+			IMPORT	Xfer1Byte_PSC,		WaitForSCSIIntrp_PSC,	WaitForIntNoTime_PSC
+			IMPORT	Wt4DREQorIntPSC,	HandleSelInProgPSC
+			IMPORT	SwapMMU
+
+			WITH	scsiPB, scsiPrivPB 				; access record without explicit qualification
+			WITH	scsiGlobalRecord, dcInstr
+;			WITH	ExpandMemRec					; For File System hook
+
+;==========================================================================
+
+
+			
+;-------------------------------------------------------------
+;
+;	A SCSI Function request handler. SCSI's are invoked by params on
+;	stack followed by a routine selector Int, and return address.
+;	NOTE: SCSIMgr is a Toolbox trap & follows Pascal calling conventions.
+;
+;	A4 is set up by StdEntry and contains a pointer to the SCSI Manager global
+;	area in the system heap.
+;
+
+SCSIMgr_PSC:								; "Normal" 680x0 CPU's with "SCSIGlobals" lomem
+			move.l	(sp)+,a0					; get the return address
+			move.w	(sp)+,d0					; function selector (word)
+			move.l	a0,-(sp)					; push the return address
+
+			cmp.w	#numSelectors,d0			; valid selector?
+			bhs.s	Unimplemented_PSC			; Sorry, Charlie
+
+			link	a6,#LocalSize				; locals for bus error stuff
+			movem.l a2-a5/d2-d7,-(sp)			; save registers
+			movea.l	SCSIGlobals,a4				; get pointer to SCSI Manager globals
+
+scsiMgrCommon
+			move.l	base5380(a4),a3				; 
+			moveq.l	#0,zeroReg
+			moveq.l	#0,d4						; needed by read/write
+
+			move.w	d0,d1						; save a copy of selector
+
+;		 IF	Cpu ≥ 020 AND forRom THEN			; 
+			move.l	0(a4,d0.w*4),a0				; indexed addressing
+;		 ELSE									; 
+;			lsl.w 	#2,d0						; index times four
+;			move.l	0(a4,d0.w),a0				; get jump vector
+;		 ENDIF									; <C846>
+			jmp		(a0)						;   and go there
+
+
+
+;--------------------------------------------------------------------------
+;
+StdExit	
+			movem.l (sp)+, a2-a5/d2-d7				; restore these guys					
+			unlk	a6
+			move.l	(sp)+, a0						; get return address
+			add.w 	d0, sp							; fixup the stack										<T4>
+			jmp 	(a0)
+
+
+
+
+;--------------------------------------------------------------------------
+;
+; Common code when exiting old SCSI Mgr after an error
+;
+; Uses : d0, a0
+
+ExitCleanup:
+			move.b	zeroReg, G_State(a4)	; clear out SCSI Mgr semaphore 
+											;  (from ClearState proc, SCSIMgrNew.a)
+			rts								;													<T3>
+
+
+
+
+;----------------------------------------------------------------
+;
+;	Unimplemented selector (or out of range)
+;
+
+Unimplemented_PSC
+			moveq.l	#dsCoreErr, d0				; unimplemented core routine					<T3>
+			_SysError							; sorry, Charlie								<T3>
+@1			bra.s	@1							; not safe to continue
+
+
+
+
+;--------------------------------------------------------------------------
+;
+;	FUNCTION SCSIStat: INTEGER;
+;						(8)
+;
+;	Get SCSI bus status.
+;
+;	A bit-to-bit bus and status register mapping is not possible from the 53C80 to 53C96.
+;	Consequently, we fake the status and return what we think the status should be.
+;	Also note that we OR the two SCSI bus stati(?) because only 2 situations are possbile:
+; 	1) One bus is active and the other idle 2) both buses are idle.
+; 
+;	The following list is the status bit map:
+; 	signal names in parenthesis are the closest c96 status bit equivalents
+;
+;		53c80 Status Bit		53c96 Status Bits
+;		DBP						n/a
+;		SEL						n/a
+;		I/O						I/O
+;		C/D						C/D
+;		MSG						MSG
+;		REQ						n/a (1 if scBusy)
+;		BSY						n/a (1 if scBusy)
+;		RST						n/a																		<T4>
+;		ACK						n/a
+;		ATN						n/a
+;		BSY ERR					n/a																		<T4>
+;		PHS MAT					n/a
+;		INT REQ					n/a (INT PEND)
+;		PRT ERR					n/a																		<T4>
+;		DMA REQ					DREQ (DMA REQ)															<T4>
+;		END DMA					n/a
+;
+;	G_FakeStat contains fake bit values that different procs of the SCSI manager
+;	have set or cleared.  The values in it reflect the best-guessed status of the
+;	bus as determined by the SCSI manager.
+;
+; Uses: d0, d1, d2
+;
+; Return Codes:
+;		noErr
+
+DoSCSIStat_PSC
+			and.w	#$FFF2, G_FakeStat(a4)		; clear phase bits first, except SEL					<T4>
+			move.l	a3, -(sp)					; save a3
+			clr.l	 d1							;
+			move.l	base539x0(a4), a3			; load ptr for SBus0									<T2>
+			move.b	rSTA(a3), d1				; read this bus' status									<T2>
+
+;		IF isUniversal THEN						;														<T2>
+			TestFor	SCSI96_2Exists				; do we have a 2nd SCSI96 chip? 						<T2>
+			beq.s	@noSCSI96					; bra. if no 2nd SCSI96									<T2>
+			move.l	base539x1(a4), a3			; load ptr for SBus1									<T2>
+			or.b	rSTA(a3), d1				; OR this bus' status									<T2>
+@noSCSI96										;														<T2>
+;		ENDIF									;														<T2>
+			move.l	(sp)+, a3					; restore a3
+			andi.b	#iPhaseMsk, d1				; mask off the rest to get phase bits
+			lsl.b	#2, d1						; position the MSG-CD-IO bits
+			or.w	d1, G_FakeStat(a4)			;
+			
+			moveq.l	#aBSY+aSEL, D0				; what are Busy and Sel signals set to?
+			and.w	G_FakeStat(a4), D0
+			cmp.w	#aBSY, D0					; if Busy but no Sel,
+			bne.s	@1							; 
+			or.w	#aREQ, G_FakeStat(a4)		; set REQ also
+			bra.s	@2
+@1		
+			and.w	#$FFFF-aREQ, G_FakeStat(a4)	; else, clear REQ
+@2
+			btst.b	#FldFakeSel, G_State96(a4)	; did we fail a select during command phz?
+			beq.s	@3							; no - ok
+			move.w	#$006c, G_FakeStat(a4)		; yes - pretend we're in status phase
+@3
+			move.w	G_FakeStat(a4), 8(a6)		; 8(a6) <- Bus and Status
+			bra.s	NoByteExit					; 9(a6) <- Current SCSI Bus Status
+
+
+
+
+;--------------------------------------------------------------------------
+;
+;	FUNCTION SCSIReset: INTEGER;
+;						(8)
+;
+;	If we have two scsi buses, hard reset both since the interface does not provide a					<T2>
+;	way for the client to specify a target bus in a dual-SCSI bus system.								<T2>
+;
+; Uses: a0, a3, d0, d2, d3
+;
+; Return Codes:
+;		noErr
+
+DoSCSIReset_PSC								
+			move.l	a3, -(sp)				; save a3													<T2>
+			movea.l	jvResetBus(a4), a0		; get address of SCSI reset routine							<T2>
+			move.l	base539x0(a4), a3		; load ptr for SBus0										<T2>
+			jsr		(a0)					; reset SCSI bus and kill all requests						<T2>
+
+;		IF isUniversal THEN					;															<T2>
+			TestFor	SCSI96_2Exists			; do we have a second SCSICyc96 chip? 							<T2>
+			beq.s	@noSCSICyc96				; bra. if no 2nd SCSICyc96										<T2>
+			movea.l	jvResetBus(a4), a0		; get address of SCSI reset routine							<T2>
+			move.l	base539x1(a4), a3		; load ptr for SBus1										<T2>
+			jsr		(a0)					; reset SCSI bus and kill all requests						<T2>
+@noSCSICyc96									;															<T2>
+;		ENDIF								;															<T2>
+			move.l	(sp)+, a3				; restore a3
+			move.l	#0, G_FakeStat(a4) 		; clear fake status
+			move.w	zeroReg, 8(a6)			; always returns 0 status
+			bsr.s	ExitCleanup				; clean up to leave								
+
+			moveq.l	#0, d2					; clear upper word											<T6> thru next <T6>
+			move.w	TimeDBRA, d2			; get # of DBRAs per mS
+			lsl.l	#8, d2					; multiply by …
+			lsl.l	#1, d2					; …512
+			move.l	d2, d3					; ...a 512mS wait
+			swap	d3
+@1
+			dbra	d2, @1					; d2 low word of counter
+			dbra	d3, @1					; d3 high word 												<T6>
+
+
+
+	
+NoByteExit
+			moveq.l	#0, d0					; no arguments to clean up
+			bra.w 	StdExit
+			
+
+
+
+;--------------------------------------------------------------------------
+;
+;	FUNCTION SCSIGet: INTEGER;
+;						(8)
+;
+;	SCSI arbitration is now an integrated operation with SELECT 
+;	in the 5394/5396.  It is here only for backward compatibility.  We will fake
+;	an asserted BSY & SEL signals just in case the user above decides to perform
+;	a SCSIStat.
+;
+;	IMPORTANT: SCSIMgr clients MUST still call SCSIGet before SCSISelect.  This will be enforced in		<T4>
+;			   SCSISelect.  G_State will be used as a flag to indicate that SCSIGet was called.
+;				
+; Uses: d0, d1, d2, d3
+;
+; Return Codes:
+;		noErr
+
+DoSCSIGet_PSC
+			bset.b	#scBusy, G_State(a4)		; set to SCSI busy state								<T2>
+			bne.s	@isBusy						; if nonzero, SCSI Mgr is in use						<T2>
+
+;			move.l	zeroReg, d0					; disable SCSI interrupts with old SCSI Mgr
+;			movea.l	jvDisEnable(a4), a0			; addr of interrupt enable/disable routine
+;			jsr		(a0)						; disable interrupts
+														
+			move.w	#aBSY+aSEL, G_FakeStat(a4) 	; Set to a fake successful arb status
+			moveq.l #noErr, d0					; no error
+@exit											;														<T2>
+			move.w	d0, 8(a6)					; return code
+			bra.s	NoByteExit
+
+@isBusy											;														<T2>
+			moveq.l	#scMgrBusyErr ,d0			; SCSI Mgr is busy										<T2>
+			bra.s	@exit						; bail out in order to avoid deadlock					<T2>
+
+
+
+
+;--------------------------------------------------------------------------
+;
+;	FUNCTION SCSISelect(TargID:INTEGER): INTEGER;
+;	FUNCTION SCSISelAtn(TargID:INTEGER): INTEGER;
+;						  (8) 			   (10)
+;
+;	Select the target at TargID on the "virtual" SCSI bus. Returns 0 for success, or error.
+;	Selection can be done with or without the ATN line.
+; 
+;	This proc sets up the proper SCSI chip addresses for Select_PSC for dual-bus machines.
+;	It uses the G_SCSIDevMapX bitmap for each bus with 1 bit for each ID on that bus to 
+;	decide which bus to send a selection attempt to.  During initialization of the SCSI  
+;	manager, these bitmaps are cleared, indicating that no device has been detected at  
+;	any of the SCSI IDs for either bus.  The proper bit is set the first time a successful  
+;	select of that ID on that bus is performed.  
+;
+;	Functionally, if no device has been seen on either the internal or external buses,
+;	the internal bus will be checked first and if that fails, the external bus is checked.
+;	If both fail (if no device is at that ID on either bus) then neither bit will have
+;	been set.  Also, if a device has been seen once at a certain ID, then that ID will
+;	only be accessible from that bus until the next reboot.
+;
+;	This routine will first check the state of the requested ID's external bit.  If it
+;	is set, the first and only selection attempt is performed on bus 1 otherwise it is 
+;	attempted on bus 0.  If the bus 0 select fails, then the bus 0 bitmap is checked to
+;	see if there was previously a device at that ID.  If there wasn't then a selection
+;	is sent to bus 1 as well.
+
+DoSCSISelect_dPSC
+DoSCSISelAtn_dPSC
+			bset.b	#scBusy, G_State(a4)		; set SCSI busy state here too for those who bypass SCSIGet	<T4>
+			move.w	G_FakeStat(a4), -(sp) 		; save fake status										<T4>
+			move.w	#aBSY, (sp)					; assume successful selection, set fake status			<T4>
+
+			moveq.l	#0, d6						; clear upper bits								<T6> thru next <T6>
+			move.w	8(a6), d6					; get the target's ID								
+			cmp.w	#scsiSelAtn, d1				; select with ATN?	
+			bne.s	@noATN						; no ATN	
+;@wATN
+			bset.l	#16, d6						; use ATN
+			ori.w	#aATN, (sp)					; assume successful select w/ATN, set fake status	<T4>
+@noATN
+			move.l	d6, G_TargetID(a4)			; remember destination ID & ATN bit				
+			btst.b	d6, G_SCSIDevMap1(a4)		; if this device is marked as on bus 1...			
+			bne.s	@SBus1						; then try select on bus 1
+			
+@SBus0											; else try select on bus 0	
+			move.l	base539x0(a4), a3			; load SCSI base 0
+			move.l	a3, base5380(a4)			; expected SCSI base adrs for this ID for SCSIRead/Write/Complete etc.
+			move.l	pdma5380(a4), a0			; pdma5380 contains DREQ regr address
+			move.l	d6, d0						; copy target ID
+;			bsr.w 	Select_PSC					; try it							<H1>
+			moveq.l	#0, D0						; always return OK status  			<H1>
+			bne.s	@fldSel0					; branch if select failed
+			bset.b	d6, G_SCSIDevMap0(a4)		; else record this device's existence
+			bra.s	@exit	
+@fldSel0
+			btst.b	d6, G_SCSIDevMap0(a4)		; if this device was marked as on bus 0
+			bne.s	CommonSelErrXit				; then we return an error
+												; else we try bus 1
+@SBus1
+			move.l	base539x1(a4), a3			; load SCSI base 1
+			move.l	a3, base5380(a4)			; expected SCSI base adrs for this ID for SCSIRead/Write/Complete etc.
+			move.l	hhsk5380(a4), a0			; hhsk5380 contains DREQ regr address
+			move.l	d6, d0						; copy target ID
+;			bsr.w 	Select_PSC					; try it							<H1>
+			moveq.l	#0, D0						; always return OK status  			<H1>
+			bne.s	CommonSelErrXit				; branch if select failed
+			bset.b	d6, G_SCSIDevMap1(a4)		; else record this device's existence
+;;			bra.s	@exit
+
+
+@exit
+			move.w	(sp)+, G_FakeStat(a4)		; save new fake status						<T4>
+			move.l	a0, G_SCSIDREQ(a4)			; save SCSI DREQ regr for SCSIRead/Write/Complete etc.
+			move.w	d0, 10(a6)					; return the result
+			moveq.l	#2, d0						; stack cleanup - 1 word parm to get rid of
+			bra.w 	StdExit						;											<T6> from prev <T6>
+			
+
+;-----------------
+
+CommonSelErrXit									; common Select error exit
+			clr.w	(sp)						; set failed fake status
+			move.l	d0, -(sp)					; save d0
+			bsr.w	ExitCleanup					; clean up to leave							
+			move.l	(sp)+, d0					; restore d0
+			move.l	#scsiSelect, d6				; load proc ID											
+			bsr.w	Error_PSC						; call Error proc - for debug
+			move.w	(sp)+, G_FakeStat(a4)		; save new fake status
+			move.w	d0, 10(a6)					; return the result
+			moveq.l	#2, d0						; stack cleanup
+			bra.w 	StdExit						; special exit								<T9>
+
+
+
+
+;--------------------------------------------------------------------------
+;
+;	FUNCTION SCSISelect(TargID:INTEGER): INTEGER;
+;	FUNCTION SCSISelAtn(TargID:INTEGER): INTEGER;
+;						  (8) 			   (10)
+;
+;	Select the target on the bus. Returns 0 for success, or error.
+;	Selection can be done with or without the ATN line.
+; 	Single SCSI BUS Select Proc
+
+DoSCSISelect_sPSC
+DoSCSISelAtn_sPSC
+			bset.b	#scBusy, G_State(a4)		; set SCSI busy state here too for those who bypass SCSIGet	<T4>
+			move.w	G_FakeStat(a4), -(sp) 		; save fake status										<T4>
+			move.w	#aBSY, (sp)					; assume successful selection, set fake status			<T4>
+
+			moveq.l	#0, d6						; clear upper bits					<P2>
+			move.w	8(a6), d6					; get the target's ID				<P2>
+			cmp.w	#scsiSelAtn, d1				; select with ATN?	
+			bne.s	@noATN						; no ATN			
+			bset.l	#16, d6						; use ATN							<P2>	
+			ori.w	#aATN, (sp)					; assume successful select w/ATN, set fake status	<T4>
+@noATN
+			move.l	d6, G_TargetID(a4)			; remember destination ID & ATN bit		<T9>
+			move.l	pdma5380(a4), a0			; pdma5380 contains DREQ regr address
+			move.l	d6, d0						; copy target ID					<P2>
+;			bsr.w 	Select_PSC					; try it							<H1>
+			moveq.l	#0, D0						; always return OK status  			<H1>
+;			bne.s	CommonSelErrXit				; branch if error						<T4>
+@exit
+			move.w	(sp)+, G_FakeStat(a4)		; save new fake status					<T4>
+			move.l	a0, G_SCSIDREQ(a4)			; save SCSI DREQ regr
+			move.w	d0, 10(a6)					; return the result
+			moveq.l	#2, d0						; stack cleanup
+			bra.w 	StdExit
+
+			
+			
+
+;--------------------------------------------------------------------------
+;
+;	FUNCTION SCSICmd(Buffer:Ptr, Count:INTEGER): INTEGER;
+;					  (10)		  (8)			   (14)
+;
+;  Send the target the given command.
+;
+; Return Codes:
+;		noErr, scPhaseErr, scCommErr
+
+DoSCSICmd_PSC
+			move.l	10(a6), a2					; get command buffer address			
+			move.w	8(a6), d2					; get the length					
+			move.l	G_TargetID(a4), d0			; get destination ID & ATN bit		<H1>
+			bsr.w 	Select_PSC					; try it							<H1>
+;			bsr.w 	SendCMD_PSC 					; send it
+			bne.s	@err						; bra. if error		
+@exit											;									<T3> thru next T3>
+			move.w	d0, 14(a6)					; return the result
+			moveq.l	#6, d0
+			bra.w 	StdExit
+@err
+			btst.b	#OurBus, G_State96(a4)		; if we didn't get the bus then
+			bne.s	@1
+			bset.b	#FldFakeSel, G_State96(a4)	; we failed that select 
+@1
+			move.l	d0, -(sp)					; save d0
+			move.l	(sp)+, d0					; restore d0
+
+			move.l	#scsiCmd, d6				; load proc ID						
+			bsr.w	Error_PSC						; call Error proc - for debug		
+			bra.s	@exit						;									<T3>
+
+
+
+
+;--------------------------------------------------------------------------
+;
+;	SCSIRead, SCSIRBlind, SCSIWrite, SCSIWBlind
+;
+;	Called by:	Toolbox Trap Dispatcher
+;
+;	Calls:		Transfer, primitive data transfer routines
+;
+;	On entry:	a3 - SCSI read base address
+;				a4 - pointer to SCSI Manager globals
+;	
+;	Internal:	a1 - TIB scan pointer
+;
+;	Function:	Performs TIB interpretation, and data transfers.
+
+NewSCSIWBlind_PSC
+			moveq.l	#scsiWriteFast, d4			; select the fast write routine
+			bra.s	dataCommon_PSC				; continue
+NewSCSIWrite_PSC
+			moveq.l	#scsiWriteSlow, d4			; select the slow write routine
+			bra.s	dataCommon_PSC				; continue
+NewSCSIRBlind_PSC
+			moveq.l	#scsiReadFast, d4			; select the fast read routine
+			bra.s	startRead_PSC				; continue
+NewSCSIRead_PSC
+			moveq.l	#scsiReadSlow, d4			; select the slow read routine
+startRead_PSC
+
+dataCommon_PSC
+
+			move.l	8(a6), a1					; get the TIB pointer
+			bra.s	@exec						; tighten loop by branching first
+			
+@c_compare
+			bset.l	#scsiCompBit, d4			; add offset to use the compare routines
+			; FALL THROUGH to @c_inc			; continue
+
+@c_inc
+			movea.l	jvTransfer(a4), a0			; get the address of the transfer routine
+			jsr		(a0)						; go to the transfer routine
+			bne.s	@data_end					; if error, bail out
+			add.l	d1, scParam1(a1)			; increment the pointer
+			bclr.l	#scsiCompBit, d4			; remove offset for the compare routines
+			; FALL THROUGH to @next_cmd			; continue
+			
+@next_cmd
+@c_nop											; also NOP, just skip the command
+			add.w	#scSize, a1					; point to the next TIB instruction
+			; FALL THROUGH to @exec
+			
+@exec
+			move.w	scOpcode(a1), d1			; get the function opcode
+			move.l	scParam1(a1), a2			; get the generic address
+			move.l	scParam2(a1), d2			; get the generic count
+			
+			cmp.w	#maxOpcode, d1				; valid opcode ?
+			bhi.s	@c_badop					; return err if not
+			
+			add.w	d1,d1						; index times two
+			jmp		@JmpTable(d1.w)				; jump into table
+			
+@JmpTable										;					
+			bra.s	@c_badop					; 0 is not a valid opcode
+			bra.s	@c_inc						; 1
+			bra.s	@c_noinc					; 2
+			bra.s	@c_add						; 3
+			bra.s	@c_move						; 4
+			bra.s	@c_loop						; 5
+			bra.s	@c_nop						; 6
+			bra.s	@c_stop						; 7
+			bra.s	@c_compare					; 8
+
+@c_badop
+			moveq.l	#scBadparmsErr, d0			; bad opcode
+			bra.s	@data_end
+
+@c_noinc 										; NOINC addr,count
+			movea.l	jvTransfer(a4), a0			; get the address of the transfer routine
+			jsr		(a0)						; go to the transfer routine
+
+			bne.s	@data_end					; if error, exit
+			bra.s	@next_cmd					; else process next command
+
+@c_add											; ADD addr,data
+			add.l	d2, (a2) 					; the count added to the where
+			bra.s	@next_cmd					; process the next command
+
+@c_move											; MOVE addr1,addr2
+			move.l	d2, a0						; get the destination address
+			move.l	(a2), (a0)					; simple enough
+			bra.s	@next_cmd					; process the next command
+
+@c_loop											; LOOP relative addr,count
+			tst.l	d2							; check for zero loop count
+			beq.s	@next_cmd					; if count is already zero, quit loop
+			subq.l	#1, d2						; drop the count
+			move.l	d2, scParam2(a1)			; put the count back for next time
+			beq.s	@next_cmd					; if count exhausted, don't loop	
+			add.l	a2, a1						; modify the command pointer
+			bra.s	@exec						; and process the next command
+
+@c_stop
+			moveq.l	#noErr, d0					; indicate no error
+			; FALL THROUGH to @data_end			; <C846>
+
+
+@data_end
+;--- Flush the cache line that contains location 8 (because of MOVE16 bug)						<3> thru next <3>
+
+			movem.l	D0-D2, -(sp)
+			moveq.l	#9, D0						; FlushCacheRange HWPriv selector
+			move.l	#8, A0						; starting address of flush range
+			move.l	#4, A1						; length of range
+			_HWPriv
+			movem.l	(sp)+, D0-D2				; restore regs									<3> from last <3>
+
+;--- exit and return result
+			move.w	d0, 12(a6)					; return the result
+			moveq.l	#4, d0						; stack cleanup
+			bra.w 	StdExit
+
+
+
+
+
+;--------------------------------------------------------------------------
+;
+;	FUNCTION SCSIComplete(VAR Stat, Message: INTEGER; wait:LongInt): INTEGER;
+;							  (16)   (12) 					(8) 	   (20)
+;
+;	Complete the SCSI command by:
+;	1) Sending command complete sequence byte to get status & msg bytes from target
+;	2) Sending message accepted command to complete the cycle
+;
+; Return Codes:
+;		noErr, scCommErr, scPhaseErr, scComplPhaseErr
+
+DoSCSIComplete_PSC
+			move.w	zeroReg, -(sp)				; assume no_error return value
+			bclr.b	#FldFakeSel, G_State96(a4)	; clear before next xaction - had we fld?
+			bne.s	@completeDone				; yes - then SCSIComplete has nothing to do
+			
+			move.l	Ticks, d4					; get current time	
+			add.l	8(a6), d4					; add count to start ticks	
+			jsr		HandleSelInProgPSC
+			bne.w	@phaseErr
+@chkStatus
+			moveq.l	#iPhaseMsk, d3				; load mask bits for phase value
+			and.b	rSTA(a3), d3				; get phase bits
+			cmpi.b	#iStatus, d3				; are we in status phase?
+			bne.w	@phaseErr					; 
+@inPhase										; we should be in status phase.
+			move.b	#cCmdComp, rCMD(a3)			; load cmd complete code
+			jsr		WaitForSCSIIntrp_PSC			; Wait for intrp w/ timeout
+												;    on exit d5 = rF0S|rINT|0|rSTA
+			beq.w	@noStatus					; Branch if timedout
+@gotStatus
+			clr.l	d2
+			move.b	rFFO(a3), d2				; read status byte from FIFO
+			move.l	16(a6), a1					; get the Status ptr
+			move.w	d2, (a1)					; return status byte
+@gotMsg
+			move.b	rFFO(a3), d2				; read msg byte from FIFO
+			move.l	12(a6), a1					; get the Message ptr
+			move.w	d2,(a1) 					; return the msg byte
+			
+;			;move.l	d5, d0						; 												<T8> thru next <T8>
+;			;andi.b	#iPhaseMsk, d0				; we should be in msg-in phase.
+;			;cmpi.b	#iMsgIn, d0					;   & *ACK still asserted	
+;			;bne.s	@cmdErr																		<T8> from last <T8>
+
+			move.b	#cMsgAcep, rCMD(a3)			; load msg accepted code which de-asserts *ACK
+			jsr		WaitForSCSIIntrp_PSC			; Wait for intrp w/ timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			beq.w	@badAcpt					; Branch if timedout
+			bclr.b	#OurBus, G_State96(a4)		; c96 NOT initiator on bus
+			
+@completeDone
+			move.l	#0, G_FakeStat(a4) 			; clear fake status
+			move.w	(sp)+, 20(a6)				; return error
+			bsr.w	ExitCleanup					; clean up to leave
+			
+			moveq.l	#12, d0						; stack cleanup
+			bra.w	StdExit						;												<T3>
+
+@phaseErr										; only called for Complete phase errors
+			move.w	#scPhaseErr, (sp)			; phase Err but try getting us to status phase			<T9>
+			jsr		([jvCyclePhase,a4])			; get us to status phase if possible
+			beq.s	@1							; if cyclephz has no error, keep old one
+			move.w	d0, (sp)					; else save this new error in (sp)							
+@1
+			moveq.l	#iPhaseMsk, d3				; load mask bits for phase value
+			and.b	rSTA(a3), d3				; get phase bits
+			cmpi.b	#iStatus, d3				; are we in status phase?
+			beq.w	@inPhase					; yes - go get the data
+@checkTime
+			cmp.l	Ticks, d4					; got the time, pal?
+			bhi.w	@chkStatus					; bra. & check phase if we still have time...
+;			btst.b	#FCIntPend, G_State96(a4)	; timed out; were we waiting for a slow peripheral?		<T9>
+;			beq.s	@completeDone				; no - exit with whatever status we've got
+@timedOut
+@noStatus										;										
+@badAcpt
+@notDSCErr
+@cmdErr
+			move.w	#scCommErr, (sp)			; return status
+@badComp				
+			move.l 	(sp), d0					; load error
+			move.l	#scsiComplete, d6			; load proc ID
+			bsr.w	Error_PSC						; call Error proc - for debug
+			bra.s	@completeDone				;													<T5>
+
+
+
+
+
+;--------------------------------------------------------------------------
+;
+;	FUNCTION SCSIMsgIn(VAR Message: INTEGER): INTEGER;
+;							(8)					(12)
+;
+;	Receive a message from the target.
+;
+; Return Codes:
+;		noErr, scCommErr, scPhaseErr
+
+DoSCSIMsgIn_PSC									; SCSIMsgIn added 
+			bsr.w 	GetMsg_PSC
+			bne.s	@err						; bra. if error							<T3>
+			move.l	8(a6), a1					; get the Message ptr
+			move.w	d2, (a1) 					; return the Message byte
+@exit
+			move.w	d0, 12(a6)					; return error
+			moveq.l	#4, d0						; stack cleanup							<T3> thru next <T3>
+			bra.w	StdExit
+@err
+			move.l	#scsiMsgIn, d6				; load proc ID
+			bsr.w	Error_PSC						; call Error proc - for debug
+			bra.s	@exit						;										<T3>
+			
+
+
+
+
+;--------------------------------------------------------------------------
+;
+;	FUNCTION SCSIMsgOut(Message: INTEGER): INTEGER;
+;						  (8)				(10)
+;
+;	Send a message to the target.
+;
+; Return Codes:
+;		noErr, scCommErr, scPhaseErr
+
+DoSCSIMsgOut_PSC									; SCSIMsgOut added 
+			move.w	8(a6), d2 					; get the Message in d2
+			bsr 	SendMsg_PSC
+			bne.s	@err						;										<T3> thru next <T3>																														
+@exit
+			move.w	d0, 10(a6)					; return error
+			moveq.l	#2, d0						; stack cleanup	
+			bra.w	StdExit
+@err
+			move.l	#scsiMsgIn, d6				; load proc ID
+			bsr.w	Error_PSC						; call Error proc - for debug
+			bra.s	@exit
+
+
+
+
+
+;----------------------------------------------------------------
+;	Select Device.
+;		In the 5396, arbitration, selection and command-send operations are integrated operations.
+;		We need the target id and the actual command descriptor block in order to exploit the
+;		capabilities of the chip. Unfortunately, the old SCSI manager was structured for separate
+;		such operations.  This proc is an attempt to remain compatible to that type of operation.
+;		Our goal is to select a target and report the success or failure of that operation.  
+;		This is accomplished by:
+;		1) Loading transfer count, TC, with one in order to activate the select process
+;		2) Using DMA mode in order to allow us to send the actual CDB during DoSCSICmd proc.
+;
+;		Upon exit, we should be in transfer phase waiting for the client to perform either a 
+;		command send or msg-out--if select w/ ATN.  The c96 would be ready and waiting for the
+;	 	CDB or message byte because we told it to expect at least 1 byte of data.
+;
+;		Select w/ ATN asserts the ATTENTION line during selection process.  This allows the
+;		client to perform a 1 byte msg-out via SCSIMsgOut.  The ATN line is deasserted
+;		prior to sending the msg byte.
+;
+;		-->	A0	= DAFB register address for this c96 (for reading DREQ state)
+;		d0.w 	--> Target ID
+;		d0.b16	--> If bit 16 of d0 is set, then ATN is asserted during selection.
+;					This is useful for telling the target that we
+;					want to send it a message before the command phase.
+;		d0 - <-- error (if any)
+;		d2 - --> number of command bytes
+;		d5 - <-- xxxx|xxxx|xxxx|rSTA
+;
+;		a2 - ptr to command block
+;		a3 - SCSI read base address
+;		a4 - ptr to SCSI Mgr globals
+;
+; Uses: d0, d1, d2, d3
+
+Select_PSC
+; set MMU Mode to 32-bit for DREQ test later on
+;		    move.b	MMU32Bit, -(sp)				; save current mode on stack
+;			move.l	d0, -(sp)					; save D0
+;			jsr		SCSIpcTo32Bit_PSC				; use pc relative
+;			moveq	#true32B, d0				; switch to 32-bit mode to look at SCSI config regr 					
+;			jsr		SwapMMU						; do it, call _SwapMMUMode jump vector
+;			move.l	(sp)+, d0					; restore D0
+			
+; Set up chip for select process (flush FIFO, init dest ID)
+			move.b	#cFlshFFO, rCMD(a3)				; Flush FIFO, make sure it's empty
+			nop
+			nop
+			move.b	d0, rDID(a3) 					; load select bus ID w/ target ID
+			nop
+			bra.s	@btmPreLoad
+@topPreLoad
+			move.b	(a2)+, rFFO(a3)
+			nop
+@btmPreLoad
+			dbra	d2, @topPreLoad
+			
+			btst.l	#16, d0							; is this a Sel w/Atn?
+			bne.s	@withAtn
+
+; If Select w/o Atn then set up for 1 DMA byte (last byte of command block) and start process
+@withoutATN			
+			move.b	zeroReg, rXCM(a3)				; tell chip that we will be sending 1
+			move.b	#1, rXCL(a3)					; DMA byte (in command phase)
+			nop
+			move.b	#cSlctNoAtn, rCMD(a3)			; issue Select w/o Atn cmd
+			bset.b	#NeedCmdSent, G_State96(a4)		; flag=expect to see a COMMAND phase next			<T9>
+			bra.s	@2
+
+; If Select w/Atn then set up for 2 DMA bytes (msg_out byte + last byte of command block)
+@withATN			
+			move.b	zeroReg, rXCM(a3)				; tell chip that we will be sending 2
+			move.b	#1, rXCL(a3)					; DMA bytes (1 in msg_out, 1 in command) 
+			move.b	#cSlctNoAtn, rCMD(a3)			; issue Select w/ Atn cmd  !!!FWIP!!!
+			bset.b	#NeedMsgOut, G_State96(a4)		; flag=expect to see a MESSAGE_OUT phase next		<T9>
+@2			
+			bset.b	#SelInProg, G_State96(a4)		; set flag->select is in prog, expect intrpt	<T8><T9>
+			bset.b	#OurBus, G_State96(a4)			; c96 is initiator on bus								<T2>
+
+
+; Set up >512mS timeout for select operation to get somewhere (probably more like 2 seconds)
+			moveq.l	#0, d1							; clear upper word
+			move.w	TimeSCSIDB, d1					; get # of DBRAs
+			lsl.l	#8, d1							; multiply by 256
+			lsl.l	#1, d1							; multiply by 2									<T8> thru next <T8>
+			move.l	d1, d2							; ...a 512mS wait for overall watchdog			
+			swap	d2
+
+			moveq.l	#-1,d3							; for debug - last four rSTA reads			
+			moveq.l	#-1,d4							; for debug - last four rSQS reads			
+	
+			
+; We have told the chip to start it, now we wait for an indication that it has completed a
+; selection.  Several things can happen:
+;	- the target at the requested ID may not exist or may not respond to the select.  In
+;		this case we will receive a Disconnect interrupt from the chip.
+;	- the target may select OK but go into something other than Command phz (if Sel w/o Atn)
+;		or Message_Out phz (if Sel w/Atn).  Here we will see a Function Complete/Bus Service
+;		interrupt.  
+;	- the target may select OK and go into the expected phz - the SUCCESS case.  When this
+;		happens, the chip will assert DREQ because it wants the Command (or Msg_Out) byte. 
+;	- the bus may be hung and the chip is unable to arbitrate.  We detect this by timing
+;		out on the whole process.
+;
+; So basically, this is a 3-way wait for: 
+;	1) DREQ asserted
+;	2) interrupt
+;	3) loop timed out
+
+
+;———————————————————
+@waitLoop
+	; Check for a REQ from the target (within valid phase)
+;			move.l	(a0), d5						; read DAFB regr (a0=DAFB register addr)
+;			btst.l	#bDREQ, d5						; do we have an active DREQ from c96
+;			bne.s	@gotDREQ						; yes: then we have a REQ for Msg_Out or Cmd byte
+
+	; Check for an int - either Disconnected (fld select) or Bus Service/Func. Cmplt (good select)			
+			lsl.l	#8,d3							; shift old rSTA reads up a byte
+			move.b	rSTA(a3),d3
+			move.b	d3,d0
+			btst.l	#bINT,d0						; check for intrp bit ie. timeout or weird phase
+			dbne	d1, @waitLoop					; if intrp then non-normal select op so exit.
+			dbne	d2, @waitLoop					; loop until count exhausted or intrp detected
+													; count is up or intrp detected so we're outta' here
+			beq		@timedOut
+;———————————————————
+
+	; If we got an interrupt, it means that the select command is complete.  Either the target did
+	; not respond (i.e. didn't exist) or it was selected but went to an unexpected phase.
+@gotINT												; else we got an interrupt
+			move.b	rSTA(a3), d3					; read status for debug
+			move.b	rINT(a3), d1					; clear intrp bit		
+			move.b	d3, lastSTAread(a4)				; store in case anybody wants to know…
+			move.b	d1, lastINTread(a4)				; …what kind of INT we got
+			bclr.b	#FCIntPend, G_State96(a4)		; clear the FC Int pend flag				<T9>
+			bclr.b	#SelInProg, G_State96(a4)		; and clear the SelectInProgress flag		<T9>
+			bclr.b	#NeedMsgOut, G_State96(a4)		; and Message_Out  							<T9>
+			bclr.b	#NeedCmdSent, G_State96(a4)		; and Command expected flags				<T9>
+
+	; Was it a disconnect interrupt? (i.e. a failed select?)
+			btst.l	#bDSC,d1						; (i.e. timed-out then bus free)
+			beq		@goodSEL						; no - assume it is a good select then 
+@badSEL												;												<T8> from last <T8>
+			bclr.b	#OurBus, G_State96(a4)			; c96 NOT initiator on bus
+			moveq.l #scCommErr, d2					; select timeout
+			bra.s	@exit
+
+@timedOut
+			moveq.l #scArbNBErr, d2					; select timeout							<T9>
+			bra		@exit							; branch if our watchdog timed out
+
+@gotDREQ
+@goodSEL
+			moveq.l #noErr, d2						; successful selection
+@exit
+;			move.b	(sp)+, d0						; switch to previous mode
+;			jsr		SwapMMU						; do it, call _SwapMMUMode jump vector
+			move.l	d2, d0
+			rts
+
+
+
+; Check for non-zero sequence value - means select has completed and 
+;@1			lsl.l	#8,d4							; shift old rSQS reads up a byte				
+;			move.b	rSQS(a3), d4					; determine where we are in select sequence 
+;			move.b	d4,d0							; make copy for checking
+;			and.b	#iSQSMsk, d0					; did we get somewhere in the sequence?
+;			beq.s	@zeroSSV						; i.e. a non-zero seq.step value
+
+; If we have a non-zero phase value and non-zero sequence, then we had a good select
+;			lsl.l	#8,d3							; shift old rSTA reads up a byte
+;			move.b	rSTA(a3), d3					; get phase value
+;			move.b	d3,d0
+;			and.b	#iPhaseMsk, d0					; look for info xfer phz (i.e. non zero)
+;			bne.s	@goodSEL						; bra if not in bus-free (we have a data_out hole here)
+
+
+
+
+
+
+;--------------------------------------------------------------------------
+;
+; Send Command. # bytes in d2. Command block pointer is in a2.
+;
+;		d0 - <-- error (if any)
+;		d2 - --> number of command bytes
+;		d5 - <-- xxxx|xxxx|xxxx|rSTA
+;
+;		a2 - ptr to command block
+;		a3 - SCSI read base address
+;		a4 - ptr to SCSI Mgr globals
+;
+; The command descriptor block is sent using both pseudo-DMA and non-pDMA.  The non-pDMA
+; send appears as preloaded data in the FIFO.  The last byte is send via pDMA to satisfy
+; the transfer count and DMA-mode of the c96.  See SELECT proc.
+;		 
+;
+; Reminder: Check this routine to make sure it still works with
+;	 		Tape Backup 40SC drive.  See note in SCSIMgrOld.a, SendCMD routine.
+;
+; Uses: d0, d1, d3, d5
+;
+; Error Codes:
+;		scPhaseErr, scCommErr
+;
+; STILL NEEDS: If somehow we end up here but did not have NeedCmdSent but we are actually in Cmd Phase,
+;	we should probably go ahead and do it anyway - just do the transfer with all rFFO (no rDMA).
+
+SendCMD_PSC	
+			btst.b	#NeedCmdSent, G_State96(a4)	; are we expecting a command phase here?
+			beq		@notExpected				; no - handle it without DMA
+			move.b	#iCommand, d1				; set up wait for command phase
+			jsr		Wt4DREQorIntPSC				; yes - wait till target REQs or screws up
+			beq		@gotInt						; if Int then we're not in Command phase
+												; else, we are, so send the bytes
+@sendBytes
+			ori.b	#SlowCableMode,rCF1(a3)		; set Slow cable mode for the command bytes				<T9>
+			subq.l	#1, d2						; adjust for DMA of last byte							<T9>
+			bra.s	@btmLoadFIFO				; bra to dbra for zero case (1 byte CDB)				<T9>
+@loadFIFO										; loading the FIFO w/o pseudo-DMA will simulate
+			move.b	(a2)+, rFFO(a3)				;    preloading of the FIFO...we then pDMA the 
+@btmLoadFIFO									;														<T9>
+			dbra	d2, @loadFIFO				;	 last byte in order to satisfy the c96's DMA		<T2>
+												;	 circuitry & get us that intrp.						<T2>
+	
+			btst.b	#NeedCmdSent, G_State96(a4)	; were we expecting a command phase here?			<2> thru next <2>
+			beq.s	@skipDMA
+															
+	; Wait for either FIFO empty or a phase change
+	
+@wt4EmptyOrPhz
+			moveq.l	#iFOFMsk, d1				; use mask to get FIFO flag field
+			and.b	rFOS(a3), d1				; how many bytes left in FIFO?
+			beq.s	@lastCmdByte				; if none, send the last command byte
+
+			moveq.l	#iPhaseMsk, d1				;
+			and.b	rSTA(a3), d1				; are we in command phase?
+			cmp.b	#iCommand, d1				; 
+			beq.s	@wt4EmptyOrPhz				; yes - loop again
+@lastCmdByte
+			moveq.l	#iPhaseMsk, d1				;
+			and.b	rSTA(a3), d1				; get phase bits before sending last byte			<2> from prev <2>
+
+			move.b	(a2)+, rDMA(a3)				; Use psuedo DMA to load last byte						<T2>
+
+			bclr.b	#NeedCmdSent,G_State96(a4)	; no longer need command sent and,						<T9>
+			bset.b	#FCIntPend,G_State96(a4)	; now we can expect a FunctionCmplt interrupt			<T9>
+			cmp.b	#iCommand, d1				; were we in command phz b4 last byte?				<2>
+			bne.s	@phaseErr					; no - then we had a phase error					<2>
+@skipDMA
+			moveq.l	#iPhaseMsk, d3				; load mask bits for phase value
+			and.b	rSTA(a3), d3				; get phase value
+			cmpi.b	#iCommand, d3				; are we in command phase?
+			beq.s	@cmdHack					; bra. if we're still in cmd phase
+@cmdOK
+		; we no longer waste a wait here for the FC interrupt but instead do it in a data				<T8>
+		; phase or in SCSIComplete with a call to HandleSelInProgPSC.
+
+			moveq.l #noErr, d0					; no error												<T9>
+@cmdExit										; At this point, we're out of cmd phase
+			and.b	#$FF-SlowCableMode,rCF1(a3)	; turn-off Slow cable mode								<T9>
+			tst.w	d0							;
+			rts
+
+			;	This is a hack for the Tape Backup 40SC drive.  40SC asserts an extra REQ on
+			;	10-byte commands, which appears as a request for an 11th byte (that's what
+			;	the SCSI standard says!)  On very fast CPU's, this extra REQ hangs over to
+			;	the next phase of the transaction, causing a phase error, and causes the 
+			;	transaction to fail.  This delay code will wait at most 256ms
+			;	for a phase change before continuing.		
+			;	NOTE: On the c96, this code is probably worthless since the chip will fill
+			;	any additional bytes (for any additional REQs) after the DREQ is fulfilled
+			;	whether we wait for it or not. (See state diagram in Emulex lit.)
+@cmdHack
+			move.l	zeroReg, d0					; clear upper word							
+			move.w	TimeSCSIDB, d0				; get SCSI DBRA's ms timing constant		
+			lsl.l	#8, d0						; wait at least 256ms for the tape drive	
+			move.l	d0, d2						; set up d2 as high word					
+			swap	d2 							;											
+@hack			
+			moveq.l	#iPhaseMsk, d3				; load mask bits for phase value
+			and.b	rSTA(a3), d3				; get phase value
+			cmpi.b	#iCommand, d3				; are we in command phase?
+			dbne.w	d0, @hack					; loop until not cmd phase or timeout	
+			dbne.w	d2, @hack					; high word of timeout
+			bra.s	@cmdOk
+
+; We got our select_process complete interrupt - set our state reflecting that
+@gotInt
+			bclr.b	#FCIntPend, G_State96(a4)		; clear the FC Int pend flag				<Taa>
+			bclr.b	#SelInProg, G_State96(a4)		; and clear the SelectInProgress flag		<Taa>
+			bclr.b	#NeedMsgOut, G_State96(a4)		; and Message_Out  							<Taa>
+			bclr.b	#NeedCmdSent, G_State96(a4)		; and Command expected flags				<Taa>
+			move.b	#cFlshFFO, rCMD(a3)				; flush the FIFO of unused Command bytes			
+@phaseErr
+			moveq.l #scPhaseErr, d0				; phase error											<T5>
+			move.l	#scsiCmd, d6				; load proc ID											<T5>
+			bsr.w	Error_PSC						; call Error proc - for debug							<T5>
+			bra.s	@cmdExit					;														<T5>																		
+
+
+@notExpected
+			moveq.l	#iPhaseMsk, d3				; load mask bits for phase value
+			and.b	rSTA(a3), d3				; get phase value
+			cmpi.b	#iCommand, d3				; are we in command phase?
+			bne.w	@phaseErr					; bra. on phase err
+			addq.l	#1, d2						; adjust for DMA of last byte							<T9>
+			bra.w	@sendBytes
+					
+
+
+
+;--------------------------------------------------------------------------
+;
+;	GetMsg - get a message byte from target and return in d2
+;
+; Uses: d0, d2, d3
+;
+; Return Codes:
+;		noErr, scCommErr, scPhaseErr
+
+GetMsg_PSC
+			moveq.l	#iPhaseMsk, d3				; load mask bits for phase value
+			and.b	rSTA(a3), d3				; get phase value
+			cmpi.b	#iMsgIn, d3					; are we in MsgIn phase already?
+			bne.s	@phaseErr					; 
+			
+			move.b	#cIOXfer, rCMD(a3)			; load Transfer cmd byte in CMD regr
+			jsr		WaitForSCSIIntrp_PSC			; Wait for intrp w/ timeout						<T3>
+												;    on exit d5 = xxxx|rSQS|rSTA|rINT
+			beq.s	@timedOut					; Branch if timedout
+						
+			move.b	rFFO(a3), d2				; xfer fifo msg byte into d2 w/ *ACK still asserted
+												; now, unconditionally accept the message byte
+			move.b	#cMsgAcep, rCMD(a3)			; load msg accepted code which de-asserts *ACK
+			jsr		WaitForSCSIIntrp_PSC			; Wait for intrp w/ timeout						<T3>		
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			beq.s	@timedOut					; Branch if timedout
+			
+												; check for disconnect or bus service intrp
+												; <--- here!
+			moveq.l	#noErr, d0
+			rts
+
+
+@dscErr
+@timedOut	
+			moveq.l #scCommErr, d0				; comm error
+			bra.s	@badGetMsg
+@phaseErr	
+			moveq.l	#scPhaseErr, d0
+@badGetMsg
+			move.l	#0, G_FakeStat(a4) 			; Set to a fake stat
+			tst.l	d0							; set the condition code						<T3>
+			rts
+
+
+
+
+;--------------------------------------------------------------------------
+;
+; SendMsg - Send a message byte to the target (in d2 on entry)
+;
+; This proc assumes that the ATTENTION line has been asserted via SEL w/ ATN.
+; Note that only 1 msg byte can be sent via this method.
+;
+;	Entry:
+;		--> d2		message byte to send
+;		--> a3		base address of 53c96
+;
+;	Exit:
+;		<-- d0		result code
+;
+;	Uses: d0, d1, d3
+;
+; Error Codes:
+;		noErr, scCommErr, scPhaseErr
+
+SendMsg_PSC
+			btst.b	#NeedMsgOut,G_State96(a4)	; did we send a Select w/ATN?
+			beq.s	@unexpected					; no - just phase err out of here then				
+
+			move.b	#iMsgOut, d1				; set up wait for command phase
+			jsr		Wt4DREQorIntPSC
+			beq.s	@gotInt						; if we got an interrupt, something's wrong
+
+			move.b	rSTA(a3), d3				; get phase value								<T9> to next <T9>
+			and.b	#iPhaseMsk, d3				; load mask bits for phase value
+			cmpi.b	#iMsgOut, d3				; are we in MsgOut phase already?
+			bne.s	@phaseErr					;  
+
+@inPhase	; We probably got here from Select w/ATN which means
+			; ATN is deasserted prior to transfer of msg byte
+			move.b	d2, rFFO(a3)				; xfer msg byte	
+			bclr.b	#NeedMsgOut,G_State96(a4)	; did we send a Select w/ATN?
+			beq.s	@needXfer					; no - just split
+			bset.b	#NeedCmdSent,G_State96(a4)	; yes - we took care of MsgOut, now we need to send command
+			bra.s	@noErr
+@needXfer
+			jsr		Xfer1Byte_PSC
+			bra.s	@noErr
+
+
+@unexpected		; wait for 256mS for correct phase
+			jsr		HandleSelInProgPSC
+			bne.s	@phaseErr
+			
+			moveq.l	#0, d1						; clear upper word
+			move.w	TimeSCSIDB, d1				; get # of DBRAs
+			lsl.l	#8, d1						; multiply by 256
+			move.l	d1, d3						; ...a 256mS wait
+			swap	d3
+			
+@1			
+			move.b	rSTA(a3), d3				; get phase value								<T9> to next <T9>
+			and.b	#iPhaseMsk, d3				; load mask bits for phase value
+			cmpi.b	#iMsgOut, d3				; are we in MsgOut phase already?
+			beq.s	@inPhase					; yes - send byte
+			dbra	d1, @1						; 
+			dbra	d3, @1						; loop until done
+
+
+@gotInt											; 
+			bclr.b	#FCIntPend, G_State96(a4)		; clear the FC Int pend flag
+			bclr.b	#SelInProg, G_State96(a4)		; and clear the SelectInProgress flag
+			bclr.b	#NeedMsgOut, G_State96(a4)		; and Message_Out  							<T9>
+			bclr.b	#NeedCmdSent, G_State96(a4)		; and Command expected flags				<T9>
+@phaseErr
+			moveq.l #scPhaseErr, d0				; phase error
+			bra.s	@clrATN						; 		
+
+@commErr	
+			moveq.l #scCommErr, d0				; comm error
+			bra.s	@clrATN						; 		
+
+@noErr
+			moveq.l #noErr, d0					; no error
+@clrATN		
+			and.w	#$FFFF-aATN,G_FakeStat(a4) 	; clear fake ATN bit!							<T9> from prev <T9>
+			tst.w	d0							; return results in status register
+			rts
+
+
+
+
+;--------------------------------------------------------------------------						<T3>
+;
+;	CyclePhase_PSC -- we may have to discard data or write filler bytes to get to
+;				  the desired phase, status phase.
+;
+;	This routine is broken into two main sections; standard I/O and psuedo-DMA.  The DMA
+;	sequence is used in case we are in the middle of a failed DMA transfer which left the
+;	transfer count nonzero.  We only have to handle psuedo-DMA in data phase.  All other
+;	phases (and normal I/O mode data phase) are handled 1 byte at a time by individual
+;	phase handling code with, after each byte, returns to check the next phase to see
+;	where to go next.
+;
+; Phase		Action
+; —————		——————
+; Command:	We send as many EE bytes as needed to get out of phase.  If the select sequence 
+;			flag 'NeedCmdSent' is set, it turns out that the chip will do the fill by itself
+;			once we send 1 rDMA byte (thereby completing the transfer) using 
+;			rDMA. We also set the flag 'FCIntPend' bit if 'NeedCmdSent' was set.
+;
+; Msg_Out:	We send as many 08(NOP) bytes as needed to get out of phase.  If the select 
+;			sequence flag 'NeedMsgOut' flag is set we set the flag 'NeedCmdSent' and continue.
+;
+; Data_In:	We bitbucket as many bytes as needed to clear phase.
+;
+; Data_Out:	We send as many EE bytes as needed to get out of phase.
+;
+;
+; Note: We need to check if the SCSIMgr is busy in order to differentiate between				<T2>
+;		IDLE bus phase and DATA OUT phase.  They both have phase value = 0.						<T2>
+;
+; Uses: d0 
+
+CyclePhase_PSC									; (accessed thru jvCyclePhase)
+			btst.b	#OurBus, G_State96(a4)		; check if c96 is initiator on bus					<T2>
+			beq.s	@xferErr					;  bra. if not
+
+@checkNextPhase									;											<T9> to next <T9>
+			moveq.l	#iPhaseMsk, d0				; load mask bits for phase value
+			and.b	rSTA(a3), d0				; get phase bits
+
+			cmp		#iDataIn, d0				; 
+			beq.s	@inDataPhase				; 
+			
+			cmp		#iDataOut, d0				; 
+			beq.s	@inDataPhase				; 
+			
+			cmp		#iCommand, d0				; 
+			beq.s	@shoveCommand				; 
+			
+			cmp		#iMsgOut, d0				; 
+			beq.w	@shoveMsgOut					; 
+			
+			cmp		#iMsgIn, d0					; 
+			beq.w	@bitbucketMsgIn				; 
+			
+			cmp		#iStatus, d0					; 
+			bne.s	@xferErr
+@okExit			
+			move.w	 #scComplPhaseErr, d0		; tell SCSIComplete we had to read/write junk	<T2>
+			rts									; err code is saved
+			
+@xferErr										;								<T3>	
+			clr.l	d0							; no recovery
+			rts			
+
+
+; If data phase, check if we have been transferring with psuedo-DMA, if so, continue.
+@inDataPhase
+			move.b	rCMD(a3), d1				; what was our most recent command?
+			cmp.b	#cDMAXfer, d1				; IF command was DMAXfer AND …
+			bne.s	@notDMA						; 
+			tst.b	rXCL(a3)					; …there are outstanding pDMA transfers …
+			bne.w	@pDMA						; THEN go finish them up with psuedo-DMA 
+			tst.b	rXCM(a3)
+			bne.w	@pDMA
+@notDMA
+			cmp.b	#iDataOut, d0				; ELSE … what phase?
+			beq.s	@shoveDataOut				; data_out - shove data using IO xfers
+;;			bra.s	@bitbucketData				; data_in - bit bucket using normal IO xfers
+
+; Grab and bit bucket a data_in bytes until we've gone into another phase		
+@bitbucketData
+			jsr		Xfer1Byte_PSC					; xfer 1 byte and wait for intrp w/o timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			bne.s	@xferErr						; bra. on xfer error
+			move.b	rFFO(a3), d0				; just empty the FIFO
+			bra.s	@checkNextPhase
+
+
+; Dump out data_out bytes until we've gone into another phase		
+@shoveDataOut
+			move.b	#$EE, rFFO(a3)				; load filler byte into FIFO 
+			jsr		Xfer1Byte_PSC					; xfer 1 byte and wait for intrp w/o timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			bne.s	@xferErr						; bra. on xfer error
+			bra.s	@checkNextPhase
+
+
+; Dump out Command bytes until we've gone into another phase		
+@shoveCommand
+			bclr.b	#NeedCmdSent, G_State96(a4)	; did we expect this?
+			beq.s	@nonDMA						; no - bra, do xfer using FIFO	
+			move.b	#$EE, rDMA(a3)				; yes - use DMA (since chip is waiting for it)
+			bset.b	#FCIntPend,G_State96(a4)	; we took care of cmd, now expect FC interrupt	
+			jsr		WaitForSCSIIntrp_PSC
+			beq.s	@timedOut					; bra if timedout
+			bclr.b	#FCIntPend, G_State96(a4)	; clear the FC Int pend flag
+			bclr.b	#SelInProg, G_State96(a4)	; clear the select in progress flag
+@timedOut										; if we timed out, something's haywire
+			bra.s	@2							; trying again is as good as anything else
+@nonDMA
+			move.b	#$EE, rFFO(a3)				; load filler byte into FIFO 
+			jsr		Xfer1Byte_PSC					; xfer 1 byte and wait for intrp w/o timeout
+			bne.s	@xferErr						; bra. on xfer error
+@2
+			bra.s	@checkNextPhase
+
+
+; Dump out message_out bytes until we've gone into another phase		
+@shoveMsgOut			
+			move.b	#$08, rFFO(a3)				; load filler byte into FIFO (NOP message)
+			bclr.b	#NeedMsgOut, G_State96(a4)	; did we expect this?
+			beq.s	@needXferCmd				; no - branch	
+			bset.b	#NeedCmdSent,G_State96(a4)	; yes - taking care of MsgOut, now we need cmd
+			bra.s	@skipXferCmd
+@needXferCmd
+			jsr		Xfer1Byte_PSC					; xfer 1 byte and wait for intrp w/o timeout
+			bne.s	@xferErr					; bra. on xfer error
+@skipXferCmd
+			bra.s	@checkNextPhase
+
+
+; Grab and bit bucket message bytes until we've gone into another phase		
+@bitbucketMsgIn
+			jsr		Xfer1Byte_PSC					; xfer 1 byte and wait for intrp w/o timeout
+			bne.s	@xferErr					; bra. on xfer error
+			move.b	rFFO(a3), d0				; just empty the FIFO
+			move.b	#cMsgAcep, rCMD(a3)			; load msg accepted code which de-asserts ACK
+			jsr		WaitForSCSIIntrp_PSC			; Wait for intrp w/ timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			bra.s	@checkNextPhase
+			
+			
+;
+; Use pseudo-DMA to clean up pending pDMA transfers ie. recovery from bus timeout	<JMA> to next <JMA>
+; It is entirely possible that we might have to use non-pDMA to complete the cleanup
+; which is what the upper half of cyclePhase does.
+
+@pDMA
+			jsr		SCSIpcTo32Bit_PSC				; use pc relative
+		    move.b	MMU32Bit, -(sp)				; save current mode on stack
+			moveq	#true32B, d0				; switch to 32-bit mode to look at SCSI config regr 					
+			jsr		SwapMMU						; do it, call _SwapMMUMode jump vector
+			move.l	G_SCSIDREQ(a4), a0			; G_SCSIDREQ contains DREQ regr address
+			
+			moveq.l	#iPhaseMsk, d0				; 
+			and.b	rSTA(a3), d0				; 
+			cmp		#iDataOut, d0				; what phase?
+			beq.s	@pDMAwrite					; data_out - pDMAwrite
+;;			bra.s	@pDMAread					; data_in - pDMAread
+
+; Read data bytes using DMA until DREQ goes away
+
+@pDMAread
+			btst.b	#bINT, rSTA(a3)				; poll for intrp hopefully from TC zero
+			bne.s	@readAll					; bra. if we got one
+			move.l	(a0), d5					; read DAFB SCSI DREQ 
+			btst.l	#bDREQ, d5					; poll for DREQ
+			beq.s	@pDMAread					; bra. if inactive
+			move.w	rDMA(a3), d5				; bit-bucket data
+			bra.s	@pDMAread
+@readAll										; Intrp will occur when REQ is asserted for the next phase
+			jsr		WaitForIntNoTime_PSC			; Expecting an intrp, clear it when occurs
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			bra.s	@pDMADone					; check if we reached status phase
+
+
+; Write data bytes using DMA until DREQ goes away
+
+@pDMAwrite
+			btst.b	#bINT, rSTA(a3)				; poll for intrp hopefully from TC zero
+			bne.s	@writeAll					; bra. if we filled all data
+			move.l	(a0), d5					; read DAFB SCSI DREQ 
+			btst.l	#bDREQ, d5					; poll for DREQ
+			beq.s	@pDMAwrite					; bra. if inactive
+			move.w	#$EEEE, rDMA(a3)			; load filler data into FIFO
+			bra.s	@pDMAwrite
+@writeAll										; Intrp will occur when REQ is asserted for the next phase
+			jsr		WaitForIntNoTime_PSC			; Expecting an intrp, clear it when occurs
+												;    on exit d5 = rFOS|rINT|0|rSTA
+												
+; Return to previous MMUMode and check for next phase to cycle out of
+
+@pDMADone			
+			move.b	(sp)+, d0					; switch to previous mode
+			jsr		SwapMMU						; do it, call _SwapMMUMode jump vector
+			bra.w	@checkNextPhase				; go check for next phase to cycle out of
+;																								<T9> from prev <T9>
+
+
+
+
+;_______________________________________________________________________		<T2> thru next <T2>
+;
+;	SCSIpcTo32Bit_PSC
+;  Inputs:		none
+;  Destroys:	A0, D0
+;  Calls:		_Translate24To32
+;
+;  Function:	Converts the PC to a 32-bit address.
+;
+;  Routine from EdiskDrvr.a
+;_______________________________________________________________________
+
+_Translate24To32	OPWORD  	$A091	;											
+
+SCSIpcTo32Bit_PSC
+		move.l	(sp), d0				; put return address in d0
+		_Translate24to32				; convert the address to 32-bit mode
+		move.l	d0, (sp)				; save the new return address
+		rts								;										<T2>
+
+
+
+
+;_______________________________________________________________________
+;
+;	TestForDREQ
+;		This is good for a one time only test.  If the value of DREQ
+;		needs to be determined in a loop, use something else.
+;_______________________________________________________________________
+;
+TestForDREQ
+			jsr		SCSIpcTo32Bit_PSC				; use pc relative
+			moveq	#true32B, d0				; switch to 32-bit mode to look at SCSI config regr 					
+			jsr		SwapMMU						;  (sets up d0 with previous mode)
+
+			move.l	G_SCSIDREQ(a4), a0			; G_SCSIDREQ contains DREQ regr address
+			move.l	(a0), d5					; read DAFB regr
+
+			jsr		SwapMMU						; return to previous mode (in d0)
+
+			btst.l	#bDREQ, d5					; check for active SCSI DREQ
+			rts
+
+
+
+
+;--------------------------------------------------------------------------
+;
+;	Error_PSC -- proc call by most top level SCSI proc when an error occurs
+;			 Primarily for debugging.
+;
+;	Called by: SCSISelect(S/D,ATN), SCSICmd, SCSIRead(Slow/Fast), SCSIWrite(Slow/Fast),
+;				SCSIComp(Slow/Fast), SCSIMsgIn, SCSIMsgOut, SCSIComplete
+;
+; 	d0 -> SCSI error code
+; 	d6 -> SCSI proc ID
+;
+; 	Uses:	a0 
+
+Error_PSC
+			movea.l	jvErr(a4), a0				; get address of error routine
+			jsr		(a0)						;
+			rts
+
+
+
+
+
+;--------------------------------------------------------------------------
+;
+;	SCSIErr -- Primarily for debugging.
+;
+SCSIErr_PSC
+			rts									;
+
+
+
+			
+;==========================================================================
+
+		ENDWITH
+
+		END 

@@ -1,0 +1,294 @@
+;
+;	File:		SCSIMgrInit96.a
+;
+;	Contains:	SCSI Manager 53c96 initialization routines
+;
+;	Written by:	Jonathan Abilay
+;
+;	Copyright:	© 1990-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM13>	 8/12/93	KW		conditionalizing smurf branches
+;	  <SM12>	 8/11/93	KW		added some branches based on new smurf boxes
+;	  <SM11>	01-11-93	jmp		Updated various BoxFlag names.
+;	  <SM10>	12/23/92	RC		Added Support for Smurf on Wombat
+;	   <SM9>	 11/3/92	SWC		Changed SCSIEqu.a->SCSI.a.
+;	   <SM8>	10/18/92	CCH		Added support to use new DREQ location in PDM.
+;	   <SM7>	  8/9/92	CCH		Modified boxflag check for Quadras to include RISC Quadras.
+;		 <4>	 5/22/92	DTY		#1029009 <jab>: Added support for Wombat DREQ testing.
+;		 <3>	  5/1/92	JSM		Whoops, rolled in the fix from SuperMario incorrectly in the
+;									last revision. Set up a3 in the right place.
+;		 <2>	  5/1/92	JSM		Get rid of forC96Init conditional, roll-in change for ROM only
+;									from SuperMario: Fix bug in INITMGR_SCSI96 (Load SCSIBase into
+;									a3).  forROM is now the only conditional left in this file.
+;		 <1>	10/24/91	SAM		Rolled in Regatta file.
+;		
+;									Regatta Change History:
+;
+;									 <2>	 8/19/91	SAM		(PDW) Reverted to old in/out buserr handler support. Added 'IF
+;																forROM' around initialization that is not needed in a linked
+;																patch.
+;									 <1>	  8/8/91	SAM		(PDW) Checked into Regatta for the first time with lots of 
+;																changes over the TERROR sources.
+;									 <0>	  8/8/91	SAM		Split off from 7.0 GM sources.
+;
+;									Terror Change History:
+;
+;									 <T7>	 6/27/91	djw		(pdw) Removed all traces of SCSIBusy and FreeHook stuff Added
+;																BusErr and CyclePhase jump vector initialization.
+;									 <T6>	 6/14/91	djw		(actually PDW) Added jvTransfer initialization (overriding
+;																Transfer with Transfer_96).
+;									 <T5>	  6/9/91	BG		(actually PDW) Rearranged headers to work more consistently
+;																between test INIT and ROM builds. Also added IF around
+;																_SetTrapAddress so that the INIT does not patch the trap
+;																address.
+;									 <T4>	 3/30/91	BG		(actually JMA) Added PostFreeHook_96.
+;									 <T3>	 2/17/91	BG		(actually JMA) added SlowComp_96, FastComp_96, DoSCSIBusy_96 &
+;																SCSIErr_96
+;									 <T2>	  1/5/91	BG		(actually JMA) Added more functionalities.
+;									 <T1>	 12/7/90	JMA		Checked into TERROR for the first time.
+;
+;==========================================================================							<T3>
+
+			BLANKS		ON				; assembler accepts spaces & tabs in operand field
+			STRING		ASIS			; generate string as specified
+			PRINT		OFF				; do not send subsequent lines to the listing file
+										;	don't print includes
+
+			LOAD		'StandardEqu.d'			; from StandardEqu.a and for building ROMs
+			INCLUDE		'HardwareEqu.a'			;													<T2>
+			INCLUDE		'SCSI.a'
+			INCLUDE 	'SCSIPriv.a'
+			INCLUDE		'UniversalEqu.a'		; for TestFor										<T2>
+			INCLUDE		'SCSIEqu96.a'
+			INCLUDE 	'LinkedPatchMacros.a'
+
+			PRINT		ON				; do send subsequent lines to the listing files
+
+SCSIInit96	PROC	EXPORT				;
+
+			EXPORT	InitMgr_SCSI96
+
+		; From SCSIMgr96.a ---
+			IMPORT	SCSIMgr_96
+			IMPORT	DoSCSICmd_96,		DoSCSIComplete_96
+			IMPORT	DoSCSISelect_S96,	DoSCSISelect_D96						;						<T2>
+			IMPORT	DoSCSISelAtn_S96,	DoSCSISelAtn_D96,	CyclePhase_96		;						<T9>
+			IMPORT	DoSCSIStat_96,		DoSCSIMsgOut_96
+			IMPORT	Unimplemented_96
+			IMPORT	DoSCSIReset_96,		DoSCSIGet_96
+			IMPORT	DoSCSIMsgIn_96
+			IMPORT	NewSCSIRead_96,		NewSCSIWrite_96
+			IMPORT	NewSCSIWBlind_96,	NewSCSIRBlind_96
+			IMPORT	SCSIErr_96
+		; From SCSIMgrHW96.a ---
+			IMPORT	BusErrHandler_96
+			IMPORT	ResetBus_96,		SlowRead_96,		Transfer_96
+			IMPORT	SlowWrite_96,		SlowComp_96
+			IMPORT	FastRead_96,		FastWrite_96,		FastComp_96
+
+			
+			WITH	scsiGlobalRecord
+			
+
+;-------------------------------------------------------------
+;
+;	Initialization code for the SCSI Manager 5394/5396
+
+InitMgr_SCSI96
+			movem.l	intrRegs, -(sp)			; save all registers, for convenience
+			moveq.l	#0, zeroReg				; initialize "zeroReg"
+			movea.l	SCSIGlobals, a4			; get ptr to structure
+			
+			moveq.l	#numSelectors-1, d1		; loop count 									
+		IF forROM THEN						; if not a linked patch, make addrs relative
+			lea.l	SCSIMgr_96, a1			; get start of SCSI Mgr code
+			move.l	a1, d0					; remember base address
+		ELSE
+			moveq.l	#0, D0					; if linked patch, make addrs absolute
+		ENDIF
+			lea		OffsetTbl96, a1			; address of offset table
+			movea.l	a4, a0					; point to base of old SCSI Mgr jump table		
+@MakeJmpTbl
+			move.l	(a1)+, d2				; get the next offset
+			beq.s	@skipEntry				; if zero, skip this entry
+			add.l	d0, d2					; compute the address
+			move.l	d2, (a0)				; install it in the jump table
+@skipEntry
+			adda.l	#4, a0
+			dbra	d1, @MakeJmpTbl			; loop for all vectors
+			
+			lea.l	Transfer_96, a1			;															<T6>	<T2>
+			move.l	a1, jvTransfer(a4)		; use this Transfer routine									<T6>	<T2>
+
+			lea.l	CyclePhase_96, a1		;									<T7> pdw
+			move.l	a1, jvCyclePhase(a4)	; use this CyclePhase routine		<T7> pdw
+
+			lea.l	ResetBus_96, a1
+			move.l	a1, jvResetBus(a4)		; use this Bus Reset routine
+
+			lea.l	BusErrHandler_96, a1	;									<T7> pdw
+			move.l	a1, jvBusErr(a4)		; use this SCSI Bus Error handler	<T7> pdw
+			
+			move.l	#1,blindBusTO(a4)		; initlz blind rd/wr timeout to Å1mS
+
+			lea.l	SlowRead_96, a1
+			move.l	a1, jvVSRO(a4)			; use this Slow Read routine
+			
+			lea.l	SlowWrite_96, a1
+			move.l	a1, jvVSWO(a4)			; use this Slow Write routine
+			
+			lea.l	FastRead_96, a1
+			move.l	a1, jvVFRO(a4)			; use this Fast Read routine
+			
+			lea.l	FastWrite_96, a1
+			move.l	a1, jvVFWO(a4)			; use this Fast Write routine
+
+			lea.l	SlowComp_96, a1			;																	<T3> thru next <T3>
+			move.l	a1, jvCSO(a4)			; use this Slow Compare routine
+			
+			lea.l	FastComp_96, a1
+			move.l	a1, jvCFO(a4)			; use this Fast Compare routine													
+
+			lea.l	SCSIErr_96, a1
+			move.l	a1, jvErr(a4)			; use this Error routine
+
+			lea.l	Unimplemented_96, a1
+			move.l	a1, jvClearIRQ(a4)		; use this clear IRQ routine
+			move.l	a1, jvSel15(a4)			; Selector 15 routine
+			move.l	a1, jvSel16(a4)			; Selector 16 routine
+			move.l	a1, jvSel17(a4)			; Selector 17 routine												<T3>
+
+			move.l	zeroReg, d0						; disable SCSI interrupts									<T2> thru next <T2>
+			movea.l	jvDisEnable(a4), a0				; addr of interrupt enable/disable routine
+			jsr		(a0)							; disable interrupts
+
+	IF forROM THEN									;										<2>
+			clr.l	G_IntrpStat(a4)					; clear our Intrp Status
+			clr.l	G_FakeStat(a4)					; clear fake stat
+			clr.l	G_State96(a4)					; clear our indicators of 53c96 state			<T7> pdw
+			clr.l	G_SCSIDevMap0(a4)				; initialize SCSI Device Map 0
+			clr.l	G_SCSIDevMap1(a4)				; initialize SCSI Device Map 1
+			clr.l	base539x1(a4)					; init second SCSI base address
+			clr.l	G_SCSIDREQ(a4)					; initialize SCSI DREQ regr
+			
+			; All this time  we've been using a default host ID = 7.  Just in case that ever changes <2>
+			; load whatever SCSIMgrInit got from PRAM as our host ID.
+
+			move.b	G_ID(a4), d1					; get SCSI host ID mask
+			move.b	#7, d0							; load shift count
+@1			
+			lsl.b	#1, d1							; shift out mask bit until all 0's
+			dbeq	d0, @1							; remaining count in d0 will be SCSI ID
+			ori.b	#initCF1, d0					; use this our designated SCSI host ID 
+			
+			movea.l	SCSIBase,a3						; get the chip base							<2> kc
+			move.b	d0, rCF1(a3)					; use this new config regr. value, hopefully
+													;   nobody has changed the setting since HW init time
+
+			move.l	SCSIBase, base539x0(a4)			; load addr of first SCSI chip
+			move.l	#SCSI0_DAFB, pdma5380(a4)		; load addr of DAFB regr containing DREQ bit
+	ENDIF											;										<2>
+
+			clr.b	G_bitDREQ(a4)					; initialize bit position of DREQ regr			<H4> thru to next <H4> jab
+
+			TestFor	HMCDecoder						; are we PDM ?									<SM8>
+			beq.s	@notPDM
+			move.b	#bDREQ_PDM,G_bitDREQ(a4)		; setup bit location of DREQ check
+			move.l	#SCSI0_DREQ_PDM,pdma5380(a4)	; setup DREQ location	
+			bra.s	@chk2Bus						;												<SM8>
+
+@notPDM		cmpi.b	#boxQuadra700,BoxFlag			; are we a Quadra 700?
+			beq.s	@wereQuadra						; yes ... set our DREQ location
+
+			cmpi.b	#boxQuadra900,BoxFlag			; are we a Quadra 900?
+			beq.s	@wereQuadra						; yes ... set our DREQ location
+
+			cmpi.b	#boxQuadra950,BoxFlag			; are we a Quadra 950?
+			beq.s	@wereQuadra						; yes ... set our DREQ location
+
+		IF forSmurf THEN
+			cmpi.b	#boxRiscQuadra700,BoxFlag		; are we a RISC?						<SM12>
+			beq.s	@wereQuadra						; yes ... set our DREQ location			<SM12>
+			cmpi.b	#boxRiscQuadra900,BoxFlag		; are we a RISC?						<SM12>
+			beq.s	@wereQuadra						; yes ... set our DREQ location			<SM12>
+			cmpi.b	#boxRiscQuadra950,BoxFlag		; are we a RISC?						<SM12>
+			beq.s	@wereQuadra						; yes ... set our DREQ location			<SM12>
+
+			cmpi.b	#boxRiscCentris610,BoxFlag		; are we a RISC?						<SM12>
+			beq.s	@wereQuadra						; yes ... set our DREQ location			<SM12>
+			cmpi.b	#boxRiscCentris650,BoxFlag		; are we a RISC?						<SM12>
+			beq.s	@wereQuadra						; yes ... set our DREQ location			<SM12>
+			cmpi.b	#boxRiscQuadra800,BoxFlag		; are we a RISC?						<SM12>
+			beq.s	@wereQuadra						; yes ... set our DREQ location			<SM12>
+			cmpi.b	#boxRiscQuadra610,BoxFlag		; are we a RISC?						<SM13>
+			beq.s	@wereQuadra						; yes ... set our DREQ location			<SM13>
+			cmpi.b	#boxRiscQuadra650,BoxFlag		; are we a RISC?						<SM13>
+			beq.s	@wereQuadra						; yes ... set our DREQ location			<SM13>
+		ENDIF										; for smurf
+		
+			move.b	#bDREQ_BIOS,G_bitDREQ(a4)		; setup bit location of DREQ check
+			move.l	#SCSI0_DREQ_BIOS,pdma5380(a4)	; setup DREQ location	
+			bra.s	@chk2Bus						; 		
+
+@wereQuadra
+			move.b	#bDREQ,G_bitDREQ(a4)			; setup bit location of DREQ check
+			move.l	#SCSI0_DAFB,pdma5380(a4)		; setup DREQ location
+
+@chk2Bus											;												<H4> jab
+			TestFor	SCSI96_2Exists					; do we have a second SCSI96 chip? 
+			beq.s	@noSCSI96						;
+@s2Exists
+			move.l	SCSI2Base, base539x1(a4)		; addr of second SCSI chip
+			move.l	#SCSI1_DAFB, hhsk5380(a4)		; load addr of DAFB regr containing DREQ bit
+
+			lea.l	DoSCSISelect_D96, a1			; point to Dual SCSI96 Select proc
+			move.l	a1, jvSelect(a4)				; use this Select routine
+			
+			lea.l	DoSCSISelAtn_D96, a1			; point to Dual SCSI96 Select/WAtn proc
+			move.l	a1, jvSelAtn(a4)				; use this Select routine
+@noSCSI96											; 
+
+			move.b	#mgrVersion2, state2(a4)		; save the version number
+@InitDone
+
+			movem.l	(sp)+, intrRegs					; restore registers
+			rts
+			
+			
+
+;-------------------------------------------------------------
+;
+			Macro
+			DispatchVector &ROMAddress
+		IF forROM THEN
+			dc.l	&ROMAddress-SCSIMgr_96
+		ELSE
+			dcImportResident &ROMAddress
+		ENDIF
+			EndM
+
+OffsetTbl96
+
+			DispatchVector	DoSCSIReset_96				;  0: SCSIReset
+			DispatchVector	DoSCSIGet_96				;  1: SCSIGet
+			DispatchVector	DoSCSISelect_S96			;  2: SCSISelect										<T2>
+			DispatchVector	DoSCSICmd_96				;  3: SCSICmd
+			DispatchVector	DoSCSIComplete_96			;  4: SCSIComplete
+			DispatchVector	NewSCSIRead_96				;  5: SCSIRead
+			DispatchVector	NewSCSIWrite_96				;  6: SCSIWrite
+			DispatchVector	Unimplemented_96			;  7: Was SCSIInstall							
+			DispatchVector	NewSCSIRBlind_96			;  8: SCSIRBlind
+			DispatchVector	NewSCSIWBlind_96			;  9: SCSIWBlind
+			DispatchVector	DoSCSIStat_96				; 10: SCSIStat
+			DispatchVector	DoSCSISelAtn_S96			; 11: SCSISelAtn										<T2>
+			DispatchVector	DoSCSIMsgIn_96				; 12: SCSIMsgIn
+			DispatchVector	DoSCSIMsgOut_96				; 13: SCSIMsgOut
+
+;==========================================================================
+
+		ENDWITH
+
+		END 
+

@@ -1,0 +1,505 @@
+;
+;	File:		FileIDs.a
+;
+;	Contains:	This file contains the high level calls for FileIDs. It sets up calls for the
+;				low level file (FileIDsSvcs.a) after going through the proper HFS async queuing,
+;				and checking for volume legality (i.e., online, writable, TFS vol, exists). See
+;				doc preceeding each call for more details.
+;				Registers A0-A1, D0-D2 are assumed trashable by calling convention.
+;
+;	Copyright:	© 1989-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM4>	 8/27/93	BH		Removed <SM3>. The flushing stuff is now in CmdDone.
+;	   <SM3>	  8/3/93	BH		Flushing critical volume info when changed for a volume in a
+;									manual-eject drive.
+;		<SM2>	 5/19/92	CS		Integrated changes from Reality:
+;									<14> 4/4/92	gs Fixed bug# 1021960 : BNE.S should be to @Exit1, NOT @Exit after
+;									the JSRs to DtrmV3 and ExtOffLinCk. 'bugz' bit
+;									gestaltResolveFileIDRefFix should be set when this is fixed.
+;	   <SM1>	 4/15/92	kc		Removed the "ROM" prefix from the RomBind routines.
+;									• Pre-SuperMario comments follow •
+;		<13>	 9/13/91	JSM		Cleanup header.
+;		<12>	 4/16/91	KST		bb and dnf, #KSCT20: Fixing a bug in ExchangeFile which leaves
+;									cache buffers in an inconsistent state.
+;		<11>	 4/12/91	dnf		bb,#86775: Have ExchangeFiles call FClose (the standard File
+;									Manager fork flushing path) to ensure that information in the
+;									FCB array is synchronized to disk.
+;		<10>	 3/19/91	dnf		dba, #84908: Allow ExchangeFiles to exchange locked files. Since
+;									ExchangeFiles uses the same permissions rules as CatMove, we use
+;									the same rule as CatMove here, and don’t bother to respect the
+;									file locked bits.
+;		 <9>	 1/14/91	KST		Documentation change.
+;		 <8>	 9/22/90	dnf		(bb/dnf) Fix PB-trashing bug in ExchangeFiles.
+;		 <7>	 9/10/90	KST		Fixing a bug in EXCHANGEFILE which saved/restored only the LS Word
+;									of A1 <5>. Also we free the cache buffers only, not trashing them.
+;		 <6>	 8/29/90	KST		Fixing a bug in DeleteFileIDRef which BSR to CmdDone (should be JMP).
+;		 <5>	 8/28/90	dnf		Fix file flushing code in ExchangeFiles.
+;		 <4>	  8/6/90	dnf		Make it impossible to exchange a file with itself.
+;		 <3>	 7/30/90	dnf		Rename rom references and use jsrROM macro.
+;		 <2>	  2/4/90	DNF		Remove include of HFS70equ.a
+;	   <1.9>	11/15/89	EKN		Tweeks from 2nd code review + ResolveID,DeleteID use ioNamePtr
+;									for vol spec.
+;				11/14/89	EKN		Tweeks from 2nd code review + ResolveID, DeleteID use ioNamePtr.
+;	   <1.8>	10/13/89	EKN		CreateID should get the ID if it exists on a locked volume.
+;				10/12/89	EKN		CreateID will get the ID even if the volume is locked, but will
+;									bypass the create.
+;	   <1.7>	 9/29/89	EKN		Exchange on Open Files AND Little twiddles for stylish stuff
+;									from code review.
+;				 9/28/89	EKN		Exchange work on closed and open files! Little twiddles for
+;									stylish stuff from code review. (ie, take out saving of
+;									registers)
+;	   <1.6>	 8/29/89	EKN		PBHResolveID had BNE errors reversed for TFSVCBTst and
+;									ExtOffLinChk.
+;	   <1.5>	 7/24/89	EKN		PBHExchangeFiles <= closed files. New errors fidFileOpen,
+;									fidDiffVol. Pass catHints. Error if not TFS vol.
+;				 7/21/89	EKN		Change PBHExchangeFiles to work on closed (vs open) files AGAIN.
+;									Enumerate fcbs to enforce closed files in PBHExchangeFiles (err
+;									fidFileOpen) Enforce same volumes with pathnames in
+;									PBExchangeFiles (err fidDiffVol) Added passing of catHints in
+;									PBHExchangeFile for better enforcing of closed-ness. Add
+;									TFSVCBTst to all calls. Use A6 stack to save names instead of A7
+;									in CreateID and Exchange... Pretty up: Capitalize all "bsr"s;
+;									Change JSRs to BSRs;fix comments.
+;	   <1.4>	  7/6/89	dnf		Change all references to ExtOffLinCh to ExtOffLinCk to match ROM
+;									names
+;	   <1.3>	 5/30/89	dnf		Getting more kinks out
+;	   <1.2>	 5/30/89	dnf		Changes to support HFS7.0 Enhancements ptch
+;				 5/29/89	EKN		Created file.
+;	   <1.1>	 5/24/89	rwh		include inc.sum.a to fix build problems
+;	   <1.0>	 5/15/89	EKN		Get the FileIDs facility into the system build for the first
+;									time.
+;
+
+;_________________________________________________________________________________
+;
+; External
+;  Routines: PBHCreateID  -  Creates a file thread to an HFS existing file.
+;			 PBHDeleteID  -  Destroys the file thread to the HFS File.
+;			 PBHResolveID -  Given a fileID, returns the parID and cname of the file.
+;			 PBHExchangeFiles  -  Exchanges the data of the files. For doing "safe saves".
+;
+;_________________________________________________________________________________
+
+
+			BLANKS	ON					; need semicolons to separate comments now
+			STRING  ASIS   				; strings are the way they look
+			PRINT   OFF					; don't send lines to assembly listing file
+			LOAD	'StandardEqu.d'
+			include	'LinkedPatchMacros.a'
+			PRINT   ON					; okay, send the lines for the listing
+			PRINT   NOGEN				; don't show the macro expansions
+
+FileIDs		PROC	EXPORT
+			EXPORT	CreateFileIDRef, DeleteFileIDRef, ResolveFileIDRef, PBHExchangeFiles
+			IMPORT	FIDCreateID, FIDDeleteID, FIDGetID, FIDResolveID, FIDExchangeFiles
+
+;_______________________________________________________________________
+;
+; Routine:	 CreateFileIDRef
+;
+; Function:  Sets up the call to FIDCreateID. But first, it queues us for async calls,
+;			 converts pathnames, and checks volumes legality (exists, online, writable, and TFS).
+;			 Also, if the volume is locked, the existance of a fileID is checked and returned,
+;			 but not created!
+;
+; Note: 	 There is a decrepancy between FndFilName and PushCName. FndFilName returns a
+;			 long length for name, while pushCname uses a word length for name.
+;
+; Input:	 A0.L -- pointer to HParamBlockRec parameter block of type FIDParam, uses
+;						ioVRefNum, ioFileName, ioSrcDirID
+;
+; Output:	 A0.L -- pointer to HParamBLockRec parameter block of type FIDParam, uses
+;						ioFileID, ioResult
+;_______________________________________________________________________
+
+CreateFileIDRef:
+			jsrROM  FSQUEUE   			; first wait our turn
+
+			jsrROM 	FNDFILNAME   		; parse pathname(IN: A0=prmblk OUT: D0=err D2.L=namLen D6=dirID
+										;  D7=cathint A1=volBuffer A2=vcb A3=WDCB A4=cname A5=fileDirEntry)
+			BNE.S	@Exit
+
+			jsrROM	EXTOFFLINCK   		; is the volume online and used by us (not ExtFS)? (IN: A2=vcb OUT: D0=err)
+			BNE.S	@Exit
+
+			jsrROM	TFSVCBTST   		; it better be an HFS volume (IN: A2=vcb)
+			BNE.S	@NotHFSErr
+
+			MOVEA.L A0, A3				; sure paramblock ptr for later
+			jsrROM 	PUSHCNAME   		; Put name on A6 stack (IN: A4=name D2.W=len OUT: A0=name D2=len)
+			MOVE.W	D2,-(A6)			; Save rounded source name length
+
+			jsrROM	CVFLGS   			; is the volume writable? (IN: A2=vcb OUT: D0=err)
+			BEQ.S	@DoCreate
+
+			MOVE.W	D0, D7				; save the error
+			MOVE.L	D6, D0				; dirID or parent dirID
+			JSR		FIDGetID			; get the ID (IN: A0=cname D0=dirID A2=vcb OUT: D0=err D1=fthd)
+			MOVE.W	(A6)+,D2			; Recover rounded source length
+			jsrROM 	POPCNAME   			; Remove dest. name string (IN: A6=string D2=rndLen OUT: D2=len)
+			MOVE.L	D1, ioFileID(A3) 	; set the fileID back in the paramblock ptr
+			TST.W	D0
+			BEQ.S	@existsErr			; the fileID exists on the locked volume
+			CMP.W	#cmFThdGone, D0
+			BNE.S	@nxtErrChk
+			MOVE.W	D7, D0				; the fileID doesn't exist, so pass back LOCKED status
+			BRA.S	@Exit
+
+@DoCreate	MOVE.L	D6, D0				; dirID or parent dirID
+			JSR		FIDCreateID			; and do it (IN: A0=cname D0=dirID A2=vcb OUT: D0=err D1=fthd)
+			MOVE.W	(A6)+,D2			; Recover rounded source length
+			jsrROM 	POPCNAME   			; Remove dest. name string (IN: A6=string D2=rndLen OUT: D2=len)
+			MOVE.L	D1, ioFileID(A3) 	; set the fileID back in the paramblock ptr
+			TST.W	D0
+			BEQ.S	@Exit				; no errors, get out
+
+			CMP.W	#CMExists, D0		; Convert "Cnode exists" to "File ID exists"
+			BNE.S	@nxtErrChk
+@existsErr	MOVE.W	#fidExists, D0
+			BRA.S	@Exit
+@nxtErrChk	CMP.W	#cmFThdDirErr, D0
+			BNE.S	@nxtErrChk1
+			MOVE.W	#NotAFileErr, D0
+			BRA.S	@Exit
+@nxtErrChk1	CMP.W	#CMNotFound, D0
+			BNE.S	@Exit
+			MOVEQ	#fnfErr, D0
+			BRA.S	@Exit
+@NotHFSErr	MOVEQ	#wrgVolTypErr, D0
+
+@Exit		jmpROM	CMDDONE   				; will also put the D0 result in ioResult(A0)
+
+
+;_______________________________________________________________________
+;
+; Routine:	 DeleteFileIDRef
+;
+; Function:  Sets up the call to FIDDeleteID. But first, it queues us for async calls,
+;			 and checks volumes legality (exists, online, writable, and TFS).
+;
+; Input:	 A0.L -- pointer to HParamBlockRec parameter block of type FIDParam, uses
+;						ioVRefNum, ioFileID, ioFileName
+;
+; Output:	 A0.L -- pointer to HParamBLockRec parameter block of type FIDParam, uses
+;						ioResult
+;_______________________________________________________________________
+
+DeleteFileIDRef:
+
+			jsrROM 	FSQUEUE   			; first wait our turn
+
+			jsrROM 	DTRMV3   			; get the vcb by vrefnum or name(IN: A0=prmblk OUT:A2=vcb D0=err)
+			BNE.S	@Exit				;   D2=nameLen? D3=volName? A3=WDCB A4=pathName)
+
+			jsrROM	CVFLGS   			; is the volume writable? (IN: A2=vcb OUT: D0=err)
+			BNE.S	@Exit
+			jsrROM	EXTOFFLINCK   		; is the volume online and used by us (notExtFS)? (IN: A2=vcb OUT: D0=err)
+			BNE.S	@Exit
+
+			jsrROM	TFSVCBTST   		; it better be an HFS volume (IN: A2=vcb)
+			BNE.S	@NotHFSErr
+
+			MOVE.L	ioFileID(A0), D0	; file id
+			JSR		FIDDeleteID			; and do it (IN: A2=vcb D0=fThd OUT: D0=err)
+			BEQ.S	@Exit
+
+			CMP.W	#cmFThdGone, D0
+			BNE.S	@nxtErrChk
+			MOVE.W	#fidNotFound, D0
+			BRA.S	@Exit
+@nxtErrChk	CMP.W	#CMNotFound, D0
+			BNE.S	@nxtErrChk1
+			MOVE.W	#fnfErr, D0
+			BRA.S	@Exit
+@nxtErrChk1	CMP.W	#cmFThdDirErr, D0
+			BNE.S	@Exit
+			MOVE.W	#NotAFileErr, D0
+			BRA.S	@Exit
+@NotHFSErr	MOVEQ	#wrgVolTypErr, D0
+
+@Exit		jmpROM	CMDDONE   			; will also put the D0 result in ioResult(A0)
+
+;_______________________________________________________________________
+;
+; Routine:	 ResolveFileIDRef
+;
+; Function:  Sets up the call to FIDResolveID. But first, it queues us for async calls,
+;			 and checks volumes legality (exists, online, and TFS).
+;
+; Input:	 A0.L -- pointer to HParamBlockRec parameter block of type FIDParam, uses
+;						ioVRefNum, ioFileID, ioFileName
+;
+; Output:	 A0.L -- pointer to HParamBLockRec parameter block of type FIDParam, uses
+;						ioResult, ioFileName, ioSrcDirID
+;_______________________________________________________________________
+
+ResolveFileIDRef:
+
+			jsrROM 	FSQUEUE   			; first wait our turn
+
+			jsrROM 	DTRMV3   			; get the vcb by vrefnum or name (IN: A0=prmblk OUT:A2=vcb D0=err)
+			BNE.S	@Exit1				; <SM2> CSS   D2=nameLen? D3=volName? A3=WDCB A4=pathName?)
+			jsrROM	EXTOFFLINCK   		; is the volume online and used by us (notExtFS)? (IN: A2=vcb OUT: D0=err)
+			BNE.S	@Exit1				; <SM2> CSS
+
+			jsrROM	TFSVCBTST   		; it better be an HFS volume (IN: A2=vcb)
+			BNE.S	@NotHFSErr
+
+			MOVEA.L	A0, A3				; save paramblock ptr for later
+			MOVE.L	ioFileID(A0), D0	; file id
+			MOVEA.L ioFileName(A0), A0; empty storage provided by client to put name in
+			JSR		FIDResolveID		; and do it (IN: A2=vcb D0=fThd OUT: A0=cname D1=dirID D0=err)
+			BEQ.S	@Exit
+
+			CMP.W	#CMNotFound, D0
+			BNE.S	@nxtErrChk
+			MOVE.W	#fidNotFound, D0
+			BRA.S	@Exit1
+@nxtErrChk	CMP.W	#cmFThdDirErr, D0
+			BNE.S	@Exit
+			MOVE.W	#NotAFileErr, D0
+			BRA.S	@Exit1
+@NotHFSErr	MOVEQ	#wrgVolTypErr, D0
+			BRA		@Exit1
+
+@Exit		MOVE.L	D1, ioSrcDirID(A3)	; put it back in paramblock
+@Exit1		jmpROM	CMDDONE   			; will also put the D0 result in ioResult(A0)
+
+;_______________________________________________________________________
+;
+; Routine:	 PBHExchangeFiles
+;
+; Function: Sets up the call to FIDExchangeFiles. But first, it queues us for async calls,
+;			converts pathnames, checks volumes legality (exists, online, writable, and TFS),
+;			makes sure the two files are on the same volume (in case pathnames were used),
+;			and flushes any cached blocks for open forks on either file by enumerating all fcbs.
+;
+; Input:	 A0.L -- pointer to HParamBlockRec parameter block of type FIDParam, uses
+;						ioVRefNum, ioFileName, ioSrcDirID, ioDestNamePtr, ioDestDirID
+;
+; Output:	 A0.L -- pointer to HParamBLockRec parameter block of type FIDParam, uses
+;						ioResult
+;_______________________________________________________________________
+
+PBHExchangeFiles:
+
+; 	the use of registers end up to be as follows after some initial manipulation:
+;	A2 = vcb, A3 = destName, A4 = cmvars/scratch, A5 = srcName
+;	D2 = srcCatHint, D3 = destCatHint, D4 = destFileNum, D5 = srcFileNum, D6 = destDirID, D7 = srcDirID
+
+			jsrROM 	FSQUEUE   			; first wait our turn
+
+			jsrROM 	FNDFILNAME   		; parse pathname(IN: A0=prmblk OUT: D0=err D2.L=namLen D6=dirID
+			BNE		@Exit				;  D7=cathint A1=volBuffer A2=vcb A3=WDCB A4=cname A5=fileDirEntry)
+			MOVE.L	D6, D1				; save src dirID for later
+			MOVE.L	D2, D5				; save the rounded source name length for later
+			MOVE.L	A4, -(A6)			; save the name for later
+			MOVE.L	A2,	-(A6)			; hold onto vcb for a while
+
+			move.l	ioFileName(a0), -(a6)		; save caller's ioFileName value		<bb/dnf 8>
+			move.l	ioSrcDirID(a0), -(a6)		; save caller's ioSrcDirID value		<bb/dnf 8>
+			MOVE.L	ioDestNamePtr(A0), ioFileName(A0)
+			MOVE.L	ioDestDirID(A0), ioSrcDirID(A0)
+			jsrROM 	FNDFILNAME   		; parse pathname(IN: A0=prmblk OUT: D0=err D2.L=namLen D6=dirID
+										;  D7=cathint A1=volBuffer A2=vcb A3=WDCB A4=cname A5=fileDirEntry)
+			move.l	(a6)+, ioSrcDirID(a0)		; restore caller's ioSrcDirID value		<bb/dnf 8>
+			move.l	(a6)+, ioFileName(a0)		; restore caller's ioFileName value		<dd/dnf 8>
+			MOVE.L	(A6)+, A3			; pop the vcb a little early, in case we exit next
+			TST.W	D0					; set the Z status again
+			BNE		@PopAndErr
+			MOVE.L	D1, D7				; move the src dirID to someone safe
+
+			CMP.L	A2, A3				; better be the same volumes if specified by pathnames
+			BNE		@difVolErr
+
+			jsrROM	CVFLGS   			; is the volume writable? (IN: A2=vcb OUT: D0=err)
+			BNE		@PopAndErr			; no ->
+			jsrROM	EXTOFFLINCK   		; is the volume online and used by us (notExtFS)? (IN: A2=vcb OUT: D0=err)
+			BNE		@PopAndErr
+			jsrROM	TFSVCBTST   		; and it better be an HFS volume (IN: A2=vcb)
+			BNE		@NotHFSErr
+
+; set up the names properly
+
+			MOVE.L	(A6)+, A5			; get the src name off the A6 stack before it changes
+			jsrROM  PUSHCNAME   		; Put dest name on A6 stack (IN: A4=name D2.W=len OUT: A0=name D2=len)
+			MOVE.L	A0, A3				; save the dest name
+			MOVE.L	A5, A4				; get the src name
+			MOVE.L	D2,-(A6)			; Save dest rounded name length
+			MOVE.L	D5, D2				; get the src name length
+			jsrROM 	PUSHCNAME   		; Put src name on A6 stack (IN: A4=name D2.W=len OUT: A0=name D2=len)
+			MOVE.L	D2,-(A6)			; Save rounded name length
+
+; grab the File ID numbers to use later for fcb searching on open files
+
+			SUB		#lenCMVars, A6		; LocCRec expects some storage from A6 pointed to by A4
+			MOVEA.L	A6, A4
+
+			MOVEA.L	A0, A5				; keep the src name
+			MOVE.L	D7,	D0			    ; set the src dir ID
+			MOVEQ	#0, D2				; no cat hint
+			jsrROM	LOCCREC   			; search the catalog (IN: A2=vcb A4=cmvars A0=name D0=dirID D2=catHInt
+			BNE		@ExchErr			;   OUT: D0=err D1=size D2=catHint A0=ckr A1=cdr)
+			MOVE.L	D2, D4				; save the src cat hint
+		    MOVE.L	filFlNum(A1), D5	; save src file ID
+
+			MOVEA.L	A3, A0				; set the dest name
+			MOVE.L	D6, D0				; set the dest dir ID
+			MOVEQ	#0, D2				; no cat hint
+			jsrROM	LOCCREC   			; search the catalog (IN: A2=vcb A4=cmvars A0=name D0=dirID D2=catHInt
+			BNE		@ExchErr			;   OUT: D0=err D1=size D2=catHint A0=ckr A1=cdr)
+			MOVE.L	D2, D3				; save the dest cat hint
+
+			MOVE.L	D4, D2				; put the src cat hint where it belongs (dest cat hint is in D3)
+			MOVE.L	filFlNum(A1), D4	; save dest file ID
+
+			cmp.l	d4, d5				; are we trying to exchange a file with itself?				<dnf 4>
+			bne.s	@NotTheSameFile		; if not, just keep going									<dnf 4>
+			move.l	#sameFileErr, d0	; if so, we don't have to do anything						<dnf 4>
+			bra		@PopAndExit			; optimize, optimize, optimize...							<dnf 4>
+@NotTheSameFile:						;															<dnf 4>
+
+; Flush any open paths with the files in question! (release cache buffers)							<KSCT>
+
+; Note: The cache takes fcb refnum as an argument for flushing. The only way to get
+; this value is to walk the fcb array and find matches of the file number. If a match
+; is found, that fcb refnum can be used for flushing. BUT, the fcb walk continues, since
+; there can be more than one open path per file.
+
+; FINE TUNING: Flag if either file is open. THEN after FidExchangeFiles, if none, skip fcb walking.
+
+			jsrROM	GT1STFCB   			; get the first fcb (uses A1, D1)
+@loop		CMP.L	fcbVPtr(A1, D1), A2	; better be correct volume
+			BNE.S	@nxtFCB
+			CMP.L	fcbFlNm(A1, D1), D5
+			BNE.S	@tstDestID
+			BRA.S	@flushAndNxt
+@tstDestID	CMP.L	fcbFlNm(A1, D1), D4
+			BNE.S	@nxtFCB
+@flushAndNxt
+
+			st		FlushOnly			; only flush, please										<11>
+			jsrROM	FClose				; sync the FCB info w/catalog file entry					<11>
+			bne		@PopAndExit			; bail at the slightest hint of trouble						<11>
+			
+			movem.L	a1/d1, -(a6)		; save refnum and FCBSptr around flush		<dnf 5>
+			MOVE.W	D1, D0				; set it up for flush (fcb index = refnum)
+			MOVEQ	#kFCTrash, D1		; must trash them because exchangefiles will not		<16Apr91 #12>
+										; update the file number in the buffer header after the exchange
+			MOVE.L	VCBBufAdr(A2), A1
+			ST		CacheFlag		 	; really flush
+			jsrROM	FLUSHCACHE   		; release the buffers to free buffer pool
+			movem.L	(a6)+, a1/d1		; restore refnum and FCBSPtr after flush	<dnf 5>
+
+@nxtFCB		jsrROM	GTNXTFCB   
+			BCS.S	@loop 				; loop thru them all
+
+; we are almost ready to roll...FINALLY!...
+; (future enhancement: flush the catalog and extents file from the caches in case of ioErrors)
+; (future enhancement: trash/flush the catalog and extents file from the caches if ioErrors upon return)
+
+			MOVEA.L	A5, A0				; the src CName
+			MOVEA.L	A3, A1				; the dest CName
+			MOVE.L	D6, D1				; the dest dir id
+	;; valid buffer in the free queue has a file number tag to it in the header, however,
+	;; after FIDExchangeFiles the file number is no longer valid. So we have to call TrashFBlocks
+	;; to invalidate all the buffer associated with the files.					<16Apr91 #12 ksct>
+	;; A2.L = VCBptr, D4,D5 = file numbers we want to trash						<16Apr91 #12>
+
+			MOVE.L	D4,D0				; D0 = file number						<16Apr91 #12>
+			BSR		trashFileBlocks		; trash one file						<16Apr91 #12>
+			MOVE.L	D5,D0				; D0 = file number						<16Apr91 #12>
+			BSR		trashFileBlocks		; trash the other file					<16Apr91 #12>
+
+			MOVE.L	D7, D0				; the src dir id						<16Apr91 #12>
+			JSR		FIDExchangeFiles	; and do it (IN: A0=srcName A1=destName A2=vcb D0=srcDID
+			BNE.S	@ExchErr			;   D1=destDID D2=srcCatHint D3=destCatHint OUT: D0=err)
+
+; exchange fcb info (file number, file name, and file parID only!)
+
+			jsrROM	GT1STFCB   			; get the first fcb (uses A1, D1)
+@loop1		CMP.L	fcbVPtr(A1, D1), A2	; better be correct volume
+			BNE.S	@nxtFCB1
+			CMP.L	fcbFlNm(A1, D1), D5
+			BNE.S	@tstDestID1
+
+			MOVE.L	#0, FcbCatPos(A1, D1)
+			MOVE.L	D4, fcbFlNm(A1, D1)
+			MOVE.L	D6, fcbDirID(A1, D1)
+
+			MOVEA.L	A3, A0			  	; move dest name into fcbCName of src file
+			MOVEA.L	A1, A4				; Save A1 across _BlockMove
+			LEA 	FCBCName(A1, D1),A1 ; fcb spot to move to
+			MOVEQ	#1,D0				; Clear upper bytes in D0, add length byte
+			ADD.B	(A0),D0 			; Pick up number of bytes to copy
+			_BlockMove					; Copy the filename
+			MOVEA.L A4, A1				; Restore A1
+
+			BRA.S	@nxtFCB1
+
+@tstDestID1	CMP.L	fcbFlNm(A1, D1), D4
+			BNE.S	@nxtFCB1
+
+			MOVE.L	#0, FcbCatPos(A1, D1)
+			MOVE.L	D5, fcbFlNm(A1, D1)
+			MOVE.L	D7, fcbDirID(A1, D1)
+
+			MOVEA.L	A5, A0			  	; move src name into fcbCName of dest file
+			MOVEA.L	A1, A4				; Save A1 across _BlockMove
+			LEA 	FCBCName(A1, D1),A1 ; fcb spot to move to
+			MOVEQ	#1,D0				; Clear upper bytes in D0, add length byte
+			ADD.B	(A0),D0 			; Pick up number of bytes to copy
+			_BlockMove					; Copy the filename
+			MOVEA.L A4, A1				; Restore A1
+
+
+@nxtFCB1	jsrROM	GTNXTFCB   
+			BCS.S	@loop1 				; loop thru them all
+
+			BRA.S	@PopAndExit
+
+; if we had errors....
+
+@ExchErr	CMP.W	#CMNotFound, D0
+			BNE.S	@nxtErrChk1
+			MOVEQ	#fnfErr, D0
+			BRA.S	@PopAndExit
+@nxtErrChk1	CMP.W	#cmFThdDirErr, D0
+			BNE.S	@PopAndExit
+			MOVE.W	#NotAFileErr, D0
+			BRA.S	@PopAndExit
+@difVolErr	MOVE.W	#DiffVolErr, D0
+			BRA.S	@PopAndExit
+@NotHFSErr	MOVEQ	#wrgVolTypErr, D0
+@PopAndErr	ADDQ	#4, A6				; pop the name off the stack
+			BRA.S	@Exit
+
+; YIPPIE! we're done!
+
+@PopAndExit	ADD		#lenCMVars, A6		; get the temp storage back needed by LocCRec
+			MOVE.L	(A6)+,D2			; Recover rounded length
+			jsrROM 	POPCNAME   			; Remove src name string (IN: A6=string D2=rndLen OUT: D2=len)
+			MOVE.L	(A6)+,D2			; Recover rounded length
+			jsrROM 	POPCNAME   			; Remove dest name string (IN: A6=string D2=rndLen OUT: D2=len)
+
+@Exit		jmpROM	CMDDONE   			; will also put the D0 result in ioResult(A0)
+
+
+
+;_________________________________________________________________________________
+; trashFileBlocks 	(trash all cache things of the file), Entry to the TrashFBlocks.
+; Input:		D0.L  -  file number
+;				A2.L  -  VCB ptr
+;_________________________________________________________________________________
+trashFileBlocks							; all registers preserved						<16Apr91 #12>
+
+			MOVEM.L D0-D6/A0-A4,-(SP)	; jTBStartSearch needs these on the stack		<16Apr91 #12>
+			MOVE.L  D0,D3				; file number									<16Apr91 #12>
+			MOVEQ	#0,D1				; zero means trash all blocks					<16Apr91 #12>
+			MOVE.L	jTrashBlocks,-(SP)	; go start the search							<16Apr91 #12>
+			RTS							; jTrashBlocks restores d0-d6/a0-a4				<16Apr91 #12>
+										; this actually jumps to cache's TBStartSearch 	<16Apr91 #12>
+			ENDP
+			END

@@ -1,0 +1,188 @@
+;
+;	File:		SysBeepPatch.a
+;
+;	Copyright:	© 1988-1990, 1992 by Apple Computer, Inc., all rights reserved.
+;
+;   This file is used in these builds: ROM System
+;
+;	Change History (most recent first):
+;
+;		 <2>	 3/10/92	PN		Change sysbeep to upper case for the linker
+;		<16>	 6/12/91	LN		added #include 'SysPrivateEqu.a'
+;		<15>	 6/12/91	LN		Removed #includes for private interfaces from public interfaces.
+;									Changed #include 'HardwareEqu.a' to 'HardwarePrivateEqu.a'
+;		<14>	 8/21/90	KIP		Fix a with statement.
+;		<13>	 8/21/90	KIP		Try to play the ROM beep if the resource ID in PRAM is not
+;									found; switch logic of sysBeepState value.
+;		<12>	 8/13/90	KIP		Make SysBeep look again for sound volume of zero and flash the
+;									menu bar (Neil changed _SndPlay to do this, but that was the
+;									wrong thing to do).
+;		<11>	 6/12/90	DDG		NEEDED FOR SIXPACK: Fixed previous comment.
+;		<10>	 6/11/90	CV		NEEDED FOR SIXPACK: Removing test for sound active and sound
+;									volume equal to 0 because they are in the sound manager now.
+;		 <9>	  6/2/90	NC		NEEDED FOR SIXPACK: New Sound Manager can disable SysBeep for
+;									presentation purposes. SysBeepPatch now looks at the global and
+;									exits if sysbeep is disabled.
+;		 <8>	 5/29/90	DDG		NEEDED FOR SIXPACK: Changed all the sixpack conditionals from
+;									six-point-oh-seven to six-point-oh-six.
+;		 <7>	 3/20/90	DDG		Changed $610 to $606 in all the system version conditionals.
+;		 <6>	  2/5/90	DDG		Fix SysBeep by including it in the sound manager patch instead
+;									of the individual patches for each ROM. (Neil [NC] actually did
+;									the fix)
+;		 <5>	  2/3/90	NC		SysBeep is now patched by the Sound Manager.  This file should
+;									now reside in the SoundMgr folder but BBS won't let me put it
+;									there!
+;		 <4>	  2/1/90	NC		How about using asm Ifs instead of C #ifs?
+;		 <3>	  2/1/90	NC		Conditionally remove the SoundActive check because new Sound
+;									Manager really returns errors.
+;		 <2>	  1/4/90	dba		get rid of warning caused by unnecessary branch; also get rid of
+;									MacPlusBeep/MacSEBeep symbols; this file will become part of a
+;									Mac Plus/Mac SE patch file and will use Bind in the future
+;	   <1.0>	11/16/88	CCH		Added to EASE.
+;				  7/8/88	bbm		<S529> Made massive changes to SysBeepPatch.a. Cleaned up some
+;									code. We now jump to rom if extra parameter ram is not present,
+;									or if we are playing 'snd ' 1 on a MacPlus or MacSE. Since the
+;									new sound manager uses timer one, any application that called
+;									SysBeep and used timer one would die on System 6.0. If a user
+;									chooses simple beep, the sound manager won’t be called on a
+;									MacPlus or MacSE, so the application won’t croak.
+;
+;	To Do:
+;
+
+			INCLUDE	'sysequ.a'
+			INCLUDE	'HardwarePrivateEqu.a'
+			INCLUDE	'Traps.a'
+			INCLUDE	'ToolEqu.a'
+			INCLUDE 'SysPrivateEqu.a'
+PrNonPortable	SET	 1
+			INCLUDE	'private.a'
+PrNonPortable	SET  0
+			
+
+			CASE	OBJ
+			MACHINE	MC68000
+
+;--------------------------------------------------------------------------------------------
+;
+;	SMgrGlobals	Ax	returns the Ptr to our New Sound Manager Globals in Ax
+;
+			MACRO
+			SMgrGlobs	&temp
+			MOVE.L	ExpandMem,&temp
+			MOVE.L	ExpandMemRec.soundMgrGlobals(&temp),&temp
+			ENDM
+		
+sysBeepState	EQU		24
+
+;--------------------------------------------------------------------------------------------
+
+
+			PROC	ENTRY
+			EXPORT	SYSBEEP
+SYSBEEP
+			MOVEM.L	D0-D7/A1-A6,-(SP)		; save the world
+			MOVE.W	60(sp),D7				; save duration for later
+
+			MOVE.W	SR,D0					; are we at interrupt level?
+			AND.W	#$0700,D0				;
+			BNE		@done					; if we are, can't make sound
+
+			SMgrGlobs	A0
+			TST.W	sysBeepState(A0)
+			BEQ.S	@done					; if SysBeep value is disabled, then GTFO
+
+			TST.B	SdVolume				; zero sound?
+			BNE.S	@makeSound				; br if not
+
+@flash										;
+			TST.B	WWExist					; is there a window world?
+			BNE.S	@done					; if not, skip this entirely
+
+			CLR.L	-(SP)					; flash entire menu bar
+			_FlashMenuBar					; flash menu bar instead
+			SUB.L	A0,A0					;
+			ADDQ	#8,A0					;
+			_Delay							;
+			_FlashMenuBar					;
+			BRA.S	@done					;
+
+@makeSound
+			btst	#hwCbClock,HWCfgFlags	; is new clock chip here
+			bne.s	@getSoundId				; if so, get resource id
+			bsr.s	@rombeep				;	else go do a beep if possible
+			bra.s	@done					;	and exit
+
+@getSoundId									; get resource id from param ram here
+			CLR.W	-(SP)					; space for id
+			MOVE.L	SP,A0					; it's address
+			MOVE.L	#$0002007C,D0			; two bytes, from snd res location
+			_ReadXPRam						;
+			MOVE.W	(SP)+,D5				; get it (and leave it there)
+			cmp.w	#1,D5					; special case simple beep (id=1)
+			bne.s	@getsound				;
+@tryRomBeep									; <13> KIP
+			bsr.s	@rombeep				; go do a beep if possible
+			beq.s	@done					; exit if sound played
+@getsound
+			CLR.L	-(SP)					;leave space for result
+			MOVE.L	#'snd ',-(SP)			;push resource type
+			MOVE.W	D5,-(SP)				;push resource number
+			MOVE.B	ResLoad,D4				;save resload
+			MOVE.B	#1,ResLoad				;set resload true
+
+			_RGetResource
+
+			MOVE.B	D4,ResLoad				;restore resload
+			MOVE.L	(SP)+,A0				;get handle back
+
+			CLR.W	-(SP)					;leave space for result
+			CLR.L	-(SP)					;push nil for channel
+			MOVE.L	A0,-(SP)				;push handle
+			CLR.W	-(SP)					;push false for async
+			_SndPlay						;_SndPlay
+			MOVE.W	(SP)+,D0				;pop function result off
+			TST.W	D0						;was there an error?
+			BEQ.S	@done					;if not, we're done
+			CMP.W	#1,D5					;was it id #1?
+			BEQ.S	@flash					;yes, to bad, can't beep so flash
+			MOVE.W	#1,D5					;else, try id #1 just for laughs
+			BRA.S	@tryRomBeep				; <13> KIP
+
+@done
+			MOVEM.L	(SP)+,D0-D7/A1-A6		; restore the world
+			MOVE.L	(SP)+,A0
+			ADDQ	#2,SP
+			JMP		(A0)
+
+
+; ---------------------------------------------------------------------------
+; upon entry,
+;	D7 has duration.
+; upon exit,
+;	cc = EQ		rom sound played
+;	cc = NE		no sound played
+; ---------------------------------------------------------------------------
+
+@rombeep
+			move.l	rombase,A0				; is this is a rom we know?
+			add.w	#8,A0					; point at rom version
+			cmpi.w	#$0075,(A0)				; is rom MacPlus rom?
+			bne.s	@1
+
+			move.l	#$4011DC,A0
+			bra.s	@dobeep
+@1
+			cmpi.w	#$0276,(A0)				; is rom MacSE rom?
+			bne.s	@rts					; if not, punt (unknown cpu)
+			move.l	#$4029B4,A0
+@dobeep
+			move.w	D7,-(sp)				; get duration for sysbeep
+			jsr		(A0)					; do rombeep and fall into @done
+			moveq	#0,d0					; set condition code before return
+@rts
+			rts
+
+			ENDPROC
+
+			END

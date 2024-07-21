@@ -1,0 +1,714 @@
+;
+;	File:		VSM.a
+;
+;	Contains:	This module provides the Volume Space Management in the Turbo
+;				File System.
+;
+;	Written by:	Patrick W. Dirks, December 11 1984
+;
+;	Copyright:	© 1984-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <2>	 9/13/91	JSM		Add a header.
+;	   <1.2>	  3/2/89	DNF		removed references to forROM; HFS now builds identically for ram
+;									or rom
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	  <¥1.1>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				10/27/86	BB		Vectored ReadBM routine.
+;				 9/25/86	BB		Updated to use new MPW equate files.
+;				10/29/85	LAK		Vectored BlkAlloc, BlkDealloc.
+;				10/25/85	PWD		Fixed FrBitScn to back up starting position before backing out
+;									at EOV. Added debugging code to catch partial-word $FFFF
+;									advances.
+;				10/24/85	PWD		Added debugging code to check allocation before return
+;				10/22/85	PWD		Fixed bug in EOV check in FrBitScan
+;				10/21/85	PWD		Changed BlkAlloc to check VCBFreeBks before attempting to
+;									allocate any block. Speed up scan for free space by checking for
+;									all 1's.
+;				 10/6/85	PWD		Changed to return error instead of calling _SysError Changed to
+;									call common subroutine NextBit
+;				 10/1/85	LAK		Use GBrelease option when calling GetBlock.
+;				  9/8/85	LAK		Added routine UpdateFree to refigure the free block count for
+;									the MountVol consistency check.
+;				  9/3/85	LAK		Contiguous allocation had a bug with buffer non-release. Rewrote
+;									this to use MarkBlock to dirty a block instead, and immediately
+;									call RelBlock after GetBlock.
+;				 8/21/85	PWD		Fixed request size rounding to pre-divide by VCBAlBlSiz.
+;				  7/3/85	PWD		Added consistency checking code.
+;				 5/28/85	PWD		Changed to leave AllocPtr at start of last allocation (to
+;									minimize fragmentation after truncate on Close).
+;				 5/13/85	PWD		Added code to BlkAlloc to check for zero free space
+;				 3/22/85	PWD		Changed to use A6 stack, and use word-sized AlBlkSize
+;				 2/24/85	PWD		Added explicit TST.W D0 in routines to re-set status codes
+;				 2/12/85	PWD		Changed BlkDealloc to pass on result code in D0
+;				 2/11/85	PWD		Changed BlkDealloc to check for zero-length block counts.
+;				12/11/84	PWD		New today.
+;
+
+;________________________________________________________________________________
+;
+; Routines:    BlkAlloc, BlkDealloc, BlkChk
+;
+;________________________________________________________________________________
+
+
+		  BLANKS	ON
+		  STRING	ASIS
+
+		  PRINT		OFF
+		  LOAD		'StandardEqu.d'
+		  PRINT 	ON
+		  PRINT 	NOGEN
+
+VSM 	  PROC	EXPORT
+
+		  EXPORT BlkAlloc, BlkDealloc, BlkChk, UpdateFree
+		  IMPORT GetBlock,RelBlock,MarkBlock,DivUp,RoundAlloc,MarkVCB
+
+		  EXPORT  vBlkAlloc,vBlkDealloc,vReadBM 								;<27Oct86>
+
+		  EJECT
+;________________________________________________________________________________
+;
+; Routine:	   BlkAlloc
+;
+; Function:    Allocate space on a volume.	If contiguous allocation is requested,
+;			   at least the requested number of bytes will be allocated or an
+;			   error will be returned.	If contiguous allocation is not forced,
+;			   the space will be allocated at the first free fragment following
+;			   the requested starting allocation block.  If there is not enough
+;			   room there, a block of less than the requested size will be
+;			   allocated.
+;
+;			   If the requested starting block is 0 (for new file allocations),
+;			   the volume's allocation block pointer will be used as a starting
+;			   point.
+;
+;			   All requests will be rounded up to the next highest clump size, as
+;			   indicated in the file's FCB.
+;
+; Input Arguments:
+;	 A2   - Pointer to VCB for the volume to allocate space on
+;	 A3   - Pointer to FCB for the file for which storage is being allocated
+;	 D2.W - Preferred starting allocation block, 0 = no preference
+;	 D3.B - Force contiguous flag - if bit 0 set (NE), allocation is contiguous
+;			or an error is returned
+;	 D4.L - Number of bytes requested.	If the allocation is non-contiguous, less
+;			than this may actually be allocated
+;
+; Output:
+;	 D0.W - Error code, zero for successful allocation
+;	 D2.W - Actual starting allocation block
+;	 D3.W - Actual number of allocation blocks allocated
+;
+; Internal register usage:
+;	 A0   - Pointed to bitmap buffer
+;	 A1.W - Used to hold the number of allocation blocks on the volume
+;	 D0.W - Used to hold current bitmap word
+;	 D1.W - Count of number of unexamined bits left in D0
+;	 D3.L - High word used to stash starting allocation block
+;	 D5.W - Current bitmap block number
+;	 D6.W - Index into bitmap block buffer
+;	 D7.W - Number of allocation blocks actually allocated
+;
+; Side effects:
+;	 The volume bitmap is read and updated; the volume bitmap cache may be changed.
+;
+; Modification history:
+;	<06Oct85>  PWD	Changed to check for errors after calls to ReadBM and NextWord
+;					Relocated call to MarkBlock in allocation loop
+;					Changed to call NextBit
+; <21Oct85>   PWD	Changed to check VCBFreeBks before attempting to allocate any block.
+;					Speed up scan for free space by checking for all 1's.
+;________________________________________________________________________________
+;
+
+BlkAlloc:
+			MOVE.L	jBlkAlloc,-(SP) 	; jumptable entry for vBlkAlloc 		<29Oct85>
+			RTS 						; go there								<29Oct85>
+vBlkAlloc								; 'vectored' BlkAlloc routine			<29Oct85>
+
+			MOVE.L	  (SP)+,-(A6)		  ; Save return address
+			MOVEM.L   D1/D4-D7/A0-A1,-(A6); Save caller's registers
+			TST.W	  VCBFreeBks(A2)	  ; Any blocks free at all?
+			BEQ 	  bkAllocFull		  ; Exit if not 									<03Sep85>
+
+			ANDI.W	  #$0001,D3 		  ; Clear all extra bits for our use
+			TST.W	  D2				  ; Preferred starting block selected?
+			BNE.S	  @1				  ; Yes - leave it be.
+			MOVE.W	  VCBAllocPtr(A2),D2  ; No - start from the volume-wide pointer
+			BSET	  #7,D3 			  ; Set flag to update vcbAllocPtr later
+
+@1: 		SWAP	  D3				  ; Get high word accessible
+			MOVE.W	  D2,D3 			  ; Store starting block
+			SWAP	  D3				  ; And restore flags word for use
+			BCLR	  #15,D3			  ; Clear wrap-around flag
+
+blkLoop:
+			BSR 	  ReadBM			  ; Pick up the bitmap block of interest
+			TST.W	  D1				  ; No errors?									<PWD 06Oct85>
+			BMI 	  bkAllocExit		  ; If negative, D0 is now error code			<PWD 06Oct85>
+
+			MOVEA.W   VCBNmAlBlks(A2),A1  ; Set up the size of the volume
+
+; Look for a free fragment at or beyond the starting block selected:
+
+@1: 		CMP.W	  A1,D2 			  ; Did we reach the end-of-volume?
+			BCS.S	  @2				  ; If not (D2 < A1), march merrily along
+
+			ROL.L	  D1,D0 			  ; Rotate D0 back into place
+			MOVE.L	  D0,0(A0,D6.W) 	  ; Replace it in the buffer (buffer is clean)
+			CLR.W	  D2				  ; Reset the starting block to the beginning
+			BSR 	  ReadBM			  ; Read the appropriate bitmap block
+			BSET	  #15,D3			  ; Indicate we wrapped around the EOV
+			BNE 	  bkAllocFull		  ; Exit if already set, with DskFulErr, D3=0
+
+; It wasn't set yet, start over again
+
+@2: 		TST.W	  D1				  ; Any errors occur?							<PWD 06Oct85>
+			BMI 	  bkAllocExit		  ; Punt on errors								<PWD 06Oct85>
+			TST.L	  D0				  ; If bit 31 clear (free alloc. block)?
+			BPL.S	  bkAlFree			  ; If so, check if fragment is big enough
+			BSR 	  FrBitScan 		  ; Look for another free bit.					<PWD 21Oct85>
+			BRA.S	  @1				  ; And keep trying
+
+; We found a free fragment; check to see if it isn't too small.  For a contiguous
+; allocation, this should guarantee that at least as much as requested is actually
+; allocated, although more may be granted; the request is rounded up to the next
+; highest clump later.
+
+bkAlFree:
+			SUB.W	  D2,A1 			  ; Change A1 to # block left to EOV
+			BTST	  #0,D3 			  ; Is contiguous allocation requested?
+			BEQ.S 	  bkAllocDoIt		  ; If not, just start allocating here.
+
+			MOVE.L	  D4,-(A6)			  ; Store original alloc. request size
+
+			MOVEM.L   D0-D1,-(A6)		  ; Free up for use in division
+			MOVE.L	  D4,D0 			  ; Set up to divide
+			MOVE.W	  vcbAlBlkSiz+2(A2),D1 ; by allocation block size
+			JSR 	  DivUp 			  ; and round result up to next alloc. block
+			MOVE.L	  D0,D4 			  ; D4 is now min. number of alloc. blocks
+			MOVEM.L   (A6)+,D0-D1		  ; Restore original registers
+			CLR.W	  D7				  ; Set up fragment length count, al. blocks
+
+@1: 		CMP.W	  D7,D4 			  ; Check current length: enough already?
+			BLS.S	  @5				  ; If reguest <= fragment so far, go for it!
+			CMP.W	  A1,D7 			  ; Reached the edge?
+			BEQ.S	  @2				  ; If so, that wasn't quite enough
+			TST.L	  D0				  ; If bit 31 set (allocated block)?
+			BMI.S	  @2				  ; If so, fragment wasn't big enough
+			ADDQ.W	  #1,D7 			  ; If not, bump fragment length count
+			BSR 	  NextBit			  ; Pick up the next bit out of the bitmap		<PWD 06Oct85>
+			TST.W	  D1				  ; Any errors occur?							<PWD 06Oct85>
+			BMI 	  bkAllocExit		  ; Punt on errors								<PWD 06Oct85>
+			BRA.S	  @1				  ; Otherwise keep trying
+
+@2: 		MOVE.L	  (A6)+,D4			  ; Restore original request size (bytes)
+			ADD.W	  D7,D2 			  ; This fragment too small - update starting block
+			CMP.W	  A1,D7 			  ; Did we reach to the EOV?
+			BCS.S	  @3				  ; Nope - try this for a next position
+			BTST	  #15,D3			  ; Did we wrap around yet?
+			BNE.S	  @4				  ; Yes - give up: history repeats itself
+			BSET	  #15,D3			  ; No - give it another shot
+			CLR.W	  D2				  ; From the beginning of the volume
+
+@3: 		BTST	  #15,D3			  ; Did we wrap around yet?
+			BEQ		  blkLoop			  ; If not, scan on
+
+			SWAP	  D3				  ; Get a hold of the starting block
+			CMP.W	  D2,D3 			  ; Are we back where we started?
+			BLS.S	  @4				  ; If we're beyond the start, quit
+			SWAP	  D3				  ; Otherwise, restore D3
+			BRA 	  blkLoop			  ; And scan on
+
+@4: 		ROL.L	  D1,D0 			  ; Rotate D0 back into place
+			MOVE.L	  D0,0(A0,D6.W) 	  ; And replace it in the buffer
+			BRA 	  bkAllocFull		  ; Exit with DskFulErr, D3=0						<03Sep85>
+
+@5: 		MOVE.L	  (A6)+,D4			  ; Retrieve request size in bytes
+			ROL.L	  D1,D0 			  ; Restore D0 to its original position ???
+			MOVE.L	  D0,0(A0,D6.W) 	  ; Replace it in the buffer (buffer is still clean) ???
+			BSR 	  ReadBM			  ; And set up from the current position (D2)
+			TST.W	  D1				  ; Any errors occur?							<PWD 06Oct85>
+			BMI 	  bkAllocExit		  ; Punt on errors								<PWD 06Oct85>
+
+; Start allocating block at this point: round the request off to the next highest
+; clump size now, and try to take as much as possible up to that limit.
+
+bkAllocDoIt:
+			MOVEM.L   D0-D1,-(A6)		  ; Save current bitmap word & bit count
+			MOVE.L	  D4,D0 			  ; Get requested allocation length (bytes) 		<22Aug85>
+			MOVE.L	  FCBClmpSize(A3),D1  ; Get clump size for file 						<22Aug85>
+			JSR 	  RoundAlloc		  ; Divide, rounding up -> Size in AlBlks			<22Aug85>
+			MOVE.L	  D0,D4 			  ; Stash it away									<22Aug85>
+			MOVEM.L   (A6)+,D0-D1		  ; And retrieve original bitmap word & count
+			CLR.L	  D7				  ; Zero out actual allocation counter
+
+; Mark blocks allocated from the starting block:
+
+@1: 		TST.W	  D4				  ; Allocated enough already?
+			BEQ.S	  BkAllocOK 		  ; If so, quit
+			CMP.W	  A1,D7 			  ; If not, is there more here?
+			BCC.S	  BkAllocOK 		  ; If D7 >= A1, we've reached the EOV
+			TST.L	  D0				  ; Check bit 31 of current word (curr. blk)
+			BMI.S	  BkAllocOK 		  ; If allocated, stop trying
+
+			TST.W	  VCBFreeBks(A2)	  ; Does vol. think there are any bits left?	<PWD 21Oct85>
+			BEQ.S	  BkAllocOK 		  ; Nope - we're done (for) then . . .          <PWD 21Oct85>
+			SUBQ.W	  #1,VCBFreeBks(A2)   ; Yes - well, there's one fewer now.          <PWD 21Oct85>
+			JSR 	  MarkVCB			  ; Mark the VCB dirty							<PWD 21Oct85>
+
+			BSET	  #31,D0			  ; Mark the current block as allocated
+			ADDQ.W	  #1,D7 			  ; Add one to allocated block count
+			SUBQ.W	  #1,D4 			  ; Subtract one from request size
+			JSR 	  MarkBlock 		  ; This block is dirty . . .					<PWD 06Oct85>
+			BSR 	  NextBit			  ; Get the next bit from the bitmap			<PWD 06Oct85>
+			TST.W	  D1				  ; Check: any errors reading BM?				<PWD 06Oct85>
+			BGE.S	  @1				  ; If D1>0, all was well						<PWD 06Oct85>
+			BRA.S	  BkAllocExit		  ; Otherwise give up (D0 is error code)		<PWD 06Oct85>
+
+; Allocation is done:
+
+BkAllocOK:
+			BTST	  #7,D3 			  ; Did we start from the VCB's AllocPtr?
+			BEQ.S	  @2				  ; If not, never mind
+			MOVE.W	  D2,D4 			  ; Prepare new allocPtr
+
+; Adding in the length of the current allocation might reduce the next allocate
+; call by avoiding a re-scan of the already allocated space.  However, the clump
+; just allocated can quite conceivably end up being truncated or released when
+; the file is closed or its EOF changed.  Leaving the allocation pointer at the
+; start of the last allocation will avoid unnecessary fragmentation in this case.;
+
+			CMP.W	  VCBNmAlBlks(A2),D4  ; Is it at EOV?
+			BCS.S	  @1				  ; If CS, D4 < NmAlBlks: all is well
+			CLR.W	  D4				  ; If D4 >= NmAlBlks, wrap around
+@1: 		MOVE.W	  D4,VCBAllocPtr(A2)  ; Update VCB's allocation pointer
+										  ; <VCB is already marked dirty>
+
+@2: 		ROL.L	  D1,D0 			  ; Rotate the bitmap word back into place
+			MOVE.L	  D0,0(A0,D6.W) 	  ; And put it back where it came from
+			JSR 	  MarkBlock 		  ; Mark the buffer dirty
+			MOVE.L	  D7,D3 			  ; Return the actual allocation size
+
+			IF	HFSDebug THEN			  ; 												<24Oct85>
+			MOVE.W	  D3,-(A6)			  ; Save D3 for actual return value 				<24OCt85>
+			BSR 	  ReadBM			  ; Read the bitmap entry for the allocated space	<24OCt85>
+@5			TST.W	  D1				  ; Found it?										<24Oct85>
+			BMI.S	  @10				  ; Nope - bomb.									<24Oct85>
+			TST.L	  D0				  ; Check - is top bit actually set?				<24Oct85>
+			BPL.S	  @10				  ; Nope - trouble! 								<24Oct85>
+			BSR 	  NextBit			  ; OK - look for the next bit in the allocation	<24Oct85>
+			SUBQ.W	  #1,D3 			  ; ...that's one block successfully allocated      <24Oct85>
+			BNE.S	  @5				  ; Go check the other blocks allocated 			<24Oct85>
+			BRA.S	  @20				  ; Success!										<24Oct85>
+@10 		_HFSDebug $321				  ; "Pause for debugging"...						<24Oct85>
+@20 		MOVE.W	  (A6)+,D3			  ; Restore D3 for return to user					<24Oct85>
+			ENDIF						  ; 												<24Oct85>			 MOVEQ	   #0,D0			   ; and success
+
+			MOVEQ	  #0,D0 			  ; Sweet success
+
+BkAllocExit:
+			MOVEM.L   (A6)+,D1/D4-D7/A0-A1; Restore registers
+			MOVE.L	  (A6)+,-(SP)		  ; Restore return address
+			TST.W	  D0				  ; Set condition codes for return
+			RTS 						  ; And call it a day.
+
+bkAllocFull:
+			MOVEQ	  #0,D3 			  ; No Blocks allocated
+			MOVEQ	  #DskFulErr,D0 	  ; Disk is full
+			BRA.S	  BkAllocExit		  ;
+
+
+		  EJECT
+;________________________________________________________________________________
+;
+; Routine:	   BlkDealloc
+;
+; Function:    Update the bitmap to deallocate a run of disk allocation blocks
+;
+; Input Arguments:
+;	 A2   - Pointer to VCB for the volume to free space on
+;	 D2.W - First allocation block to be freed
+;	 D3.W - Number of allocation blocks to free up (must be > 0!)
+;
+; Output:
+;	 D0.W - Result code
+;
+; Internal register usage:
+;	 A0   - Pointed to bitmap buffer
+;	 D0.W - Used to hold current bitmap word
+;	 D1.W - Count of number of bits left unexamined in D0
+;	 D5.W - Current bitmap block number
+;	 D6.W - Index into bitmap block buffer
+;
+; Side effects:
+;	 The volume bitmap is read and updated; the volume bitmap cache may be changed.
+;
+; Modification history:
+;
+;	<06Oct85>  PWD	Changed to check for error after calls to ReadBM and NextWord
+;					Now calls NextBit to read successive bits from the bitmap
+;________________________________________________________________________________
+;
+BlkDeAlloc:
+			MOVE.L	jBlkDeAlloc,-(SP)	; jumptable entry for vBlkDeAlloc		<29Oct85>
+			RTS 						; go there								<29Oct85>
+vBlkDeAlloc 							; 'vectored' BlkDeAlloc routine 		<29Oct85>
+
+			MOVE.L	  (SP)+,-(A6)		  ; Save return address
+			MOVEM.L   D1-D6/A0,-(A6)	  ; Save registers for use
+			MOVEQ	  #0,D0 			  ; Set up completion code
+			TST.W	  D3				  ; Check block count
+			BEQ.S	  @95				  ; If zero, we're done.
+
+			BSR 	  ReadBM			  ; Pick up the relevant bitmap information
+@10:		TST.W	  D1				  ; Any error occur?							<PWD 06Oct85>
+			BMI.S	  @95				  ; If not, keep going							<PWD 06Oct85>
+			BCLR	  #31,D0			  ; Free up the block
+			IF	HFSDebug THEN
+			BNE.S	  @15				  ; Check to make sure it was set...			<PWD 24Oct85>
+			_hFSDebug $123				  ; Pause to check this out...					<PWD 24Oct85>
+@15:
+			ENDIF
+			JSR 	  MarkBlock 		  ; Mark this buffer dirty (will be in a sec...)<PWD 06Oct85>
+			ADDQ.W	  #1,VCBFreeBks(A2)   ; Adjust free block count
+			JSR 	  MarkVCB			  ; Mark the VCB dirty
+			SUBQ.W	  #1,D3 			  ; That's one down: any left?
+			BEQ.S	  @90				  ; No - that's it
+			BSR 	  NextBit			  ; Get next bitmap bit 						<PWD 06Oct85>
+			BRA.S	  @10				  ;
+
+@90:		ROL.L	  D1,D0 			  ; Rotate D0 back into position
+			MOVE.L	  D0,0(A0,D6.W) 	  ; Put the bitmap word back where it came from
+;			JSR 	  MarkBlock 		  ; Mark the buffer dirty . . . 				<PWD 24Oct85>
+			MOVEQ	  #0,D0 			  ; success!
+
+@95:
+			MOVEM.L   (A6)+,D1-D6/A0	  ; Restore registers
+			MOVE.L	  (A6)+,-(SP)		  ; Restore return address
+			TST.W	  D0				  ; Set condition codes
+			RTS 						  ; And call it a day.
+
+		  EJECT
+;_______________________________________________________________________
+;
+; Routine:		BlkChk
+; Arguments:	  A0.L (input)	-- pointer to extent record
+;				  A2.L (input)	-- VCB for volume
+;
+;				  D0.L (output) -- 0 if block was already allocated
+;								   -1 otherwise
+;
+; Internal register usage:
+;	 A0   - Pointed to bitmap buffer
+;	 A1   - Pointed to extent record
+;	 D0.W - Used to hold current bitmap word
+;	 D1.W - Count of number of bits left unexamined in D0
+;	 D2.W - Allocation block currently being checked
+;	 D3.L - Set in case a block was found unallocated
+;	 D4.L - Count of number of blocks in current extent
+;	 D5.W - Current bitmap block number
+;	 D6.W - Index into bitmap block buffer
+;	 D7.W - Index into extent record
+;
+; Called By:	MountVol
+; Function: 	Make sure the extents in the extent record are marked as
+;				allocated in the volume bitmap.  The allocation blocks mapped
+;				by the extent record are marked in the bitmap if they weren't
+;				already marked (in which case D0 is set).
+;
+; Modification History:
+;	  3-Jul-85	PWD  New today.
+;	 <06Oct85>	PWD  Added check for errors after calls to ReadBM and NextWord
+;_______________________________________________________________________
+
+BlkChk:   MOVE.L	(SP)+,-(A6) 		; Save return address
+		  MOVEM.L	D1-D7/A1,-(A6)		; Save scratch registers
+		  MOVEA.L	A0,A1				; Save away the extent record pointer
+		  MOVEQ 	#0,D3				; Clear trouble flag
+		  MOVEQ 	#0,D7				; Prepare index into extent record
+
+@5		  MOVE.W	xdrStABN(A1,D7),D2	; Pick up the first allocation block
+		  MOVEQ 	#0,D4				; Clear upper word of D4
+		  MOVE.W	xdrNumABlks(A1,D7),D4 ; Pick up length of block run
+		  BEQ.S 	@90 				; If it's zero, we're all done
+		  BSR.S 	ReadBM				; Pick out the bit of interest
+		  BRA.S 	@50 				; Start out decrementing
+
+@10 	  BSET		#31,D0				; Make sure the bit is set
+		  BNE.S 	@30 				; If it was already set, allocation was OK
+		  MOVEQ 	#-1,D3				; Otherwise, raise the trouble flag.
+		  JSR		MarkBlock			; And mark the buffer dirty . ..		<03Sep85>
+
+@30 	  ADDQ.W	#1,D2				; Advance to the next ABN
+		  ROL.L 	#1,D0				; Rotate the bitmap long
+		  SUBQ.W	#1,D1				; That's one fewer bits left.
+		  BGT.S 	@50 				; If there are more in this D0, go for it
+		  TST.W 	D4					; Any blocks left to examine?
+		  BEQ.S 	@60 				; If not, quit.
+		  BSR		NextWord			; Pick up the next bitmap longword
+
+@50 	  TST.W 	D1					; Any errors occur reading BM?					<PWD 06Oct85>
+		  BMI.S 	@95 				; If so, just punt right here & now . . .		<PWD 06Oct85>
+		  DBRA		D4,@10				; Go check next block in extent
+		  ROL.L 	D1,D0				; Rotate D0 back into position
+
+@60 	  MOVE.L	D0,0(A0,D6.W)		; Put the bitmap word back where it came from
+		  ADDQ.W	#lenExt,D7			; Advance to next extent
+		  CMP.W 	#lenXDR,D7			; Hit the end of the extent record?
+		  BLO.S 	@5					; If not, continue with next extent desc.
+
+@90 	  MOVE.L	D3,D0				; Return trouble flag
+@95 	  MOVEM.L	(A6)+,D1-D7/A1		; Restore scratch registers
+		  MOVE.L	(A6)+,-(SP) 		; Restore return address
+		  TST.L 	D0					; Set condition codes
+		  RTS							; And call it a day.
+
+;_______________________________________________________________________
+;
+; Routine:		UpdateFree
+; Arguments:	  A2.L (input)	-- VCB for volume
+;
+; Internal register usage:
+;	 A0   - Pointed to bitmap buffer
+;	 A1   - Pointed to extent record
+;	 D0.W - Used to hold current bitmap word
+;	 D1.W - Count of number of bits left unexamined in D0
+;	 D2.W - Allocation block currently being checked
+;	 D4.L - Count of free blocks
+;	 D5.W - Current bitmap block number
+;	 D6.W - Index into bitmap block buffer
+;
+; Called By:	MountVol
+; Function: 	This routine is used as part of the MountVol consistency check
+;				to figure out the number of free allocation blocks in the volume.
+;
+; Modification History:
+;	<08Sep85>  LAK	New today.
+;	<06Oct85>  PWD	Added explicit check for errors after calls to ReadBM, NextWord
+;					Now calls NextBit.
+;_______________________________________________________________________
+
+UpdateFree:
+			MOVE.L	(SP)+,-(A6) 		; save return address
+			MOVEM.L D0-D6/A0-A1,-(A6)	; save all registers used
+
+			MOVEQ	#0,D4				; start with zero free
+			MOVEQ	#0,D2				; start at the beginning
+			BSR.S 	ReadBM				; pick up the first bitmap block, set up D1, D0
+			MOVE.W	VCBNmAlBlks(A2),D2	; total number of allocation blocks
+
+@1			TST.W	D1					; Any error reading BM? 						<PWD 06Oct85>
+			BMI.S	@9					; If so, give up now							<PWD 06Oct85>
+			TST.L	D0					; check high bit
+			BMI.S	@2					; br if it's not free
+			ADDQ.W	#1,D4				; increment free count
+
+@2			SUBQ.W	#1,D2				; one less block
+			BEQ.S	@3					; br if we've finished
+			BSR.S 	NextBit 			; Pick up the next bitmap bit					<PWD 06Oct85>
+			BRA.S	@1					; So keep trying
+
+@3			MOVE.W	D4,VCBFreeBks(A2)	; update the free block count
+@9			MOVEM.L (A6)+,D0-D6/A0-A1	; Restore registers
+			MOVE.L	(A6)+,-(SP) 		; Restore return address
+			RTS 						; And call it a day.
+
+		  EJECT
+;________________________________________________________________________________
+;
+; Routine:	   ReadBM
+;
+; Function:    Pick up the status bit for a particular block in the volume bitmap
+;
+; Input Arguments:
+;	 A2   - Pointer to volume's VCB
+;	 D2.W - Allocation block of interest
+;
+; Output:
+;	 A0   - Pointed to bitmap block containing bit of interest
+;	 D0.L - Relevant word of the bitmap, rotated so that the right bit is in [31]
+;			If an error is encountered reading the bitmap, D0 holds the error
+;			code, and D1 is negative
+;	 D1.W - The number of bits originally to the right of the bit of interest
+;	 D5.W - Bitmap block number (unsigned)
+;	 D6.W - Index of relevant LongWord in bitmap block
+;
+; Side effects:
+;	 The volume bitmap is read; the volume bitmap cache may be changed.
+;
+; Modification history:
+;	<06Oct85>  PWD	Changed to return error code and set D1 negative instead of
+;					calling _SysError.
+;________________________________________________________________________________
+
+ReadBM:
+			MOVE.L	jReadBM,-(SP) 		; jumptable entry for vReadBM 			<27Oct86>
+			RTS 						; go there								<27Oct86>
+vReadBM									; 'vectored' ReadBM routine				<27Oct86>
+
+			MOVE.L	  (SP)+,-(A6)		  ; Save return address
+			MOVE.W	  D2,D5 			  ; Copy to extract BM block number
+			LSR.W	  #8,D5 			  ; Shift to divide by almost 4096 (bits/block)
+			LSR.W	  #4,D5 			  ; Finish the division by 4096
+			MOVE.W	  D2,D6 			  ; Copy to compute longword index
+			AND.W	  #$0FE0,D6 		  ; Leave only middle 7 bits for index
+			LSR.W	  #3,D6 			  ; Shift to divide by 8 (bits/byte)
+			MOVE.W	  D2,D1 			  ; Copy to compute bit position
+			AND.W	  #$001F,D1 		  ; Leave only lower 5 bits (bit position)
+			BSR.S 	  GetBMBlk			  ; Read the right bitmap block
+			BEQ.S	  @10				  ; Proceed if all seems well
+
+			MOVEQ	  #-1,D1			  ; Indicate an error occurred					<PWD 06Oct85>
+			BRA.S	  @99				  ; Without hope of continuing					<PWD 06Oct85>
+
+@10:		MOVE.L	  0(A0,D6.W),D0 	  ; Pick out the relevant longword
+			ROL.L	  D1,D0 			  ; Rotate the bit into place [MSB]
+			NEG.W	  D1				  ; Subtract position from
+			ADD.W	  #32,D1			  ; 32 to get number of bits left unseen
+
+@99:		MOVE.L	  (A6)+,-(SP)		  ; Restore return address
+			RTS 						  ; And call it a day.
+
+		  EJECT
+;________________________________________________________________________________
+;
+; Routine:	   NextBit
+;
+; Function:    Pick up the next bit from the bitmap, rolling over to the next
+;			   bitmap block if necessary.
+;
+; Arguments:   D0.L - Current longword under examination
+;			   D1.W - Number of bits left unexamined in D0
+;
+; Side effects:
+;	 The volume bitmap may be read, changing the cache state.
+;
+; Modification history:
+;	<06Oct85>  PWD	New today, filtered out of BlkAlloc/BlkDealloc
+;	<22Oct85>  PWD	Fixed bug in EOV check in FrBitScan
+;	<25Oct85>  PWD	Fixed to back up starting position before backing out at EOV.
+;________________________________________________________________________________
+
+NextBit:	MOVE.L	  (SP)+,-(A6)		  ; Strip the stack for ,ASYNC I/O			<PWD 22Oct85>
+			ROL.L	  #1,D0 			  ; Advance to next bit for examination
+			SUBQ.W	  #1,D1 			  ; That's one fewer left unseen
+			BNE.S	  NxtBitRTS 		  ; If there are any left at all, we're all set.
+			BSR.S	  NextWord			  ; Pick up the next bitmap word
+NxtBitRTS	MOVE.L	  (A6)+,-(SP)		  ; Restore return address					<PWD 22Oct85>
+			RTS 						  ; And keep going
+
+; Special routine for BlkAlloc free bit scan:
+
+FrBitScan:	MOVE.L	  (SP)+,-(A6)		  ; Strip the stack for ,ASYNC I/O			<PWD 22Oct85>
+			ADDQ.W	  #1,D2 			  ; Advance the starting position			<PWD 21Oct85>
+			BSR.S	  NextBit			  ; And go pick up the next bit 			<PWD 21Oct85>
+@0			CMP.L	  MinusOne,D0		  ; Quick check: is it all ones (-1)?		<PWD 21Oct85>
+			BNE.S	  NxtBitRTS 		  ; Nope: go get 'em                        <PWD 21Oct85>
+			ADD.W	  D1,D2 			  ; Advance starting block by 32			<PWD 21Oct85>
+			CMP.W	  A1,D2 			  ; Reached the EOV?						<PWD 21Oct85>
+			BCC.S	  @10				  ; Yes - look no further					<PWD 22Oct85>
+			BSR.S	  NextWord			  ; Go straight for a new word				<PWD 21Oct85>
+			BRA.S	  @0				  ; And try again							<PWD 21Oct85>
+
+@10 		SUB.W	  D1,D2 			  ; Restore disk position					<PWD 25OCt85>
+			BRA.S	  NxtBitRts 		  ; And go use up the remainder 			<PWD 25Oct85>
+;________________________________________________________________________________
+;
+; Routine:	   NextWord
+;
+; Function:    Pick up the next word from the bitmap, rolling over to the next
+;			   bitmap block if necessary. DOES NOT MARK THE CURRENT BUFFER DIRTY.
+;
+; Input Arguments:
+;	 A0   - Pointer to bitmap buffer
+;	 A2   - Pointer to VCB for volume being worked on
+;	 D0   - Current bitmap word
+;	 D5   - Bitmap block number
+;	 D6   - LongWord index of the current word in the bitmap buffer
+;
+; Output:
+;	 A0   - Pointed to current bitmap block buffer
+;	 D0   - Next bitmap word or error code [if D1 < 0]
+;	 D1   - Number of bits left unseen in D0 (always 32), <0 on error
+;	 D5   - Number of current bitmap block
+;	 D6   - Advanced to index of current LongWord in the bitmap buffer
+;
+; Side effects:
+;	 The volume bitmap may be read, changing the cache state.
+;
+; Modification history:
+;	<06Oct85>  PWD	Changed to return error instead of calling _SysError when
+;					bitmap cannot be read.
+;________________________________________________________________________________
+;
+NextWord:
+			MOVE.L	(SP)+,-(A6) 		; Save return address
+			MOVE.L	D0,0(A0,D6.W)		; Store the current word
+			ADDQ.W	#4,D6				; Bump the longword index
+			CMPI.W	#512,D6 			; Have we reached the end of BM block?
+			BCS.S	nwGetLong			; Nope - just pick out the next longword
+
+			ADDQ.W	#1,D5				; Move on to the next bitmap block
+			BSR.S 	GetBMBlk			; Read the new block in
+			BEQ.S	nwRstIndex			; Br if we got it									<03Sep85>
+
+			MOVEQ	#-1,D1				; Indicate an internal error occurred		<PWD 06Oct85>
+			BRA.S	nwExit				; Without hope of continuing				<PWD 06Oct85>
+
+nwRstIndex:
+			CLR.W	D6					; Reset the index to the first longword
+
+nwGetLong:
+			MOVE.L	0(A0,D6.W),D0		; Read the next word from the bitmap buffer
+			MOVEQ	#32,D1				; Set count for full longword
+
+nwExit		MOVE.L	(A6)+,-(SP) 		; Restore return address
+			RTS 						; And call it a day.
+
+		  EJECT
+;________________________________________________________________________________
+;
+; Routine:	   GetBMBlk
+;
+; Function:    Read a block out of the bitmap.	The block will be read into cache
+;			   storage; RelBMBlk should be called to write the page back to disk
+;			   and release the storage.
+;
+; Input Arguments:
+;	 D5.W - Bitmap block number
+;	 A2   - Pointer to VCB for volume being worked on
+;
+; Output:
+;	 A0   - Pointed to cache buffer containing bitmap block.
+;	 D0   - Error code, 0 if block read successfully.
+;
+; Side effects:
+;	 The volume bitmap is read; the volume bitmap cache may be changed.
+;________________________________________________________________________________
+
+GetBMBlk:
+			MOVE.L	  (SP)+,-(A6)		  ; Save return address
+			MOVEM.L   D1-D2/A1-A2,-(A6)   ; Save some registers from extinction
+			MOVE.W	  VCBVRefNum(A2),D0   ; Set volume refNum
+			MOVEQ	  #0,D2 			  ; Clear top of D2
+			MOVE.W	  VCBVBMSt(A2),D2	  ; First sector in bitmap
+			ADD.W	  D5,D2 			  ; Compute physical block wanted
+			MOVEA.L   VCBMAdr(A2),A1	  ; Point to bitmap cache queue header
+			MOVEQ	  #kGBrelease,D1	  ; release it immediately (we work on				<01Oct85>
+										  ;  one at a time anyway - call MarkBlock later if dirtied)
+			JSR 	  GetBlock			  ; Actually read the sector
+			MOVEM.L   (A6)+,D1-D2/A1-A2   ; Restore registers
+			MOVE.L	  (A6)+,-(SP)		  ; Restore return address
+			TST.W	  D0				  ; Set status codes for return
+			RTS 						  ; And call it a day.
+
+
+		  END
+
+

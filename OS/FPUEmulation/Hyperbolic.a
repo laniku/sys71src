@@ -1,0 +1,553 @@
+;
+;	File:		Hyperbolic.a
+;
+;	Contains:	Routines to emulate hyperbolic functions
+;
+;	Originally Written by:	Motorola Inc.
+;	Adapted to Apple/MPW:	Jon Okada
+;
+;	Copyright:	© 1990, 1991 by Apple Computer, Inc., all rights reserved.
+;
+;   This file is used in these builds:   Mac32
+;
+;	Change History (most recent first):
+;
+;		 <2>	 3/30/91	BG		Rolling in Jon Okada's latest changes.
+;		 <1>	12/14/90	BG		First checked into TERROR/BBS.
+
+;  hyperbolic.a
+
+;  Based upon Motorola files 'satanh.sa', 'scosh.sa', 'ssinh.sa', and 'stanh.sa'.
+
+;  CHANGE LOG:
+;  04 Jan 91	JPO	Moved constants T1, T2, and TWO16380 (used in scosh/ssinh)
+;			  to file 'constants.a'.  Renamed constant BOUNDS1 (used
+;			  in stanh) to BNDTANH.
+;
+
+;  satanh
+
+*
+*	satanh.sa 3.1 12/10/90
+*
+*	The entry point satanh computes the inverse
+*	hyperbolic tangent of
+*	an input argument; satanhd does the same except for denormalized
+*	input.
+*
+*	Input: Double-extended number X in location pointed to
+*		by address register a0.
+*
+*	Output: The value arctanh(X) returned in floating-point register Fp0.
+*
+*	Accuracy and Monotonicity: The returned result is within 3 ulps in
+*		64 significant bit, i.e. within 0.5001 ulp to 53 bits if the
+*		result is subsequently rounded to double precision. The 
+*		result is provably monotonic in double precision.
+*
+*	Speed: The program satanh takes approximately 270 cycles.
+*
+*	Algorithm:
+*
+*	ATANH
+*	1. If |X| >= 1, go to 3.
+*
+*	2. (|X| < 1) Calculate atanh(X) by
+*		sgn := sign(X)
+*		y := |X|
+*		z := 2y/(1-y)
+*		atanh(X) := sgn * (1/2) * logp1(z)
+*		Exit.
+*
+*	3. If |X| > 1, go to 5.
+*
+*	4. (|X| = 1) Generate infinity with an appropriate sign and
+*		divide-by-zero by	
+*		sgn := sign(X)
+*		atan(X) := sgn / (+0).
+*		Exit.
+*
+*	5. (|X| > 1) Generate an invalid operation by 0 * infinity.
+*		Exit.
+*
+
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* satanh	IDNT	2,1 Motorola 040 Floating Point Software Package
+
+
+satanhd:
+*--ATANH(X) = X FOR DENORMALIZED X
+
+	bra	t_extdnrm
+
+
+satanh:
+	move.l	(a0),d0
+	move.w	4(a0),d0
+	ANDI.L	#$7FFFFFFF,D0
+	CMPI.L	#$3FFF8000,D0
+	BGE.B	ATANHBIG
+
+*--THIS IS THE USUAL CASE, |X| < 1
+*--Y = |X|, Z = 2Y/(1-Y), ATANH(X) = SIGN(X) * (1/2) * LOG1P(Z).
+
+	FABS.X	(a0),FP0		;...Y = |X|
+	FMOVE.X	FP0,FP1
+	FNEG.X	FP1			;...-Y
+	FADD.X	FP0,FP0			;...2Y
+	FADD.S	#"$3F800000",FP1	;...1-Y
+	FDIV.X	FP1,FP0			;...2Y/(1-Y)
+	move.l	(a0),d0
+	ANDI.L	#$80000000,D0
+	ORI.L	#$3F000000,D0		;...SIGN(X)*HALF
+	move.l	d0,-(sp)
+
+	fmovem.x fp0,(a0)		;...overwrite input
+	move.l	d1,-(sp)
+	clr.l	d1
+	bsr	slognp1			;...LOG1P(Z)
+	fmove.l	(sp)+,fpcr
+	FMUL.S	(sp)+,FP0
+	bra	t_frcinx
+
+ATANHBIG:
+	FABS.X	(a0),FP0		;...|X|
+	FCMP.S	#"$3F800000",FP0
+	fbgt	t_operr
+	bra	t_dz
+
+
+
+;  scosh
+
+*
+*	scosh.sa 3.1 12/10/90
+*
+*	The entry point sCosh computes the hyperbolic cosine of
+*	an input argument; sCoshd does the same except for denormalized
+*	input.
+*
+*	Input: Double-extended number X in location pointed to
+*		by address register a0.
+*
+*	Output: The value cosh(X) returned in floating-point register Fp0.
+*
+*	Accuracy and Monotonicity: The returned result is within 3 ulps in
+*		64 significant bit, i.e. within 0.5001 ulp to 53 bits if the
+*		result is subsequently rounded to double precision. The
+*		result is provably monotonic in double precision.
+*
+*	Speed: The program sCOSH takes approximately 250 cycles.
+*
+*	Algorithm:
+*
+*	COSH
+*	1. If |X| > 16380 log2, go to 3.
+*
+*	2. (|X| <= 16380 log2) Cosh(X) is obtained by the formulae
+*		y = |X|, z = exp(Y), and
+*		cosh(X) = (1/2)*( z + 1/z ).
+*		Exit.
+*
+*	3. (|X| > 16380 log2). If |X| > 16480 log2, go to 5.
+*
+*	4. (16380 log2 < |X| <= 16480 log2)
+*		cosh(X) = sign(X) * exp(|X|)/2.
+*		However, invoking exp(|X|) may cause premature overflow.
+*		Thus, we calculate sinh(X) as follows:
+*		Y	:= |X|
+*		Fact	:=	2**(16380)
+*		Y'	:= Y - 16381 log2
+*		cosh(X) := Fact * exp(Y').
+*		Exit.
+*
+*	5. (|X| > 16480 log2) sinh(X) must overflow. Return
+*		Huge*Huge to generate overflow and an infinity with
+*		the appropriate sign. Huge is the largest finite number in
+*		extended format. Exit.
+*
+*
+
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* SCOSH	IDNT	2,1 Motorola 040 Floating Point Software Package
+
+scoshd:
+*--COSH(X) = 1 FOR DENORMALIZED X
+
+	FMOVE.S	#"$3F800000",FP0
+
+	FMOVE.L	d1,FPCR
+	FADD.S	#"$00800000",FP0
+	bra	t_frcinx
+
+
+scosh:
+	FMOVE.X	(a0),FP0		;...LOAD INPUT
+
+	move.l	(a0),d0
+	move.w	4(a0),d0
+	ANDI.L	#$7FFFFFFF,d0
+	CMPI.L	#$400CB167,d0
+	BGT.B	COSHBIG
+
+*--THIS IS THE USUAL CASE, |X| < 16380 LOG2
+*--COSH(X) = (1/2) * ( EXP(X) + 1/EXP(X) )
+
+	FABS.X	FP0			;...|X|
+
+	move.l	d1,-(sp)
+	clr.l	d1
+	fmovem.x fp0,(a0)		;pass parameter to setox
+	bsr	setox			;...FP0 IS EXP(|X|)
+	FMUL.S	#"$3F000000",FP0	;...(1/2)EXP(|X|)
+	move.l	(sp)+,d1
+
+	FMOVE.S	#"$3E800000",FP1	;...(1/4)
+	FDIV.X	FP0,FP1	 		;...1/(2 EXP(|X|))
+
+	FMOVE.L	d1,FPCR
+	FADD.X	fp1,FP0
+
+	bra	t_frcinx
+
+COSHBIG:
+	CMPI.L	#$400CB2B3,d0
+	BGT.B	COSHHUGE
+
+	FABS.X	FP0
+	FSUB.D	T1(pc),FP0	; ...(|X|-16381LOG2_LEAD)
+	FSUB.D	T2(pc),FP0	; ...|X| - 16381 LOG2, ACCURATE
+
+	move.l	d1,-(sp)
+	clr.l	d1
+	fmovem.x fp0,(a0)
+	bsr	setox
+	fmove.l	(sp)+,fpcr
+
+	FMUL.X	TWO16380(pc),FP0
+	bra	t_frcinx
+
+COSHHUGE:
+	fmove.l	#0,fpsr		;clr N bit if set by source
+	bclr.b	#7,(a0)		;always return positive value
+	fmovem.x (a0),fp0
+	bra	t_ovfl
+
+
+
+;  ssinh
+
+*
+*	ssinh.sa 3.1 12/10/90
+*
+*       The entry point sSinh computes the hyperbolic sine of
+*       an input argument; sSinhd does the same except for denormalized
+*       input.
+*
+*       Input: Double-extended number X in location pointed to 
+*		by address register a0.
+*
+*       Output: The value sinh(X) returned in floating-point register Fp0.
+*
+*       Accuracy and Monotonicity: The returned result is within 3 ulps in
+*               64 significant bit, i.e. within 0.5001 ulp to 53 bits if the
+*               result is subsequently rounded to double precision. The
+*               result is provably monotonic in double precision.
+*
+*       Speed: The program sSINH takes approximately 280 cycles.
+*
+*       Algorithm:
+*
+*       SINH
+*       1. If |X| > 16380 log2, go to 3.
+*
+*       2. (|X| <= 16380 log2) Sinh(X) is obtained by the formulae
+*               y = |X|, sgn = sign(X), and z = expm1(Y),
+*               sinh(X) = sgn*(1/2)*( z + z/(1+z) ).
+*          Exit.
+*
+*       3. If |X| > 16480 log2, go to 5.
+*
+*       4. (16380 log2 < |X| <= 16480 log2)
+*               sinh(X) = sign(X) * exp(|X|)/2.
+*          However, invoking exp(|X|) may cause premature overflow.
+*          Thus, we calculate sinh(X) as follows:
+*             Y       := |X|
+*             sgn     := sign(X)
+*             sgnFact := sgn * 2**(16380)
+*             Y'      := Y - 16381 log2
+*             sinh(X) := sgnFact * exp(Y').
+*          Exit.
+*
+*       5. (|X| > 16480 log2) sinh(X) must overflow. Return
+*          sign(X)*Huge*Huge to generate overflow and an infinity with
+*          the appropriate sign. Huge is the largest finite number in
+*          extended format. Exit.
+*
+
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* SSINH	IDNT	2,1 Motorola 040 Floating Point Software Package
+
+ssinhd:
+*--SINH(X) = X FOR DENORMALIZED X
+
+	bra	t_extdnrm
+
+
+ssinh:
+	FMOVE.x	(a0),FP0	...LOAD INPUT
+
+	move.l	(a0),d0
+	move.w	4(a0),d0
+	move.l	d0,a1		;save a copy of original (compacted) operand
+	AND.L	#$7FFFFFFF,D0
+	CMP.L	#$400CB167,D0
+	BGT.B	SINHBIG
+
+*--THIS IS THE USUAL CASE, |X| < 16380 LOG2
+*--Y = |X|, Z = EXPM1(Y), SINH(X) = SIGN(X)*(1/2)*( Z + Z/(1+Z) )
+
+	FABS.X	FP0		...Y = |X|
+
+	movem.l	a1/d1,-(sp)
+	fmovem.x fp0,(a0)
+	clr.l	d1
+	bsr	setoxm1	 	...FP0 IS Z = EXPM1(Y)
+	fmove.l	#0,fpcr
+	movem.l	(sp)+,a1/d1
+
+	FMOVE.X	FP0,FP1
+	FADD.S	#"$3F800000",FP1	...1+Z
+	FMOVE.X	FP0,-(sp)
+	FDIV.X	FP1,FP0			...Z/(1+Z)
+	MOVE.L	a1,d0
+	AND.L	#$80000000,D0
+	OR.L	#$3F000000,D0
+	FADD.X	(sp)+,FP0
+	MOVE.L	D0,-(sp)
+
+	fmove.l	d1,fpcr
+	fmul.s	(sp)+,fp0	;last fp inst - possible exceptions set
+
+	bra	t_frcinx
+
+SINHBIG:
+	cmp.l	#$400CB2B3,D0
+	bgt	t_ovfl
+	FABS.X	FP0
+	FSUB.D	T1(pc),FP0	...(|X|-16381LOG2_LEAD)
+	move.l	#0,-(sp)
+	move.l	#$80000000,-(sp)
+	move.l	a1,d0
+	AND.L	#$80000000,D0
+	OR.L	#$7FFB0000,D0
+	MOVE.L	D0,-(sp)	...EXTENDED FMT
+	FSUB.D	T2(pc),FP0	...|X| - 16381 LOG2, ACCURATE
+
+	move.l	d1,-(sp)
+	clr.l	d1
+	fmovem.x fp0,(a0)
+	bsr	setox
+	fmove.l	(sp)+,fpcr
+
+	fmul.x	(sp)+,fp0	;possible exception
+	bra	t_frcinx
+
+
+
+;  stanh
+
+*
+*	stanh.sa 3.1 12/10/90
+*
+*	The entry point sTanh computes the hyperbolic tangent of
+*	an input argument; sTanhd does the same except for denormalized
+*	input.
+*
+*	Input: Double-extended number X in location pointed to
+*		by address register a0.
+*
+*	Output: The value tanh(X) returned in floating-point register Fp0.
+*
+*	Accuracy and Monotonicity: The returned result is within 3 ulps in
+*		64 significant bit, i.e. within 0.5001 ulp to 53 bits if the
+*		result is subsequently rounded to double precision. The
+*		result is provably monotonic in double precision.
+*
+*	Speed: The program stanh takes approximately 270 cycles.
+*
+*	Algorithm:
+*
+*	TANH
+*	1. If |X| >= (5/2) log2 or |X| <= 2**(-40), go to 3.
+*
+*	2. (2**(-40) < |X| < (5/2) log2) Calculate tanh(X) by
+*		sgn := sign(X), y := 2|X|, z := expm1(Y), and
+*		tanh(X) = sgn*( z/(2+z) ).
+*		Exit.
+*
+*	3. (|X| <= 2**(-40) or |X| >= (5/2) log2). If |X| < 1,
+*		go to 7.
+*
+*	4. (|X| >= (5/2) log2) If |X| >= 50 log2, go to 6.
+*
+*	5. ((5/2) log2 <= |X| < 50 log2) Calculate tanh(X) by
+*		sgn := sign(X), y := 2|X|, z := exp(Y),
+*		tanh(X) = sgn - [ sgn*2/(1+z) ].
+*		Exit.
+*
+*	6. (|X| >= 50 log2) Tanh(X) = +-1 (round to nearest). Thus, we
+*		calculate Tanh(X) by
+*		sgn := sign(X), Tiny := 2**(-126),
+*		tanh(X) := sgn - sgn*Tiny.
+*		Exit.
+*
+*	7. (|X| < 2**(-40)). Tanh(X) = X.	Exit.
+*
+
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* STANH	IDNT	2,1 Motorola 040 Floating Point Software Package
+
+X	equ	FP_SCR5
+XDCARE	equ	X+2
+XFRAC	equ	X+4
+
+SGN	equ	L_SCR3
+
+V	equ	FP_SCR6
+
+BNDTANH	DC.L $3FD78000,$3FFFDDCE	; 2^(-40), (5/2)LOG2 - label changed <1/4/91, JPO>
+
+
+stanhd:
+*--TANH(X) = X FOR DENORMALIZED X
+
+	bra	t_extdnrm
+
+
+stanh:
+	FMOVE.X	(a0),FP0	...LOAD INPUT
+
+	FMOVE.X	FP0,X(a6)
+	move.l	(a0),d0
+	move.w	4(a0),d0
+	MOVE.L	D0,X(a6)
+	AND.L	#$7FFFFFFF,D0
+	CMP2.L	BNDTANH(pc),D0	...2**(-40) < |X| < (5/2)LOG2 ?
+	BCS.B	TANHBORS
+
+*--THIS IS THE USUAL CASE
+*--Y = 2|X|, Z = EXPM1(Y), TANH(X) = SIGN(X) * Z / (Z+2).
+
+	MOVE.L	X(a6),D0
+	MOVE.L	D0,SGN(a6)
+	AND.L	#$7FFF0000,D0
+	ADD.L	#$00010000,D0		...EXPONENT OF 2|X|
+	MOVE.L	D0,X(a6)
+	AND.L	#$80000000,SGN(a6)
+	FMOVE.X	X(a6),FP0		...FP0 IS Y = 2|X|
+
+	move.l	d1,-(a7)
+	clr.l	d1
+	fmovem.x fp0,(a0)
+	bsr	setoxm1	 	...FP0 IS Z = EXPM1(Y)
+	move.l	(a7)+,d1
+
+	FMOVE.X	FP0,FP1
+	FADD.S	#"$40000000",FP1	...Z+2
+	MOVE.L	SGN(a6),D0
+	FMOVE.X	FP1,V(a6)
+	EOR.L	D0,V(a6)
+
+	FMOVE.L	d1,FPCR			;restore users exceptions
+	FDIV.X	V(a6),FP0
+	bra	t_frcinx
+
+TANHBORS:
+	CMP.L	#$3FFF8000,D0
+	BLT.B	TANHSM
+
+	CMP.L	#$40048AA1,D0
+	BGT.W	TANHHUGE
+
+*-- (5/2) LOG2 < |X| < 50 LOG2,
+*--TANH(X) = 1 - (2/[EXP(2X)+1]). LET Y = 2|X|, SGN = SIGN(X),
+*--TANH(X) = SGN -	SGN*2/[EXP(Y)+1].
+
+	MOVE.L	X(a6),D0
+	MOVE.L	D0,SGN(a6)
+	AND.L	#$7FFF0000,D0
+	ADD.L	#$00010000,D0		...EXPO OF 2|X|
+	MOVE.L	D0,X(a6)		...Y = 2|X|
+	AND.L	#$80000000,SGN(a6)
+	MOVE.L	SGN(a6),D0
+	FMOVE.X	X(a6),FP0		...Y = 2|X|
+
+	move.l	d1,-(a7)
+	clr.l	d1
+	fmovem.x fp0,(a0)
+	bsr	setox			...FP0 IS EXP(Y)
+	move.l	(a7)+,d1
+	move.l	SGN(a6),d0
+	FADD.S	#"$3F800000",FP0	...EXP(Y)+1
+
+	EOR.L	#$C0000000,D0	...-SIGN(X)*2
+	FMOVE.S	d0,FP1		...-SIGN(X)*2 IN SGL FMT
+	FDIV.X	FP0,FP1	 	...-SIGN(X)2 / [EXP(Y)+1 ]
+
+	MOVE.L	SGN(a6),D0
+	OR.L	#$3F800000,D0	...SGN
+	FMOVE.S	d0,FP0		...SGN IN SGL FMT
+
+	FMOVE.L	d1,FPCR		;restore users exceptions
+	FADD.X	fp1,FP0
+
+	bra	t_frcinx
+
+TANHSM:
+	MOVE.W	#$0000,XDCARE(a6)
+
+	FMOVE.L	d1,FPCR		;restore users exceptions
+	FMOVE.X	X(a6),FP0		;last inst - possible exception set
+
+	bra	t_frcinx
+
+TANHHUGE:
+*---RETURN SGN(X) - SGN(X)EPS
+	MOVE.L	X(a6),D0
+	AND.L	#$80000000,D0
+	OR.L	#$3F800000,D0
+	FMOVE.S	d0,FP0
+	AND.L	#$80000000,D0
+	EOR.L	#$80800000,D0	...-SIGN(X)*EPS
+
+	FMOVE.L	d1,FPCR		;restore users exceptions
+	FADD.S	d0,FP0
+
+	bra	t_frcinx
+
+

@@ -1,0 +1,659 @@
+    BLANKS ON
+    STRING ASIS
+
+			EJECT
+;_______________________________________________________________________
+;
+;		   NBP Routines
+;_______________________________________________________________________
+;
+
+;_______________________________________________________________________
+;
+;	NBPLoad
+;
+;	Loads NBP code into the application heap.  If it is already loaded,
+;	it does nothing.
+;
+;	This call can only be made syncronously.  The IOQ element block is
+;	allocated on the stack for the control call.
+;
+;	FUNCTION NBPLoad : INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;
+;	Possible errors:
+;
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	 12/3/84	 GRT  Code crunch; eliminated register saving
+;
+;_______________________________________________________________________
+
+NBPLoad		PROC	EXPORT
+			ENTRY	NBPEnterInit,CheckNBPLoaded
+			
+			JSR	 	NBPEnterInit		 ; init code
+			MOVE  	#LoadNBP,CSCode(A0) ; code number for load NBP
+			_Control
+			ADD	 	#IOQElSize,SP 	 ; deallocate the queue element
+			MOVE  	D0,4(SP) 	  ; return function result (CCRs set)
+			LEA	 	NBPLoadStatus,A1
+			SEQ	 	(A1)		  ; set load status information
+			RTS
+
+			EJECT
+;_______________________________________________________________________
+;
+;	NBPEnterInit
+;
+;	Common code for NBP Load and Unload calls std init routines and allocates
+;	an IO queue element on the stack.
+;
+;	On return, A0 is a pointer to the IO queue element block
+;		  A1 is trashed
+;_______________________________________________________________________
+
+NBPEnterInit	MOVE.L	(SP)+,A1		 ; get subroutine return addr
+			JSR	 	RemoveHdlBlks 	 ; check handles
+			SUB	 	#IOQElSize,SP 	 ; allocate space for the IOQEl
+			MOVE.L	SP,A0		 ; A0 -> IO queue element block
+			MOVE  	#MPPRefNum,IORefNum(A0) ; set refnum up
+			JMP	 	(A1)		  ; exit
+
+;_______________________________________________________________________
+;
+;	CheckNBPLoaded
+;
+;	Checks to see if NBP has been loaded in.  If not, an open call is
+;	automatically made to the driver.
+;
+;	On Return:
+;	 D0 = zero if NBP is loaded and ready
+;	 Condition codes are set upon exit
+;	 A1 is trashed and D0 returns error result
+;_______________________________________________________________________
+
+CheckNBPLoaded CLR	 	D0		   ; clear error result (assume no error)
+			LEA	 	NBPLoadStatus,A1
+			TST.B	(A1) 		 ; test to see if NBP is loaded in
+			BNE.S	@90
+			MOVEM.L	D1-D2/A0,-(SP) 	; save required registers
+			CLR	 	-(SP)		  ;	 space for function result
+			JSR	 	NBPLoad		  ;	 make the call
+			MOVE  	(SP)+,D0 	  ;	 get result of load call
+			MOVEM.L	(SP)+,D1-D2/A0 	; restore registers
+@90		 	TST   	D0 	    ; test
+			RTS
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	NBPUnload
+;
+;	Unload the NBP non-resident code
+;
+;	FUNCTION NBPUnload : INTEGER;
+;
+;	This call can only be made syncronously.  The IOQ element block is
+;	allocated on the stack for the control call.
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	 12/3/84	 GRT  Code curnch; eliminated register saving
+;
+;_______________________________________________________________________
+
+NBPUnload 	PROC	EXPORT
+			JSR	 	NBPEnterInit		 ; std init calls; allocate IOQ element
+			MOVE  	#UnLoadNBP,CSCode(A0) ; code number for unload NBP
+			_Control
+			ADD	 	#IOQElSize,SP 	 ; deallocate the queue element
+			MOVE  	D0,4(SP) 	  ; return function result
+			LEA	 	NBPLoadStatus,A1
+			CLR.B	(A1) 		 ; clear (nbp not loaded)
+			RTS
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	NBPLookUp
+;
+;	Looks up a name over the (inter)net.
+;
+;	The IOQ element block associated with the control call contains an
+;	extra 6 bytes at the end, holding the ptr to the abRecord and the
+;	async flag.
+;
+;	FUNCTION NBPLookUp(abRecord : ABRecHandle; async: BOOLEAN): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .BYTE	  async flag
+;		  .BYTE	  pascal filler
+;		  .LONG	  record handle
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;
+;	Possible errors:
+;
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	 12/3/84	 GRT  Made BRA.S after @2; GetHdlAndLock requires .LONG param
+;	 12/18/84  GRT  In completion routine, abRecHandle saved on stack and
+;		   later restored
+;	 3/15/85	 GRT  RecoverHandle call added
+;	 5/1/86	 GRT  saving queue element handle in the queue element
+;_______________________________________________________________________
+
+NBPLookUp 	PROC	EXPORT
+			ENTRY	CompactData,CrunchName
+			
+			JSR	 	RemoveHdlBlks 	 ; check handles to be disposed
+			MOVE.L	(SP)+,D2		 ; save return address
+			MOVE.B	(SP)+,D1		 ; save async flag
+			MOVE.L	(SP)+,A0		 ; record handle copy made
+			JSR	 	CheckNBPLoaded	 ; does NBP need to be loaded?
+			BNE.S	@100 		 ; if error then exit!
+
+@2		 	MOVEM.L	A2-A3,-(SP)		 ; save A2/3
+			_HLock			  ; lock record handle down
+			TST	 D0		   ; test result
+			BNE.S	@90			 ; if not zero return an error
+			MOVE.L	(A0),A2		 ; A2 -> Ptr to ABRecord
+			MOVE.L	A0,A1		 ; save handle for later storage
+			MOVE  	#1,abResult(A2)	 ; 1 means we are currently in execution
+			MOVE.B	#tNBPLookUp,abOpCode(A2)   ; put call type in record
+			MOVE.L	#IOQElSize+xtraNBPSize,D0  ; number of bytes to allocate
+			JSR	 	GetHdlAndLock 	 ; allocate the memory A0->IOQElement Hdl
+			BNE.S	@90			 ; error if didn't work
+			MOVE.L	A0,D0		 ; D0 = handle to queue element
+			MOVE.L	(A0),A0		 ; A0 -> IOQElement blk (dereferenced)
+			MOVE.L	D0,qElHdl(A0)		; save handle in queue element
+			MOVE.L	A1,ABRecHdl(A0)	; save it in case the call is async
+
+; A2 points to ABRecord.  A0 points to IOQElement
+
+			JSR	 	CompactData		 ; compact the entity name into a ptr
+			BNE.S	@90			 ; error can only be from GetHdlAndLock
+
+; Upon return, A3 = ptr to compacted data.
+
+; Since we have to dispose of the compaction ptr, I am assuming that entityPtr
+; contains a valid ptr to the data block, even after returning from the control call.
+
+			LEA	 	Interval(A0),A1	 ; A1 -> start of CSParam area
+			MOVE  	nbpRetInterval(A2),(A1)+ ; set interval time
+			MOVE.L	A3,(A1)+		 ; set entity ptr for control call
+			MOVE.L	nbpBufPtr(A2),(A1)+ ; ptr to where matches will be
+			MOVE  	nbpBufSize(A2),(A1)+ ; size of return buffer
+			MOVE  	nbpDataField(A2),(A1) ; max entries to get
+
+			MOVE.B	D1,theAsyncFlag(A0) ; save async flag in IOQ blk
+			MOVE  	#LookUpName,CSCode(A0) ; set control code
+
+			LEA	 	LkUpComplete,A2	 ; A2 -> our IO completion routine
+			JSR	 	DoControlCall 	 ; make the call
+
+@90		 	MOVEM.L	(SP)+,A2-A3		 ; restore A2/3
+@100 		JMP	 	ExitD0		  ; return
+
+;_______________________________________________________________________
+;
+;	LkUpComplete
+;
+;	IO completion routine for NBP LookUp
+;	A0 -> IOQ element block
+;_______________________________________________________________________
+
+LkUpComplete
+			MOVEM.L	D0/A0-A2,-(SP) 	; save registers
+
+			JSR	 	CmpEntrance		 ; set up registers, unlock AB record hdl
+			MOVE.L	A0,-(SP)		 ; save abRecHandle temporarily
+
+			MOVE  	NumGotten(A2),nbpDataField(A1) ; return num received
+
+; release memory space used by the compacted entity name
+
+			MOVE.L	compactHdl(A2),A0	; A0 = handle to compaction block
+			JSR	 	UnlockAndLinkHdl
+
+			MOVE.L	(SP)+,A0		 ; get back the abRecHandle
+			JSR	 	CmpEventPost		 ; check to see if we need to post event
+
+			MOVEM.L	(SP)+,D0/A0-A2 	; restore registers
+			RTS
+
+			EJECT
+;_______________________________________________________________________
+;
+;	CompactData
+;
+;	Compacts a pascal entity record into a single name for use by
+;	NBP.  This routine allocates max size for the entity name on the heap.
+;
+;	Entry:	 A2		 ptr to ab record
+;		  A0 	  ptr to current IO Q element block
+;	Returns:		A3		ptr to compacted name
+;		  D0 	  error code
+;
+;	Modification History:
+;	 8/23/84	 ABO  New Today
+;	 12/3/84	 GRT  GetHdlAndLock requires .LONG parameter
+;	 5/1/86	 GRT  saving memory block hdl into queue element
+;_______________________________________________________________________
+
+CompactData
+			MOVEM.L	A0-A2/D1,-(SP)
+			MOVE.L	A0,A1		 ; A1 -> queue element
+			MOVE.L	#99,D0		 ; max size of names entity
+			JSR	 	GetHdlAndLock 	 ; allocate space
+			BNE.S	@90			 ; if error, exit
+			MOVE.L	A0,compactHdl(A1)	; save hdl in queue element
+			MOVE.L	(A0),A0		 ; dereference ptr to compact data
+			MOVE.L	A0,A3		 ; save for returning later
+			MOVE.L	nbpEntityPtr(A2),A2 ; A2 = ptr to beginnning of pascal data
+			BSR.S	CrunchName	 ; do the compaction
+			CLR	 	D0		   ; no error
+@90		 	MOVEM.L	(SP)+,A0-A2/D1
+			RTS
+
+;
+; This lower level routine does the actual compaction.  NBPRemove uses
+; this routine directly.
+;
+;	Call:	A2 -> pascal entity name structure
+;		 A0 -> where to put the compacted name
+;
+;	D0-D1 are trashed; A0-A2 are too.
+
+CrunchName
+			LEA	 	nbpEntObj(A2),A1	 ; initial starting address
+			MOVE.B	(A1),D1		 ; get length byte of string
+			BSR	 	MoveBytes	  ; move those bytes!
+			LEA	 	nbpEntTyp(A2),A1	 ; address of type field
+			MOVE.B	(A1),D1		 ; get type length
+			BSR	 	MoveBytes
+			LEA	 	nbpEntZone(A2),A1	 ; address of zone field
+			MOVE.B	(A1),D1		 ; get zone name length
+			BSR	 	MoveBytes
+			RTS
+
+;
+; MoveBytes is a specific NBP routine for moving an unsigned number of bytes.
+;
+; Call: D1 = number of bytes to move
+;	   A0 = ptr to place bytes
+;	   A1 = ptr to move bytes from
+;
+; A0,A1,D1 is modified
+;
+
+MoveBytes 	MOVE.B	(A1)+,(A0)+		; move a byte
+			SUBQ.B	#1,D1		 ; dec counter
+			BHS.S	MoveBytes 	 ; if still more then go back
+			RTS
+			ENDPROC
+			
+			EJECT
+;___________________________________________________________________________
+;
+; NBPExtract - extract a tuple from a NBPLookup buffer.
+;
+;	This call does not check to load the NBP code in since it really is only
+;	a utility, and never actually calls the NBP low level code.
+;
+;	 Call:	 theBuffer - pointer to the lookup buffer
+;		  NumInBuff - number of tuples in the buffer
+;		  whichOne - which tuple to extract (starts at one)
+;
+;	 Returns:  abEntity - the extracted entity name
+;		  addr - the extracted entity address
+;		  error result - noErr or eExtractErr
+;
+;	 FUNCTION NBPExtract (theBuffer : Ptr; numInBuf : INTEGER;
+;			    whichOne : INTEGER; VAR abEntity : EntityName
+;			    VAR address : addrBlock) : INTEGER;
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .LONG	 AddrBlock address
+;	 .LONG	 abEntity address
+;	 .WORD	 whichOne
+;	 .WORD	 NumInBuf
+;	 .LONG	 theBuffer pointer
+;	 .WORD	 Function result (return code)
+;
+;	Modification History:
+;	 8/24/84	 New Today (ABO)
+;
+;_____________________________________________________________________________
+
+NBPExtract	PROC	EXPORT
+			JSR	 	RemoveHdlBlks 	 ; check handles to be disposed
+			LEA	 	12(SP),A0	  ; A0 -> whichone
+			MOVE  	#extractErr,D2	; Assume an error
+			MOVE  	(A0)+,D1 	  ; D1 = whichOne
+			BEQ.S	ExtError		 ; Zero's an error
+			CMP	 	(A0)+,D1 	  ; Is it there?
+			BHI.S	ExtError		 ; Error if not
+			MOVE.L	(A0),A1		 ; A1 -> the buffer
+ExtLoop		SUBQ  	#1,D1		  ; Decrement count until got it
+			BEQ.S	ExtGot		 ; Branch if got the one we want
+			ADDQ  	#TupleName,A1 	 ; A1 -> name in next tuple
+			CLR	 	D2		   ; Clear out D2 high byte
+			MOVE.B	(A1),D2		 ; D2 = object length
+			ADD.B	1(A1,D2),D2		; D2 = type + object length
+			ADD.B	2(A1,D2),D2		; D2 = zone + type + object length
+			ADDQ.B	#3,D2		 ; D2 = entity name length
+			ADD	 	D2,A1		  ; A1 -> next entity
+			BRA.S	ExtLoop		 ; Loop
+
+ExtGot		MOVE.L	4(SP),A0		 ; A0 -> address block
+			MOVE.B	(A1)+,(A0)+		; Move in address from the tuple
+			MOVE.B	(A1)+,(A0)+		; (All four bytes)
+			MOVE.B	(A1)+,(A0)+
+			MOVE.B	(A1)+,(A0)+
+			ADDQ  	#1,A1		  ; Skip over enumerator
+			MOVEQ	#3,D2		 ; D2 = number of parts to do
+			MOVE.L	8(SP),D0		 ; D0 -> place for entity
+@5		 	MOVE.L	D0,A0		  ; A0 -> place for next part
+			MOVE.B	(A1),D1		 ; D1 = size of next part
+@10		 	MOVE.B	(A1)+,(A0)+		 ; Move in next byte of next part
+			SUBQ.B	#1,D1		 ; Decrement count
+			BCC.S	@10			 ; Move in whole next part
+			ADD.L	#nbpEntTyp,D0		; D0 -> place for next part
+			SUBQ  	#1,D2		  ; Decrement count of parts to do
+			BNE.S	@5		  ; Move in all three parts
+ExtError		MOVE.L	(SP)+,A1		 ; A1 = return address
+			ADD	 	#4+4+2+2+4,SP 	 ; Pop off arguments
+			MOVE  	D2,(SP)		  ; Set error code
+			JMP	 	(A1)		  ; And return
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	NBPConfirm
+;
+;	Confirms an entity name over the net.
+;
+;	The IOQ element block associated with the control call contains an
+;	extra 6 bytes at the end, holding the ptr to the abRecord and the
+;	async flag.
+;
+;	FUNCTION NBPConfirm(abRecord : ABRecHandle; async: BOOLEAN): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .BYTE	  async flag
+;		  .BYTE	  pascal filler
+;		  .LONG	  record handle
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;
+;	Possible errors:
+;
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	 12/3/84	 GRT  GetHdlAndLock requires .LONG parameter; made BRA.S after @2
+;	 12/18/84  GRT  In completion routine, abRecHandle saved on stack and
+;		   then restored before making CmpPostEvent call.
+;	 3/15/85	 GRT  RecoverHandle call added
+;	 5/1/86	 GRT  saving queue element handle in the queue element
+;		   No more _RecoverHandle in completion routine
+;_______________________________________________________________________
+
+NBPConfirm	PROC	EXPORT
+			JSR	 	RemoveHdlBlks 	 ; check handles to be disposed
+			MOVE.L	(SP)+,D2		 ; save return address
+			MOVE.B	(SP)+,D1		 ; save async flag
+			MOVE.L	(SP)+,A0		 ; record handle copy made
+			JSR	 	CheckNBPLoaded	 ; do we need to load in NBP?
+			BNE	 	@100		  ; if error then exit!
+
+@2		 	MOVEM.L	 A2-A3,-(SP)		 ; save A2/3
+			_HLock			  ; lock record handle down
+			TST	 	D0		   ; test result
+			BNE.S	@90			 ; if not zero return an error
+			MOVE.L	(A0),A2		 ; A2 -> Ptr to ABRecord
+			MOVE.L	A0,A1		 ; save another copy of the handle
+			MOVE  	#1,abResult(A2)	 ; 1 means we are currently in execution
+			MOVE.B	#tNBPConfirm,abOpCode(A2)	; put call type in record
+			MOVE.L	#IOQElSize+xtraNBPSize,D0	; number of bytes to allocate
+			JSR	 	GetHdlAndLock 	 ; allocate the memory A0->IOQElement Hdl
+			BNE.S	@90			 ; error if didn't work
+			MOVE.L	A0,D0		 ; D0 = handle to queue element
+			MOVE.L	(A0),A0		 ; A0 -> IOQElement blk (dereferenced)
+			MOVE.L	D0,qElHdl(A0)		; save hdl in queue element
+			MOVE.L	A1,ABRecHdl(A0)	; save it for use by the completion routine
+
+; A2 points to ABRecord.  A0 points to IOQElement
+
+			JSR	 	CompactData		 ; compact the entity name into a ptr
+			BNE.S	@90			 ; if error then exit
+
+; Upon return, A3 = ptr to compacted data.
+
+; Since we have to dispose of the compaction ptr, I am assuming that entityPtr
+; contains a valid ptr to the data block, even after returning from the control call.
+
+			MOVE.L	A3,EntityPtr(A0)	; set entity ptr for control call
+			MOVE  	nbpRetInterval(A2),Interval(A0) ; set interval time (gets bothe info)
+			MOVE.L	nbpAddrNet(A2),ConfirmAddr(A0)  ; addr to confirm at
+			MOVE.B	D1,theAsyncFlag(A0) ; save aysnc flag
+			MOVE  	#ConfirmName,CSCode(A0) ; set control code
+
+			LEA	 	CnfrmComplete,A2	 ; A2 -> our IO completion routine
+			JSR	 	DoControlCall 	 ; make the call to the driver
+
+@90		 	MOVEM.L	(SP)+,A2-A3		 ; restore A2/3
+@100 		JMP	 	ExitD0		  ; return
+
+;_______________________________________________________________________
+;
+;	CnfrmComplete
+;
+;	IO completion routine for NBP LookUp
+;	A0 -> IOQ element block
+;_______________________________________________________________________
+
+CnfrmComplete
+			MOVEM.L	D0/A0-A2,-(SP) 	; save registers
+			JSR	 	CmpEntrance		 ; set up registers, unlock AB record hdl
+			MOVE.L	A0,-(SP)		 ; save abRecHandle temporarily
+
+; return relevant info to ab record
+
+			CLR	 	nbpDataField(A1)	 ; zero out entire word
+			MOVE.B	NewSocket(A2),nbpDataField+1(A1) ; return new socket info
+
+; release memory block associated with the compacted entity name
+
+			MOVE.L	compactHdl(A2),A0	; A0 = handle to compact memory blk
+			JSR	 	UnlockAndLinkHdl
+
+			MOVE.L	(SP)+,A0		 ; get back the abRecHandle
+			JSR	 	CmpEventPost		 ; see if we need to post event
+			MOVEM.L	(SP)+,D0/A0-A2 	; restore registers
+			RTS
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	NBPRegister
+;
+;	Registers a name in the Names Directory.  The user is responsible for
+;	allocating a n byte Names Table Queue Element.  Once passed to MPP,
+;	it belongs to the driver until a NBPRemove call is made.  The ptr
+;	to the NTQEl is passed in nbpBufPtr.
+;
+;	The IOQ element block associated with the control call contains an
+;	extra 8 bytes at the end, holding the ptr to the abRecord and a ptr
+;	to the compacted entity name.
+;
+;	FUNCTION NBPRegister(abRecord : ABRecHandle; async: BOOLEAN): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .BYTE	  async flag
+;		  .BYTE	  pascal filler
+;		  .LONG	  record handle
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;
+;	Possible errors:
+;
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	 12/3/84	 GRT  GetHdlAndLock requires .LONG parameter
+;	 5/1/86	 GRT  Saving queue element handle in queue element
+;_______________________________________________________________________
+
+NBPRegister	PROC	EXPORT
+			JSR	 	RemoveHdlBlks 	 ; check handles to be disposed
+			MOVE.L	(SP)+,D2		 ; save return address
+			MOVE.B	(SP)+,D1		 ; save async flag
+			MOVE.L	(SP)+,A0		 ; record handle copy made
+			JSR	 	CheckNBPLoaded	 ; do we need to load in NBP code?
+			BNE	 	@100		  ; if error then exit!
+
+@2		 	MOVEM.L	A2-A3,-(SP)		 ; save A2/3
+			_HLock				  ; lock record handle down
+			TST	 	D0		   ; test result
+			BNE.S	@90			 ; if not zero return an error
+			MOVE.L	(A0),A2		 ; A2 -> ptr to ABRecord
+			MOVE.L	A0,A1		 ; save handle for later
+			MOVE  	#1,abResult(A2)	 ; 1 means we are currently in execution
+			MOVE.B	#tNBPRegister,abOpCode(A2)	; put call type in record
+			MOVE.L	#IOQElSize+xtraNBPSize,D0	; number of bytes to allocate
+			JSR	 	GetHdlAndLock 	 ; allocate the memory A0->IOQElement Hdl
+			BNE.S	@90			 ; error if didn't work
+			MOVE.L	A0,D0		 ; D0 = handle
+			MOVE.L	(A0),A0		 ; A0 -> IOQElement blk (dereferenced)
+			MOVE.L	D0,qElHdl(A0)		; save handle in queue element
+			MOVE.L	A1,ABRecHdl(A0)	; save ab ptr for completion routine
+
+			MOVEM.L	A0-A2/D1,-(SP) 	; must save cause crunch name clobbers them
+			MOVE.L	nbpBufPtr(A2),A3	; get ptr to new buffer
+			MOVE.L	A3,NTQElPtr(A0)	; save for MPP
+			ST	 	VerifyFlag(A0)	 ; no verify on network
+			MOVE.B	nbpAddrSkt(A2),NTSocket(A3) ; save socket number
+			LEA	 	NTEntity(A3),A0	 ; get ptr to the entity name
+			MOVE.L	nbpEntityPtr(A2),A2 ; ptr to pascal entity name
+
+; On call, A2 -> pascal entity name, A0 -> place to put crunched name
+; Crunch name does not allocate any memory (unlike CompactName)
+
+			JSR	 	CrunchName	  ; compact the entity name into a ptr
+			MOVEM.L	(SP)+,A0-A2/D1 	; restore saved registers
+
+; Restored: A2 points to ABRecord.  A0 points to IOQElement
+
+			MOVE  	nbpRetInterval(A2),Interval(A0) ; set interval time (gets both info)
+			MOVE.B	D1,theAsyncFlag(A0) ; save async flag
+			MOVE  	#RegisterName,CSCode(A0) ; set control code
+
+			LEA	 	RgstrComplete,A2	 ; A2 -> our IO completion routine
+			JSR	 	DoControlCall 	 ; make the control call
+
+@90		 	MOVEM.L	(SP)+,A2-A3		 ; restore A2/3
+@100 		JMP	 	ExitD0		  ; return
+
+;_______________________________________________________________________
+;
+;	RgstrComplete
+;
+;	IO completion routine for NBP Confirm
+;	A0 -> IOQ element block
+;_______________________________________________________________________
+
+RgstrComplete
+			MOVEM.L	D0/A0-A2,-(SP) 	; save registers
+			JSR	 	CmpEntrance		 ; set up registers, unlock AB record hdl
+
+			JSR	 	CmpEventPost		 ; check to see if we need to post event
+			MOVEM.L	(SP)+,D0/A0-A2 	; restore registers
+			RTS
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	NBPRemove
+;
+;	Remove a name from the Names Directory.
+;
+;	The IOQ element block associated with the control call is allocated
+;	on the stack.	This call is only made synchronously.
+;
+;	FUNCTION NBPRemove(abEntity : EntityPtr): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .LONG	  ptr to entity name
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;
+;	Possible errors:
+;
+;
+;	Modification History:
+;	 8/24/84	 Ready for alpha release  (GRT)
+;
+;_______________________________________________________________________
+
+NBPRemove 	PROC	EXPORT
+			JSR	 	RemoveHdlBlks 	 ; check handles
+			MOVE.L	(SP)+,D1		 ; save return address
+			MOVE.L	(SP)+,D0		 ; ptr to pascal entity name
+			MOVE.L	D1,-(SP)		 ; push back return address
+			MOVE.L	A2,-(SP)		 ; save A2
+			MOVE.L	D0,A2		 ; put entity name ptr in A2
+			JSR	 	CheckNBPLoaded	 ; do we need to load in NBP code?
+			BNE	 	@100		  ; if error then exit!
+
+@2		 	LEA   	tmpEntityName,A0	  ; address of where to put name
+			JSR	 	CrunchName	  ; put the name in the right order
+			SUB	 	#IOQElSize,SP 	 ; allocate space for the IOQEl
+			MOVE.L	SP,A0		 ; A0 -> IO queue element block
+			LEA	 	tmpEntityName,A1	 ; get the addr of the name back
+			MOVE.L	A1,EntityPtr(A0)	; set entity ptr
+			MOVE  	#RemoveName,CSCode(A0) ; code number for load NBP
+			MOVE  	#MPPRefNum,IORefNum(A0) ; set refnum up
+			_Control
+			ADD	 	#IOQElSize,SP 	 ; deallocate the queue element
+
+@100 		MOVE.L	(SP)+,A2		 ; restore A2
+			MOVE  	D0,4(SP) 	  ; return function result
+			RTS
+
+			ENDPROC

@@ -1,0 +1,194 @@
+;
+;	File:		GibblyMacros.a
+;
+;	Contains:	macros for use in CPU Gibbly source
+;
+;	Written by:	Dean Yu
+;
+;	Copyright:	© 1990-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <7>	 6/30/92	DTY		Pop 'lodr' off the stack.
+;		 <6>	 6/27/92	DTY		#1033818: Now that Gibblies are initially placed underneath the
+;									system resource map, some extra steps need to be taken to get
+;									the linked patch loader from the System file.  Now, if a linked
+;									patch loader is not found in the Gibbly, use the one in the
+;									System.  SysErr only if a 'lodr' resource is not found in the
+;									System file.
+;		 <5>	 6/24/92	DTY		#1033818 <csd>: Gibblies are no longer the top resource map when
+;									MakeGibblyResident is called. Look for the Gibbly at the bottom
+;									of the resource chain, and unset the twoDeepBit on the map above
+;									it.
+;		 <4>	  6/2/92	FM		Fix the DoStandardBoot macro to put a copy of the handle to the
+;									'boot' 3 resource in A3 because thats what 'boot' 3 resources
+;									expect. Otherwise we would be detaching the handle in a3 when
+;									DoStandardBoot is called.
+;		 <3>	  4/8/92	DTY		Add conditionals that set ROMMapInsert instead of calling
+;									_UseResFile if &lpchResFile is 1.  This is how Gibblies can
+;									specify ROM resources.
+;		 <2>	 2/21/92	DTY		Keep the use of &ptblResID and &lpchResFile consistent.
+;		 <1>	  2/6/92	DTY		first checked in
+
+			include		'SysErr.a'
+			include		'Traps.a'
+			INCLUDE		'SysPrivateEqu.a'
+			include		'Private.a'
+			include		'ResourceMgrPriv.a'
+
+;
+;
+; DoStandardBoot: Boot the machine with the 'boot' 3 resource from the System file.
+;
+;	In order to call this macro correctly you should have the following registers 
+;	set up with the values passed in to your Gibbly. If you don't, the 'boot' 3 that
+;	is being called won't work correctly.
+;
+; Registers passed in from boot blocks:
+;	A4 = dirID of the startup application (for pre-7.0 systems; used by the remote booting INIT)
+;	A5 = pointer to globals (SP + 400)
+;	A6 = pointer to boot blocks (used by the remote booting INIT)
+
+		Macro
+		DoStandardBoot
+			move.l	ExpandMem,a0
+			move.b	ExpandMemRec.emScanOverrideMaps(a0),-(sp)			; Save current override state
+			clr.b	ExpandMemRec.emScanOverrideMaps(a0)					; Turn off overrides explicitly since SetScanOverride may not be implemented yet.
+			
+			subq	#2,sp
+			_CurResFile													; Remember current resource map
+			clr.w	-(sp)
+			_UseResFile													; Get 'boot from System file.
+			
+			subq	#4,sp
+			move.l	#'boot',-(sp)
+			move.w	#3,-(sp)
+			_Get1Resource
+			move.l	(sp)+,d1											; Save 'boot' handle in D1 where it won’t get trashed by _UseResFile
+			bz.s	@noBootResource
+			
+			_UseResFile													; Restore the previous resource map
+			move.l	ExpandMem,a0
+			move.b	(sp)+,ExpandMemRec.emScanOverrideMaps(a0)			; Restore override state
+			
+			move.l	d1,a3												; Boot code expects handle in A3 on entry
+			move.l	(a3),d0
+			_StripAddress
+			move.l	d0,a0
+			jmp		(a0)												; Jump to the boot code.
+		
+		@noBootResource:
+			move.w	#dsBadPatch,d0
+			_SysError
+		EndM
+		
+;
+; LoadLinkedPatchesFrom: Load the linked patches from the specified resource file.
+;
+
+		Macro
+		LoadLinkedPatchesFrom	&lpchResFile
+		
+			subq	#2,sp
+			_CurResFile													; Get the current resource file
+
+		if &lpchResFile = '#1' then
+			move.w	#MapTrue,ROMMapInsert
+		endif
+			move.w	&lpchResFile,CurMap									; Get 'lpch' resources from this file.
+
+			subq	#4,sp
+@getLinkedPatchLoader&lpchResFile
+			move.l	#'lodr',-(sp)
+			move.w	#-16385,-(sp)
+			_GetResource												; Use the first linked patch loader we can find.
+			move.l	(sp),d0
+			bnz.s	@stripLoaderAddress&lpchResFile						; Uniquely identify this label in case caller is loading lpchs from several files.
+			
+			move.w	SysMap,d0											; <6> Get system resource map
+			cmp.w	CurMap,d0											; <6> Did we just try to get the system’s linked patch loader?
+			beq.s	@noLinkedPatchLoader								; <6> If we did, and we couldn’t, bomb out
+			move.w	SysMap,CurMap										; <6> If we tried to get a linked patch loader from the Gibbly, and failed, try to use the one from the system
+			bra.s	@getLinkedPatchLoader&lpchResFile					; <6>
+			
+@noLinkedPatchLoader
+			moveq	#dsBadPatch,d0										; Couldn’t find the patch loader code
+			_SysError
+
+@stripLoaderAddress&lpchResFile
+		if &lpchResFile = '#1' then
+			move.w	#MapTrue,ROMMapInsert
+		endif
+			move.w	&lpchResFile,CurMap									; Get 'lpch' resources from this file.
+		
+			move.l	d0,a0
+			move.l	(a0),d0
+			_StripAddress
+			move.l	d0,a0
+			jsr		(a0)												; Call the loader
+
+			_ReleaseResource											; Done with the linked patch loader
+			_UseResFile													; Restore the current resource map
+		EndM
+		
+;
+; LoadRangeOfLinkedPatchesFrom: Load a range of linked patches from the specified resource file
+;
+
+		Macro
+		LoadRangeOfLinkedPatchesFrom	&lpchResFile,&ptblResID
+		
+		if &lpchResFile = '#1' then
+			move.w	#MapTrue,ROMMapInsert
+		endif
+		
+			subq	#4,sp
+			move.l	#'ptbl',-(sp)										; This macro is resource based.
+			move.w	&ptblResID,-(sp)									; Push the resource ID of the 'ptbl' resource
+			_GetResource
+			move.l	(sp),d0
+			bnz.s	@gotPatchRangeHandle&ptblResID
+			moveq	#dsBadPatch,d0
+			_SysError
+			
+@gotPatchRangeHandle&ptblResID
+			move.l	d0,a3												; Get handle to 'ptbl' resource
+			move.l	(a3),d0
+			_StripAddress												; Strip it for grins
+			move.l	d0,a3												; Linked patch loader wants a pointer to a range table in A3.
+			
+			LoadLinkedPatchesFrom &lpchResFile							; Load the linked patches from this resource file
+			
+			_ReleaseResource											; Done with the 'ptbl' resource
+		EndM
+			
+;
+; MakeGibblyResident: Turns the Gibbly’s resource map into an override map for the system.
+;	This macro assumes that there will be at least two resource maps in the resource chain,
+;	and that the Gibbly’s resource map is the one at the bottom of the chain.
+;
+
+		Macro
+		MakeGibblyResident
+			movem.l	d0-d2/a0-a2,-(sp)									; <4>
+			move.l	SysMapHndl,a1										; <4>
+		@findBottomResourceMap:											; <4>
+			move.l	(a1),a0												; <4>
+			move.l	mNext(a0),d0										; <4> Get the next map
+			bz.s	@gotBottomResourceMap								; <4> Assume the resource map at the bottom of the chain is the Gibbly’s map
+			move.l	a1,a2												; <4> Remember the map above the one at the bottom
+			move.l	d0,a1												; <4>
+			bra.s	@findBottomResourceMap								; <4> Find the map at the bottom
+		
+		; Got the resource map at the bottom of the chain.  Clear the twoDeepBit in the map above it.
+		
+		@gotBottomResourceMap:											; <4>
+			move.l	(a2),a0												; <4>
+			bclr	#twoDeepBit,mInMemoryAttr(a0)						; <4> The map above it will now be the bottom map, so clear out the twoDeep bit.
+			move.l	a1,-(sp)											; <4> A1 has a handle to the Gibbly’s resource map
+			move.l	SysMapHndl,-(sp)									; <4> Override the system map
+			_InsertOverrideMap											; <4>
+			movem.l	(sp)+,d0-d2/a0-a2									; <4>
+		EndM
+
+		

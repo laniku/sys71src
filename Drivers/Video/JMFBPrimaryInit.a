@@ -1,0 +1,1225 @@
+;
+;	File:		JMFBPrimaryInit.a
+;
+;	Contains:	PrimaryInit for 4•8/8•24 Cards.
+;
+;	Written by:	Casey King/Mike Puckett
+;
+;	Copyright:	© 1986-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;   This file is used in these builds: Mac32
+;
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 6/14/93	kc		Roll in Ludwig.
+;	   <LW4>	 5/14/93	fau		This delay is still not right.  While I get the source for the
+;									latest ROM for this card, I'm upping the delay to 5ms and doing
+;									a Nubus read in between rights, to flush the MUNI FIFO's.
+;	   <LW3>	 5/14/93	fau		Put a delay in writing to Endeavor so that it works with
+;									Cylone40.  It looks like MUNI is writing out the data too fast!
+;	   <LW2>	 4/27/93	fau		Bug #1081554:  Added an extra delay before starting JMFB, so
+;									that they work on Cyclone 40MHz.
+;	   <SM2>	11/18/92	SWC		Changed SlotEqu.a->Slots.a and VideoEqu.a->Video.a.
+;		 <2>	 1/15/92	KC		Repair "uncompleted conditional directive" error. Removed
+;									gratuitous branch.
+;		 <1>	  1/7/92	RB		first checked in
+;	=============== Terror History ========================
+;
+;		 <4>	 6/17/91	jmp		Eliminated support for PAL displays & encoder boxes since the
+;									versions of the 4•8 & 8•24 cards that we’re patching out don’t
+;									have the sRsrcs.
+;		 <3>	  4/4/91	jmp		Cleaned up the conditional assembly stuff (i.e., started using
+;									ForRom instead of PadForOverPatch).
+;		 <2>	 2/25/91	jmp		Rolled in Casey’s latest changes.
+;		 <1>	01/06/90	jmp		Checked into TERROR ROM for the first time.
+;		 <0>	11/19/90	jmp		Formatted for use with TERROR ROM (as opposed to a
+;									declaration ROM).
+;
+;-------------------------------------------------------------------
+;
+; This file contains the primary initialization code for the Elmer 
+; Fudd video ROM and is included by ElmerROM.a.  The purpose of the 
+; primary initialization is to detect the monitor type in use and the 
+; memory available so that the appropriate sResource list can be selected
+; and the others discarded. In addition the the display device is setup
+; for 1 BPP operation by setting the color lookup table to black and white,
+; initializing the hardware for 1 BPP and then graying the screen.
+;
+; Notes:
+; ------
+;
+; 1. The basic flow of the primary initialization code is as follows:
+;
+;	Start
+;	  Header Information
+;	  Set Initial Vendor Status to good
+;	  Form 32 bit slot base address
+;	  Setup a slot parameter block for sRsrc pruning
+;	  Check to see which slot mgr is around and save
+;	  Decode sense lines to detect monitor type
+;	  Setup Mode to be Disabled to invalid
+;	  Get saved monitor type from parameter RAM
+;	  Init the inval screen flag to false
+;	  If monitor type is different then invalidate scrn resource flag
+;	  If ntsc then determine oscan/uscan state and if changed then inval scrn flag
+;	  Size video RAM and set VRAM configuration bit
+;	  Form the spID candidate to disable
+;	  If Inval scrn then save new mode in pram
+;	  Remove Invalid sRsrc Lists
+;	  Setup Hardware
+;	  Disable Interrupts (card resets disabled!)
+;	  Setup CLUT for 1 BPP
+;	  Gray the Screen
+;	End
+;
+; 2. Monitor Sensing
+;
+;	The raw monitor sense lines read in are reformatted to facilitate sRsrc pruning
+;	and the following table summarizes the raw sense line combinations and the 
+;	the reformatted ones.  The RGB Kong monitor is the only one that is reformated.
+;	The 2 least significant bits of the sRsrc IDs (see ROM.a header comments) are
+;	idenitical to the 2 least significant bits (b1:b0) of the reformated sense line 
+;	combination and b2 of the sense line indicates whether its RGB or B/W.
+;
+;		Sense(2:0) Raw		Reformatted Sense			Monitor Type
+;		--------------		-----------------			-------------
+;			000					111						RGB Workstation (Kong)
+;			001					001						B/W Full Page (Portrait)
+;			010					010						Modified Apple II-GS RGB (Rubik)
+;			011					011						B/W Workstation (Kong)
+;			100					100						NTSC (Interlaced)
+;			101					101						RGB Full Page (Portrait)
+;			110					110						Standard RGB
+;			111					000						No Sense read (unconnected)
+;
+;	There are a couple of interesting relationships that we can take advantage of from
+;	the reformatted sense line combinations:
+;
+;		a)  Kong or Portrait = b0
+;		b)	Other			 = not b0
+;		c)  Kong timing		 = b1 and b0
+;		d)  Portrait timing	 = not b1 and b0
+;
+;	In addition to the traditional monitor sensing that we have normally done, this
+;	card also utilizes Rosko's extended sense scheme.  We use this only to detect if
+;	the Sarnoff breakout box is connected and if it is we will always default to
+;	the RS170 timing mode.  This will enable us to at least use the box as an RGB
+;	to NTSC encoder when it arrives.
+;
+; 3. Pruning
+;
+;	Refer to the comment in the code.
+;
+; 4. Hardware setup sequence
+;			
+;	a)  Setup CLUT pixel bus control register
+;		Setup JMFB CSR except for REFEN, VRSTB, and VIDEN
+;		Setup JMFB Load Divisor Register
+;		Setup JMFB Base Register
+;		Setup JMFB Row Long Words Register
+;	b)  Set up the Endeavor chip (M,N, and EXTCLK)
+;	c)  Enable the Endeavor clock by set PIXSEL1 in the JMFB CSR
+;	d)  Delay to guarantee a stable clock from Endeavor
+;	e)  Enable JMFB by setting VRSTB in JMFB CSR
+;	f)  Setup Stopwatch parameters (must happen after VRSTB is set because
+;		that also reinitializes Stopwatch!)
+;	g)  Enable Stopwatch by setting SRST
+;	h)  Enable REFEN in JMFB CSR
+;	i)  Enable Video Transfer Cycle in JMFB CSR
+;
+; 5. 24 Bit addressing and 32 bit addressing
+;
+;	This card is not accessible in 24 bit addressing mode and all accesses must be made
+;	in 32 bit mode when hitting the hardware.  That's explains the frequent use of
+;	SwapMMUMode to switch back and forth.  It is not desirable to access a 32 bit 
+;	address in 24 bit mode as we will not go where we want to!!!
+;
+; 6. Trident use of PRAM
+;
+;	This card uses pram as follows:
+;
+;		byte 0, 1		->	board ID
+;		byte 2			->	mode (screen depth)
+;		byte 3			->	saves the default sRsrcID (changed by SetDefault)
+;		byte 4			->	pinit raw sRsrcID (only modified by pinit)
+;		byte 5			->  specialFlag (set to $FF if connected to interlaced monitor and past shutdown mode is 32 bpp)
+;		byte 6			->  clockType flag (set to $00 if Endeavor and $FF if National)	
+;
+; Register usage:
+; ---------------
+;
+;	D0 - Initially used to form the cards slot number.
+;	     Later used as the switch ID for SwapMMUMode trap.
+;	     Used in the vRAM test to hold test pattern.
+;	D1 - Used throughout as a utility register (counter or index usually).
+;	D2 - Used in Pruning section to form the candidate spID to be deleted.
+;	     Used in Gray Screen to hold the number of rowlongs as a counter.
+;	D3 - Used to hold the spID of the mode to be disabled (interlaced modes only)
+;		 Used in Gray Screen to hold the number of screen rows.
+;	D4 - Used to hold the reformated sense line combination.
+;	     Used to form the spID based on monitor and memory.
+;	     Used to select which parameter list to be used in hardware setup.
+;		 Used to determine appropriate default fb base offset in grayscreen.
+;	D5 - Used to hold the dither pattern in gray screen.
+;	D6 - Used to identify if the new slot manager is present (0=new, $FF=old) .
+;	D7 - Used to temporarily hold previous addr state during SwapMMUMode
+;	   - Used to count the number of sRsrcs deleted.
+;
+;	A0 - On entry contains a parameter block pointer to an SEBlock
+;	     Later used to point to the slot parameter block.
+;		 Later used to point to the hardware setup parameter data.
+;	A1 - Used initially to point to the cards base address ($Fs00 0000).
+;	     Used later to point to control register space during hardware setup.
+;	A2 - Used to point to the valid mode list during sRsrc pruning 
+;		 Used to point to the JMFB Control and Status Register during hardware setup.
+;		 Used to point to the CLUT during color table initialization.
+;	     Used to point to the frame buffer during gray screen
+;	A3 - Used to save the cards base address (A1) in hardware setup, clut setup and gray screen.
+;
+
+				If ForRom Then
+
+				Machine	MC68020
+				
+				Load	'StandardEqu.d'
+				
+				Print	Off
+				Include 'GestaltEqu.a'
+				Include	'ROMEqu.a'
+				Include	'Slots.a'	
+				Include	'Video.a'
+				
+				Include	'JMFBDepVideoEqu.a'
+				Print	On
+
+JMFBPrimaryInit	Proc	Export
+				
+				Else
+
+;Header
+;------
+				DC.B	sExec2							;Code revision (Primary init)
+				DC.B	sCPU68020						;CPU type is 68020	
+				DC.W	0								;Reserved
+				DC.L	Begin-*							;Offset to code.
+
+				Endif
+
+;Initialization Code
+;-------------------
+				WITH 	seBlock,spBlock
+
+Begin
+
+				If ForROM Then							; For Terror ROM, PrimaryInit is NOT executed thru _sExec.
+SaveRegs		Reg		A0-A4/D0-D7						; So, we need to save our work registers.
+				Movem.l	SaveRegs,-(Sp)
+				Endif
+
+;
+; set initial vendor status to good
+;	- PrimaryInit must return a good status or else SecondaryInit will not run.
+;
+
+				MOVE.W	#1,seStatus(A0)					; VendorStatus <- good
+
+;
+; form 32-bit base address in A1
+;
+
+				MOVE.L	#$F0000000,D1					; D1 <- F0000000
+				MOVE.B	seSlot(A0),D0					; get slot number
+				BFINS	D0,D1{4:4}						; D1 <- Fs000000
+				MOVE.L	D1,A1							; copy to address reg
+
+;
+; set up a slot parameter block for sRsrc pruning
+;
+	
+				SUBA	#spBlockSize,SP					; make an slot parameter block on stack
+				MOVE.L	SP,A0							; get pointer to parm block now
+				MOVE.B	D0,spSlot(A0)					; put slot in pBlock
+				CLR.B	spExtDev(A0)					; external device = 0
+;
+; determine if new slot manager is around
+;
+				CLR.B	D6								; D6 will indicate which slot mgr is present
+				_sVersion								; determine which one (0 = new 32 BQD one)
+				SNE		D6								; D6 = 0 if new, D6 = $FF if old
+;
+; decode sense lines to detect monitor type
+;	- the monitor sense combination is read from the JMFB CSR which is located at zero offset
+;	- from the JMFB control space.  
+;
+GetMonitor
+				MOVEQ		#true32b,D0					; change to 32 bit addressing to get
+				_SwapMMUMode							; sense lines
+				MOVE.L		D0,-(SP)					; save prior mode cause we might need it!
+				
+				MOVE.L		#JMFB,D1					; get offset in register
+				BFEXTU		(A1,D1.L){20:3},D4			; get the state of the sense lines
+				
+				CMP.B		#NoSense,D4					; check for no connect (sense = 7)
+				BNE.S		@DoNext
+				
+				BSR			pGetXtndSense				; go see if we see an xtended sense
+				CMP.B		#Sarnoff,D0					; we only understand sarnoff
+				
+			If ForROM Then
+				Bne.s		@NoConnect					; if not Sarnoff (NTSC), then no connect
+			Else
+				BNE.S		@TryPAL						; if not Sarnoff (NTSC), then try for PAL
+			EndIf
+				
+				MOVE.B		#_NTSC_,D4					; force sarnoff to ntsc timing for now
+				BRA.S		@SwapBack					; we have a current mode so go on
+
+			If Not ForROM Then
+@TryPAL			CMP.B		#PAL,D0						; check for PAL xtnded sense
+				BNE.S		@TryPAL2
+				MOVE.B		#rPAL,D4
+				BRA.S		@SwapBack
+@TryPAL2		CMP.b		#PALmonitor,D0				; check for PAL monitor xtnded sense
+				BNE.S		@NoConnect					; if not found then do no connect
+				MOVE.B		#rPAL,D4
+				BRA.S		@SwapBack
+			EndIf
+				
+@NoConnect		MOVE.B		#InvalidSRsrcID,D4			; no valid xtnd sense so do no connect
+				BRA.S		@SwapBack					; 
+@DoNext				
+				CMP.B		#RGBKong,D4					; check to see if its an RGBKong
+				BNE.S		@SwapBack					; if not skip and go on
+				MOVE.B		#rRGBKong,D4				; if it is, reformat to maintain convention 
+				
+@SwapBack		MOVE.L		(SP)+,D0					; restore past mode
+				_SwapMMUMode							; swap back to previous addr mode (D0 still valid)
+				MOVE.L		D4,D5						; save reformated sense combo for InitCLUT
+;
+; setup the 'Mode to be disabled' to be invalid.  
+;	- if we are in connected to a monitor that supports multiple screen sizes,
+;	- D3 will be set to a valid sRsrc ID.
+;
+				MOVE.B		#InvalidSRsrcID,D3			; this upper nibble is invalid
+;
+; Get the saved monitor type from slot parameter RAM
+;	- Refer to IM V (Slot Manager) for a description of the sPRAM record.  This card uses the 
+;	- vendorUse1 field to hold the saved mode, and vendorUse2 field to hold the saved monitor type.
+;
+				SUBA	#sizesPRAMRec,SP				; make room for the pRAM block
+				MOVE.L	SP,spResult(A0)					; point to it 
+				_sReadPRAMRec							; read it 
+				MOVE.B		savedSRsrcID(SP),D1			; save in D1
+;
+; initialize the 'Invalidate screen flag' to false
+;
+				SF			D2							; $00 = don't invalidate later
+;
+; before we determine if the monitor has changed, determine which clock we're using
+;
+				MOVE.L		A1,A3						; setup for call to pGetClockType
+				MOVEQ		#true32b,D0					; setup for change to 32 bit addressing
+				_SwapMMUMode							; do it
+				MOVE		D0,D7						; save past mode so it will be restored later
+				BSR			pGetClockType				; returns clock type in D0
+				CMP.B		savedClockType(SP),D0		; check to see if it's changed
+				BEQ.S		@checkMonitor				; it hasn't change so skip the rest
+				MOVE.B		D0,savedClockType(SP)		; setup for when PRAM is reset as a f(D2)
+				ST			D2							; invalidate PRAM later
+@checkMonitor
+				MOVE		D7,D0						; restore addressing mode
+				_SwapMMUMode
+;
+; get the low 3 bits of the saved sRsrc ID
+;
+				BFEXTU		D1{29:3},D0					; get the last connected monitor state
+;
+; determine the state of the 'Invalidate screen flag' based on past and current monitor hookup
+;
+				CMP.B		D4,D0						; compare the current sense with the saved sense
+				BEQ.S		@sametype					; if equal then branch for further processing
+				ST			D2							; else the monitor has changed so set invalidate flag
+				BRA.S		SizeVRAM					; and go on to next section of pinit
+;
+;	- if we got here the basic monitor type was the same
+;
+@sametype
+				MOVE.B		D4,D0						; get the current sense
+				ANDI.B		#3,D0						; only keep the lower two bits as they provide interlaced info
+				CMP.B		#0,D0						; compare the current sense with interlaced (special case)
+				BNE.S		SizeVRAM					; if its not NTSC, then monitor is same and go to next section
+;
+; we're interlaced mode, so check to see if we shutdown in 32 bpp (special case because 24 bpp mode has a different baddr!)
+;	- if we're in this state, a special flag will be set in PRAM so SecondaryInit can write the correct baddr if installing
+;	- a 32 bit sRsrc.  We can't simply look at driver privates or PRAM (savedMode) when 32 BQD is a patch because if the
+;	- card is the startup screen, the card will have been temporarily reset to 1 bpp by the system before secondaryinit
+;	- because 32 BQD will not have been loaded yet.  During that temporary period, the driver privates and PRAM (savedMode)
+;	- will reflect 1 bpp.  This is only a problem if our card is a startup screen! UGH...  The special flag is reset to false
+;	- initially assuming the special case won't be in effect.  Note that PInit is the sole place where this flag is set and 
+;	- reset.  It is never used by anyone, unless it's an interlaced monitor and the card is the startup screen.
+;
+
+				MOVE.B		#$00,specialFlag(SP)
+				TST.B		D6								; check for new slot manager
+				BEQ.S		@hitPRAM						; 0=new, FF=old, branch if new (specialFlag should be false)						
+				CMP.B		#FifthVidMode,savedMode(SP)		; check past mode and compare with 32 bpp mode
+				BNE.S		@hitPRAM						; past mode was 1,2,4, or 8 bpp (specialFlag should be false)
+				MOVE.B		#$FF,specialFlag(SP)			; we don't have 32 BQD (yet) so this is probably the case
+@hitPRAM				
+				MOVE.L		spResult(A0),spsPointer(A0)		; set up parameter block
+				_SPutPRAMRec								; write the new record out
+;
+; continue regular and weird interlaced initialization
+;
+				BTST		#fSRsrcOscanBit,D1			; see if the requested NTSC spID is underscan (0) or overscan (1)
+				BEQ.S		@uScan						; if it is underscan, don't set the overscan bit in D4
+				BSET		#fSRsrcOscanBit,D4			; it's overscan, so set the overscan bit in D4
+
+@uScan
+				CMP.B		savedRawSRsrcID(SP),D1		; this will only be different if the user did it thru monitors
+				BEQ.S		SizeVRAM					; if they are equal go to next section
+				ST			D2							; it's changed so set invalidate flag
+;
+; size the video RAM and set VRAM configuration bit in mode nibble
+;
+SizeVRAM
+				MOVEQ	#true32b,D0						; setup for change to 32 bit addressing
+				_SwapMMUMode							; do it
+				MOVE	D0,D7							; save D0 for restore, since slotmgr could trash it on error
+				MOVE.L	#TestPos,D1						; get offset in D1
+				MOVE.L	#OneBitGray,D5					; get a test pattern 
+				MOVE.L	D5,(A1,D1.L)					; write it to alleged vRAM
+				MOVE.L	MinusOne,-(SP)					; write out some garbage to clear data lines
+				ADDQ	#4,SP							; and pitch it
+				CMP.L	(A1,D1.L),D5					; did it stick?
+				BNE.S	DisableSRsrc					; if <>, 512 RAM
+				BSET	#fSRsrcXMemBit,D4				; set 1024 vRAM bit
+;
+; setup the sRsrc to disable and complete the formation of the spID in D4
+;
+DisableSRsrc
+				BSET	#fSRsrcMSBBit,D4				; continue to form the spID in D4
+				TST.B	D6								; check for new slot manager
+				BEQ.S	@1								; 0=new, FF=old, branch if new and b4 will be 0 for 32 bit srsrc
+				BSET	#fSRsrc24Bit,D4					; complete the spID formation by setting the 24 bit srsrc bit
+				BRA.S	CheckInval						; go to next section, the old slot manager doesn't allow disabling
+
+@1				MOVE.B	D4,D3							; copy the desired spID to activate into the one to disable
+				BCHG	#fSRsrcOscanBit,D3				; swap the overscan/underscan bit in the one to disable
+;
+; invalidate the screen resource and save states in PRAM if the invalidate flag is set
+;
+CheckInval
+				TST.B	D2								; test to see if we should invalidate the screen and update pram
+				BEQ.S	@FixStack						; if equal to 0 then don't do it
+
+; it is not necessary to do this since CheckDevices will invalidate if the rect is different.  The only case
+;	where this could be an issue would be if we come up with a different mem config (1 or 2 banks), or if we 
+;	change monitors, but they have the same screen dimensions (like ntsc oscan and standard 13").  In the first 
+;	case, the new sRsrc installed will only support certain valid screen depths and even if an past mode
+;	which is not in the new mode list is called, ChkMode will not allow the mode request.  In the second case, the
+;	problem may result in desirable operation, since the menu bar will stick on the new monitor if it was there
+;	prior to the restart.  (i.e. in other scenarios, like a different sized monitor, CheckDevices will invalidate 
+;	and the main screen will go back to the card in the lower slot number).
+;
+; Although this allows various opportunities to simplify, I took the easy way out since we're so close to shipping,
+;	and I would hate to introduce a careless pinit bug at this point!.
+;
+;+++				CLR.B		scrnInval					; flag CQD thta the scrn resource is bad
+				MOVE.B		D4,savedSRsrcID(SP)			; put new monitor type in pBlock
+				MOVE.B		D4,savedRawSRsrcID(SP)		; save spID in pram (this one's not changed by SetDefault)
+				MOVE.B		#FirstVidMode,savedMode(SP)	; make one bit the new default (mode 128 is always the default)
+				MOVE.B		#$00,specialFlag(SP)		; clear the special flag, since we are making 1 bpp the new depth
+				MOVE.L		SP,spsPointer(A0)			; be careful, must be SP (not spResult(A0)), because the old slot
+														;  mgr has a bug and trashed spResult(A0) on the last _SPutPRAMRec call.
+				_SPutPRAMRec							; write the new record out
+@FixStack
+				ADDA		#SizesPRAMRec,SP			; eliminate pram block
+;
+; reset b4 in D4 and D3 since the pruning logic works better if it's off (pram spID will have b4 set properly)
+;	- a side note...it is entirely possible that secondaryinit will need to fix up the active spID based on 
+;	- the presence of 32 bqd.  It will also have to fix up the diabled spID and fix PRAM...ugh!
+;
+				BCLR	#fSRsrc24Bit,D4					; D4 now holds the active spID minus b4
+				BCLR	#fSRsrc24Bit,D3					; D3 now holds the disabled spID minus b4
+;
+; remove invalid sResource lists
+;  
+;	- The following section of code prunes out the undesirable and invalid sResources
+;	- from the sResource table.  The undesirable sResources are the 24 bit sResources
+;	- when the new slot manager/32 BQD code is in ROM, or the undesirable sResources
+;	- are the 32 bit sResources when the new slot manager/32 BQD code is not present
+;	- or installed as a patch after primary initialization is run.  Each bit in the
+;	- sResource ID has a meaning and it is summarized here:
+;	-
+;   -           b7 = 1
+;   -           b6 = 0
+;   -           b5 = 1   if 1024K of vRAM, otherwise 0 for 512K of vRAM
+;   -           b4 = 0   if 32 bit sRsrc, otherwise its a 24 bit sRsrc and b4 = 1
+;   -           b3 = a   b3, b2, b1 and b0 are used to identify monitor type
+;   -           b2 = b   b3, b2, b1 and b0 are used to identify monitor type
+;   -           b1 = c   b3, b2, b1 and b0 are used to identify monitor type
+;   -           b0 = d   b3, b2, b1 and b0 are used to identify monitor type
+;   -           
+;   -           b3:b2:b1:b0 = 0000      ->  NTSC overscan "System 7.0" mode sRsrc
+;   -           b3:b2:b1:b0 = 0001      ->  640 x 870 portrait monitor
+;   -           b3:b2:b1:b0 = 0010      ->  512 x 384 modified Apple IIGS RGB monitor
+;   -           b3:b2:b1:b0 = 0011      ->  1152 x 870 two page display monitor
+;   -           b3:b2:b1:b0 = 0100      ->  NTSC overscan mode sRsrc
+;   -           b3:b2:b1:b0 = 0101      ->  not used (reformats to 001 for RGBPortrait sense)
+;   -           b3:b2:b1:b0 = 1110      ->  640 x 480 standard monitor
+;   -           b3:b2:b1:b0 = 0111      ->  not used (reformats to 011 for RGBKong sense)
+;   -           b3:b2:b1:b0 = 1000      ->  NTSC underscan "System 7.0" mode sRsrc
+;   -           b3:b2:b1:b0 = 1001      ->  not used (defaults to 0001)
+;   -           b3:b2:b1:b0 = 1010      ->  not used (defaults to 0010)
+;   -           b3:b2:b1:b0 = 1011      ->  not used (defaults to 0011)
+;   -           b3:b2:b1:b0 = 1100      ->  NTSC underscan mode sRsrc
+;   -           b3:b2:b1:b0 = 1101      ->  not used (defaults to 0001)
+;   -           b3:b2:b1:b0 = 1110      ->  not used (defaults to 0110)
+;   -           b3:b2:b1:b0 = 1111      ->  not used (defaults to 0011)
+;
+;	- Once _sVersion is called, we know which version of the slot manager we have and 
+;	- all of the undesirable sResources (determined by the mode list, b7, and b4) will 
+;	- be deleted.
+;	-
+;	- After the undesirable sResources are removed, the invalid sResources are handled as in 
+;	- previous Apple ROMs where the current mode (as determined by the monitor sense test and 
+;	- vRAM test) is in the low 4 bits of D4 (see b3:b0 above).  The current mode is compared 
+;	- to all allowable modes and the invalid ones are deleted and the lone valid one is left.
+;	- Note that b2 is of no importance at this time and it is cleared prior to the comparisons.
+;	- 
+;	- Refer to the Video Configuration ROM Software Specification (3/15/89) for details on the
+;	- goofy things required to play in a 32 bit world!!
+;
+Prune
+				MOVE	D7,D0							; restore previous mode in D0
+				_SwapMMUMode							; swap back to previous mode (contained in D0)
+				
+				LEA		pModeList,A2					; A2 points to the Trident valid mode list
+				MOVEQ	#sRsrc_NumModes-1,D1			; counter in D1 (because of BRA, not -1)
+@0				MOVE.B	(A2)+,D2						; get the partial spID to test against (24/32 addr bit not set)
+				TST.B	D6								; check which version of the slot manager
+				BNE.S	@2								; branch if old one so 32 bit sRsrcs are deleted 
+				BSET	#fSRsrc24Bit,D2					; its the new one so 24 bit sRsrcs are deleted
+@2				MOVE.B	D2,spID(A0)						; set the mode
+@5 				_sDeleteSRTRec							; remove the invalid entry
+				DBRA	D1,@0				
+
+				CLR.W	D7
+				BTST	#fSRsrcBigScrnBit,D4			; determine if its a Kong or Portrait from b0
+				BEQ.S	@DontClear						; its not, so branch
+				BCLR	#fSRsrcRGBBit,D4				; bit 2 (RGB/BW select) not needed
+@DontClear
+				LEA	pModeList,A2						; A2 points to the Trident valid mode list
+				MOVEQ	#sRsrc_NumModes-1,D1			; counter in D1 (because of BRA, not -1)
+@10				MOVE.B	(A2)+,D2						; get the partial spID to test against (24/32 addr bit not set)
+
+				CMP.B	D3,D2							; see if this one should be disabled instead of deleted 
+				BNE.S	@7								; it's not equal so it must be valid mode or to be deleted
+				TST.B	D6								; check for new slot manager
+				BNE.S	@7								; if the old one then we can't make the new call here
+				BCLR	#fSRsrc24Bit,D2					; it's the new slot mgr so it must be the 32 bit addr spID
+				MOVE.B	D2,spID(A0)						; set up the spID to disable
+				MOVE.L	#sRsrcDisable,spParamData(A0)	; set up for disable
+				CLR.B	spExtDev(A0)					; external device = 0
+				_SetsRsrcState							; make the trap
+				CLR.L	spParamData(A0)					; restore spParamData
+				BRA.S	@20								; go do the next one
+@7
+				CMP.B	D4,D2							; is this the valid mode?
+				BEQ.S	@20								; yup, so skip deletion
+				TST.B	D6								; check which version of the slot manager
+				BEQ.S	@15								; branch if new one so 32 bit sRsrc is formed
+				BSET	#fSRsrc24Bit,D2					; its the old one so form a 24 bit sRsrc spID
+@15				MOVE.B	D2,spID(A0)						; set the mode
+				_sDeleteSRTRec							; remove the invalid entry
+				ADDQ	#1,D7							; increment the # deleted counter
+@20				DBRA	D1,@10
+				CMP.W	#sRsrc_NumModes,D7				; check to see if we've deleted all sRsrcs (i.e. disconnected)
+				BEQ		CleanUp							; if we have then get out, otherwise continue
+				
+				MOVE.B	D4,D2							; spID to be used later for ntsc processing
+				ANDI.B	#monSenseMask,D4				; now only keep the monitor sense in D4
+;
+; Fix default video device in PRAM if necessary (This is to fix the MacsBug anchoring annoyance)
+;	- We use D6 to tell us whether we've installed a 32 bit sRsrc, since D2 was stripped of this
+;	- information earlier.  This has to be unraveled in 2nd init, so check there for more weirdness!
+;
+				TST.B	D6								; test to see if 32 BQD is around (and if we are a 32 bist sRsrc)
+				BEQ.S	HWSetup							; branch over if we're already a 32 bit sRsrc
+				MOVE.B	spSlot(A0),D3					; get the current slot
+				SUBA	#2,SP							; make a DefVideoRec
+				MOVE.L	SP,A0							; and point to it
+				_GetVideoDefault						; get the current default video device
+				CMP.B	sdSlot(A0),D3					; test to see if it's our slot
+				BNE.S	@notWelcome						; if not then skip
+								
+				BCLR	#fSRsrc24Bit,D2					; make a 32 bit sRsrc temporarily
+				CMP.B	sdSResource(A0),D2				; test to see if it's our 32 bit sRsrc			
+				BNE.S	@notWelcome						; if it's not then skip
+				
+				BSET	#fSRsrc24Bit,D2					; fool MacsBug into thinking its 24 bit
+				
+				MOVE.B	D2,sdSResource(A0)				; do it
+				_SetVideoDefault
+				
+				BCLR	#fSRsrc24Bit,D2					; restore D2
+@notWelcome				
+				ADDA	#2,SP
+
+;
+; setup hardware
+;
+HWSetUp
+				CMP.B	#Rubik,D4						; is monitortype = Rubik
+				BEQ.S	@useRubik						; if yes then get Rubik parameters
+				CMP.B	#Kong,D4						; is monitortype = Kong
+				BEQ.S	@useKong						; if yes then get Kong parameters
+				CMP.B	#Portrait,D4					; else is monitortype = Portrait
+				BEQ.S	@usePortrait					; if yes then get Portrait parameters
+				CMP.B	#_NTSC_,D4						; else is monitortype = NTSC
+				BEQ.S	@testNTSC						; if yes then get NTSC parameters
+				CMP.B	#rPAL,D4						; else is monitortype = PAL
+				BEQ.S	@testPAL						; if yes then get PAL parameters
+				LEA		pOBM30Parms,A0					; else it better be standard size monitor
+				BRA.S	@setup							; branch to the setup code
+				
+@useRubik		LEA		pOBM16Parms,A0					; point to the parameters 
+				BRA.S	@setup							; branch to the setup code
+				
+@useKong		LEA		pOBM100Parms,A0					; point to the parameters 
+				BRA.S	@setup							; branch to the setup code
+				
+@usePortrait	LEA		pOBM57Parms,A0					; point to the parameters
+				BRA.S	@setup							; branch to the setup code
+				
+@testNTSC		
+				BTST	#fSRsrcXMemBit,D2				; D2 still contains the selected sRsrc ID
+				BEQ.S	@useNTSC						; if only 1 bank (b3=0) then no convolution
+				BTST	#fSRsrcOscanBit,D2				; test the underscan (0) / overscan (1) bit
+				BEQ.S	@useConvUscan					; if equal to 0 then its underscan so load uscan params	
+				LEA		pOBM12CParms,A0					; if 2 banks (b3=1) then convolution
+				BRA.S	@setup
+@useConvUscan	LEA		pOBM12CuParms,A0
+				BRA.S	@setup
+				
+@useNTSC		BTST	#fSRsrcOscanBit,D2
+				BEQ.S	@useNTSCu
+				LEA 	pOBM12Parms,A0					; point to the no convolution parameters
+				BRA.S	@setup
+
+@useNTSCu		LEA		pOBM12uParms,A0					; point to the no convolution underscan paramters
+				BRA.S	@setup
+
+@testPAL		
+				BTST	#fSRsrcXMemBit,D2				; D2 still contains the selected sRsrc ID
+				BEQ.S	@usePAL							; if only 1 bank (b3=0) then no convolution
+				BTST	#fSRsrcOscanBit,D2				; test the underscan (0) / overscan (1) bit
+				BEQ.S	@usePALConvUscan				; if equal to 0 then its underscan so load uscan params	
+				LEA		pOBM14CParms,A0					; if 2 banks (b3=1) then convolution
+				BRA.S	@setup
+@usePALConvUscan	LEA		pOBM14CuParms,A0
+				BRA.S	@setup
+				
+@usePAL			BTST	#fSRsrcOscanBit,D2
+				BEQ.S	@usePALu
+				LEA 	pOBM14Parms,A0					; point to the no convolution parameters
+				BRA.S	@setup
+
+@usePALu		LEA		pOBM14uParms,A0					; point to the no convolution underscan paramters
+
+@setup
+				MOVEQ	#true32b,D0						; change to 32 bit addressing to get
+				_SwapMMUMode							; at hardware
+				MOVE	D0,-(SP)						; save past mode so it will be restored later
+				
+				MOVE.L	A1,A3							; A3 <- slot base addr
+				ADD.L	#CLUT+CLUTPBCR,A1				; point to the CLUT Pixel Bus Control Register
+				
+				CLR.L	D0								; to ensure that the upper 2 bytes are 0
+				MOVE.W	(A0)+,D0						; setup the CLUT PBCR (data table field is word sized)
+				MOVE.L	D0,(A1)+						; make a long write to hw always for this card
+
+				MOVE.L	A3,A1							; get back to the slot base addr
+				ADD.L	#JMFB,A1						; add cntl base offset to slotbase
+				MOVE.L	A1,A2							; save for later (A2 <- JMFB base)
+				MOVE.W	#3,D1							; setup the 4 JMFB registers
+				
+				CLR.L	D0								; to ensure that the upper 2 bytes are 0
+@part1			MOVE.W	(A0)+,D0						; do it (data table field is word sized)
+				MOVE.L	D0,(A1)+						; make a long write to hw always for this card
+				DBRA	D1,@part1						
+
+				BSR		pGetClockType					; returns clock type in D0 (0=Endeavor, $FFFF=National)
+				MOVE.L	D0,-(SP)						; save the clock type
+				MOVE.L	A3,A1							; get back to the slot base addr
+				ADD.L	#Endeavor,A1					; point to the base of the Endeavor Registers
+
+				cmp.w	#EndeavorID,D0					; check for Endeavor
+				bne.s	@natlClock
+				MOVE.W	#2,D1							; setup the 3 Endeavor registers
+					
+				CLR.L	D0								; to ensure that the upper 2 bytes are 0
+@part2			MOVE.W	(A0)+,D0						; do it (data table field is word sized)
+				MOVE.L	D0,(A1)+						; make a long write to hw always for this card
+				DBRA	D1,@part2
+				ADD.L	#16,A0							; skip the National params (16*1)
+				BRA.S	@startClock
+					
+@natlClock
+				ADD.L	#6,A0							; skip the Endeavor params (3 * 2)
+				MOVE.W	#15,D1							; setup the 16 National registers
+
+				CLR.L	D0								; to ensure that the upper 3 bytes are 0
+@part2a			MOVE.B	(A0)+,D0						; do it (data table field is byte sized)
+				MOVE.L	D0,(A1)+						; make a long write to hw always for this card
+				DBRA	D1,@part2a
+								
+@startClock		ADD.L	#JMFBCSR,A2						; point to JMFB CSR
+
+				MOVE.L	(SP)+,D0						; restore the clock type
+				CMP.W	#0,D0
+				BNE.S	@SkipEndeavorReset
+				MOVE.L	(A2),D1
+				ANDI.W	#MaskSenseLine,D1				; Ensure sense lines will be written out as 000
+				ORI.W	#PIXSEL1,D1						; set PIXSEL1 to start Endeavor
+				MOVE.L	D1,(A2)
+
+@SkipEndeavorReset				
+				MOVE.W	TimeDBRA,D1						; setup delay loop count for 1 millisecond
+@delayLoop
+				DBRA	D1,@delayLoop					; wait for stable clock from Endeavor
+				
+; The second 1 millisecond loop is a hedge that we wont ship a Mac that does a dbra 8 times faster 
+;   than a IIfx.  The parameter is word size and that is the only data size that dbra does anyway.
+;   The easier, but risker way would be to do a ASL.W #1,D1 in the first time loop.
+
+				MOVE.W	TimeDBRA,D1						; setup delay loop count for 1 millisecond
+@delayLoop2
+				DBRA	D1,@delayLoop2					; wait for stable clock from National
+				
+; On a Cyclone 40, we needed an extra delay before enabling the Stopwatch								<LW3>
+;																										<LW3>
+Wait5ms			Move.l	#(-5)<<16,d1					; outer loop count 5*1ms						<LW3>
+@outer			Move.w	TimeDBRA,d1						; inner loop count 1ms							<LW3>	
+@inner			dbra	d1,@inner						; wait 1ms										<LW3>
+				Addq.l	#1,d1							; increment outer loop counter					<LW3>
+				Bne.s	@outer							; wait 5*1ms									<LW3>
+
+				MOVE.L	(A2),D1
+				ANDI.W	#MaskSenseLine,D1				; Ensure sense lines will be written out as 000
+				ORI.W	#VRSTB,D1						; set VRSTB to start JMFB
+				MOVE.L	D1,(A2)
+
+				MOVE.L	A3,A1							; get back to the slot base addr
+				ADD.L	#Stopwatch,A1					; point to the base of the Stopwatch Registers
+				MOVE.W	#14,D1							; setup next 15 registers (Stopwatch)
+							
+				CLR.L	D0								; to ensure that the upper 2 bytes are 0
+@part3			MOVE.W	(A0)+,D0						; do it (data table field is word sized)
+				MOVE.L	D0,(A1)+						; make a long write to hw always for this card
+				
+				Move.l	#(-5)<<16,d7					; outer loop count 5*1ms						<LW3>
+@outer1			Move.w	TimeDBRA,d7						; inner loop count 1ms							<LW3>	
+@inner1			dbra	d7,@inner1						; wait 1ms										<LW3>
+				Addq.l	#1,d7							; increment outer loop counter					<LW3>
+				Bne.s	@outer1							; wait 5*1ms									<LW3>
+				
+				Move.l	(A2),D7							; dummy read
+
+; On a Cyclone 40, the writing of these registers does not happen, so, by trial and error, I put in			<LW3>
+; this 1 ms delay in writing each register.	It could be MUNI writing data out too fast.						<LW3>
+;																											<LW3>
+
+				DBRA	D1,@part3
+				MOVE.L	#$6,(A1)						; both interrupts off and stopwatch soft reset in Pinit
+				MOVE.L	#$07,(A1)						; now start Stopwatch
+				
+				MOVE.L	(A2),D1
+				ANDI.W	#MaskSenseLine,D1				; Ensure sense lines will be written out as 000
+				ORI.W	#REFEN,D1						; set REFEN to start VRAM refresh
+				MOVE.L	D1,(A2)
+
+				MOVE.L	A2,A4							; save, since we'll start video as the last thing!
+				
+;+++				BSR		PDelay1VSP						; wait for one vertical blanking interval
+
+;+++				MOVE.L	(A2),D1
+;+++				ANDI.W	#MaskSenseLine,D1				; Ensure sense lines will be written out as 000
+;+++				ORI.W	#VIDGO,D1						; set VRSTB line to start video transfer cycle ... Video!
+;+++				MOVE.L	D1,(A2)
+;
+; setup CLUT for 1 bit per pixel
+;
+InitCLUT		
+				MOVE.L	A3,A1							; get slotbase back into A1 from A3
+				MOVE.L	#CLUT+CLUTDataReg,D1			; get CLUT data register addr
+				MOVE.L	#0,CLUTAddrReg-CLUTDataReg(A1,D1.L)	; set address reg to $0
+
+;
+; I noticed a problem with Trident on the RGB Kong (only the blue gun is active at PInit time).  In the 
+;	driver all of the guns are turned on correctly for RGB Kong.  Since we are making a revision to the 
+;	ROM for the RS170 stuff, I thought we'd fix this too, altho the implementation will be cleaned up again
+;   for the 4 layer board.  For simplicity, all guns are activated in PInit, regardless if monochrome or RGB, 
+;   and the driver will only activate the appropriate gun correctly.  This will result in the nice gray screen
+;   during PInit on a RGB Kong if we ever make one!
+;
+				BRA.S	@RGB							; turn on all guns only during PInit
+;+++				IF NOT ProtoVRAM THEN
+;+++					BTST	#0,D4							; check for Kong or Portrait monitor (bit 0 = 1)
+;+++					BEQ.S	@RGB							; if it is, branch and enable all 3 guns
+;+++				ELSE
+;+++					BRA.S	@RGB						; always enable all guns for proto boards
+;+++				ENDIF
+														; CLUT element 1 (white)
+				CLR.L	(A1,D1.L)						; B/W mode so write black to red 
+				CLR.L	(A1,D1.L)						;  "   "   "    "   black "  green 
+				MOVE.L	#$FF,(A1,D1.L)						;  "   "   "    "   white "  blue  
+				
+														; CLUT element 2 (black)
+				CLR.L	(A1,D1.L)						; write black to red	
+				CLR.L	(A1,D1.L)						;   "     "   "  green
+				CLR.L	(A1,D1.L)						;   "     "   "  blue
+				
+				BRA.S	GrayScrn						; skip on to graying the screen section
+				
+														; CLUT element 1 (white)
+@RGB			MOVE.L	#$FF,(A1,D1.L)						; RGB so do them all, white to red
+				MOVE.L	#$FF,(A1,D1.L)						;  "  "  "   "    "     "   "  green
+				MOVE.L	#$FF,(A1,D1.L)						;  :  "  "   "    "     "   "  blue
+				
+														; CLUT element 2 (black)
+				CLR.L	(A1,D1.L)						; write black to red	
+				CLR.L	(A1,D1.L)						;   "     "   "  green
+				CLR.L	(A1,D1.L)						;   "     "   "  blue
+;
+; gray the screen
+;	- Use the appropriate frame buffer offset depending on noninterlaced/interlaced operations.
+;	- Note that the first $2000 bytes of the frame buffer are always preloaded with black if 
+;	- the mode is interlaced. This eliminates complicated logic like JMFBSetPage in the
+;	- driver and is little overhead to pay for noninterlaced operation.  The first #2560 bytes
+;	- of the frame buffer are always preloaded with white if the mode is noninterlaced.  You may
+;	- ask why ... well believe it or not, I found it very hard to believe initially!, if you
+;	- keep black in there, that translates to white when the user switches to 24 bpp mode and that
+;	- will cause the board to exceed EMI limits (It has to do with bank switching and the front 
+;	- porch of vertical blanking).  Note also that for simplicity, the hw and sw baseoffsets for the 
+;	- big screens are the same as the small progressive screens.  
+;
+GrayScrn		
+				MOVE.L	A3,A2							; retrieve saved slotbase address
+
+				ANDI.B	#3,D4							; last use of D4 and we're only interested in lo 2 bits				
+				CMP.B	#InterlacedScreen,D4			; check to see if we're hooked up to interlaced (b0=b1=0)
+				BEQ.S	@InterlacedBlackTop				; do the special interlaced blacken of the top fb section
+				
+				MOVE.W	#defmBaseOffset,D3				; get the number of bytes to blacken for top in non interlaced modes
+				LSR		#2,D3							; convert bytes to longs
+				SUBQ	#1,D3							; and subtract 1 for dbra
+@NxtTopLongNI	MOVE.L	#$00000000,(A2)+				; write white (seen as black in 24 bpp) to top $2560 bytes in frame buffer for noninterlaced
+				DBF		D3,@NxtTopLongNI				; loop until done
+				BRA.S	@DoTheGray
+
+@InterlacedBlackTop				
+				MOVE.W	#defmBaseOffset12,D3			; get the number of bytes to blacken for top in interlaced modes
+				LSR		#2,D3							; convert bytes to longs
+				SUBQ	#1,D3							; and subtract 1 for dbra
+@NxtTopLong		MOVE.L	#$FFFFFFFF,(A2)+				; write black to top $2000 bytes in frame buffer for interlaced
+				DBF		D3,@NxtTopLong					; loop until done
+				
+@DoTheGray
+				MOVE.L	A3,A2							; retrieve saved slotbase address
+				CMP.B	#InterlacedScreen,D4			; check to see if we're hooked up to interlaced (b0=b1=0)
+				BEQ.S	@Interlaced						; if so use the interlaced baseoffset
+				ADD.L	#defmBaseOffset,A2				; if not, use normal offset and gray the screen
+				BRA.S	@setPattern						; all done here ... go gray the screen
+@Interlaced		ADD.L	#defmBaseOffset12,A2			; We're in NTSC (convolution) so point to the phantom row
+@setPattern		MOVE.L	#OneBitGray,D5					; get 1 BPP dither gray pattern
+
+				MOVE.W	(A0)+,D3						; get the number of rows
+
+NxtRow			MOVE.W	(A0),D1							; get the number of rowlongs
+
+NxtLong			MOVE.L	D5,(A2)+						; write a line of gray
+				DBF		D1,NxtLong
+				NOT.L	D5								; invert graypattern for dither
+				DBF		D3,NxtRow						; repeat for all rows
+
+				BTST	#fSRsrcOscanBit,D2				; see if the requested NTSC spID is underscan (0) or overscan (1)
+				BNE.S	SwapBack						; if overscan, we're all done here (No need to black the end part!)
+
+				MOVE.W	#(256*58)-1,D1					; should be 50 for RS170 and 58 for PAL, but it's easiest to do worst case
+@BotBlock		MOVE.L	#-1,(A2)+
+				DBRA	D1,@BotBlock
+				
+SwapBack		
+				MOVE.L	(A4),D1
+				ANDI.W	#MaskSenseLine,D1				; Ensure sense lines will be written out as 000
+				ORI.W	#VIDGO,D1						; set VRSTB line to start video transfer cycle ... Video!
+				MOVE.L	D1,(A4)
+				
+				MOVE	(SP)+,D0						; restore past mode to D0
+				_SwapMMUMode							; swap back to previous mode (D0 contains previous mode)
+
+;
+; clean up spBlock on stack
+;
+CleanUp
+				ADDA	#spBlockSize,SP					; flush the block
+;
+; return to your regularily scheduled start code
+;
+
+				If ForRom Then
+				Movem.l	(Sp)+,SaveRegs
+				Endif
+
+				RTS										
+
+
+
+*******************************************************************
+*
+*	pGetXtndSense reads the extended sense code from the sense lines.
+*	In this driver, we are looking for the Sarnoff breakout box, which
+*	has the sense lines assigned as 010100.  Note that the returned sense
+*	is of the format bc ac ab, where the first two bits are read when a 
+*	is set high, the second two bits are read when b is set high, and the
+*	third two bits are read when c is set high.  a, b, and c correspond to 
+*	sense lines 2, 1, and 0 where 2 is the msb.
+*
+*  Called by:
+*		
+*		PrimaryInit, VideoOpen
+*
+*  Traps and Utilities called:
+*
+*		None.
+*
+*  Register usage:
+*
+*       Input:
+*
+*			A1 - card base address
+*			D1 - offset to JMFB CSR (contains sense lines)
+*
+*  		Output:
+*			D0 - returns the extended sense. 
+*
+*		Locally used:
+*			D2 - scratch (saved and restored)
+*			D3 - scratch (used to hold the sense line to be output to the CSR
+*				 (i.e. 100, 010, or 001)
+*
+*  Miscellaneous:
+*
+*	1.  Must be called in 32 bit addressing mode.
+*
+*******************************************************************
+pGetXtndSense
+
+				MOVEM.L	D2-D6,-(SP)			; save D2 working register
+				CLR		D0					; initialize the return value
+				MOVE.L	#9,D5				; initialize the number of bits to shift due to byte swapping
+				MOVE.L	#readBC,D3			; set up 1 bit to be output
+				
+				
+				LSL		D5,D3				; shift up due to byte swapping
+				MOVE.L	(A1,D1.L),D4		; get current state of the JMFB CSR
+				ANDI.W	#MaskSenseLine,D4	; Ensure sense lines will be written out as 000
+				OR.L	D3,D4				; write out
+				MOVE.L	D4,(A1,D1.L)
+;+++				BFINS	D3,(A1,D1.L){20:3}	; set a in sense reg high  (This doesn't work to the card!)
+
+				BFEXTU	(A1,D1.L){20:3},D2	; read the sense register a,b,c
+				MOVE.B	D2,D0				; move into return register
+				LSL.B	#2,D0				; move over 2 bits for next one
+
+				MOVE.L	#readAC,D3			; set up 1 bit to be output
+				
+				LSL		D5,D3				; shift up due to byte swapping
+				MOVE.L	(A1,D1.L),D4		; get current state of the JMFB CSR
+				ANDI.W	#MaskSenseLine,D4	; Ensure sense lines will be written out as 000
+				OR.L	D3,D4				; write out
+				MOVE.L	D4,(A1,D1.L)
+;+++				BFINS	D3,(A1,D1.L){20:3}	; set b in sense reg high  (This doesn't work to the card!)
+
+				BFEXTU	(A1,D1.L){20:3},D2	; read the sense register a,b,c
+				MOVE.B	D2,D6				; save bit c
+				ANDI.B	#1,D6				; and only bit c
+				LSR.B	#1,D2				; move bit a over 1 to form 2 bit code
+				OR.B	D6,D2				; form it
+				OR.B	D2,D0				; move into return register
+				LSL.B	#2,D0				; move over 2 bits for next one
+
+				MOVE.L	#readAB,D3				; set up 1 bit to be output
+				
+				LSL.L	D5,D3				; shift up due to byte swapping
+				MOVE.L	(A1,D1.L),D4		; get current state of the JMFB CSR
+				ANDI.W	#MaskSenseLine,D4	; Ensure sense lines will be written out as 000
+				OR.L	D3,D4				; write out
+				MOVE.L	D4,(A1,D1.L)
+;+++				BFINS	D3,(A1,D1.L){20:3}	; set c in sense reg high  (This doesn't work to the card!)
+
+				BFEXTU	(A1,D1.L){20:3},D2	; read the sense register a,b,c
+				LSR.L	#1,D2				; shift a,b into lo 2 bits
+				OR.B	D2,D0				; move into return register
+				
+				MOVEM.L	(SP)+,D2-D6			; restore D2 				
+				
+				RTS										
+
+;--------------------------------
+;
+; pGetClockType determines if we have a National part or an Endeavor Part.  D0 will return 00 it is
+; an Endeavor part and will return a $FF if it is a National part.  The Endeavor registers can be 
+; read as well as written to.
+;
+;	A0 - used to point to the Endeavor/National address space
+;	A3 - Input and holds the slot base address for the card
+;	D0 - returns the result (0 = Endeavor, FF = National)
+;
+pGetClockType
+				MOVE.L	A0,-(SP)		; save work register
+				MOVE.L	A3,A0
+				ADD.L	#Endeavor,A0
+			
+				MOVE.L	#$55,(A0)
+				MOVE.L	(A0),D0
+				AND.W	#$00FF,D0
+				CMP.W	#$55,D0
+				BNE.S	@ItsNational
+				MOVE.L	#$AA,(A0)
+				MOVE.L	(A0),D0
+				AND.W	#$00FF,D0
+				CMP.W	#$AA,D0
+				BNE.S	@ItsNational
+
+				MOVE.W	#EndeavorID,D0
+				BRA.S	pEndGetClockType
+@ItsNational	MOVE.W	#NationalID,D0
+pEndGetClockType	MOVE.L	(SP)+,A0
+			RTS
+		
+
+; Here is the Trident valid mode list to be used in the pruning section.
+;	- note that only the 32 bit sRsrcs are shown here, the 24 bit ones are built 
+;	- and used in the pruning section from these.
+;
+pModeList	DC.B	sRsrc_Vid12Au,sRsrc_Vid12Bu
+			DC.B	sRsrc_Vid57A,sRsrc_Vid57B
+			DC.B	sRsrc_Vid30A,sRsrc_Vid30B
+			DC.B	sRsrc_Vid100A,sRsrc_Vid100B
+			DC.B	sRsrc_Vid16A,sRsrc_Vid16B
+			DC.B	sRsrc_Vid12A,sRsrc_Vid12B
+			
+			If Not ForROM Then
+ 			DC.B	sRsrc_Vid14Au,sRsrc_Vid14Bu
+ 			DC.B	sRsrc_Vid14A,sRsrc_Vid14B
+			EndIf
+			
+;
+; Here are the Elmer hardware parameters for the 4 different monitors.  The seven lines of data
+; correspond to the initialization setup sequence summarized below.  
+;
+;	Line 1 - CLUT PBCR
+;	Line 2 - JMFB CSR, JMFB load divisor register, JMFB base register,JMFB row long words register
+;	Line 3 - Endeavor M, Endeavor N, Endeavor external clock
+;	Line 4 - Stopwatch horizontal timing control parameters (see Stopwatch spec)
+;	Line 5 - Stopwatch vertical   timing control parameters (see Stopwatch spec)
+;	Line 6 - Stopwatch composite  timing control parameters (see Stopwatch spec)
+;	Line 7 - Stopwatch vertical interrupts enable
+;
+; The last two lines of data are used to determine the appropriate number of lines and longs/row
+; to be used while graying the screen.
+;
+
+pOBM14Parms		DC.W	$0080
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00E0,defmBaseOffset12>>5,OBM14RB/4
+			ELSE
+ 				DC.W	$8112,$00E0,defmBaseOffset12>>5,OBM14RB/4
+			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$03,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0160,$02FE,$0031,$0043,$0036
+				DC.W	$0003,$0000,$023F,$0028,$0005,$0005
+				DC.W	$005E,$0193
+				DC.W	defmBounds_B14-1
+				DC.W	(OBM14RB/4)-1
+
+pOBM14CParms	DC.W	$00C1
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00F8,(defmbaseOffset12-convBOfix)>>5,OBM14CRB/4
+			ELSE
+				DC.W	$8132,$00F8,(defmbaseOffset12-convBOfix)>>5,OBM14CRB/4
+ 			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$01,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0160,$02FE,$0031,$0043,$0036
+				DC.W	$0003,$0000,$023F,$0028,$0005,$0005
+				DC.W	$005E,$0193
+				DC.W	defmBounds_B14-1
+				DC.W	(OBM14CRB/4)-1
+
+pOBM14uParms	DC.W	$0080
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00E0,defmBaseOffset12>>5,OBM14uRB/4
+			ELSE
+ 				DC.W	$8112,$00E0,defmBaseOffset12>>5,OBM14uRB/4
+			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$03,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0114,$0266,$007D,$0043,$0082
+				DC.W	$0003,$0000,$0205,$0062,$0005,$0005
+				DC.W	$005E,$0193
+				DC.W	defmBounds_B14u-1
+				DC.W	(OBM14uRB/4)-1
+
+pOBM14CuParms	DC.W	$00C1
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00F8,(defmbaseOffset12-convBOfix)>>5,OBM14CRB/4
+			ELSE
+				DC.W	$8132,$00F8,(defmbaseOffset12-convBOfix)>>5,OBM14CRB/4
+ 			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$01,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0114,$0266,$007D,$0043,$0082
+				DC.W	$0003,$0000,$0205,$0062,$0005,$0005
+				DC.W	$005E,$0193
+				DC.W	defmBounds_B14u-1
+				DC.W	(OBM14CRB/4)-1
+				
+pOBM12Parms		DC.W	$0080
+			IF ProtoVRAM THEN
+				DC.W	$0113,$00E0,defmbaseOffset12>>5,OBM12CRB/4
+			ELSE
+ 				DC.W	$0112,$00E0,defmbaseOffset12>>5,OBM12CRB/4
+			ENDIF
+				DC.W	$001B,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$04,$0D,$06,$04,$01,$00,$00
+				DC.W	$0003,$0000,$0136,$027E,$0012,$003A,$003a
+				DC.W	$0003,$0000,$01E0,$0021,$0006,$0006
+				DC.W	$006E,$014a
+				DC.W	defmBounds_B12-1
+				DC.W	(OBM12CRB/4)-1
+
+pOBM12CParms	DC.W	$00C1
+			IF ProtoVRAM THEN
+				DC.W	$0133,$00F8,(defmbaseOffset12-OBM12CRB)>>5,OBM12CRB/4
+			ELSE
+				DC.W	$0132,$00F8,(defmbaseOffset12-OBM12CRB)>>5,OBM12CRB/4
+ 			ENDIF
+				DC.W	$006C,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$02,$0D,$06,$04,$01,$00,$00
+				DC.W	$0003,$0000,$0136,$027E,$0012,$003A,$003A
+				DC.W	$0003,$0000,$01E0,$0021,$0006,$0006
+				DC.W	$006E,$014a
+				DC.W	defmBounds_B12-1
+				DC.W	(OBM12CRB/4)-1
+
+pOBM12uParms	DC.W	$0080
+			IF ProtoVRAM THEN
+				DC.W	$0113,$00E0,defmbaseOffset12>>5,OBM12CRB/4
+			ELSE
+ 				DC.W	$0112,$00E0,defmbaseOffset12>>5,OBM12CRB/4
+			ENDIF
+				DC.W	$001B,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$04,$0D,$06,$04,$01,$00,$00
+; Based on lab measurements the delta value to fp/bp is $8 rather than $20.
+				DC.W	$0003,$0000,$00f4,$01fe,$0054,$003A,$0078
+				DC.W	$0003,$0000,$01B0,$0051,$0006,$0006
+				DC.W	$006E,$014A
+				DC.W	defmBounds_B12u-1
+				DC.W	(OBM12CRB/4)-1
+
+pOBM12CuParms	DC.W	$00C1
+			IF ProtoVRAM THEN
+				DC.W	$0133,$00F8,(defmbaseOffset12-OBM12CRB)>>5,OBM12CRB/4
+			ELSE
+				DC.W	$0132,$00F8,(defmbaseOffset12-OBM12CRB)>>5,OBM12CRB/4
+ 			ENDIF
+				DC.W	$006C,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$02,$0D,$06,$04,$01,$00,$00
+; Based on lab measurements the delta value to fp/bp is $8 rather than $20.
+				DC.W	$0003,$0000,$00f4,$01fe,$0054,$003A,$0078
+				DC.W	$0003,$0000,$01B0,$0051,$0006,$0006
+				DC.W	$006E,$014A
+				DC.W	defmBounds_B12u-1
+				DC.W	(OBM12CRB/4)-1
+
+pOBM16Parms		DC.W	$0080
+			IF ProtoVRAM THEN
+				DC.W	$0083,$00E0,defmBaseOffset>>5,OBM16RB/4	
+			ELSE
+				DC.W	$0082,$00E0,defmBaseOffset>>5,OBM16RB/4	
+ 			ENDIF
+				DC.W	$002F,$00F0,$0000
+				DC.B	$0E,$05,$00,$00,$0F,$00,$00,$00
+				DC.B	$00,$03,$0D,$06,$04,$01,$00,$00
+				DC.W	$0003,$0000,$0100,$01FE,$002A,$001E,$0032
+				DC.W	$0003,$0000,$0300,$0026,$0006,$0002
+				DC.W	$0004,$0260
+				DC.W	defmBounds_B16-1
+				DC.W	(OBM16RB/4)-1
+			
+pOBM30Parms		DC.W	$00C0
+			IF ProtoVRAM THEN
+				DC.W	$0083,$00F8,defmBaseOffset>>5,OBM30RB/4	
+			ELSE
+				DC.W	$0082,$00F8,defmBaseOffset>>5,OBM30RB/4	
+ 			ENDIF
+				DC.W	$0011,$002d,$0000
+				DC.B	$0F,$07,$00,$00,$05,$01,$00,$00
+				DC.B	$00,$02,$0D,$06,$04,$01,$00,$00
+				DC.W	$0003,$0000,$0050,$009E,$000A,$000E,$001A
+				DC.W	$0003,$0000,$03C0,$004E,$0006,$0006
+				DC.W	$0004,$00c8
+				DC.W	defmBounds_B30-1
+				DC.W	(OBM30RB/4)-1
+			
+pOBM57Parms		DC.W	$00A0	
+			IF ProtoVRAM THEN
+				DC.W	$0003,$00F0,defmBaseOffset>>5,OBM57RB/4
+			ELSE
+				DC.W	$0002,$00F0,defmBaseOffset>>5,OBM57RB/4
+ 			ENDIF
+				DC.W	$002b,$003c,$0000
+				DC.B	$0E,$07,$00,$00,$06,$01,$00,$00
+				DC.B	$00,$01,$0D,$06,$04,$01,$00,$00
+				DC.W	$0003,$0000,$00A0,$013E,$0012,$0026,$0022
+				DC.W	$0003,$0000,$06CC,$0054,$0006,$0006
+				DC.W	$0000,$0178
+				DC.W	defmBounds_B57-1
+				DC.W	(OBM57RB/4)-1
+
+pOBM100Parms	DC.W	$00C0	
+			IF ProtoVRAM THEN
+				DC.W	$2003,$00F8,defmBaseOffset>>5,OBM100RB/4
+			ELSE
+				DC.W	$2002,$00F8,defmBaseOffset>>5,OBM100RB/4
+ 			ENDIF
+				DC.W	$0005,$0004,$0000
+				DC.B	$0E,$0B,$00,$00,$03,$01,$00,$00
+				DC.B	$00,$01,$0D,$06,$04,$01,$00,$00
+				DC.W	$0003,$0000,$0090,$011E,$0016,$001E,$0012
+				DC.W	$0003,$0000,$06CC,$004E,$0006,$0006
+				DC.W	$0000,$014C
+				DC.W	defmBounds_B100-1
+				DC.W	(OBM100RB/4)-1
+				
+								
+				ENDWITH
+				
+				If ForRom Then
+				Endp
+				Endif
+				End

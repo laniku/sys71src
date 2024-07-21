@@ -1,0 +1,375 @@
+;____________________________________________________________________________________
+;
+;	File:		HALc96_PSC.a
+;
+;	Contains:	Stuff for 53c96/PSC machines (Cyclone)
+;
+;	Written by:	Paul Wolf
+;
+;	Copyright:	© 1990-1993 by Apple Computer, Inc., all rights reserved.
+;
+;
+;	Change History (most recent first):
+;
+;	  <SM28>	11/22/93	pdw		Rolling in from <MCxx>.
+;	  <SM27>	10/29/93	DCB		Getting rid of warnings.
+;	  <SM26>	10/27/93	DCB		Saving ChanlControl in the Halg so Cyclone doesn't choke on
+;									itself.
+;	  <SM25>	10/14/93	pdw		<MC> roll-in.
+;	   <MC2>	10/12/93	pdw		Added support for Synchronous data transfers, rewrote State
+;									Machine, message handling etc.
+;	  <SM24>	  9/9/93	pdw		Lots of little changes.  Name changes, temporary cache_bug
+;									stuff.
+;	  <SM23>	 7/17/93	pdw		Added this minDMAsize thing.
+;	  <SM22>	 6/29/93	pdw		Massive checkins: Change asynchronicity mechanism to CallMachine
+;									stack switching mechanism.  Adding support for Cold Fusion.
+;									Rearranging HW/SW Init code. Some code optimizations.
+;	  <SM21>	  5/5/93	PW		Converted names to meanies-friendly names.  Updated with latest
+;									from Ludwig stuff.
+;	  <LW11>	  5/1/93	PW		Removed PSC register write retries (old PSC bug workaround).
+;	   <LW9>	 3/26/93	PW		Removed generic DMA routines from this file and put them into
+;									HALc96DMA.a.
+;	  <SM19>	 3/20/93	PW		New (effectively).  Split HALc96PSC.a into 2 files - this one
+;									and HALc96DMA.a to better handle alternate DMA hardware (i.e.
+;									AMIC).
+;
+;____________________________________________________________________________________
+
+
+			MACHINE		MC68020			; '020-level
+			BLANKS		ON				; assembler accepts spaces & tabs in operand field
+			PRINT		OFF				; do not send subsequent lines to the listing file
+										;	don't print includes
+
+	
+			LOAD		'StandardEqu.d'
+;			INCLUDE		'HardwarePrivateEqu.a'
+			INCLUDE		'HardwareEqu.a'											;						
+			INCLUDE		'UniversalEqu.a'		; for TestFor											
+			INCLUDE		'Debug.a'				; for NAME macro		
+
+			INCLUDE		'SCSI.a'
+			INCLUDE		'SCSIEqu53c96.a'
+			INCLUDE		'ACAM.a'
+			INCLUDE 	'SIMCoreEqu.a'
+			
+			INCLUDE 	'HALc96equ.a'
+			INCLUDE		'PSCequ.a'
+
+			PRINT		ON				; do send subsequent lines to the listing files
+			CASE		OBJECT
+			
+			
+			IMPORT		RecordEvent
+			IMPORT		OneByteRead,	OneByteWrite
+			
+
+
+;==========================================================================
+ IF 0 THEN		; from PSCEqu.a  $50F31000 +
+	SCSI_CNTL		EQU	$C00			; Channel 0 control register
+	SCSI			EQU	$1000			; Channel 0 base
+	SCSI_ADDR0		EQU	$1000			; Register Set 0 address register
+	SCSI_CNT0		EQU	$1004			; Register Set 0 count register
+	SCSI_CMDSTAT0	EQU	$1008			; Register Set 0 command/status register
+	SCSI_ADDR1		EQU	$1010			; Register Set 1 address register
+	SCSI_CNT1		EQU	$1014			; Register Set 1 count register
+	SCSI_CMDSTAT1	EQU	$1018			; Register Set 1 command/status register
+
+; 
+; PSC DMA Channel Register offsets
+;	
+
+PSC_DMA_CHNL	RECORD	0			; PSC DMA Channel record for use
+Addr			DS.L	1			; with Channel base equ's below, 
+Cnt				DS.L	1			; SCSI_CHNL, MACE_RECV_CHNL, etc.
+CmdStat			DS.W	1
+				ENDR
+ ENDIF
+;==========================================================================
+
+
+;ÑÑÑ DMA Channel Control Register bit offsets
+
+PSCChannelBits	RECORD	0
+
+unused0		ds.b	8
+CIRQ		ds.b	1		; 8
+FLUSH		ds.b	1		; 9
+PAUSE		ds.b	1		; 10
+SWRESET 	ds.b	1		; 11
+CIE			ds.b	1		; 12
+BERR		ds.b	1		; 13
+FROZEN		ds.b	1		; 14
+
+				ENDR
+
+;ÑÑÑÑ DMA Channel Set Command/Status Register bit offsets
+	
+PSCSetBits		RECORD	0
+
+unused0		ds.b	8
+IF 			ds.b	1		; 8
+DIR			ds.b	1		; 9
+TERMCNT		ds.b	1		; 10
+ENABLED 	ds.b	1		; 11
+IE			ds.b	1		; 12
+unused13	ds.b	2
+SENSE		ds.b	1		; 15	
+
+				ENDR
+
+kmWriteOnes		equ		1<<PSCSetBits.SENSE
+kmSET			equ		$1			; only 1 bit valid for set indication
+kPSC_SetOffset	equ		$10			; distance between set control registers
+knbPSC_SetOffset	equ	$4			; number of bits to shift for set offset
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ			
+StackFrame			RECORD	{link},DECR
+
+;---- parameters ----
+direction			ds.w	1		; direction of transfer (kIn or kOut)
+byteCount			ds.l	1		; number of bytes to transfer
+bufferAddr			ds.l	1		; source/dest buffer for DMA transfer
+
+;---- mechanics
+returnAddr			ds.l	1		; return address
+link				ds.l	1		; location of old A6 (after LINK A6)
+
+;----
+linkSize		EQU	*
+
+					ENDR
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ			
+
+
+
+trashedRegs		EQU		A2		
+
+; ÑÑÑÑÑÑÑÑ Internal:ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+A2_SetRegs		EQU		A2		; ptr to the now active register set
+A1_ChanlControl	EQU		A1
+
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ			
+StartPSC		PROC	EXPORT
+
+;
+; Register Usage:
+;
+; ÑÑÑÑÑÑÑÑ On Entry:ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;
+;
+; ÑÑÑÑÑÑÑÑ On Exit:ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+D0_result		EQU		D0		;.w :
+;
+;
+;
+		
+		WITH	StackFrame, HALc96GlobalRecord, PSC_DMA_CHNL
+
+			link	a6, #linkSize
+			move.l	A2, -(sp)
+;
+; Get ptrs to PSC regs in A2 and A1
+;
+
+			movea.l	UnivInfoPtr, A1						; get pointer to ProductInfo
+			adda.l	ProductInfo.DecoderInfoPtr(A1), A1	; point to the base address table
+			move.l	DecoderInfo.PSCAddr(A1), A2
+			
+			lea		SCSI_CNTL(A2), A1_ChanlControl		; set up A1 (whole channel control reg)
+			lea		SCSI(A2), A2_SetRegs				; set up A2 (top of active set's registers)
+			move.l	A1_ChanlControl, HALc96GlobalRecord.chanlControl(A5)
+
+; PAUSE	the channel	
+;
+			IMPORT	PausePSC
+			bsr		PausePSC
+;			
+; Displace A2 to point to the Active set's registers
+;
+			move.w	(A1_ChanlControl), D0
+			and.w	#kmSET, D0							; which is the current set?
+			lsl.w	#knbPSC_SetOffset, D0
+			add.w	D0, A2_SetRegs						; active set's register base
+			
+			move.w	CmdStat(A2_SetRegs), D0
+;			btst	#ENABLED, D0						; is the active set ENABLED?
+;			beq.s	@1
+;		_debugger										; trap if it is (pre-alpha) it should be stable
+@1
+
+;
+; Set up set registers; count, addr and cmdStat (direction, intFlag cleared, ENABLED)
+;
+			move.l	byteCount(a6), Cnt(A2_SetRegs)			; <removed retry><LW11> pdw F§
+			move.l	bufferAddr(a6), Addr(A2_SetRegs)		; <removed retry><LW11> pdw F§
+			
+			move.w	#1<<DIR, d0								; direction : if out, clear (with SENSE=0)
+			tst.w	direction(a6)
+			beq.s	@dirOut
+			
+			or.w	#1<<SENSE, d0							; if in, set (with SENSE=1)
+@dirOut
+			move.w	d0, CmdStat(A2_SetRegs)					; write direction to reg
+			move.w	#1<<PSCSetBits.IF, CmdStat(A2_SetRegs)	; clear InterruptFlag
+				
+			move.w	#(1<<SENSE) + (1<<PSCSetBits.ENABLED), CmdStat(A2_SetRegs)	; ENABLE this set
+			
+;
+; UnPAUSE and return to caller
+;
+			move.w	#(1<<PSCChannelBits.PAUSE), (A1_ChanlControl)
+			
+			move.l	A1_ChanlControl, chanlControl(A5)
+			move.l	A2_SetRegs, setRegs(A5)
+
+			move.l	(sp)+, A2
+			unlk	a6
+			rts
+
+		NAME 'StartPSC'
+				
+			ENDWITH
+			ENDPROC
+			
+
+;--------------------------------------------------------------------------
+
+PausePSC	PROC	EXPORT
+;
+			move.l	HALc96GlobalRecord.chanlControl(A5), A1_ChanlControl
+			move.w	#(1<<SENSE)+(1<<PSCChannelBits.PAUSE), (A1_ChanlControl)	; PAUSE the whole channel
+@frozenWait
+			move.w	(A1_ChanlControl), D0
+			btst	#PSCChannelBits.FROZEN, D0
+			beq.s	@frozenWait
+			rts
+
+		NAME 'PausePSC'
+			
+			ENDPROC
+
+			
+;--------------------------------------------------------------------------
+
+Wt4PSCComplete	PROC	EXPORT
+
+		WITH	HALc96GlobalRecord, PSC_DMA_CHNL
+
+			move.l	A2, -(sp)
+
+			move.l	chanlControl(A5), A1_ChanlControl
+			move.l	setRegs(A5), A2_SetRegs
+
+@loop		btst	#CIRQ, CmdStat(A2_SetRegs)
+			beq.s	@loop
+
+@loop2		btst	#ENABLED, CmdStat(A2_SetRegs)		; because somehow we ended up in the
+			bne.s	@loop2								; next DMA with a set ENABLED!
+
+			move.l	Cnt(A2_SetRegs), D0
+
+			move.l	(sp)+, A2
+			rts
+						
+		NAME 'Wt4PSCComplete'
+			
+			ENDWITH
+			ENDPROC
+			
+			
+;--------------------------------------------------------------------------
+
+StopPSCRead			PROC	EXPORT
+;
+; Pauses and returns D0 = number of bytes left in count register
+;
+
+		WITH	HALc96GlobalRecord, PSC_DMA_CHNL
+
+			move.l	A2, -(sp)
+
+			move.l	chanlControl(A5), A1_ChanlControl
+			move.l	setRegs(A5), A2_SetRegs
+;
+; Check to see if transfer is complete.
+;
+			btst	#PSCSetBits.TERMCNT, CmdStat(A2_SetRegs)
+			bne.s	@finishedDMA			
+;
+; FLUSH the PSC FIFO then wait for its completion.
+;
+			move.w	#(1<<SENSE)+(1<<PSCChannelBits.FLUSH), (A1_ChanlControl)	; FLUSH the channel
+@wt4Flushed
+			btst	#PSCChannelBits.FLUSH, (A1_ChanlControl)	; flushing?
+			bne.s	@wt4Flushed									; if still Flushing, repeat
+;
+; Pause the channel then get the Cnt register
+;
+			IMPORT	PausePSC
+			bsr		PausePSC
+@getCount
+			move.l	Cnt(A2_SetRegs), D0							; get count 
+			beq.s	@exit
+@putZeroCount
+			move.l	#0, Cnt(A2_SetRegs)
+			tst.l	Cnt(A2_SetRegs)
+			bne.s	@putZeroCount
+			bra.s	@exit
+			
+@finishedDMA
+			moveq.l	#0, D0
+@exit
+			move.l	(sp)+, A2
+			rts
+						
+		NAME 'StopPSCRead'
+			
+			ENDWITH
+			ENDPROC
+			
+			
+;--------------------------------------------------------------------------
+
+StopPSCWrite			PROC	EXPORT
+;
+; Pauses and returns D0 = number of bytes left in count register
+;
+
+		WITH	HALc96GlobalRecord, PSC_DMA_CHNL
+			IMPORT	PausePSC
+
+			move.l	A2, -(sp)
+
+			move.l	chanlControl(A5), A1_ChanlControl
+			move.l	setRegs(A5), A2_SetRegs
+;
+; Check to see if transfer is complete.  If it is then exit with D0=0
+;
+			btst	#PSCSetBits.TERMCNT, CmdStat(A2_SetRegs)
+			bne.s	@finishedDMA			
+
+;
+; Pause the channel then get the Cnt register then reset the channel (flush unwritten data)
+;
+@getCount
+			bsr		PausePSC
+			move.l	Cnt(A2_SetRegs), D0					; get count 
+			move.w	#(1<<SENSE)+(1<<PSCChannelBits.SWRESET), (A1_ChanlControl)	; FLUSH the channel
+			bra.s	@exit
+			
+@finishedDMA
+			moveq.l	#0, D0
+@exit
+			move.l	(sp)+, A2
+			rts
+						
+		NAME 'StopPSCWrite'
+			
+			ENDWITH
+			ENDPROC
+			
+			END
+			

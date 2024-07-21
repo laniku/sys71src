@@ -1,0 +1,1540 @@
+************************************************************************
+;
+;	File:		CudaMgr.a
+;
+;	Contains:	Contains low level code to support sending and receiving
+;				packets (ADB, Pseudo Commands, Ticks, etc) to/from the Cuda
+;				6805uC.  Uses some common routines that are in EgretMgr.a and 
+;				EgretPatches.a.  The Egret/Caboose Firmware and the Cuda firmware
+;				use the same globals area and parameter blocks.
+;
+;
+;	Written by:		Gary Rensberger
+;	Modified by:	Gus Andrade
+;	Cuda Port by:	Ray Montagne
+;	Modified by:	Greg Schroeder
+;
+;	Copyright	© 1990-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM14>	 11/9/93	KW		added some eieioSTP macros.  Only expands for CygnusX1 ROM
+;	  <SM13>	 9/29/93	SAM		From mc900ftjesus.
+;	   <MC2>	 9/25/93	SAM		Sucked over CudaDispatch from CudaMgrPatch.a (in the Gibbly).
+;	  <SM12>	 6/14/93	kc		Roll in Ludwig.
+;	   <LW8>	 6/11/93	chp		Enabling interrupts too broadly across the Cuda Manager results
+;									in frequent system hangs when using LocalTalk. Extensive
+;									performance analysis indicates that Cuda Manager interrupt
+;									latency is worst when calling _CudaDispatch with interrupts
+;									masked (see also: the Reliability Manager) and in the loop
+;									waiting for the first byte of a command packet to shift out of
+;									the VIA. SCC interrupts are now reenabled just before this wait
+;									loop, but not in CudaShiftRegisterIRQ.
+;	   <LW7>	 5/21/93	GS		(chp,mal,fau)  Really fixed the LW6 fix of making sure the
+;									interrupt level moves from 7 back down to 3 after the first byte
+;									of the transaction has been moved into the Shift Reg in
+;									CudaDispatch.
+;	   <LW6>	 5/14/93	GS		Changed the interrupt level from level 3 to 7 around some time
+;									critical code during the sample of the TReq line and moving the
+;									first byte of a transaction into the SR of the VIA.
+;	   <LW5>	 5/10/93	chp		During Cuda transactions, disable interrupts only through level
+;									3 instead of through level 6. This markedly improves handling of
+;									MIDI, DMA, and DSP interrupts. Fixes RADAR #1059613. Reviewed by
+;									God and both houses of Parliament.
+;	   <LW4>	 1/28/93	mal		Fixed typo where D7 used instead of D0. Fixes bug #1062496.
+;	   <LW3>	 1/14/93	GS		Fix a mis-typed label.
+;	   <LW2>	 1/14/93	GS		(RBM)  Fix the occassional hang at boot.  When outputing from
+;									the VIA to Cuda, the interrupt will occur prior to the rising
+;									edge of CB1.  Delay long enough for the edge to occur before
+;									acknowledging the shift register interrupt.
+;	  <SM11>	11/20/92	GS		Removed the support for the Cuda PDMsgs by removing routines
+;									CudaPDMPatch, CudaKeyBdSwHandler, and associated routines.  This
+;									function is now handled by the Gibbly.
+;	  <SM10>	 11/5/92	SWC		Changed ShutdownEqu.a->Shutdown.a.
+;	   <SM9>	10/20/92	fau		Changed CudaInit to use A2 instead of A1.  This was required
+;									because routines in Universal.a that happenned after the call to
+;									CudaInit were depending on A1 being set up.
+;	   <SM8>	 10/8/92	GS		Added code to the KeybdSwHnadler to inhibit calls to the
+;									OSDispatcher if the Trap is not yet installed by the System.
+;	   <SM7>	 10/7/92	GS		[RBM,TJR]  Added call to initialize vector in Cuda manager
+;									globals with pointer to the power message resume procedure.
+;									Added dispatch selector to execute the power message resume
+;									procedure.
+;									Needed to initialize the high word of d7 before going to
+;									Error1Handler.
+;									If interrupts get disabled while Cuda is in the process of
+;									generating an IDLE acknowledge, a subsequent attention byte
+;									could cause the IDLE acknowledge and ATTENTION byte to be
+;									appended into the current response packet.
+;									Changed the handling of response packets such that when the last
+;									byte has been received, the Cuda manager will wait for the IDLE
+;									acknowledge (should occur within 71.5µS minimum of negation of
+;									TIP).
+;	   <SM6>	 9/18/92	GS		Re-Enable the CudaEnableKeybdNMI routine because of the Vector
+;									table. Cuda No longer uses this routine, but there was a vector
+;									set aside for it. This needs to be addressed in a later version
+;									of the ROM.
+;	   <SM5>	 9/18/92	GS		(rbm)  If interrupts get disabled while Cuda is in the process
+;									ofgenerating an IDLE acknowledge, a subsequent attention byte
+;									could cause the IDLE acknowledge and ATTENTION byte to
+;									beappended into the current response packet. Changed the
+;									handling of response packets such that when the last byte has
+;									been received, the Cuda manager will wait for the IDLE
+;									acknowledge (should occur within 71.5µS minimum of negation of
+;									TIP).
+;									(gaa/rbm)	Modified CudaInit to check if Cuda was trying to start
+;									a transaction prior to starting the Sync Ack process.  This
+;									fixed a bug where DeadCuda was called because the timeout would
+;									be reached because
+;									Cuda was trying to start a transaction and the system side
+;									thought that it was in the middle of a Sync Ack cycle.
+;									Update Tickle Timer to 160 count.  Decr Timer in Cuda FW is at
+;									16cnts/sec.
+;									Remove Completion routine in TickleCuda routine.
+;	   <SM5>	 8/24/92	GS		Added code in the IRQDispatcher to fix the bug that passed back
+;									data in a Read6805 request, when the data bytes reqquessted was
+;									zero.  The fix will chk the recvDataCnt var of the Parm blk before
+;									placing data in the recv buffer ptr.
+;	   <SM4>	 6/30/92	GS		Fixed a problem in the Cuda Dispatcher.  If a collision occurs,
+;									wait for the busy state flag to be cleared by the IdleAck
+;									handler before accepting another command.  This problem causes
+;									the ADB transactions to get out of sync and the system will
+;									hang.
+;	   <SM3>	 6/26/92	GS		(RBM)  Updated 'SetTransferParams' so that special setup for
+;									'RdWrIIC' is performed. This command requires a non conforming
+;									parameter
+;									block in that the EgretPB.ByteCnt requires the number of bytes
+;									to send prior to the data portion of the IIC transaction and
+;									EgretPB.BufPtr points to a pString. On write, the pString
+;									contains the data to write while on read operations, the pString
+;									contains only a count of bytes to read. Data is then returned
+;									inthe pString.
+;									Removed Cuda Cmds to enable Keyboard NMI, and IIC mode.  These
+;									are no longer need, because KeyboardNMI now defaults to Enabled.
+;									SetDFACorIIC mode is no longer a command.  IIC and DFAC both use
+;									use the Data and Clk pins in the same mode.
+;									EnableWakeUpMode is now done with a CDev.
+;									
+;	   <SM2>	 5/25/92	RB		Removed definition of 'CUDA' since it has a conflict with
+;									another symbol and it is not used anyway. Also got rid of
+;									'branch to next instruction warning.
+;		 <1>	 5/22/92	RB		first checked in
+;		<SM1>	 5/21/92	RB		First Checked in.  Got rid of OverPatch area and PadForOverPatch
+;									conditionals.
+;		<P4>	  3/23/92	GS		Fixed bug in code rolled in from the Regatta System files in
+;									the CudaShiftRegIRQ routine.  Incorrectly, entered the 
+;									tickcompletion routine with bogus values then placed into the
+;									TIME lomem
+;		<P3>	  3/3/92	GS		Updated the INIT of Cuda to include the IIC and Wakeup modes.
+;									Also added the Enable Keybd NMI cmd to CudaINIT.
+;		<P2>	 2/10/92	GS		Cleaned up some comments.  Must return here to add in code for
+;									checks of the use of DFAC or IIC mode used on Cuda depending on
+;									machine type.
+;		 <1>	 1/16/92	GS		first checked in
+; ———————————————————————————————————————————————————————————————————————————————————————
+;	  Pre-Pandora ROM comments begin here.
+; ———————————————————————————————————————————————————————————————————————————————————————
+; ———————————————————————————————————————————————————————————————————————————————————————
+;	 Previous history
+; ———————————————————————————————————————————————————————————————————————————————————————
+;	Changes for Cuda:
+;		 {9}	08/21/91	gjs		added patch to align code in Egret/Cuda Dispatch code.  Patch
+;									placed in CudaPatches.a
+;		 {8}	07/30/91	gjs		Preserved/Restored status register on calls to the completion
+;									routines in ShiftRegIRQ routine at @Implicit, and at routine
+;									delay100us
+;		 {7}	07/03/91	gjs		Overpatched the CudaInit code into CudaPatchesToo.a
+;									added Export DeadCuda
+;		 {6}	06/24/91	gjs		Rolled the Cuda Manager changes into Terror
+;		 <5>	 2/20/91	BG		Fixed error in CheckPacket. The check for allowable
+;									pseudo-packets was a hard-coded name check instead of an
+;									end-of-table check.
+;		 <4>	12/11/90	JJ		Mac LC: Changes references to VISAChipBit to V8ChipBit.
+;		 <3>	 12/7/90	CCH		Adjusted the patch code in CheckPacket so that it fits in the
+;									same number of bytes as the original code.
+;		 <2>	 12/6/90	BG		(with GA) Rolled in Eclipse-related Egret/Caboose changes.
+;
+;		<01>	12/6/90		RBM		Ported Cuda manager from Egret manager <Eclipse version>.  
+;									Due to major changes in the transaction protocol, Egret is no longer supported.
+;									ROM builds should include IF HasCUDA for startinit & diagnostics.
+;									Changed handshake protocol to implement CUDA.  Eliminated timed
+;									assertions/negations & inverted polarity of handshake lines that
+;									are controlled by the system.  Handshake line signal names have
+;									been changed to avoid confusion in usage.  Added an Idle State
+;									acknowledgement after termination of a response packet transaction.
+;									Exit from ShiftRegIrq now restores the interrupt mask on exit from
+;									transmission of command packet data.
+;
+;									Restructured code in ShiftRegIrq so that testing the TReq handshake
+;									line does not occur after manipulation of TIP or ByteAck.
+;
+;									CudaInit no longer needs to send a NOP command to turn off the
+;									asynchronous transaction sources on ReBoot.  This function is
+;									performed through a 'SYNC' handshake sequence which disables 
+;									all asynchronous message sources.
+;
+;									Exported routines are in a jump table so that any future overpatching
+;									may be a little easier to implement.
+;
+************************************************************************
+				machine		mc68020
+
+				BLANKS		ON
+				STRING		ASIS
+
+				PRINT		OFF
+				LOAD		'StandardEqu.d'
+				INCLUDE		'HardwarePrivateEqu.a'
+				INCLUDE		'UniversalEqu.a'
+				INCLUDE		'DebugMonEqu.a'
+				INCLUDE		'ShutDown.a'
+				include		'EgretEqu.a'
+				PRINT		ON
+ 				eject
+ 
+CudaMgr			PROC		EXPORT		;	{	CudaMgr Proc
+
+				EXPORT		CudaDispatch, SendCudaCmd, CudaInit
+				EXPORT		CudaTickHandler, CudaShiftRegIRQ
+				
+				IMPORT		GetHardwareInfo, Error1Handler
+				IMPORT		SetResponseParams, CheckPacket
+				IMPORT		PseudoCntTable,ADBCntTable
+
+CudaDebug		EQU		1				; Enables Debug features during development
+ErrCudaInit		equ		$0030			; TEMPORARY definition of error equate defined in STEQU.a
+
+
+			WITH 	EgretGlobals,EgretPB,RespHeader		
+			eject						;	{ 	With
+;________________________________________________________________________________________________
+;	Routine:	CudaDispatch
+;
+;	Function:	This is the Cuda manager trap routine.  It waits for Cuda to be idle, sends
+;				the first byte of the command packet.  If Cuda didn't abort, then it sets up
+;				globals for the IRQ handler, and if a completion routine was specified, it returns
+;				back to the caller.  If no completion routine, then it waits synchronously for
+;				the command/response to finish, using the busy bit.  When the IRQ handler has finished
+;				the response packet, it preps the globals to expect an auto-response packet 
+;				(ticks or ADB), clears 'busy' and calls the completion routine (if any).
+;
+;	Inputs:		a0	-	pointer to parameter block as follows…
+;
+;						pbPacketType	dc.b	
+;						pbCmd			dc.b	
+;						pbParam			dc.b	
+;										dc.b	
+;										dc.b	
+;										dc.b	
+;						pbByteCnt		dc.w	
+;						pbBufPtr		dc.l	
+;						pbFlags			dc.b	
+;										dc.b	
+;						pbResult		dc.w	
+;						pbCompletion	dc.l	
+;
+;	Outputs:	d0	-	result (0 for now)
+;
+;	Destroys:	a0-a2, d0-d1
+;________________________________________________________________________________________________
+
+CudaDispatch
+			jsr		CheckCudaPacket				; Validate the Packet type & command byte
+			tst.w	pbResult(a0)				; is packet ok?
+			bne		@done						; Exit if Error packet
+			movea.l	EgretBase,a2				; a2 gets ptr to globals
+			movea.l	VIA,a1						; a1 points to VIA base			
+
+			cmpi.b	#specialPkt,pbCmdType(a0)	; is this a special command?
+
+			bne.s	@ckPDMInit					; check for Eclipse PowerDown Message Initialization
+			move.l	a0,ADBpb(a2)				; yes, is to set the ADB param block (for autopoll data).
+			bra		@done
+@ckPDMInit	
+			cmpi.b	#PDMVectPkt,pbCmdType(a0)	; check for PowerDown message vector Init
+			bne.s	@ckContInit
+			move.l	pbParam(a0),PDMComp(a2)		; handler for Eclipse PowerDown Message Packet
+			bra		@done
+@ckContInit
+			cmpi.b	#ContinueVectPkt,pbCmdType(a0)	; check for PowerDown message vector Init
+			bne.s	@ckDoCont
+			move.l	pbParam(a0),ContinueComp(a2)	; handler for power message continue procedure
+			bra		@done
+@ckDoCont
+			cmpi.b	#DoContinueProc,pbCmdType(a0)	; check for PowerDown message vector Init
+			bne.s	@CudaRestart				; Must be Egret Command
+			tst.l	ContinueComp(a2)			; is there a continue procedure?
+			beq		@done						; no, then do nothing
+			lea		ContinueComp(a2),a2
+			move.l	(a2),a2
+			jsr		(a2)						; else, execute the continue procedure
+			bra		@done
+
+@CudaRestart
+			move.w	sr,-(sp)					; save SR
+			ori.w	#hiIntMask,sr				; mask interrupts
+			
+		eieioSTP
+			btst.b	#TReq,vBufB(a1)				; does Cuda want to abort?
+		eieioSTP
+			beq.s	@abort						; yes, wait for it to go away
+			btst.b	#busy,flags(a2)				; has an idle acknowledge occured?
+			bne.s	@abort						; no, then wait for it!
+			bset.b	#busy,flags(a2)				; not an abort, mark that we're busy.
+			beq.s	@sendPackType				; we were not busy before, so try to send the first byte
+			
+@abort		move.w	(sp)+,sr					; we were busy, enable interrupts
+			jsr		pollByte					; poll shift reg, calling handler if interrupts masked
+			bra.s	@CudaRestart				; and keep waiting for busy to go away...
+
+@sendPackType									; interrupts masked here
+		eieioSTP
+			bset.b	#SRdir,vACR(a1)				; switch to output, Define direction FROM System		
+		eieioSTP
+			move.b	pbCmdType(a0),vSR(a1)		; send command packet to shift reg
+		eieioSTP
+			bset.b	#vByteAck,vBufB(a1)			; make sure state is idle before transaction
+		eieioSTP
+			bclr.b	#TIP,vBufB(a1)				; assert TIP (we're starting command packet)
+		eieioSTP
+
+;
+;		If PollProc exists, Poll the SCC and save any available data
+;		When the shift register irq comes in call the PollProc
+;		then process the shift register irq data
+;
+			movem.l	d0/d1/a0-a4/a6,-(sp)		; save some registers
+			move.l	PollStack,-(sp)				; save previous poll stack
+			lea		@zero, a3
+			move.l	sp,PollStack				; Pointer to buffer for polled bytes
+
+;			btst.b	#0,SccIopFlag				; Check if we are in IOP mode (On Eclipse...)
+;			beq.s	@wait
+
+			tst.l	PollProc					; Check for a Poll Proc available
+			beq.s	@wait						;
+
+			movea.l	SccRd,a3					; SCC may have data to get
+			movea.l	a3,a6
+			addq.l	#Actl,a3					; Point to data available register (RR0)
+			addq.l	#AData,a6					; Point to the SCC data register
+
+@wait		btst.b	#RxCa,(a3)					; Test for SCC data available
+			beq.s	@2
+			move.b	(a6),-(sp)					; Push the data on the stack
+@2
+		eieioSTP
+			btst.b	#vShift,vIFR(a1)			; now wait for shift reg IRQ
+		eieioSTP
+			beq.s	@wait
+
+			cmpa.l	PollStack,SP				; Is there any poll data
+			beq.s	@NoSCCData
+;
+;		We have SCC data and a Poll Proc to call.  Go call it
+;
+			pea		@NoSCCData					; Return addr for PollProc
+			move.l	PollProc,-(SP)				; Point to the PollProc
+			rts									; Call the PollProc
+
+@zero		dc.w	0
+
+@NoSCCData
+			move.l	(sp)+,PollStack				; restore previous poll stack
+			movem.l	(sp)+,d0/d1/a0-a4/a6		; restore work registers
+		eieioSTP
+			btst.b	#TReq,vBufB(a1)				; did CUDA abort?		
+		eieioSTP
+			bne.s	@accepted					; no, then it will accept our packet
+;-----------------------------------------------------------------------------------------------
+;	Note that changing the VIA mode can generate an edge internal to the VIA which will
+;	increment the bit count for the next byte to be shifted.
+;	When outputing from the VIA to Cuda, the interrupt will occur prior to the rising edge
+;	of CB1.  Delay long enough for the edge to occur before acknowledging the shift
+;	register interrupt.	(R. Montagne	1/11/93)
+;________________________________________________________________________________________________
+			moveq	#10,d0						; delay for 10µS min.
+@mode7delay
+		eieioSTP
+			tst.b	vBufB(a1)					; 1.2µS per access
+		eieioSTP
+			dbra	d0,@mode7delay
+			
+		eieioSTP
+			bclr.b	#SRdir,vACR(a1)				; yes, switch back to input
+		eieioSTP
+			tst.b	vSR(a1)						; clear pending shift register interrupt
+		eieioSTP
+			ori.b	#((1<<TIP)|\				; abort the current transaction
+					(1<<vByteAck)),vBufB(a1)	;						
+		eieioSTP
+@abortAck
+		eieioSTP
+			btst.b	#ifSR,vIFR(a1)				; now wait for shift reg IRQ to acknowledge abort
+		eieioSTP
+			beq.s	@abortAck					;						
+			jsr		CudaCallShiftRegIRQ			; handle it				
+			bra.s	@abort						; and wait				
+@accepted										; we sent the packetType, now set up for the IRQ handler
+			jsr		SetTransferParams			; setup globals for this packet
+			jsr		CudaCallShiftRegIRQ			; transfer second byte (command) to start things
+			move.w	(sp)+,sr					; now enable interrupts
+			
+			tst.l	pbCompletion(a0)			; do we have a completion routine
+			bne.s	@done						; yes, then return asynchronously
+			
+@waitComplete
+			btst.b	#busy,flags(a2)				; otherwise, are we still busy?
+			beq.s	@done						; no, then we're done...
+			
+			jsr		pollByte					; yes, poll out a byte if necessary
+			bra.s	@waitComplete				; and wait here (synchronously)
+
+@done		moveq	#0,d0						; no errors for now
+			rts
+
+;________________________________________________________________________________________________
+;	Routine:	PollByte
+;
+;	Function:	This routine checks to see if level 1 interrupts are masked, exits if not.  
+;				If masked, it polls the flag register for a shift reg interrupt, and 
+;				calls the handler if found.
+;
+;	Inputs:		a1	-	VIA base ptr
+;				a2	-	globals pointer
+;
+;	Outputs:	none
+;
+;	Destroys:	d0,d1
+;________________________________________________________________________________________________
+;			Export	PollByte	
+PollByte	
+			move.w	sr,d0						; get 68xxx interrupt mask
+			andi.w	#hiIntMask,d0				; are we at interrupt level?
+			beq.s	@exit						; no, just exit
+		eieioSTP
+			btst.b	#ifSR,vIFR(a1)				; yes, poll the shift reg
+		eieioSTP
+			beq.s	@exit						; no shift reg interrupt, return
+			bsr.s	CudaCallShiftRegIRQ			; yes, handle it
+@exit		rts
+
+
+;________________________________________________________________________________________________
+;	Routine:	SendByte
+;
+;	Function:	This routine transmits a byte by writing to the via shift register and
+;				then changes the state of vByteAck to indicate that the via shift register
+;				contains data ready to be read.
+;
+;	Inputs:		d0	-	byte to send
+;				a1	-	VIA base ptr
+;				
+;	Outputs:	none
+;
+;	Destroys:	d1
+;________________________________________________________________________________________________
+;			Export	SendByte	
+SendByte
+		eieioSTP
+			move.b	d0,vSR(a1)					; send the byte to the shift reg
+		eieioSTP
+			eori.b	#1<<vByteAck,vBufB(a1)		; let Cuda know it's there
+		eieioSTP
+			rts
+
+;________________________________________________________________________________________________
+			Export	CudaCallShiftRegIRQ	
+CudaCallShiftRegIRQ
+			movem.l	a0-a3/d0-d3, -(sp)			; save regs like interrupt handler does
+			move.w	sr, -(sp)					; save status reg
+			movea.l  Lvl1DT+8,a0	        	; get the shift reg IRQ handler
+			jsr		(a0)						; call it
+			move.w	(sp)+, sr					; restore status reg
+			movem.l	(sp)+, a0-a3/d0-d3			; restore regs
+			rts
+
+
+;________________________________________________________________________________________________
+;	Routine:	CudaShiftRegIRQ
+;
+;	Function:	This routine is called in response to a VIA shift reg interrupt.  It will transfer
+;				the next byte in the current packet.  When the packet is complete, the globals are
+;				prepped for an auto-response packet (ADB/Ticks), then the completion routine
+;				is called (if present).
+;
+;	Cuda Transaction States -
+;						___					____
+;			ViaDir		TIP		vByteAck	TReq
+;			   0		 0		   0		  0		Receive Data Byte
+;			   0		 0		   0		  1		Receive Last Data Byte
+;			   0		 0		   1		  0		Receive Data Byte
+;			   0		 0		   1		  1		Receive Last Data Byte
+;			   0		 1		   0		  0		Abort/Sync
+;			   0		 1		   0		  1		Abort/Sync
+;			   0		 1		   1		  0		Attention
+;			   0		 1		   1		  1		Idle
+;			   1		 0		   0		  0		illegal
+;			   1		 0		   0		  1		Transmit Data Byte
+;			   1		 0		   1		  0		illegal
+;			   1		 0		   1		  1		Transmit Data Byte
+;			   1		 1		   0		  0		Abort/Sync
+;			   1		 1		   0		  1		Abort/Sync
+;			   1		 1		   1		  0		illegal
+;			   1		 1		   1		  1		Idle
+;
+;	Inputs:		a1	-	VIA base ptr
+;				
+;	Outputs:	a2	-	globals pointer
+;
+;	Destroys:	a0-a2,d0-d3
+;________________________________________________________________________________________________
+CudaShiftRegIRQ
+			move.w	sr,d3
+			ori.w	#hiIntMask,sr				; mask interrupts						<LW8><LW5>
+			movea.l	EgretBase,a2				; get ptr to globals <13>
+			bset.b	#busy,flags(a2)				; make sure we're marked as busy
+			
+		eieioSTP
+			btst.b	#SRdir,vACR(a1)				; see if VIA direction is output
+		eieioSTP
+			beq.s	@input						; no, then we're receiving..
+;________________________________________________________________________________________________
+;	When outputing from the VIA to Cuda, the interrupt will occur prior to the rising edge
+;	of CB1.  Delay long enough for the edge to occur before acknowledging the shift
+;	register interrupt.	(R. Montagne	1/11/93)
+;________________________________________________________________________________________________
+			moveq	#10,d0						; delay for 10µS min.					<LW2><VIA rbm>
+@mode7delay
+		eieioSTP
+			tst.b	vBufB(a1)					; 1.2µS per access						<LW2><VIA rbm>
+		eieioSTP
+			dbra	d0,@mode7delay				;										<LW2><VIA rbm>
+		
+		eieioSTP
+			tst.b	vSR(a1)						; clear the shift reg interrupt
+		eieioSTP
+			tst.w	sendHdrCnt(a2)				; any bytes left in header?
+			ble.s	@ckSendData					; no, see if any send bytes left...
+
+			movea.l	sendHdrPtr(a2),a0			; get ptr to header
+			move.b	(a0)+,d0					; get next header byte
+			move.l	a0,sendHdrPtr(a2)			; and update header ptr
+			bsr		SendByte					; send the byte
+			subq.w	#1,sendHdrCnt(a2)			; count it
+			bra		@exit						; and exit
+@ckSendData	
+			tst.w	sendDataCnt(a2)				; any bytes left in data to send
+			ble.s	@CmdFinished				; no, then we're finished with command packet
+			movea.l	sendDataPtr(a2),a0			; get current data ptr
+			move.b	(a0)+,d0					; yes, get next data byte
+			move.l	a0,sendDataPtr(a2)			; and update the ptr
+			bsr		SendByte					; send it
+			subq.w	#1,sendDataCnt(a2)			; count it
+			bra		@exit						; and exit
+@CmdFinished
+		eieioSTP
+			bclr.b	#SRdir,vACR(a1)				; now switch to input
+		eieioSTP
+;________________________________________________________________________________________________
+;	When changing VIA direction, a clock can be generated to the VIA bit counter.  An
+;	access to the shift data register will keep the counter in sync with the communications
+;	protocol to Cuda.
+;________________________________________________________________________________________________
+		eieioSTP
+			tst.b	vSR(a1)						; make sure VIA counter is in sync		<LW2><VIA rbm>
+		eieioSTP
+@sendCmd	
+		eieioSTP
+			ori.b	#((1<<TIP)| \				; terminate transaction	
+					 (1<<vByteAck)),vBufB(a1)	; and set idle state	
+		eieioSTP
+			bra		@exit						; and exit
+			
+@input		;-----------------------------------------------------------------------------
+		eieioSTP
+			move.b	vSR(a1),d0					; read the byte from shift reg into D0			
+		eieioSTP
+			tst.w	rcvHdrCnt(a2)				; any bytes left in response packet header?
+			ble.s	@ckRcvData					; if not then must be data byte
+@getHdrByte
+
+			move.w	rcvHdrIndex(a2),d1			; get index into header
+			lea		rcvHeader(a2),a0			; point to header buffer
+			move.b	d0,(a0,d1.w)				; store byte away
+
+			addq.w	#1,rcvHdrIndex(a2)			; bump to next byte
+			subq.w	#1,rcvHdrCnt(a2)			; count it
+			
+			tst.w	rcvHdrCnt(a2)				; chk header count
+			bgt.s	@ackHdr						; not done with header yet... exit
+;
+;		If we have an error packet in progres then read 5 bytes instead of 4 for the header.
+;		A flag will be set on the fourth byte of an error packet and will be cleared
+;		after reading the fifth byte of the error packet.
+;
+@CheckError	lea		rcvHeader(a2),a0			; point to header buffer
+			cmp.b	#ErrorPkt,1(a0)				; check packet type for error packet
+			bne.s	@ackHdr						; not an error packet go check for data
+
+			bclr.b	#BadPkt,flags(a2)			; check for error packet in progress flag
+			bne.s	@ackHdr						; we read the fifth byte of the error packet
+@readbyte5	addq.w	#1,rcvHdrCnt(a2)			; adjust the count before reading the fifth byte
+			bset.b	#BadPkt,flags(a2)			; set the flag then read the fifth byte
+			bra.s	@ackHdr
+			
+@ckRcvData
+			btst.b	#TIP,vBufB(a1)				; is a transaction in progress?
+			bne.w	@done						; no, don't buffer the idle acknowledge interrupt
+			tst.w	rcvDataCnt(a2)				; is request for zero bytes??						<SM5> 
+			movea.l	rcvDataPtr(a2),a0			; get ptr to receive data buffer
+			beq.s	@zeroReq					; yes, don't pass any data back						<SM5> 
+			move.b	d0,(a0)+					; store the data byte
+@zeroReq			
+		eieioSTP
+			btst.b	#TREQ,vBufB(a1)				; was this the last byte?
+		eieioSTP
+			bne		@lastIrq					; yes, terminate response packet
+			move.l	a0,rcvDataPtr(a2)			; and update data ptr
+			subq.w	#1,rcvDataCnt(a2)			; count it
+			bgt.s	@ack						; not last, normal acknowlege
+			btst.b	#openData,flags(a2)			; is this an open ended data packet?
+			bne.s	@lastIrq					; and we're done
+
+@ack
+			tst.w	rcvDataCnt(a2)				; any receive data bytes to get?
+			ble		@lastIrq					; no, then terminate transaction and exit
+@ackHdr
+			move.b	vBufB(a1),d0				; get current handshake state
+			andi.b	#((1<<TIP)|\
+					(1<<vByteAck)|\
+					(1<<TReq)),d0
+			cmp.b	#((1<<TIP)|\				; is this an idle acknowledge?
+					(1<<vByteAck)|\
+					(1<<TReq)),d0
+			beq.s	@done						; yes, dont handshake.	
+
+			cmp.b	#((1<<TIP)|\				; is this an attention byte?
+					(1<<vByteAck)|\
+					(0<<TReq)),d0
+			beq.s	@attnIrq					; yes					
+
+			andi.b	#((1<<TIP)|\				; now look at TIP and TReq...
+					(0<<vByteAck)|\
+					(1<<TReq)),d0
+			cmp.b	#((0<<TIP)|\				; is this the last byte?
+					(1<<TReq)),d0				; 
+			beq.s	@lastIRQ					; yes					
+
+@dataIrq
+		eieioSTP
+			eori.b	#1<<vByteAck,vBufB(a1)		; acknowledge the current byte
+		eieioSTP
+			bra		@exit						;						
+
+@attnIrq
+		eieioSTP
+			bclr.b	#TIP,vBufB(a1)				; start the response packet transaction
+		eieioSTP
+			bra		@exit						;						
+
+@lastIrq
+		eieioSTP
+			ori.b	#((1<<TIP)|\				; no, terminate the response packet transaction
+					(1<<vByteAck)),vBufB(a1)
+		eieioSTP
+
+;---------------------------------------------------------------------------
+
+;																									<SM6> (rbm)
+;	Now that the response transaction has been terminated, let's wait for the idle					<SM6> (rbm)
+;	acknowledge interrupt to occur.  This should happen about 71.5 µS after the negation			<SM6> (rbm)
+;	of TIP.  This will prevent any problem related to interrupts being masked during the			<SM6> (rbm)
+;	transmission of the idle acknowledge when another asynchronous Cuda transaction is to			<SM6> (rbm)
+;	begin while interrupts are masked (as may happen during disc access while moving the			<SM6> (rbm)
+;	mouse).																							<SM6> (rbm)
+;																									<SM6> (rbm)
+@waitIdleAck									;													<SM6> (rbm)
+		eieioSTP
+			btst.b	#ifSR,vIFR(a1)				; wait for idle state acknowledgement				<SM6> (rbm)
+		eieioSTP
+			beq.s	@waitIdleAck				;													<SM6> (rbm)
+		eieioSTP
+			tst.b	vSR(a1)						; clear the shift reg interrupt						<SM6> (rbm)
+		eieioSTP
+
+;---------------------------------------------------------------------------
+@done
+			movea.l	curPb(a2),a0				; a0 points to current param block
+			lea		rcvHeader(a2),a1			; a1 points to header buffer
+		eieioSTP
+			cmp.b	#ErrorPkt,1(a1)				; check for Error response packet
+		eieioSTP
+			bne.s	@NotError
+;
+;		The current transaction generated an Error <11>
+;
+			move.l	1(a1),pbParam(a0)			; Return the Error Response packet to the caller (dont include attn byte)
+			move.w	#paramErr,pbResult(a0)		; and return a parameter block error
+
+@NotError	cmpa.l	adbPb(a2),a0				; was this an implicit command?
+			beq.s	@implicit					; yes, handle autopoll/tick packet
+			
+			tst.b	1(a1)						; is this an ADB response?
+			bne.s	@ckComp						; no, then data already transfered, call completion
+
+@adbResp
+			cmpa.l	adbPb(a2),a0				; is this autopoll data
+			bne.s	@skip						; no, don't fix ray's flag
+			bset.b	#EgAutoPoll,2(a1)			; yes, fix em
+@skip
+
+			btst.b	#EgAutoPoll,2(a1)			; check status, is this AutoPoll data?			
+			bne		@ckAutoPollComp				; yes, handle if we have completion routine
+		
+			move.b	2(a1),pbFlags(a0)			; explicit ADB command, stuff flags byte
+			move.w	rcvHdrIndex(a2),d0			; get header+data byte count
+			subq.w	#4,d0						; - header bytes
+			beq.s	@dontupdate					; if no data received don't update the byte count
+			move.w	d0,pbByteCnt(a0)			; stuff data byte count
+@dontupdate	move.l	pbBufPtr(a0),a2				; get users buffer ptr
+			addq.w	#4,a1						; point at the data
+			bra.s	@cnt
+@xfer		move.b	(a1)+,(a2)+					; copy the byte
+@cnt		dbra	d0,@xfer					; repeat for all bytes
+			
+			move.l	EgretBase,a2				; get globals ptr again
+
+@ckComp		move.l	pbCompletion(a0),d0			; any completion routine?
+			beq		@exitNoComp					; no, just exit
+
+			move.l	d0,a1						; yes, get it's address
+			move.l	a0,-(sp)					; save param block ptr
+			bigjsr	SetResponseParams,a3		; setup globals to handle auto response packets again
+			move.w	d3,sr						; restore interrupts
+			move.l	(sp)+,a0					; restore param block ptr
+			move.w	sr,-(sp)					; save register for completion routines that trash it	<SM7>
+			jsr		(a1)						; and call it											<SM7>
+			move.w	(sp)+,sr					;														<SM7>
+			rts									;														<SM7>
+
+
+;--------------------------------------------------------------------------------------------			
+; AutoPoll or Tick data, push it on stack and call completion rtn
+
+@implicit
+			tst.b	RespPktType(a1)				; is this an ADB response?
+			beq.s	@ckAutoPollComp				; yes, handle it
+
+			cmpi.b	#tickPkt,RespPktType(a1)	; is this a short tick response?
+			beq.s	@ckTickComp					; yes, handle it (has no param block)
+			cmpi.b	#pseudoPkt,RespPktType(a1)	; no, should be pseudo command tick response
+												; ShiftRegIRQPatch from EgretPatchesToo.a
+			bne.s	@ckPDM						; check for PowerDown Message (Eclipse ONLY)
+			cmpi.b	#RdTime,RespCmd(a1)			; yes, it should be read time
+			bne.s	@exitNoComp					; if not read time ignore the transaction (SHOULD NOT HAPPEN!!)
+			bra.s	@ckTickComp					; otherwise, push response packet on stack, call it.
+												; >>CONTINUE original routine
+;-----------------------------------------------
+;		Eclipse Check for PowerDown Message
+;
+@ckPDM		cmpi.b	#PDMPkt,RespPktType(a1)		; check for PowerDown Message Packet type <GAA Eclipse>
+			bne.s	@exitNoComp					; None of the above Packets ignore it (SHOULD NOT HAPPEN)	
+												; if it does EGRET is Very SICK!!			<P4> 
+;
+;		For PDM packets check for service routine address and
+;		call it if one exists.
+;
+			move.l	PDMComp(a2),d2				; get the completion routine address
+			beq.s	@exitNoComp					; go away if vector is null					<P4> 		
+			bigjsr	SetResponseParams,a3		; setup globals to handle auto response packets again
+			move.l	d2,a3						; call the Service routine
+			move.b	RespCmd(a1),d0				; get the powerDown Switch destination position
+			move.w	sr,d3						; save interrupts
+			jsr		(a3)
+			move.w	d3,sr						; restore interrupts
+			bra.s	@exit						; done, now exit
+												; end  ShiftRegIRQPatch EgretPatchesToo.a	<P4> 			
+@ckTickComp										; tick data, check for completion routine
+			move.l	tickComp(a2),d2				; get completion routine in d2
+			beq.s	@exitNoComp					; none specified, just exit
+			bra.s	@push						; otherwise, push response packet on stack, call it.
+
+@ckAutoPollComp									; ADB autopoll data, check for completion rtn
+			bset.b	#EgAutoPoll,2(a1)			; Set AutoPoll bit to fix bug in old Egret parts
+			tst.l	a0							; do we really have a current param block? (we should)
+			beq.s	@exitNoComp					; no, exit
+			
+			move.l	pbCompletion(a0),d2			; any completion routine? (keep in d2)
+			beq.s	@exitNoComp					; no, just exit
+@push
+			suba.w	#12,sp						; allocate 12 byte buffer on stack
+			movea.l	sp,a2						; point to the buffer
+			move.l	(a1)+,(a2)+					; copy response header 	onto stack
+			move.l	(a1)+,(a2)+					; copy response data 	onto stack
+			move.l	(a1)+,(a2)+					; copy response data 	onto stack
+			movea.l	EgretBase,a2					; restore ptr to globals
+			move.w	rcvHdrIndex(a2),d0			; d0 = # bytes in response header
+			subq.w	#4,d0						; byte count = # data bytes (strip off header bytes)
+			bigjsr	SetResponseParams,a3		; setup globals to handle auto response packets again
+			move.w	d3,sr						; restore interrupts
+
+			move.l	sp,a1						; a1 = ptr to response packet
+			addq.l	#2,a1						; a1 = ptr to status flag
+			move.l	d2,a3						; get completion routine
+
+;
+; ••••• Calling Completion Routine •••••
+;
+;	a0 =	Pointer to parameter block
+;	a1 =	Pointer to status flag in response packet (Cuda Transaction Format)
+;	a2 =	Pointer to Cuda Globals
+;	d0 =	Number of bytes in response packet, excluding Attention, Type, Flags & Command.
+;	
+			move.w  d3, -(sp)					; preserve status reg during completion routine	{8}<gjs>
+			jsr		(a3)						; call it (a0 points to param block for ADB)
+			move.w  (sp)+, d3					; restore status reg					
+			adda.w	#12,sp						; pop buffer
+			rts
+
+@exitNoComp										; no completion routine specified, 
+			bigjsr	SetResponseParams,a3		; setup globals to handle auto response packets again
+@exit											;							
+			move.w	d3,sr						; restore interrupts
+			rts
+
+			Eject
+
+;________________________________________________________________________________________________
+;	Routine:	SetTransferParams
+;
+;	Function:	This routine sets up transmit/receive ptrs (globals) for the packet pointed to by A0, 
+;				for use by the Shift Reg interrupt handler.
+;
+;	Inputs:		a0	-	Param block pointer
+;				a1	-	VIA
+;				a2	-	Ptr to globals (EgretBase)
+;
+;	Outputs:	none
+;	Destroys:	d0,d1
+;________________________________________________________________________________________________
+;			Export	SetTransferParams	
+SetTransferParams
+			move.l	a1,-(sp)						; save a1
+			lea		pbCmd(a0),a1
+			move.l	a1,sendHdrPtr(a2)				; point to 1st byte of header to send
+
+			moveq	#0,d0
+			move.b	pbCmd(a0),d0					; get command
+
+			tst.b	pbCmdType(a0)					; is this an ADB command?
+			bne.s	@pseudo							; no, must be a pseudo command
+
+			andi.b	#%00001111,d0					; keep low 4 bits
+			biglea	ADBCntTable,a1					; get ptr to our ADB command table
+			bra		@check							; and look up our send/rcv byte counts
+			
+;
+;	Pseudo Command. Now Check for SEND DFAC and treat as special case if it is. <12>
+;	On DFAC, use the byte count in the parameter block as the count to send <12>
+;	to Egret instead the count contained in the PseudoCntTable. <12>
+;
+@pseudo
+			cmp.b	#WrDFAC,pbCmd(a0)				; check for DFAC 								<12>
+			bne.s	@notDFAC						; use the table if not DFAC 					<12>
+
+			move.w	pbByteCnt(a0),d1				; was Write DFAC use the byte count in the pBlock <12>
+			addq.w	#1,d1							; include the packet byte already sent 			<12>
+			move.w	d1,sendHdrCnt(a2)				; set up header byte count 						<12>
+			clr.w	sendDataCnt(a2)					; no extended data bytes 						<12>
+			clr.l	sendDataPtr(a2)					; no extended data ptr 							<12>
+			bra		@rcvParams
+			
+@notDFAC	cmp.b	#RdWrIIC,pbCmd(a0)				; check for IIC transaction						<SM3>
+			bne.s	@notRdWrIIC						; use the table if not RdWrIIC					<SM3>
+*
+*	Here is how the transfer globals are set up for IIC transactions…
+*
+*	_Parameter______	_RdWrIIC_(write)_____________		_Parameter______	_RdWrIIC_(read)______________
+*	CudaPB													CudaPB
+*		pbCmdType		pseudoPkt								pbCmdType		pseudoPkt
+*		pbCmd			RdWrIIC									pbCmd			RdWrIIC
+*		pbParam[0]		IIC Device Addr.						pbParam[0]		IIC Device Addr.
+*		pbParam[1]		IIC Register Addr. (optional)			pbParam[1]		IIC Register Addr. (optional)
+*		pbParam[2]		•										pbParam[2]		•
+*		pbParam[3]		•										pbParam[3]		•
+*		pbByteCnt		# fields in pbParam array				pbByteCnt		# fields in pbParam array
+*		pbBufPtr		myBuffer								pbBufPtr		myBuffer
+*		pbFlags			•										pbFlags			•
+*		pbSpare			•										pbSpare			•
+*		pbResult		•										pbResult		•
+*		pbCompletion	NIL										pbCompletion	NIL
+*	SendHdrCnt			CudaPB.pbByteCnt					SendHdrCnt			CudaPB.pbByteCnt
+*	SendHdrPtr			&CudaPB.pbCmd						SendHdrPtr			&CudaPB.pbCmd
+*	SendDataCnt			(char)myBuffer[0]					SendDataCnt			0
+*	SendDataPtr			&myBuffer[1]						SendDataPtr			NIL
+*	RcvHdrCnt			4+0									RcvHdrCnt			4+0
+*	RcvHdrIndex			0									RcvHdrIndex			0
+*	RcvDataCnt			0									RcvDataCnt			(char)myBuffer[0]
+*	RcvDataPtr			&myBuffer[1]						RcvDataPtr			&myBuffer[1]
+*	RcvHeader												RcvHeader
+*		RespAttn		•										RespAttn		•
+*		RespType		•										RespType		•
+*		RespFlags		•										RespFlags		•
+*		RespCmd			•										RespCmd			•
+*		RespData		•										RespData		•
+*	curPB				CudaPB								curPB				CudaPB
+*
+			move.w	pbByteCnt(a0),d1				; RdWrIIC uses byte count for send portion	<SM3>
+			addq.w	#1,d1							; include the packet byte already sent		<SM3>
+			move.w	d1,sendHdrCnt(a2)				; set up header byte count					<SM3>
+			move.w	#4,rcvHdrCnt(a2)				; 4 byte header default						<SM3>
+			clr.w	rcvHdrIndex(a2)					; reset index into header buffer			<SM3>
+			move.l	pbBufPtr(a0),a1					; get address of data buffer				<SM3>
+			btst.b	#0,pbParam(a0)					; is this a read or write IIC operation?	<SM3>
+			bne.s	@doIICread						;											<SM3>
+@doIICwrite											;											<SM3>
+			moveq	#0,d1							; data phase count must be 1 to 256			<SM3>
+			move.b	(a1),d1							;											<SM3>
+			bne.s	@wrCntOK						;											<SM3>
+			move.w	#$0100,d1						;											<SM3>
+@wrCntOK											;											<SM3>
+			move.w	d1,sendDataCnt(a2)				; number of extended data bytes to send		<SM3>
+			adda.l	#1,a1							;											<SM3>
+			move.l	a1,sendDataPtr(a2)				; extended data ptr							<SM3>
+			clr.w	rcvDataCnt(a2)					; no data to receive on IIC write			<SM3>
+			move.l	a1,rcvDataPtr(a2)				; but let's point at xmit buffer to be safe	<SM3>
+			bra.s	@RdWrIICexit					;											<SM3>
+@doIICread											;											<SM3>
+			clr.w	sendDataCnt(a2)					; no extended data bytes to send			<SM3>
+			clr.l	sendDataPtr(a2)					; no extended data ptr						<SM3>
+			moveq	#0,d1							; data phase count must be 1 to 256			<SM3>
+			move.b	(a1),d1							;											<SM3>
+			bne.s	@rdCntOK						;											<SM3>
+			move.w	#$0100,d1						;											<SM3>
+@rdCntOK											;											<SM3>
+			move.w	d1,rcvDataCnt(a2)				; number of extended data bytes to receive	<SM3>
+			adda.l	#1,a1							;											<SM3>
+			move.l	a1,rcvDataPtr(a2)				; extended data ptr							<SM3>
+@RdWrIICexit										;											<SM3>
+			bset.b	#openData,flags(a2)				; open ended data packet (RdWrIIC)			<SM3>
+			bra.s	@exit							;											<SM3>
+@notRdWrIIC											;											<SM3>
+			biglea	PseudoCntTable,a1				; get ptr to our pseudo command table
+@check		
+			lsl.w	#1,d0							; x 2 for word table
+			move.w	(a1,d0.w),d1					; get send/rcv byte counts for this command
+
+			ror.w	#8,d1							; get send byte count in low byte
+			tst.b	d1								; is this an open-ended send command?
+			bmi.s	@sendExt						; yes, branch...
+			move.b	d1,d0							; get byte count from table
+			ext.w	d0								; extend to word
+			addq.b	#1,d0							; data bytes + 1 = header byte count 
+			move.w	d0,sendHdrCnt(a2)				; set up header byte count
+			clr.w	sendDataCnt(a2)					; no extended data bytes
+			clr.l	sendDataPtr(a2)					; no extended data ptr
+			bra.s	@rcvParams						; now setup receive ptrs
+
+@sendExt	moveq	#$7F,d0							; prepare to mask sign
+			and.w	d1,d0							; get rid of sign
+			addq.w	#1,d0							; + 1 for command (packet type already sent)
+			move.w	d0,sendHdrCnt(a2)				; set up header byte count
+			move.w	pbByteCnt(a0),sendDataCnt(a2)	; set up data byte count
+			move.l	pbBufPtr(a0),sendDataPtr(a2)	; set up send data ptr
+
+@rcvParams	clr.w	rcvHdrIndex(a2)					; reset index into header buffer
+			move.w	#4,rcvHdrCnt(a2)				; 4 byte header default
+			asr.w	#8,d1							; get receive data byte count
+			bmi.s	@rcvExt							; branch for open-ended reads
+
+			tst.b	pbCmdType(a0)					; reading, is this a pseudo command?
+			beq.s	@rcvADB							; no, must be adb data
+			
+			lea		pbParam(a0),a1					; pseudo data will be received in pbParam
+			move.l	a1,rcvDataPtr(a2)
+			move.w	d1,rcvDataCnt(a2)				; get receive count from table
+			bra.s	@exit							; and exit
+			
+@rcvADB		add.w	d1,rcvHdrCnt(a2)				; total header bytes = 4 + ADB data
+			clr.w	rcvDataCnt(a2)					; not used
+			bclr.b	#openData,flags(a2)				; this is not an open ended data packet (readPram, read6805)
+			bra.s	@exit
+			
+@rcvExt		move.w	pbByteCnt(a0),rcvDataCnt(a2)	; set up received data byte count
+			move.l	pbBufPtr(a0),rcvDataPtr(a2)		; set up received data buffer ptr
+			bset.b	#openData,flags(a2)				; this is an open ended data packet (readPram, read6805)
+			
+@exit		move.l	a0,curPb(a2)					; set up current param block
+			movea.l	(sp)+,a1						; restore a1
+			rts
+
+;_______________________________________________________________________
+;
+;	Routine:	CheckPacketPatch 
+;				a0 = pointer to parameter block
+;	Exit:		z = 1	if packet type within bounds
+;				z ≠ 1 if packet type not within bounds
+;_______________________________________________________________________
+CheckCudaPacket
+			moveq	#0,d0						; pre clear the register						<17>rbm
+			move.b	pbCmdType(a0),d0			; get the command byte							<17>rbm
+			beq.s	@okExit						; if it is an ADB command, continue				<17>rbm
+			cmp.w	#DoContinueProc,d0			; is this one of the special packets?			<17>rbm
+			blt.s	@notSpecial					; no, error										<17>rbm
+@OkExit
+			move.w	#0,pbResult(a0)				; no error returned in parameter block			<17>rbm
+			rts									;												<17>rbm
+@notSpecial
+			cmp.w	#pseudoPkt,d0				; is it a standard packet						<17>rbm
+			bne.s	@BadExit					; yes, do it									<17>rbm
+			cmp.b	#MaxPseudoCmd,pbCmd(a0)		; is it a valid pseudo command?					<17>rbm
+			bls.s	@OkExit						; yes											<17>rbm
+			move.w	#InvPseudo,pbParam(a0)		; report a pseudo command error
+			bra.s	@errorExit
+@BadExit
+			move.w	#InvPkt,pbParam(a0)			; report invalid packet type					<17>rbm
+@errorExit
+			move.w	pbCmdType(a0),pbParam+2(a0)	; we are faking an error packet					<17>rbm
+			move.w	#paramErr,pbResult(a0)		; parameter error in result field				<17>rbm
+			rts
+
+
+;________________________________________________________________________________________________
+;	Routine:	CudaTickHandler
+;
+;	Function:	This is the completion routine for tick response packets.
+;
+;	Inputs:		d0		-	number of bytes in response packet
+;				a1		-	pointer to status flag
+;				a2		-	ptr to globals
+;				(sp)	-	points to response packet
+;
+;	Outputs:	none
+;
+;	Destroys:	???
+;
+;	This routine is from the Regatta Patches file PatchIIciROM.a
+;----------------------------------------------------------------------------------------------------
+;	This patch fixes a bug in Egret Manager TickHandler routine.						<89><101>
+;	The routine will store the 32 bit time passed by Egret to the
+;	system if the packet is a ReadRealTime into TIME lowmen.
+;	Decrements the lowmem Time by one to compensate for the interrupt
+;	Handler incrementing it by one and then calls the LVL1DT interrupt
+;	handler.
+;	If the packet is a tick packet then it calls LVL1DT to increment the
+;	time setting and check the alarm state.
+;
+;	Entry:
+;		A1.l = Points at Response data buffer At Flags byte:
+;
+;			+---------+----------+---------+---------+---------//-------+
+;			| Attn    | Pkt Type | Flags   | Pkt Cmd | 8 Bytes data Max |
+;			+---------+----------+---------+---------+---------//-------+
+;
+;		A2.l = Points at Egret Manager Globals
+;
+;----------------------------------------------------------------------------------------------------
+
+;________________________________________________________________________________________________
+
+CudaTickHandler		
+			WITH	respPacket,EgretGlobals		;	{
+
+			subq.l	#2,a1						; point to the beginning of the Response data buffer
+			cmpi.b	#TickPkt,RespType(a1)		; Check the Packet type
+			beq.s	@CallLVL1DT					; If tick packet just call LVL1DT handler
+;
+;	The packet was a readTime packet from Egret.  Update the Time lowmem and
+;	adjust it to compensate for the increment in the LVL1DT handler.
+;
+			move.l	RespData(a1),Time			; write the new time in lowmem TIME
+			subq.l	#1,Time						; adjust to compensate for increment in LVL1DT
+;
+;	JUMP to routine pointed to by the Contents of LVL1DT
+;
+
+@CallLVL1DT
+			move.l	VIA,a1						; point to the VIA
+			move.l	LVL1DT,a0					; get vector
+		eieioSTP
+			jmp		(a0)
+		eieioSTP
+			ENDWITH								;	}
+			
+;=========================================================================
+; Routine: 	CudaInit
+;													
+; This routine sends a NOP/WarmStart command to Cuda.  This routine is
+; called early during rom Startup to stop autopoll and 1 sec irq.  Also,
+; the routine will issue a Send DFAC command to Cuda to initialize the
+; the DFAC hardware to a known state.  The routine does not use ANY
+; memory it is register driven only.
+;
+; Inputs:	NONE
+;
+; Outputs:	NONE
+;
+; Destroys:	D0, D1, D2, D3, A1, A5, A6, A4	(Egret 2 implementation)
+; Destroys:	D0, D3, A2, A5, A6				(Egret 3 implementation)
+;
+;	NOTE: This routine is called via a BSR6 and returns via a RTS6
+;-------------------------------------------------------------------------
+;
+; The following sequence synchronizes Cuda to the system by disabling all asynchronous transaction
+; sources (Auto Poll Data, RTC & Power Messages) and insures that no data (full or partial byte)
+; is pending in the VIA data shift register.  ByteAck is asserted with TIP negated.  Cuda responds
+; by asserting TReq and sends a byte to generate a VIA shift register interrupt.  After the
+; interrupt occurs, ByteAck is negated.  Cuda responds by negating TReq and then delays 25µS prior
+; to sending an idle acknowledge.  The VIA shift register interrupt must be cleared within 25µS of
+; the negation of TReq by Cuda.  Once the idle acknowledge interrupt occurs, the VIA shift register
+; interrupt is cleared and Cuda is ready to accept commands.  No collisions should be possible
+; until an asynchronous transaction source is enabled.
+;	        ___________________________________________________________
+; ___		  |
+; TIP		__|........................................................
+;			_______                         ___________________________
+; 			  |    |                       |
+; ByteAck	__|    |_______________________|
+;			___________________________________________________________
+; ________	                    ||||||||            ||||||||
+; ViaClk	                    ||||||||            ||||||||
+;			___________________________________________________________
+;		
+; ViaData	...........................................................
+;			_____                       _______             ______
+; 			     |                     | sync  |           | idle |
+; VIA_IRQ	_____|_____________________| ack   |___________| ack  |____
+;			___________________________________ __________________ ____
+; _____		                                   |                  |
+; ViaRD		                                   |                  |
+;			___________                        ________________________
+; ____		           |                      |
+; TREQ		___________|______________________|
+;
+;-------------------------------------------------------------------------
+CudaInit
+			movea.l	DecoderInfo.VIA1Addr(a0),a2	 		; get VIA 1 base address									<SM3> <SM9>
+		eieioSTP
+			ori.b	#((1<<TIP)| \						; terminate transaction										<SM3>
+					 (1<<vByteAck)),vBufB(a2)			; and set idle state										<SM3> <SM9>
+		eieioSTP
+			move.l	#hw4msDelay,d4						; we want to delay 4 millisecs for ADB reset to complete	<SM3>
+@killtime
+		eieioSTP
+			tst.b	vBufB(a2)							;															<SM3> <SM9>
+		eieioSTP
+			dbra	d4,@killtime						;															<SM3>
+		eieioSTP
+			btst.b	#TReq,vBufB(a2)						; is Cuda starting a transaction???							<SM3> <SM9>
+		eieioSTP
+			bne.s	@noX								; no, then continue with SyncAck							<SM3>
+			move.l	#hw4msDelay,d4						; we want to delay 4 millisecs for ADB reset to complete	<SM3>
+@asyncByte
+		eieioSTP
+			btst.b	#ifSR,vIFR(a2)						; else, wait for that lil' interrupt to occur				<SM3> <SM9>
+		eieioSTP
+			bne.s	@noX								;															<SM3>
+			dbra	d4,@asyncByte						;															<SM3>
+@noX
+		eieioSTP
+			tst.b	vSR(a2)								; clear the pending interrupt									 <SM9>
+		eieioSTP
+			move.l	#hw10msDelay,d4						; Timeout values must exceed duration of maximum ADB auto poll.	<7>
+		eieioSTP
+			bclr.b	#vByteAck,vBufB(a2)					; issue a sync state (TIP = negated, ByteAck = asserted)	 <SM9>
+		eieioSTP
+@waitSync
+		eieioSTP
+			btst.b	#TReq,vBufB(a2)						; wait for sync acknowledge									 <SM9>
+		eieioSTP
+			beq.s	@syncAck							;					
+			dbra.w	d4,@waitSync						;					
+			bra.l	DeadCuda							; go play death chimes
+@syncAck	move.l	#hw10msDelay,d4						; number of retries before giving up with Cuda
+@wSyncIrq	
+		eieioSTP
+			btst.b	#ifSR,vIFR(a2)						; wait for sync acknowledge interrupt						 <SM9>
+		eieioSTP
+			bne.s	@haveSync							;					
+			dbra.w	d4,@wSyncIrq						;					
+@haveSync	move.l	#hw10msDelay,d4						; number of retries before giving up with Cuda
+		eieioSTP
+			bset.b	#vByteAck,vBufB(a2)					; terminate the sync cycle									 <SM9>
+		eieioSTP
+@syncTerm	
+		eieioSTP
+			btst.b	#TReq,vBufB(a2)						; wait for sync termination acknowledge						 <SM9>
+		eieioSTP
+			bne.s	@haveTerm							;					
+			dbra.w	d4,@syncTerm						;					
+			bra.l	DeadCuda							; go play death chimes
+@haveTerm	
+		eieioSTP
+			tst.b	vSR(a2)								; clear the pending interrupt								 <SM9>
+		eieioSTP
+			move.l	#hw10msDelay,d4						; number of retries before giving up with Cuda
+@waitIdle2	
+		eieioSTP
+			btst.b	#ifSR,vIFR(a2)						; wait for sync termination acknowledge						 <SM9>
+		eieioSTP
+			bne.w	@haveIdle							;					
+			dbra.w	d4,@waitIdle2						;					
+			bra.l	DeadCuda							; go play death chimes
+@haveIdle												;					
+		eieioSTP
+			ori.b	#((1<<TIP)| \						; terminate transaction
+					 (1<<vByteAck)),vBufB(a2)			; and set idle state										 <SM9>
+		eieioSTP
+			tst.b	vSR(a2)								; clear the pending interrupt								 <SM9>
+		eieioSTP
+@exit
+			rts6										; setup the return to caller of CudaInit
+
+				eject
+************************************************************************************************************
+* SendCudaCmd:	This register based routine will send up to four bytes of data to 
+*				Cuda.  The packet type, command, byte count and data are passed in 
+*				registers.  The routine will return with d0.w = $0000 if it sent the 
+*				command successfully.  A value of $FFFF signifies that the command did 
+*				not get through.  The system and Cuda hung and the system aborted the 
+*				transaction.
+*
+*	WARNING:	This routine will not error check the transaction requested.  It is  the
+*	WARNING:	responsibility of the caller to make sure that the packet type, command, 
+*	WARNING:	data and data byte count are valid for the transaction requested.  Failure 
+*	WARNING:	to follow the rules will make this routine fail and CRASH the system.
+*
+*		Input:
+*				a0.l	Pointer to Base address table
+*
+*				d0.l =  High word PACKET Command
+*						Low word PACKET Type
+*
+*				d1.l =	Up to four bytes of data to send
+*						Long word data byte assigment = byte 4, byte 3, byte 2, byte 1
+*						Byte 1 sent out first
+*
+*				d2.l = 	Byte count to send. (0-4 bytes)
+*						Byte count > 4 will send four bytes only
+*
+*		Output:	d0.w	$0000 if call succeeded, Nonzero if failed
+*
+*				d1.l	high word = flags, low word packet type returned by Cuda
+*
+*		Destroys:	D2.l, D3.l, D4.l, A5.l, A4.l, A1.l
+*
+************************************************************************************************************
+SendCudaCmd	
+			movea.l	DecoderInfo.VIA1Addr(a0),a1			; get VIA 1 base address
+			move.l	#((MaxTout<<16) OR MaxRetries),d4	; number of retries before giving up with Cuda
+		eieioSTP
+			btst.b	#TIP,vBufB(a1)			; check for a transaction in progress
+		eieioSTP
+			bne.s	@AllOK
+@Timeout
+		eieioSTP
+			ori.b	#((1<<TIP)| \			; terminate transaction
+					(1<<vByteAck)),vBufB(a1)	; and set idle state
+		eieioSTP
+@WaitIdle
+		eieioSTP
+			btst.b	#ifSR,vIFR(a1)			; wait for idle state acknowledgement
+		eieioSTP
+			beq.s	@WaitIdle				;				
+		eieioSTP
+			tst.b	vSR(a1)					; clear the idle acknowledge interrupt
+		eieioSTP
+			
+@AllOK		swap.w	d4						; timeout in low word of d4 Retry count in high word
+		eieioSTP
+			btst.b	#TReq,vBufB(a1)			; check for a transaction request from Cuda
+		eieioSTP
+			beq.l	IrqMissed				; MIssed Vsr Irq because of INITVIAS
+			bsr5	@SendPtype				; send the packet type
+			beq.l	RealAbort				; Discard Aborting transaction
+;
+;	If not abort transaction in progress then send the command byte
+;
+			swap	d0
+			bsr5	sendByte1				; send the command byte
+;
+;	Now send number of bytes contained in d1 based on
+;	byte count contained in d2.w
+;
+			move.l	d1,d0					; get the data to send
+			subq	#1,d2					; adjust for DBRA
+			cmp.w	#3,d2					; if count out of range quit
+			bhi.s	@EndCmd					; if count valid then adjust for dbra
+@sendloop	bsr5	sendByte1
+			lsr.l	#8,d0					; move data byte to low byte of register
+@loopEntry	dbra	d2,@sendloop			; decrement byte count
+;
+;	Wait for the response packet header
+;
+@EndCmd
+
+		eieioSTP
+			bclr.b	#SRdir,vACR(a1)			; shift in
+		eieioSTP
+			ori.b	#((1<<TIP)|\			; terminate command packet transaction
+					(1<<vByteAck)),vBufB(a1)			;				
+		eieioSTP
+		
+;
+;	Now receive the Standard Response packet Header
+;
+			bsr5	readAttn				; get the Attention byte
+		eieioSTP
+			bclr.b	#TIP,vBufB(a1)			; start the response transaction
+		eieioSTP
+		
+			bsr5	readByte				; get the packet type
+			and		#$00FF,d0				; keep low byte only
+			swap	d0						; save the packet type
+
+			bsr5	readByte				; get the flags byte
+			and.w	#$00FF,d0				; keep low byte only
+			swap	d0						; keep the flags byte as an error code
+			exg		d0,d1					; save the packet type and flags returned
+		
+			bsr5	readByte				; get the command
+		eieioSTP
+			ori.b	#((1<<TIP)|\			; terminate command packet transaction
+					(1<<vByteAck)),vBufB(a1)			;				
+		eieioSTP
+		
+@WaitIdle1
+		eieioSTP
+			btst.b	#ifSR,vIFR(a1)			; wait for idle state acknowledgement
+		eieioSTP
+			beq.s	@WaitIdle1				;				
+		eieioSTP
+			tst.b	vSR(a1)					; clear the idle acknowledge interrupt
+		eieioSTP
+;
+;	Check for an error packet returned by Cuda
+;
+			move.l	d1,d0					; save the packet type and flags
+			cmp.b	#errorpkt,d0			; check for error packet
+			beq.s	@exit					; error pkt then just exit
+			sub.w	d0,d0					; zero for success
+@exit		
+	
+			rts6
+
+;--------------------------------------------------------------------------
+@SendPtype
+		eieioSTP
+			bset.b	#SRdir,vACR(a1)			; shift out
+		eieioSTP
+			btst.b	#TReq,vBufB(a1)			; check for abort
+		eieioSTP
+			beq.w	AbortReq				; go away if abort requested
+		eieioSTP
+			move.b	d0,vSR(a1)				; load byte into shift reg
+		eieioSTP
+			bclr.b	#TIP,vBufB(a1)			; TIP indicates shift reg is full on 1st byte
+		eieioSTP
+;
+;	Check Vsr Irq until timeout.  If timeout then check the retry count
+;	and Call Death Chimes if Retry count exausted.
+;
+@PollDelay	btst.b	#ifSR,vIFR(a1)			; wait for shift to complete
+		eieioSTP
+			bne.w	VsrIrq					; Go service Shift register Irq
+			dbra.w	d4,@PollDelay			; try again if timed out
+			move.w	#MaxTout,d4				; Reset the Timeout
+			swap.w	d4						; get the Retry count
+			subq.w	#1,d4					; Try again if Retry count not Exausted
+			bne.s	@Timeout
+	
+DeadCuda	
+		eieioSTP
+			ori.b	#((1<<TIP)| \						; terminate transaction
+					 (1<<vByteAck)),vBufB(a1)			; and set idle state
+		eieioSTP
+			move.l	#ErrCudaInit,d7			; Cuda failed, zero high byte flags 		<SM7>
+			move.l	#0001,d6				; d6.l must be nonzero
+			bigjmp	Error1Handler,a3		; Play death chimes
+
+VsrIrq
+			move.b	#10,d4					; mode 7 interrupt occurs at falling edge CB1	<LW2><VIA rbm>
+@m7dly										; use d4 since retry count not required anymore	<LW2><VIA rbm>
+		eieioSTP
+			tst.b	vBufB(a1)				; hardware access is 1.2µS						<LW2><VIA rbm>
+		eieioSTP
+			sub.b	#1,d4					; can only trash low byte						<LW2><VIA rbm>
+			bne.s	@m7dly					; wait long enough for CB1 to rise (10µS delay)	<LW2><VIA rbm>
+			
+		eieioSTP
+			tst.b	vSR(a1)					; clear the interrupt
+		eieioSTP
+			btst.b	#TReq,vBufB(a1)			; exit with abort status
+		eieioSTP
+AbortReq	rts5
+
+;--------------------------------------------------------------------------
+; DumpAbort	This routine will read all the data for an abort transaction and
+;			discard it.  When done it will jump back to SendNopCmd entry point
+;			to retry our command.  This command will eventually complete...
+			
+			Export	RealAbort	
+RealAbort	
+		eieioSTP
+			bclr.b	#SRdir,vACR(a1)			; shift in										<rbm>
+		eieioSTP
+			ori.b	#((1<<TIP)| \			; terminate transaction
+					(1<<vByteAck)),vBufB(a1)	; and set idle state
+		eieioSTP
+WAbortAck	btst.b	#ifSR,vIFR(a1)			; wait for acknowledgement of abort cycle
+		eieioSTP
+			beq.s	WAbortAck				;				
+			tst.b	vSR(a1)					; clear the pending interrupt
+		eieioSTP
+			bra.s	StartRPkt				; and go start the response transaction
+;
+; It may be possible to miss a VIA interrupt when the system is restarted because
+; a transaction may have been in process when the restart occurred.  During restart,
+; the VIA is initialized and will result in the loss of any interrupt status.  Cuda
+; will complete transmission of the attention byte within 100µS of asserting TReq
+; (65µS nominal).  By delaying 100µS we can assume that the attention byte interrupt
+; has occurred.
+;
+			Export	IrqMissed	
+IrqMissed
+			bsr5	Delay100us				; Let Cuda see SysSes. ≥ 125µsec
+		eieioSTP
+			bclr.b	#SRdir,vACR(a1)			; shift in
+		eieioSTP
+StartRPkt
+		eieioSTP
+			tst.b	vSR(a1)					; discard the byte
+		eieioSTP
+			bclr.b	#TIP,vBufB(a1)			; start the response transaction
+		eieioSTP
+
+DumpAbort
+		eieioSTP
+			btst.b	#ifSR,vIFR(a1)			; wait for shift to complete
+		eieioSTP
+			beq.s	DumpAbort
+		eieioSTP
+			tst.b	vSR(a1)					; discard the byte
+		eieioSTP
+ 			btst.b	#TReq,vBufB(a1)			; check for last byte
+		eieioSTP
+			bne.s	DumpDone				; Clock Tick Packets only 2 bytes
+		eieioSTP
+			eori.b	#1<<vByteAck,vBufB(a1)	; acknowlege byte
+		eieioSTP
+			bra.s	DumpAbort				; and loop for next byte
+;
+;	Last byte was read, terminate the transaction with the idle state in the
+;	communications protocol.  Then, wait for an idle state acknowledge before
+;	returning from the transaction.
+;		                                      _________________________
+; ___		                                 |
+; TIP		_________________________________|
+;			________________ ________________ _________________________
+; _______	                |                |
+; ByteAck	________________|________________|
+;			___________________________________________________________
+; ________	     ||||||||        ||||||||        ||||||||
+; ViaClk	     ||||||||        ||||||||        ||||||||
+;			___________________________________________________________
+;			     XXXXXXXX        XXXXXXXX   |
+; ViaData	_____XXXXXXXX________XXXXXXXX___|
+;
+; 			            |               |<-Last Byte    |<-Idle Acknowledge
+; VIA_IRQ	____________|_______________|_______________|______________
+;			                   ________________________________________
+; ____		                  |
+; TREQ		__________________|
+;
+DumpDone
+		eieioSTP
+			ori.b	#((1<<TIP)| \			; terminate transaction
+					(1<<vByteAck)),vBufB(a1)	; and set idle state
+		eieioSTP
+@WaitIdleAck
+		eieioSTP
+			btst.b	#ifSR,vIFR(a1)			; wait for idle state acknowledge
+		eieioSTP
+			beq.s	@WaitIdleAck			;				
+		eieioSTP
+			tst.b	vSR(a1)					; discard the byte
+		eieioSTP
+			bra.w	SendCudaCmd				; go try sending our command again
+
+;--------------------------------------------------------------------------
+;			Export	sendByte1	
+;	inputs:		d0.b			data byte to send to Cuda.
+;	trashes:	d0.b
+sendByte1
+		eieioSTP
+			bset.b	#SRdir,vACR(a1)			; shift out
+		eieioSTP
+			move.b	d0,vSR(a1)				; load byte into shift reg
+		eieioSTP
+			eori.b	#1<<vByteAck,vBufB(a1)	; indicate byte pending in VIA
+		eieioSTP
+@poll		btst.b	#ifSR,vIFR(a1)			; wait for shift to complete
+		eieioSTP
+			beq.s	@poll
+			move.b	#10,d0					; mode 7 interrupt occurs at falling edge CB1	<LW2><VIA rbm>
+@m7dly
+		eieioSTP
+			tst.b	vBufB(a1)				; hardware access is 1.2µS						<LW2><VIA rbm>
+		eieioSTP
+			sub.b	#1,d0					; can only trash low byte						<LW2><VIA rbm>
+			bne.s	@m7dly					; wait long enough for CB1 to rise (10µS delay)	<LW2><VIA rbm>
+			
+		eieioSTP
+			tst.b	vSR(a1)					; clear the interrupt
+		eieioSTP
+			rts5
+
+;--------------------------------------------------------------------------
+;			Export	readByte	
+readByte	
+		eieioSTP
+			btst.b	#ifSR,vIFR(a1)			; wait for shift to complete
+		eieioSTP
+			beq.s	readByte
+		eieioSTP
+			move.b	vSR(a1),d0				; read the byte
+		eieioSTP
+			eori.b	#1<<vByteAck,vBufB(a1)	; and acknowledge it
+		eieioSTP
+			rts5
+
+;--------------------------------------------------------------------------
+;			Export	readAttn	
+readAttn
+		eieioSTP
+			btst.b	#ifSR,vIFR(a1)			; wait for shift to complete
+		eieioSTP
+			beq.s	readAttn
+		eieioSTP
+			tst.b	vSR(a1)					; clear the interrupt
+		eieioSTP
+			rts5
+
+;--------------------------------------------------------------------------
+;			Export	delay100us	
+delay100us	
+			move.w	#DelayCnt,d3
+		eieioSTP
+@wait
+		eieioSTP
+			tst.b	(a1)					; sync to VIA clock
+		eieioSTP
+			dbra	d3,@wait				; delay at least 100 us (very rough)
+			rts5
+
+			
+
+	ENDPROC								;	EndProc for CudaMgr		}
+			
+	END;----------------													<H2>

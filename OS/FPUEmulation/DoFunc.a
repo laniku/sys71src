@@ -1,0 +1,1152 @@
+;
+;	File:		DoFunc.a
+;
+;	Contains:	Code to handle unimplemented instruction execution on 040s
+;
+;	Originally Written by:	Motorola Inc.
+;	Adapted to Apple/MPW:	Jon Okada
+;
+;	Copyright:	© 1990-1993 by Apple Computer, Inc., all rights reserved.
+;
+;   This file is used in these builds:   Mac32
+;
+;	Change History (most recent first):
+;
+;		<SM2>	  2/3/93	CSS		Update from Horror:
+;							<H2> 10/5/92 BG	(for Jon Okada) Fixing a bug in the Motorola FPSP found by Jon
+;									having to do with accidently clearing the quotient field in the
+;									USER_FPSR.
+;		 <4>	 5/24/91	BG		Corrected table "pmodt" (5 entries lacked offset entries).
+;		 <3>	 4/13/91	BG		Changed a constant NaN format so that the instruction FSINCOS
+;							for infinite returns the same quite Nan as the 881.
+;		 <2>	 3/30/91	BG		Rolling in Jon Okada's latest changes.
+;		 <1>	12/14/90	BG		First checked into TERROR/BBS.
+
+;  dofunc.a
+
+;  Based upon Motorola files 'do_func.sa' and 'tbldo.sa'
+
+;  CHANGE LOG:
+;  02 Jan 91	JPO	Incorporated table 'tblepre' from Motorola file 'tbldo.sa',
+;			  changing contents to 16-bit addresses relative to table top.
+;			  Changed tables 'pmodt', 'premt', and 'pscalet' to contain
+;			  16-bit addresses relative to respective table tops.
+; 			  Deleted constants MONE, PZERO, PINF, and MINF
+;			  and imbedded values in instructions.  Changed
+;			  constants MZERO and QNAN to single-precision.
+;  08 Feb 91	JPO	Modified routines "smod_fpn" and "srem_fpn" to filter out
+;			  subnormal dst cases for special handling.
+;  08 Apr 91	JPO	Fixed "tbl_pre" entries for FTENTOX with normal or zero
+;			  input (removed extra space before "-" sign.
+;  09 Apr 91	JPO	Changed constant QNAN back to extended precision.
+;  02 May 91	JPO	Corrected table "pmodt" (5 entries lacked offset entries).			  
+;  26 Aug 92	JPO	Cleared quotient field in USER_FPSR for FREM and FMOD
+;			  instructions (see under "prem" and "pmod" below).			  
+
+*
+*	do_func.sa 3.1 12/10/90
+*
+* Do_func performs the unimplemented operation.  The operation
+* to be performed is determined from the lower 7 bits of the
+* extension word (except in the case of fmovecr and fsincos).
+* The opcode and tag bits form an index into a jump table in 
+* tbldo.sa.  Cases of zero, infinity and NaN are handled in 
+* do_func by forcing the default result.  Normalized and
+* denormalized (there are no unnormalized numbers at this
+* point) are passed onto the emulation code.  
+*
+* CMDREG1B and STAG are extracted from the fsave frame
+* and combined to form the table index.  The function called
+* will start with a0 pointing to the ETEMP operand.  Dyadic
+* functions can find FPTEMP at -12(a0).
+*
+* Called functions return their result in fp0.  Sincos returns
+* sin(x) in fp0 and cos(x) in fp1.
+*
+
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* DO_FUNC	IDNT    2,1 Motorola 040 Floating Point Software Package
+
+	ALIGN	16
+
+PONE	dc.l	$3fff0000,$80000000,$00000000	;+1
+MZERO	dc.l	$80000000			; <1/2/91, JPO>
+
+MPIBY2  dc.l	$BFFF0000,$C90FDAA2,$2168C235	;-PI/2
+;QNAN	dc.l	$7FFFFFFF			; <1/2/91, JPO> - deleted <4/9/91, JPO>		<T3>
+	dc.l	$00000000			; added <4/9/91, JPO>				<T3>
+
+QNAN	dc.l	$7fff0000,$ffffffff,$ffffffff,$00000000	; added <4/9/91, JPO>			<T3>
+
+
+;MONE	dc.l	$bfff0000,$80000000,$00000000	;-1
+;PZERO	dc.l	$00000000,$00000000,$00000000	;+0
+;MZERO	dc.l	$80000000,$00000000,$00000000	;-0
+;PINF	dc.l	$7fff0000,$00000000,$00000000	;+inf
+;MINF	dc.l	$ffff0000,$00000000,$00000000	;-inf
+;QNAN	dc.l	$7fff0000,$ffffffff,$ffffffff	;non-signaling nan
+;PPIBY2  dc.l	$3FFF0000,$C90FDAA2,$2168C235	;+PI/2 available at PIBY2 in 'constants.a'
+
+
+
+*
+*	tbldo.sa 3.1 12/10/90
+*
+* Modified:
+*	8/16/90	chinds	The table was constructed to use only one level
+*			of indirection in do_func for monoadic
+*			functions.  Dyadic functions require two
+*			levels, and the tables are still contained
+*			in do_func.  The table is arranged for 
+*			index with a 10-bit index, with the first
+*			7 bits the opcode, and the remaining 3
+*			the stag.  For dyadic functions, all
+*			valid addresses are to the generic entry
+*			point. 
+*
+
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* TBLDO	IDNT    2,1 Motorola 040 Floating Point Software Package
+
+
+*	instruction		;opcode-stag Notes
+
+tblpre:
+	dc.w	smovcr-tblpre	;$00-0 fmovecr all
+	dc.w	smovcr-tblpre	;$00-1 fmovecr all
+	dc.w	smovcr-tblpre	;$00-2 fmovecr all
+	dc.w	smovcr-tblpre	;$00-3 fmovecr all
+	dc.w	smovcr-tblpre	;$00-4 fmovecr all
+	dc.w	smovcr-tblpre	;$00-5 fmovecr all
+	dc.w	smovcr-tblpre	;$00-6 fmovecr all
+	dc.w	smovcr-tblpre	;$00-7 fmovecr all
+
+	dc.w	sint-tblpre	;$01-0 fint norm
+	dc.w	szero-tblpre	;$01-1 fint zero 
+	dc.w	sinf-tblpre	;$01-2 fint inf
+	dc.w	src_nan-tblpre	;$01-3 fint nan
+	dc.w	sintd-tblpre	;$01-4 fint denorm inx
+	dc.w	serror-tblpre	;$01-5 fint ERROR
+	dc.w	serror-tblpre	;$01-6 fint ERROR
+	dc.w	serror-tblpre	;$01-7 fint ERROR
+
+	dc.w	ssinh-tblpre	;$02-0 fsinh norm
+	dc.w	szero-tblpre	;$02-1 fsinh zero
+	dc.w	sinf-tblpre	;$02-2 fsinh inf
+	dc.w	src_nan-tblpre	;$02-3 fsinh nan
+	dc.w	ssinhd-tblpre	;$02-4 fsinh denorm
+	dc.w	serror-tblpre	;$02-5 fsinh ERROR
+	dc.w	serror-tblpre	;$02-6 fsinh ERROR
+	dc.w	serror-tblpre	;$02-7 fsinh ERROR
+
+	dc.w	sintrz-tblpre	;$03-0 fintrz norm
+	dc.w	szero-tblpre	;$03-1 fintrz zero
+	dc.w	sinf-tblpre	;$03-2 fintrz inf
+	dc.w	src_nan-tblpre	;$03-3 fintrz nan
+	dc.w	snzrinx-tblpre	;$03-4 fintrz denorm inx
+	dc.w	serror-tblpre	;$03-5 fintrz ERROR
+	dc.w	serror-tblpre	;$03-6 fintrz ERROR
+	dc.w	serror-tblpre	;$03-7 fintrz ERROR
+
+	dc.w	serror-tblpre	;$04-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$04-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$04-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$04-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$04-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$04-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$04-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$04-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$05-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$05-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$05-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$05-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$05-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$05-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$05-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$05-7 ERROR - illegal extension
+
+	dc.w	sslognp1-tblpre	;$06-0 flognp1 norm
+	dc.w	szero-tblpre	;$06-1 flognp1 zero
+	dc.w	sopr_inf-tblpre	;$06-2 flognp1 inf
+	dc.w	src_nan-tblpre	;$06-3 flognp1 nan
+	dc.w	slognp1d-tblpre	;$06-4 flognp1 denorm
+	dc.w	serror-tblpre	;$06-5 flognp1 ERROR
+	dc.w	serror-tblpre	;$06-6 flognp1 ERROR
+	dc.w	serror-tblpre	;$06-7 flognp1 ERROR
+
+	dc.w	serror-tblpre	;$07-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$07-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$07-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$07-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$07-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$07-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$07-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$07-7 ERROR - illegal extension
+
+	dc.w	setoxm1-tblpre	;$08-0 fetoxm1 norm
+	dc.w	szero-tblpre	;$08-1 fetoxm1 zero
+	dc.w	setoxm1i-tblpre	;$08-2 fetoxm1 inf
+	dc.w	src_nan-tblpre	;$08-3 fetoxm1 nan
+	dc.w	setoxm1d-tblpre	;$08-4 fetoxm1 denorm
+	dc.w	serror-tblpre	;$08-5 fetoxm1 ERROR
+	dc.w	serror-tblpre	;$08-6 fetoxm1 ERROR
+	dc.w	serror-tblpre	;$08-7 fetoxm1 ERROR
+
+	dc.w	stanh-tblpre	;$09-0 ftanh norm
+	dc.w	szero-tblpre	;$09-1 ftanh zero
+	dc.w	sone-tblpre	;$09-2 ftanh inf
+	dc.w	src_nan-tblpre	;$09-3 ftanh nan
+	dc.w	stanhd-tblpre	;$09-4 ftanh denorm
+	dc.w	serror-tblpre	;$09-5 ftanh ERROR
+	dc.w	serror-tblpre	;$09-6 ftanh ERROR
+	dc.w	serror-tblpre	;$09-7 ftanh ERROR
+
+	dc.w	satan-tblpre	;$0a-0 fatan norm
+	dc.w	szero-tblpre	;$0a-1 fatan zero
+	dc.w	spi_2-tblpre	;$0a-2 fatan inf
+	dc.w	src_nan-tblpre	;$0a-3 fatan nan
+	dc.w	satand-tblpre	;$0a-4 fatan denorm
+	dc.w	serror-tblpre	;$0a-5 fatan ERROR
+	dc.w	serror-tblpre	;$0a-6 fatan ERROR
+	dc.w	serror-tblpre	;$0a-7 fatan ERROR
+
+	dc.w	serror-tblpre	;$0b-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$0b-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$0b-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$0b-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$0b-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$0b-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$0b-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$0b-7 ERROR - illegal extension
+
+	dc.w	sasin-tblpre	;$0c-0 fasin norm
+	dc.w	szero-tblpre	;$0c-1 fasin zero
+	dc.w	t_operr-tblpre	;$0c-2 fasin inf
+	dc.w	src_nan-tblpre	;$0c-3 fasin nan
+	dc.w	sasind-tblpre	;$0c-4 fasin denorm
+	dc.w	serror-tblpre	;$0c-5 fasin ERROR
+	dc.w	serror-tblpre	;$0c-6 fasin ERROR
+	dc.w	serror-tblpre	;$0c-7 fasin ERROR
+
+	dc.w	satanh-tblpre	;$0d-0 fatanh norm
+	dc.w	szero-tblpre	;$0d-1 fatanh zero
+	dc.w	t_operr-tblpre	;$0d-2 fatanh inf
+	dc.w	src_nan-tblpre	;$0d-3 fatanh nan
+	dc.w	satanhd-tblpre	;$0d-4 fatanh denorm
+	dc.w	serror-tblpre	;$0d-5 fatanh ERROR
+	dc.w	serror-tblpre	;$0d-6 fatanh ERROR
+	dc.w	serror-tblpre	;$0d-7 fatanh ERROR
+
+	dc.w	ssin-tblpre	;$0e-0 fsin norm
+	dc.w	szero-tblpre	;$0e-1 fsin zero
+	dc.w	t_operr-tblpre	;$0e-2 fsin inf
+	dc.w	src_nan-tblpre	;$0e-3 fsin nan
+	dc.w	ssind-tblpre	;$0e-4 fsin denorm
+	dc.w	serror-tblpre	;$0e-5 fsin ERROR
+	dc.w	serror-tblpre	;$0e-6 fsin ERROR
+	dc.w	serror-tblpre	;$0e-7 fsin ERROR
+
+	dc.w	stan-tblpre	;$0f-0 ftan norm
+	dc.w	szero-tblpre	;$0f-1 ftan zero
+	dc.w	t_operr-tblpre	;$0f-2 ftan inf
+	dc.w	src_nan-tblpre	;$0f-3 ftan nan
+	dc.w	stand-tblpre	;$0f-4 ftan denorm
+	dc.w	serror-tblpre	;$0f-5 ftan ERROR
+	dc.w	serror-tblpre	;$0f-6 ftan ERROR
+	dc.w	serror-tblpre	;$0f-7 ftan ERROR
+
+	dc.w	setox-tblpre	;$10-0 fetox norm
+	dc.w	ld_pone-tblpre	;$10-1 fetox zero
+	dc.w	szr_inf-tblpre	;$10-2 fetox inf
+	dc.w	src_nan-tblpre	;$10-3 fetox nan
+	dc.w	setoxd-tblpre	;$10-4 fetox denorm
+	dc.w	serror-tblpre	;$10-5 fetox ERROR
+	dc.w	serror-tblpre	;$10-6 fetox ERROR
+	dc.w	serror-tblpre	;$10-7 fetox ERROR
+
+	dc.w	stwotox-tblpre	;$11-0 ftwotox norm
+	dc.w	ld_pone-tblpre	;$11-1 ftwotox zero
+	dc.w	szr_inf-tblpre	;$11-2 ftwotox inf
+	dc.w	src_nan-tblpre	;$11-3 ftwotox nan
+	dc.w	stwotoxd-tblpre	;$11-4 ftwotox denorm
+	dc.w	serror-tblpre	;$11-5 ftwotox ERROR
+	dc.w	serror-tblpre	;$11-6 ftwotox ERROR
+	dc.w	serror-tblpre	;$11-7 ftwotox ERROR
+
+	dc.w	stentox-tblpre	;$12-0 ftentox norm	; removed tab before "-tblpre" <4/8/91, JPO>	<T3>
+	dc.w	ld_pone-tblpre	;$12-1 ftentox zero	; removed tab before "-tblpre" <4/8/91, JPO>	<T3>
+	dc.w	szr_inf-tblpre	;$12-2 ftentox inf
+	dc.w	src_nan-tblpre	;$12-3 ftentox nan
+	dc.w	stentoxd-tblpre	;$12-4 ftentox denorm
+	dc.w	serror-tblpre	;$12-5 ftentox ERROR
+	dc.w	serror-tblpre	;$12-6 ftentox ERROR
+	dc.w	serror-tblpre	;$12-7 ftentox ERROR
+
+	dc.w	serror-tblpre	;$13-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$13-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$13-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$13-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$13-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$13-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$13-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$13-7 ERROR - illegal extension
+
+	dc.w	sslogn-tblpre	;$14-0 flogn norm
+	dc.w	t_dz2-tblpre	;$14-1 flogn zero
+	dc.w	sopr_inf-tblpre	;$14-2 flogn inf
+	dc.w	src_nan-tblpre	;$14-3 flogn nan
+	dc.w	sslognd-tblpre	;$14-4 flogn denorm
+	dc.w	serror-tblpre	;$14-5 flogn ERROR
+	dc.w	serror-tblpre	;$14-6 flogn ERROR
+	dc.w	serror-tblpre	;$14-7 flogn ERROR
+
+	dc.w	sslog10-tblpre	;$15-0 flog10 norm
+	dc.w	t_dz2-tblpre	;$15-1 flog10 zero
+	dc.w	sopr_inf-tblpre	;$15-2 flog10 inf
+	dc.w	src_nan-tblpre	;$15-3 flog10 nan
+	dc.w	sslog10d-tblpre	;$15-4 flog10 denorm
+	dc.w	serror-tblpre	;$15-5 flog10 ERROR
+	dc.w	serror-tblpre	;$15-6 flog10 ERROR
+	dc.w	serror-tblpre	;$15-7 flog10 ERROR
+
+	dc.w	sslog2-tblpre	;$16-0 flog2 norm
+	dc.w	t_dz2-tblpre	;$16-1 flog2 zero
+	dc.w	sopr_inf-tblpre	;$16-2 flog2 inf
+	dc.w	src_nan-tblpre	;$16-3 flog2 nan
+	dc.w	sslog2d-tblpre	;$16-4 flog2 denorm
+	dc.w	serror-tblpre	;$16-5 flog2 ERROR
+	dc.w	serror-tblpre	;$16-6 flog2 ERROR
+	dc.w	serror-tblpre	;$16-7 flog2 ERROR
+
+	dc.w	serror-tblpre	;$17-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$17-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$17-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$17-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$17-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$17-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$17-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$17-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$18-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$18-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$18-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$18-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$18-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$18-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$18-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$18-7 ERROR - illegal extension
+
+	dc.w	scosh-tblpre	;$19-0 fcosh norm
+	dc.w	ld_pone-tblpre	;$19-1 fcosh zero
+	dc.w	ld_pinf-tblpre	;$19-2 fcosh inf
+	dc.w	src_nan-tblpre	;$19-3 fcosh nan
+	dc.w	scoshd-tblpre	;$19-4 fcosh denorm
+	dc.w	serror-tblpre	;$19-5 fcosh ERROR
+	dc.w	serror-tblpre	;$19-6 fcosh ERROR
+	dc.w	serror-tblpre	;$19-7 fcosh ERROR
+
+	dc.w	serror-tblpre	;$1a-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1a-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1a-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1a-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1a-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1a-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1a-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1a-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$1b-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1b-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1b-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1b-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1b-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1b-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1b-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$1b-7 ERROR - illegal extension
+
+	dc.w	sacos-tblpre	;$1c-0 facos norm
+	dc.w	ld_ppi2-tblpre	;$1c-1 facos zero
+	dc.w	t_operr-tblpre	;$1c-2 facos inf
+	dc.w	src_nan-tblpre	;$1c-3 facos nan
+	dc.w	sacosd-tblpre	;$1c-4 facos denorm
+	dc.w	serror-tblpre	;$1c-5 facos ERROR
+	dc.w	serror-tblpre	;$1c-6 facos ERROR
+	dc.w	serror-tblpre	;$1c-7 facos ERROR
+
+	dc.w	scos-tblpre	;$1d-0 fcos norm
+	dc.w	ld_pone-tblpre	;$1d-1 fcos zero
+	dc.w	t_operr-tblpre	;$1d-2 fcos inf
+	dc.w	src_nan-tblpre	;$1d-3 fcos nan
+	dc.w	scosd-tblpre	;$1d-4 fcos denorm
+	dc.w	serror-tblpre	;$1d-5 fcos ERROR
+	dc.w	serror-tblpre	;$1d-6 fcos ERROR
+	dc.w	serror-tblpre	;$1d-7 fcos ERROR
+
+	dc.w	sgetexp-tblpre	;$1e-0 fgetexp norm
+	dc.w	szero-tblpre	;$1e-1 fgetexp zero
+	dc.w	t_operr-tblpre	;$1e-2 fgetexp inf
+	dc.w	src_nan-tblpre	;$1e-3 fgetexp nan
+	dc.w	sgetexpd-tblpre	;$1e-4 fgetexp denorm
+	dc.w	serror-tblpre	;$1e-5 fgetexp ERROR
+	dc.w	serror-tblpre	;$1e-6 fgetexp ERROR
+	dc.w	serror-tblpre	;$1e-7 fgetexp ERROR
+
+	dc.w	sgetman-tblpre	;$1f-0 fgetman norm
+	dc.w	szero-tblpre	;$1f-1 fgetman zero
+	dc.w	t_operr-tblpre	;$1f-2 fgetman inf
+	dc.w	src_nan-tblpre	;$1f-3 fgetman nan
+	dc.w	sgetmand-tblpre	;$1f-4 fgetman denorm
+	dc.w	serror-tblpre	;$1f-5 fgetman ERROR
+	dc.w	serror-tblpre	;$1f-6 fgetman ERROR
+	dc.w	serror-tblpre	;$1f-7 fgetman ERROR
+
+	dc.w	serror-tblpre	;$20-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$20-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$20-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$20-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$20-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$20-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$20-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$20-7 ERROR - illegal extension
+
+	dc.w	pmod-tblpre	;$21-0 fmod all
+	dc.w	pmod-tblpre	;$21-1 fmod all
+	dc.w	pmod-tblpre	;$21-2 fmod all
+	dc.w	pmod-tblpre	;$21-3 fmod all
+	dc.w	pmod-tblpre	;$21-4 fmod all
+	dc.w	serror-tblpre	;$21-5 fmod ERROR
+	dc.w	serror-tblpre	;$21-6 fmod ERROR
+	dc.w	serror-tblpre	;$21-7 fmod ERROR
+
+	dc.w	serror-tblpre	;$22-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$22-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$22-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$22-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$22-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$22-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$22-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$22-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$23-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$23-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$23-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$23-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$23-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$23-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$23-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$23-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$24-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$24-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$24-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$24-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$24-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$24-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$24-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$24-7 ERROR - illegal extension
+
+	dc.w	prem-tblpre	;$25-0 frem all
+	dc.w	prem-tblpre	;$25-1 frem all
+	dc.w	prem-tblpre	;$25-2 frem all
+	dc.w	prem-tblpre	;$25-3 frem all
+	dc.w	prem-tblpre	;$25-4 frem all
+	dc.w	serror-tblpre	;$25-5 frem ERROR
+	dc.w	serror-tblpre	;$25-6 frem ERROR
+	dc.w	serror-tblpre	;$25-7 frem ERROR
+
+	dc.w	pscale-tblpre	;$26-0 fscale all
+	dc.w	pscale-tblpre	;$26-1 fscale all
+	dc.w	pscale-tblpre	;$26-2 fscale all
+	dc.w	pscale-tblpre	;$26-3 fscale all
+	dc.w	pscale-tblpre	;$26-4 fscale all
+	dc.w	serror-tblpre	;$26-5 fscale ERROR
+	dc.w	serror-tblpre	;$26-6 fscale ERROR
+	dc.w	serror-tblpre	;$26-7 fscale ERROR
+
+	dc.w	serror-tblpre	;$27-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$27-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$27-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$27-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$27-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$27-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$27-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$27-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$28-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$28-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$28-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$28-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$28-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$28-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$28-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$28-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$29-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$29-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$29-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$29-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$29-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$29-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$29-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$29-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$2a-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2a-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2a-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2a-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2a-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2a-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2a-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2a-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$2b-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2b-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2b-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2b-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2b-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2b-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2b-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2b-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$2c-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2c-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2c-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2c-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2c-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2c-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2c-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2c-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$2d-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2d-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2d-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2d-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2d-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2d-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2d-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2d-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$2e-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2e-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2e-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2e-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2e-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2e-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2e-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2e-7 ERROR - illegal extension
+
+	dc.w	serror-tblpre	;$2f-0 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2f-1 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2f-2 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2f-3 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2f-4 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2f-5 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2f-6 ERROR - illegal extension
+	dc.w	serror-tblpre	;$2f-7 ERROR - illegal extension
+
+	dc.w	ssincos-tblpre		;$30-0 fsincos norm
+	dc.w	ssincosz-tblpre		;$30-1 fsincos zero
+	dc.w	ssincosi-tblpre		;$30-2 fsincos inf
+	dc.w	ssincosnan-tblpre	;$30-3 fsincos nan
+	dc.w	ssincosd-tblpre		;$30-4 fsincos denorm
+	dc.w	serror-tblpre		;$30-5 fsincos ERROR
+	dc.w	serror-tblpre		;$30-6 fsincos ERROR
+	dc.w	serror-tblpre		;$30-7 fsincos ERROR
+
+	dc.w	ssincos-tblpre		;$31-0 fsincos norm
+	dc.w	ssincosz-tblpre		;$31-1 fsincos zero
+	dc.w	ssincosi-tblpre		;$31-2 fsincos inf
+	dc.w	ssincosnan-tblpre	;$31-3 fsincos nan
+	dc.w	ssincosd-tblpre		;$31-4 fsincos denorm
+	dc.w	serror-tblpre		;$31-5 fsincos ERROR
+	dc.w	serror-tblpre		;$31-6 fsincos ERROR
+	dc.w	serror-tblpre		;$31-7 fsincos ERROR
+
+	dc.w	ssincos-tblpre		;$32-0 fsincos norm
+	dc.w	ssincosz-tblpre		;$32-1 fsincos zero
+	dc.w	ssincosi-tblpre		;$32-2 fsincos inf
+	dc.w	ssincosnan-tblpre	;$32-3 fsincos nan
+	dc.w	ssincosd-tblpre		;$32-4 fsincos denorm
+	dc.w	serror-tblpre		;$32-5 fsincos ERROR
+	dc.w	serror-tblpre		;$32-6 fsincos ERROR
+	dc.w	serror-tblpre		;$32-7 fsincos ERROR
+
+	dc.w	ssincos-tblpre		;$33-0 fsincos norm
+	dc.w	ssincosz-tblpre		;$33-1 fsincos zero
+	dc.w	ssincosi-tblpre		;$33-2 fsincos inf
+	dc.w	ssincosnan-tblpre	;$33-3 fsincos nan
+	dc.w	ssincosd-tblpre		;$33-4 fsincos denorm
+	dc.w	serror-tblpre		;$33-5 fsincos ERROR
+	dc.w	serror-tblpre		;$33-6 fsincos ERROR
+	dc.w	serror-tblpre		;$33-7 fsincos ERROR
+
+	dc.w	ssincos-tblpre		;$34-0 fsincos norm
+	dc.w	ssincosz-tblpre		;$34-1 fsincos zero
+	dc.w	ssincosi-tblpre		;$34-2 fsincos inf
+	dc.w	ssincosnan-tblpre	;$34-3 fsincos nan
+	dc.w	ssincosd-tblpre		;$34-4 fsincos denorm
+	dc.w	serror-tblpre		;$34-5 fsincos ERROR
+	dc.w	serror-tblpre		;$34-6 fsincos ERROR
+	dc.w	serror-tblpre		;$34-7 fsincos ERROR
+
+	dc.w	ssincos-tblpre		;$35-0 fsincos norm
+	dc.w	ssincosz-tblpre		;$35-1 fsincos zero
+	dc.w	ssincosi-tblpre		;$35-2 fsincos inf
+	dc.w	ssincosnan-tblpre	;$35-3 fsincos nan
+	dc.w	ssincosd-tblpre		;$35-4 fsincos denorm
+	dc.w	serror-tblpre		;$35-5 fsincos ERROR
+	dc.w	serror-tblpre		;$35-6 fsincos ERROR
+	dc.w	serror-tblpre		;$35-7 fsincos ERROR
+
+	dc.w	ssincos-tblpre		;$36-0 fsincos norm
+	dc.w	ssincosz-tblpre		;$36-1 fsincos zero
+	dc.w	ssincosi-tblpre		;$36-2 fsincos inf
+	dc.w	ssincosnan-tblpre	;$36-3 fsincos nan
+	dc.w	ssincosd-tblpre		;$36-4 fsincos denorm
+	dc.w	serror-tblpre		;$36-5 fsincos ERROR
+	dc.w	serror-tblpre		;$36-6 fsincos ERROR
+	dc.w	serror-tblpre		;$36-7 fsincos ERROR
+
+	dc.w	ssincos-tblpre		;$37-0 fsincos norm
+	dc.w	ssincosz-tblpre		;$37-1 fsincos zero
+	dc.w	ssincosi-tblpre		;$37-2 fsincos inf
+	dc.w	ssincosnan-tblpre	;$37-3 fsincos nan
+	dc.w	ssincosd-tblpre		;$37-4 fsincos denorm
+	dc.w	serror-tblpre		;$37-5 fsincos ERROR
+	dc.w	serror-tblpre		;$37-6 fsincos ERROR
+	dc.w	serror-tblpre		;$37-7 fsincos ERROR
+
+
+
+do_func:
+	clr.b	CU_ONLY(a6)
+*
+* Check for fmovecr.  It does not follow the format of fp gen
+* unimplemented instructions.  The test is on the upper 6 bits;
+* if they are $17, the inst is fmovecr.  Call entry smovcr
+* directly.
+*
+	bfextu	CMDREG1B(a6){0:6},d0 ;get opclass and src fields
+	cmpi.l	#$17,d0		;if op class and size fields are $17, 
+*				;it is FMOVECR; if not, continue
+	bne.b	not_fmovecr
+;	jmp	smovcr		;fmovecr; jmp directly to emulation - change to bra <1/2/91, JPO>
+	bra	smovcr		; <1/2/91, JPO>
+
+not_fmovecr:
+	move.w	CMDREG1B(a6),d0
+	and.l	#$7F,d0
+	cmpi.l	#$38,d0		;if the extension is >= $38, 
+	bge.b	serror		;it is illegal
+	bfextu	STAG(a6){0:3},d1
+	lsl.l	#3,d0		;make room for STAG
+	add.l	d1,d0		;combine for final index into table
+	lea.l	tblpre,a1	;start of monster jump table
+;	move.l	(a1,d0.w*4),a1	;real target address - deleted <1/2/91, JPO>
+	adda.w	(a1,d0.w*2),a1	; <1/2/91, JPO>
+	lea.l	ETEMP(a6),a0	;a0 is pointer to src op
+	move.l	USER_FPCR(a6),d1
+	and.l	#$FF,d1		; discard all but rounding mode/prec
+	fmove.l	#0,fpcr
+	jmp	(a1)
+*
+*	ERROR
+*
+
+serror:
+	st.b	STORE_FLG(a6)
+	rts
+*
+* These routines load forced values into fp0.  They are called
+* by index into tbldo.
+*
+* Load a signed zero to fp0 and set inex2/ainex
+*
+
+snzrinx:
+	btst.b	#sign_bit,LOCAL_EX(a0)	;get sign of source operand
+	bne.b	ld_mzinx	;if negative, branch
+	bsr	ld_pzero	;bsr so we can return and set inx
+	bra	t_inx2		;now, set the inx for the next inst
+ld_mzinx:
+	bsr	ld_mzero	;if neg, load neg zero, return here
+	bra	t_inx2		;now, set the inx for the next inst
+*
+* Load a signed zero to fp0; do not set inex2/ainex 
+*
+
+szero:
+	btst.b	#sign_bit,LOCAL_EX(a0)	;get sign of source operand
+	bne	ld_mzero		;if neg, load neg zero
+	bra	ld_pzero		;load positive zero
+*
+* Load a signed infinity to fp0; do not set inex2/ainex 
+*
+
+sinf:
+	btst.b	#sign_bit,LOCAL_EX(a0)	;get sign of source operand
+	bne	ld_minf			;if negative branch
+	bra	ld_pinf
+*
+* Load a signed one to fp0; do not set inex2/ainex 
+*
+
+sone:
+	btst.b	#sign_bit,LOCAL_EX(a0)	;check sign of source
+	bne	ld_mone
+	bra	ld_pone
+*
+* Load a signed pi/2 to fp0; do not set inex2/ainex 
+*
+
+spi_2:
+	btst.b	#sign_bit,LOCAL_EX(a0)	;check sign of source
+	bne	ld_mpi2
+	bra	ld_ppi2
+*
+* Load either a +0 or +inf for plus/minus operand
+*
+
+szr_inf:
+	btst.b	#sign_bit,LOCAL_EX(a0)	;check sign of source
+	bne	ld_pzero
+	bra	ld_pinf
+*
+* Result is either an operr or +inf for plus/minus operand
+* [Used by slogn, slognp1, slog10, and slog2]
+*
+
+sopr_inf:
+	btst.b	#sign_bit,LOCAL_EX(a0)	;check sign of source
+	bne	t_operr
+	bra	ld_pinf
+*
+*	FLOGNP1 
+*
+
+sslognp1:
+	fmovem.x (a0),fp0
+	fcmp.b	#-1,fp0
+	fbgt	slognp1		
+	fbeq	t_dz2		;if = -1, divide by zero exception
+	fmove.l	#0,FPSR		;clr N flag
+	bra	t_operr		;take care of operands < -1
+*
+*	FETOXM1
+*
+
+setoxm1i:
+	btst.b	#sign_bit,LOCAL_EX(a0)	;check sign of source
+	bne	ld_mone
+	bra	ld_pinf
+*
+*	FLOGN
+*
+* Test for 1.0 as an input argument, returning +zero.  Also check
+* the sign and return operr if negative.
+*
+
+sslogn:
+	btst.b	#sign_bit,LOCAL_EX(a0) 
+	bne	t_operr			;take care of operands < 0
+	cmpi.w	#$3fff,LOCAL_EX(a0)	;test for 1.0 input
+	bne	slogn
+	cmpi.l	#$80000000,LOCAL_HI(a0)
+	bne	slogn
+	tst.l	LOCAL_LO(a0)
+	bne	slogn
+;	fmove.x	PZERO,fp0		; deleted <1/2/91, JPO>
+	fmove.b	#0,fp0
+	rts
+
+
+sslognd:
+	btst.b	#sign_bit,LOCAL_EX(a0) 
+	beq	slognd
+	bra	t_operr		;take care of operands < 0
+
+*
+*	FLOG10
+*
+
+sslog10:
+	btst.b	#sign_bit,LOCAL_EX(a0)
+	bne	t_operr			;take care of operands < 0
+	cmpi.w	#$3fff,LOCAL_EX(a0)	;test for 1.0 input
+	bne	slog10
+	cmpi.l	#$80000000,LOCAL_HI(a0)
+	bne	slog10
+	tst.l	LOCAL_LO(a0)
+	bne	slog10
+;	fmove.x	PZERO,fp0		; deleted <1/2/91, JPO>
+	fmove.b	#0,fp0			; <1/2/91, JPO>
+	rts
+
+
+sslog10d:
+	btst.b	#sign_bit,LOCAL_EX(a0) 
+	beq	slog10d
+	bra	t_operr			;take care of operands < 0
+
+*
+*	FLOG2
+*
+
+sslog2:
+	btst.b	#sign_bit,LOCAL_EX(a0)
+	bne	t_operr			;take care of operands < 0
+	cmpi.w	#$3fff,LOCAL_EX(a0)	;test for 1.0 input
+	bne	slog2
+	cmpi.l	#$80000000,LOCAL_HI(a0)
+	bne	slog2
+	tst.l	LOCAL_LO(a0)
+	bne	slog2
+;	fmove.x	PZERO,fp0		; deleted <1/2/91, JPO>
+	fmove.b	#0,fp0			; <1/2/91, JPO>
+	rts
+
+
+sslog2d:
+	btst.b	#sign_bit,LOCAL_EX(a0) 
+	beq	slog2d
+	bra	t_operr			;take care of operands < 0
+
+*
+*	FMOD
+*
+pmodt:
+*				;$21 fmod
+*				;dtag,stag
+	dc.w	smod-pmodt	;  00,00  norm,norm = normal
+	dc.w	smod_oper-pmodt	;  00,01  norm,zero = nan with operr
+	dc.w	smod_fpn-pmodt	;  00,10  norm,inf  = fpn
+	dc.w	smod_snan-pmodt	;  00,11  norm,nan  = nan
+	dc.w	smod_zro-pmodt	;  01,00  zero,norm = +-zero
+	dc.w	smod_oper-pmodt	;  01,01  zero,zero = nan with operr
+	dc.w	smod_zro-pmodt	;  01,10  zero,inf  = +-zero
+	dc.w	smod_snan-pmodt	;  01,11  zero,nan  = nan
+	dc.w	smod_oper-pmodt	;  10,00  inf,norm  = nan with operr
+	dc.w	smod_oper-pmodt	;  10,01  inf,zero  = nan with operr
+	dc.w	smod_oper-pmodt	;  10,10  inf,inf   = nan with operr
+	dc.w	smod_snan-pmodt	;  10,11  inf,nan   = nan - added "-pmodt" <5/2/91, JPO>	<T4>
+	dc.w	smod_dnan-pmodt	;  11,00  nan,norm  = nan - added "-pmodt" <5/2/91, JPO>	<T4>
+	dc.w	smod_dnan-pmodt	;  11,01  nan,zero  = nan - added "-pmodt" <5/2/91, JPO>	<T4>
+	dc.w	smod_dnan-pmodt	;  11,10  nan,inf   = nan - added "-pmodt" <5/2/91, JPO>	<T4>
+	dc.w	smod_dnan-pmodt	;  11,11  nan,nan   = nan - added "-pmodt" <5/2/91, JPO>	<T4>
+
+
+pmod:
+	clr.b	FPSR_QBYTE(a6)	 ; clear quotient bits in FPSR - ADDED <8/26/92, JPO><SM2> CSS
+	bfextu	STAG(a6){0:3},d0 ;stag = d0
+	bfextu	DTAG(a6){0:3},d1 ;dtag = d1
+
+*
+* Alias extended denorms to norms for the jump table.
+*
+	bclr.l	#2,d0
+	bclr.l	#2,d1
+
+	lsl.b	#2,d1
+	or.b	d0,d1		;d1{3:2} = dtag, d1{1:0} = stag
+*				;Tag values:
+*				;00 = norm or denorm
+*				;01 = zero
+*				;10 = inf
+*				;11 = nan
+	lea	pmodt,a1
+;	move.l	(a1,d1.w*4),a1	; removed <1/2/91, JPO>
+	adda.w	(a1,d1.w*2),a1	; get special routine from table <1/2/91, JPO>
+	jmp	(a1)
+
+smod_snan:
+	bra	src_nan
+smod_dnan:
+	bra	dst_nan
+smod_oper:
+	bra	t_operr
+smod_zro:
+	move.b	ETEMP(a6),d1	;get sign of src op
+	move.b	FPTEMP(a6),d0	;get sign of dst op
+	eor.b	d0,d1		;get exor of sign bits
+	btst.l	#7,d1		;test for sign
+	beq.b	smod_zsn	;if clr, do not set sign big
+	bset.b	#q_sn_bit,FPSR_QBYTE(a6) ;set q-byte sign bit
+smod_zsn:
+	btst.l	#7,d0		;test if + or -
+	beq	ld_pzero	;if pos then load +0
+	bra	ld_mzero	;else neg load -0
+	
+smod_fpn:
+	move.b	ETEMP(a6),d1	;get sign of src op
+	move.b	FPTEMP(a6),d0	;get sign of dst op
+	eor.b	d0,d1		;get exor of sign bits
+	btst.l	#7,d1		;test for sign
+	beq.b	smod_fsn	;if clr, do not set sign big
+	bset.b	#q_sn_bit,FPSR_QBYTE(a6) ;set q-byte sign bit
+smod_fsn:
+	tst.b	DTAG(a6)	; filter out subnormal dst case <2/8/91, JPO>
+	bpl.b	@1		; normalized dst <2/8/91, JPO>
+
+	lea.l	FPTEMP(a6),a0	; a0 <- addr(FPTEMP) <2/8/91, JPO>
+	bra	t_resdnrm	; force unfl result <2/8/91, JPO>
+
+@1:				; label added <2/8/91, JPO>
+	fmove.l USER_FPCR(a6),fpcr ;use user's rmode and precision
+	fmove.x FPTEMP(a6),fp0	;load dest operand to fp0
+	rts
+*
+*	FREM
+*
+premt:
+*				;$25 frem
+*				;dtag,stag
+	dc.w	srem-premt	;  00,00  norm,norm = normal
+	dc.w	srem_oper-premt	;  00,01  norm,zero = nan with operr
+	dc.w	srem_fpn-premt	;  00,10  norm,inf  = fpn
+	dc.w	srem_snan-premt	;  00,11  norm,nan  = nan
+	dc.w	srem_zro-premt	;  01,00  zero,norm = +-zero
+	dc.w	srem_oper-premt	;  01,01  zero,zero = nan with operr
+	dc.w	srem_zro-premt	;  01,10  zero,inf  = +-zero
+	dc.w	srem_snan-premt	;  01,11  zero,nan  = nan
+	dc.w	srem_oper-premt	;  10,00  inf,norm  = nan with operr
+	dc.w	srem_oper-premt	;  10,01  inf,zero  = nan with operr
+	dc.w	srem_oper-premt	;  10,10  inf,inf   = nan with operr
+	dc.w	srem_snan-premt	;  10,11  inf,nan   = nan
+	dc.w	srem_dnan-premt	;  11,00  nan,norm  = nan
+	dc.w	srem_dnan-premt	;  11,01  nan,zero  = nan
+	dc.w	srem_dnan-premt	;  11,10  nan,inf   = nan
+	dc.w	srem_dnan-premt	;  11,11  nan,nan   = nan
+
+
+prem:
+	clr.b	FPSR_QBYTE(a6)	 ; clear quotient bits in FPSR - ADDED <8/26/92, JPO> <SM2> CSS
+	bfextu	STAG(a6){0:3},d0 ;stag = d0
+	bfextu	DTAG(a6){0:3},d1 ;dtag = d1
+*
+* Alias extended denorms to norms for the jump table.
+*
+	bclr	#2,d0
+	bclr	#2,d1
+
+	lsl.b	#2,d1
+	or.b	d0,d1		;d1{3:2} = dtag, d1{1:0} = stag
+*				;Tag values:
+*				;00 = norm or denorm
+*				;01 = zero
+*				;10 = inf
+*				;11 = nan
+	lea	premt,a1
+;	move.l	(a1,d1.w*4),a1	; deleted <1/2/91, JPO>
+	adda.w	(a1,d1.w*2),a1	; get special routine from table <1/2/91, JPO>
+	jmp	(a1)
+	
+srem_snan:
+	bra	src_nan
+srem_dnan:
+	bra	dst_nan
+srem_oper:
+	bra	t_operr
+srem_zro:
+	move.b	ETEMP(a6),d1	;get sign of src op
+	move.b	FPTEMP(a6),d0	;get sign of dst op
+	eor.b	d0,d1		;get exor of sign bits
+	btst.l	#7,d1		;test for sign
+	beq.b	srem_zsn	;if clr, do not set sign big
+	bset.b	#q_sn_bit,FPSR_QBYTE(a6) ;set q-byte sign bit
+srem_zsn:
+	btst.l	#7,d0		;test if + or -
+	beq	ld_pzero	;if pos then load +0
+	bra	ld_mzero	;else neg load -0
+	
+srem_fpn:
+	move.b	ETEMP(a6),d1	;get sign of src op
+	move.b	FPTEMP(a6),d0	;get sign of dst op
+	eor.b	d0,d1		;get exor of sign bits
+	btst.l	#7,d1		;test for sign
+	beq.b	srem_fsn	;if clr, do not set sign big
+	bset.b	#q_sn_bit,FPSR_QBYTE(a6) ;set q-byte sign bit
+srem_fsn:
+	tst.b	DTAG(a6)	; filter out subnormal dst case <2/8/91, JPO>
+	bpl.b	@1		; normalized dst <2/8/91, JPO>
+
+	lea.l	FPTEMP(a6),a0	; a0 <- addr(FPTEMP) <2/8/91, JPO>
+	bra	t_resdnrm	; force unfl result <2/8/91, JPO>
+
+@1:				; label added <2/8/91, JPO>
+	fmove.l USER_FPCR(a6),fpcr ;use user's rmode and precision
+	fmove.x FPTEMP(a6),fp0	;return dest to fp0
+	rts
+*
+*	FSCALE
+*
+pscalet:
+*					;$26 fscale
+*					;dtag,stag
+	dc.w	sscale-pscalet		;  00,00  norm,norm = result
+	dc.w	sscale-pscalet		;  00,01  norm,zero = fpn
+	dc.w	scl_opr-pscalet		;  00,10  norm,inf  = nan with operr
+	dc.w	scl_snan-pscalet	;  00,11  norm,nan  = nan
+	dc.w	scl_zro-pscalet		;  01,00  zero,norm = +-zero
+	dc.w	scl_zro-pscalet		;  01,01  zero,zero = +-zero
+	dc.w	scl_opr-pscalet		;  01,10  zero,inf  = nan with operr
+	dc.w	scl_snan-pscalet	;  01,11  zero,nan  = nan
+	dc.w	scl_inf-pscalet		;  10,00  inf,norm  = +-inf
+	dc.w	scl_inf-pscalet		;  10,01  inf,zero  = +-inf
+	dc.w	scl_opr-pscalet		;  10,10  inf,inf   = nan with operr
+ 	dc.w	scl_snan-pscalet	;  10,11  inf,nan   = nan
+ 	dc.w	scl_dnan-pscalet	;  11,00  nan,norm  = nan
+ 	dc.w	scl_dnan-pscalet	;  11,01  nan,zero  = nan
+ 	dc.w	scl_dnan-pscalet	;  11,10  nan,inf   = nan
+	dc.w	scl_dnan-pscalet	;  11,11  nan,nan   = nan
+
+
+pscale:
+	bfextu	STAG(a6){0:3},d0 ;stag in d0
+	bfextu	DTAG(a6){0:3},d1 ;dtag in d1
+	bclr.l	#2,d0		;alias  denorm into norm
+	bclr.l	#2,d1		;alias  denorm into norm
+	lsl.b	#2,d1
+	or.b	d0,d1		;d1{4:2} = dtag, d1{1:0} = stag
+*				;dtag values     stag values:
+*				;000 = norm      00 = norm
+*				;001 = zero	 01 = zero
+*				;010 = inf	 10 = inf
+*				;011 = nan	 11 = nan
+*				;100 = dnrm
+*
+*
+	lea.l	pscalet,a1	;load start of jump table
+;	move.l	(a1,d1.w*4),a1	;load a1 with label depending on tag - removed <1/2/91, JPO>
+	adda.w	(a1,d1.w*2),a1	; <1/2/91, JPO>
+	jmp	(a1)		;go to the routine
+
+scl_opr:
+	bra	t_operr
+
+scl_dnan:
+	bra	dst_nan
+
+scl_zro:
+	btst.b	#sign_bit,FPTEMP_EX(a6)	;test if + or -
+	beq	ld_pzero		;if pos then load +0
+	bra	ld_mzero		;if neg then load -0
+scl_inf:
+	btst.b	#sign_bit,FPTEMP_EX(a6)	;test if + or -
+	beq.b	ld_pinf			;if pos then load +inf
+	bra	ld_minf			;else neg load -inf
+scl_snan:
+	bra	src_nan
+*
+*	FSINCOS
+*
+
+ssincosz:
+	btst.b	#sign_bit,ETEMP(a6)	;get sign
+	beq.b	sincosp
+;	fmove.x	MZERO,fp0		; removed <1/2/91, JPO>
+	fmove.s	MZERO,fp0		; <1/2/91, JPO>
+	bra.b	sincoscom
+sincosp:
+;	fmove.x PZERO,fp0		; deleted <1/2/91, JPO>
+	fmove.b	#0,fp0			; <1/2/91, JPO>
+sincoscom:
+  	fmovem.x PONE,fp1	;do not allow FPSR to be affected
+	bra	sto_cos		;store cosine result
+
+
+ssincosi:
+;	fmove.x QNAN,fp1	;load NAN - deleted <1/2/91, JPO>
+;	fmove.s	QNAN,fp1	; <1/2/91, JPO> - DELETED <4/9/91, JPO>			<T3>
+	fmove.x	QNAN,fp1	; load extended quiet NaN <4/9/91, JPO>			<T3>
+	bsr	sto_cos		;store cosine result
+;	fmove.x QNAN,fp0	;load NAN - deleted <1/2/91, JPO>
+;	fmove.s	QNAN,fp1	; <1/2/91, JPO> - DELETED <4/9/91, JPO>			<T3>
+	bra	t_operr
+
+
+ssincosnan:
+	move.l	ETEMP_EX(a6),FP_SCR1(a6)
+	move.l	ETEMP_HI(a6),FP_SCR1+4(a6)
+	move.l	ETEMP_LO(a6),FP_SCR1+8(a6)
+	bset.b	#signan_bit,FP_SCR1+4(a6)
+	fmovem.x FP_SCR1(a6),fp1
+	bsr	sto_cos
+	bra	src_nan
+*
+* This code forces default values for the zero, inf, and nan cases 
+* in the transcendentals code.  The CC bits must be set in the
+* stacked FPSR to be correctly reported.
+*
+***Returns +PI/2
+
+ld_ppi2:
+;	fmove.x PPIBY2,fp0		;load +pi/2 - deleted <1/2/91, JPO>
+	fmove.x	PIBY2,fp0		; <1/2/91, JPO>
+	bra	t_inx2			;set inex2 exc
+
+***Returns -PI/2
+
+ld_mpi2:
+	fmove.x MPIBY2,fp0		;load -pi/2
+	or.l	#neg_mask,USER_FPSR(a6)	;set N bit
+	bra	t_inx2			;set inex2 exc
+
+***Returns +inf
+
+ld_pinf:
+;	fmove.x PINF,fp0		;load +inf  <1/2/91, JPO>
+	fmove.s #"$7f800000",fp0	; <1/2/91, JPO>
+	or.l	#inf_mask,USER_FPSR(a6)	;set I bit
+	rts
+
+***Returns -inf
+
+ld_minf:
+;	fmove.x MINF,fp0			;load -inf  <1/2/91, JPO>
+	fmove.s #"$ff800000",fp0		; <1/2/91, JPO>
+	or.l	#neg_mask+inf_mask,USER_FPSR(a6) ;set N and I bits
+	rts
+
+***Returns +1
+
+ld_pone:
+	fmove.x PONE,fp0		;load +1
+	rts
+
+***Returns -1
+
+ld_mone:
+;	fmove.x MONE,fp0		;load -1 - deleted <1/2/91, JPO>
+	fmove.b	#-1,fp0			; <1/2/91, JPO>
+	or.l	#neg_mask,USER_FPSR(a6)	;set N bit
+	rts
+
+***Returns +0
+
+ld_pzero:
+;	fmove.x PZERO,fp0		;load +0 - deleted <1/2/91, JPO>
+	fmove.b	#0,fp0			; <1/2/91, JPO>
+	or.l	#z_mask,USER_FPSR(a6)	;set Z bit
+	rts
+
+***Returns -0
+
+ld_mzero:
+;	fmove.x MZERO,fp0		;load -0 - deleted <1/2/91, JPO>
+	fmove.s	MZERO,fp0		; <1/2/91, JPO>
+	or.l	#neg_mask+z_mask,USER_FPSR(a6)	;set N and Z bits
+	rts
+
+

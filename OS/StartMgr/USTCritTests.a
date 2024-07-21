@@ -1,0 +1,1152 @@
+;
+;	File:		USTCritTests.a
+;
+;	Contains:	This file includes the critical test routines run at system start up.  There are also
+;				some routines not run at startup but which are available to the Test Manager through 
+;				the TJump Test Table.
+;
+;	Copyright:	© 1983-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM5>	01/07/93	HY		In AddrLineTest save return address in A4 instead 
+;									of A3 before calling SizeMemory.
+;	   <SM4>	 8/20/92	CCH		Removed unneeded “forRisc” conditional.
+;	   <SM3>	 7/13/92	CCH		Don't check checksum when running on Cub Card.
+;	   <SM2>	  5/2/92	kc		Roll in Horror. Comments follow:
+;		<H2>	01/27/92	jmp		(BG,Z6) Added padding in Mod3Test and RevMod3Test because of our
+;									STUPIP assembler optimizes things even when we dont want it to.
+;									Also, conditionalized the PROC parts of this file for use in
+;									lining up the UST part of HORROR with that of TERROR/Zydeco.
+;		<T5>	  4/2/91	CCH		Rolled in changes from Scott Smyers': Made the startupROM test
+;									always pass when built forRomulator but executed in ROM, not
+;									RAM. (it used to fail when run in ROM, but force a pass when run
+;									in RAM).
+;		<T4>	12/14/90	HJR		Cleaned up the ROM checksum routines.
+;		<T3>	  9/9/90	CCH		Fixed StartupROMTest to deal with one-meg ROMs as well.
+;		<T2>	  9/5/90	CCH		Modifying ROM checksum test to deal with one-meg ROMs.
+;		<14>	 1/23/92	RB		Forced a good ROM checksum when compiled forRomulator.
+;		<13>	 9/18/91	JSM		Cleanup header.
+;		<12>	10/30/90	SS		Tweeked fix <11> so that it uses the ROMHeader structure instead
+;									of equates in STEqu.a.
+;		<11>	10/22/90	SS		Fixed the ROM checksum routines so that they do not rely on a
+;									build specific equate to get the ROM size.  This is so that the
+;									same code will work when we go to a 1 Meg ROM without having to
+;									add another conditional flag to activate the 1 Meg ROM size
+;									equate.  Also cleaned up the code a little in these routines.
+;		<10>	 9/20/90	BG		Removed <8>.  040s are now behaving more reliably.
+;		 <9>	  8/2/90	CCH		Added NOPs between consecutive MOVEMs for flaky 040s.
+;		 <8>	 4/26/90	SS		In AddrLineTest, return an error from SizeMemory if it fails.
+;		 <7>	 4/26/90	SS		Rewrote the address line test to test all of memory, not just
+;									bank A.  It will work even if banks are non-contiguous.  I also
+;									added a call to SizeMemory to this test so that you don't have
+;									to run the SizeMem test immediately before running this one.
+;		 <6>	 4/24/90	SS		In the byte lane ROM checksum test, I changed to use offsets for
+;									the address of the checksum in ROM and the end of ROM, instead
+;									of whole hardcoded addresses.
+;		 <5>	 4/20/90	SS		Changed the way I increment a register in the extended RAM test
+;									to make it a little faster.
+;		 <4>	 3/30/90	SS		Fixed a register usage problem which was destroying results in
+;									one of the RAM tests if an error was found on the last pattern
+;									test.  Note that this test is only run in RBI and test manager -
+;									not on power up.
+;		 <3>	 2/16/90	SS		Added flags to statements which were changed to support Ericson.
+;		 <2>	 2/12/90	MA		Added moving inversions RAM test.  It is not executed at
+;									startup, but is executed by the Test Manager the same as other
+;									mem. tests.
+;	   <1.3>	 8/22/89	GMR		Included the rest of Fremonts critical tests in this file.
+;	   <1.2>	 7/25/89	CCH		If forRomulator flag is set, checksum is forced good when
+;									running in RAM.
+;	   <1.1>	 7/15/89	GMR		Fixed CPU=00 conditional for the RAM tests.
+;	   <1.0>	 6/13/89	GMR		Added for first time to EASE.
+;
+		
+		STRING	ASIS
+
+CritProc	PROC
+
+		IMPORT	BaseOfRom
+		IMPORT	SizeMemory				;<7>
+		EXPORT	Mod3Test
+		EXPORT	RevMod3Test
+		EXPORT	RomTest
+		EXPORT	StartUpROMTest
+		EXPORT	ExtRAMTest
+		EXPORT	AddrLineTest
+		EXPORT	DataBusTest
+		EXPORT	dynamic_bussize_test
+		EXPORT	MovInvTest				;<3>
+		EXPORT	NoTest
+
+
+;---------------------------------------------------------------------------
+;
+;  Mod3Test is a fast test of the entire memory array.
+;
+;  Inputs:	a0 = bottom memory area to test
+;			a1 = top of memory area to test + 1
+;			a6 = return to caller
+;
+;  Outputs:	d6.l is a failed bit mask
+;	    	a0,a1 still pointing to bottom and top of area to test
+;
+;  Register usage:
+;
+;	d0 =	test data register
+;	d1 =	test data register
+;	d2 =	test data register
+;	d3 =	test data register
+;	d4 =	test data register
+;	d5 =	test data register
+;	d6 =	failed bit mask
+;
+;	a0 =	pointer to bottom test area
+;	a1 =	pointer to top of test area
+;	a2 =	copy of a0
+;	a3 =	unsued	
+;	a4 = 	unused
+;	a5 =	unused
+;
+;
+;  This test writes a modulo 3 pattern to all of memory, then shifts the
+;  pattern by writing the appropriate starting pattern, reading the next
+;  in memory, exclusive oring this with the previous location, then writing
+;  it back to the same location.  Any errors while reading (or writing) are
+;  propagated to the end of memory.  At the end of the test the last 3 long
+;  word entries must be as expected or an error has occurred.
+;
+;  In order to properly determine the failing bank with this test, it is best
+;  to call the test with a0/a1 set to test one bank at a time.
+;
+;  There are three cases that can occur at the end of memory, depending on
+;  what size memory is being tested.  Observe the last three long words:
+;
+;  Case 0: 
+;
+;	(LAST-12) $BD6BD6BD (LAST-8) $D6BD6BD6 (LAST-4) $6BD6BD6B
+;		
+;  Case 1: 
+;
+;	(LAST-12) $D6BD6BD6 (LAST-8) $6BD6BD6B (LAST-4) $BD6BD6BD
+;		
+;  Case 2: 
+;
+;	(LAST-12) $6BD6BD6B (LAST-8) $BD6BD6BD (LAST-4) $D6BD6BD6
+;
+;  The last three longs are compared against the appropriate table entries
+;  based on the case determined when memory is filled the first time.
+;  On exit, D6 reflects any bad bits found.
+;
+;  This test should only be called with a0/a1 pointing at mod 4 bounds.  The
+;  code assumes this and tests accordingly on 32 bit longword bounds, however
+;  calling this test with other bounds will result in a bus error since non-
+;  existent memory may be addressed. Also, upper - lower must be >= 24.
+;
+;  This test assumes interrupts are masked out with #$2500.
+;---------------------------------------------------------------------------
+			align	4
+Mod3Test
+
+@FillRegs	reg	d0/d1/d2/d3/d4/d5
+		movem.l	Mod3Pat,@FillRegs		;load up 2 copies of the test patterns
+		movea.l	a0,a2					; starting address
+		suba.w	#120,a1					; subtract slop from loop terminator
+		bra.s	@Fill120Start
+@Fill120Loop
+		movem.l	@FillRegs,(a2)
+		movem.l	@FillRegs,24(a2)
+		movem.l	@FillRegs,48(a2)
+		movem.l	@FillRegs,72(a2)
+		movem.l	@FillRegs,96(a2)
+		adda.w	#120,a2					; point past block just written
+@Fill120Start
+		cmpa.l	a1,a2
+		ble.s	@Fill120Loop			; fill until < 120 bytes remaining
+
+		suba.w	#12-120,a1				; subtract slop from loop terminator
+		moveq.l	#12,d5					; address increment value
+		bra.s	@Fill12Start
+@Fill12Loop
+		movem.l	d0-d2,(a2)
+		adda.w	d5,a2					; point past bytes just written
+@Fill12Start
+		cmpa.l	a1,a2
+		ble.s	@Fill12Loop				; fill until < 12 bytes remaining
+		adda.w	d5,a1					; restore end address
+
+; Now pick up the last maximum 8 bytes not written
+
+		moveq	#4,d4					;case 0, offset = 4
+		cmpa.l	a2,a1					;maybe it came out even?
+		beq.s	@FillDone				;done filling memory
+	
+		move.l	d0,(a2)+				;write one more long
+		moveq	#8,d4					;case 1, offset = 8
+		cmpa.l	a2,a1					;compare against real mem top
+		beq.s	@FillDone				;done filling memory
+		
+		move.l	d1,(a2)+				;write one more long
+		moveq	#0,d4					;case 2, offset = 0
+
+@FillDone
+		movea.l	a0,a2					;copy starting address
+		
+; Memory is filled with the mod 3 pattern.  The pattern is sequenced through
+; three iterations for the test by exclusive oring in the following manner. 		
+
+		move.l	a1,d3					;first get the top boundary
+		sub.l	a0,d3					; = number of bytes to test
+		subq.l	#4,d3					;less 4 bytes
+		moveq.l	#$3F,d2					; mask for index into loop
+		and.w	d3,d2					; compute the index
+		neg.w	d2						; index backwards
+		lsr.l	#6,d3					; 64 bytes per loop
+
+		eor.l	d1,(a2)					;write starting pattern
+		addi.l	#$FFFFFFFF,d5			;help any floating bits float up
+		jmp		@61(d2.w)				; jump to the correct starting position
+
+@60		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+		move.l	(a2)+,d2				;read a pattern
+		eor.l	d2,(a2)					;generate next pattern
+@61		dbra	d3,@60					; until done
+		subi.l	#$00010000,d3			; adjust outer loop count
+		bpl.s	@60
+	
+		cmp.w	#ErrParRAM,d7			;have we finished parity ram test?
+		beq		@exit					;yep, we're outta here
+
+;  Now the final pass through the test area.
+
+		cmp.l	d0,d1					; is this the second pass
+		beq.s	@62						; if so, we're done
+		move.l	d0,d1					; use pattern from D0 on final pass
+		bra.s	@FillDone				; make another pass
+@62
+
+; Now pick up the appropriate 3 longs nearest the end point.  These should	
+; match patterns based on the case in d4, which was set up in the memory
+; fill earlier. If any error occurred during eoring, it is propagated to the end.
+
+		movem.l	-12(a1),d0-d2			;pickup last 12 bytes
+
+; and remember d4 is still set up..
+	
+		movem.l	Mod3Pat(d4.w),d3-d5		;get original test patterns	
+		
+		eor.l	d3,d0
+		eor.l	d4,d1
+		eor.l	d5,d2		
+		or.l	d2,d0
+		or.l	d1,d0					;compile final "bad bit" mask
+		
+		or.l	d0,d6					;record for caller
+		
+		btst	#parity,d7				;determine need for parity ram test		
+		beq.s	@exit					;no parity ram, we're done			
+		move.w	#ErrParRAM,d7			;set parity ram error code			
+		movem.l	Mod3Pat+4,@FillRegs		;load up 2 copies of the test patterns		
+		bra		@FillDone				;do one more pass if parity ram installed	
+@exit	RTS6							;and return
+			
+; Table of test and compare patterns
+
+Mod3Pat			
+		dc.l	$6DB6DB6D				;case 2, offset = 0
+		dc.l	$B6DB6DB6				;case 0, offset = 4
+		dc.l	$DB6DB6DB				;case 1, offset = 8
+		dc.l	$6DB6DB6D
+		dc.l	$B6DB6DB6		
+		dc.l	$DB6DB6DB		
+		
+;---------------------------------------------------------------------------
+;
+;  RevMod3Test is a fast test of the entire memory array, very similar to the
+;  Mod3Test above.  It tests memory with the test addresses generated in the
+;  reverse direction.
+;
+;  changed reg a3 to a2 in following code to make it like mod3test	
+;  and to free-up a3 for other stuff
+;
+;  Inputs:	a0 = bottom memory area to test
+;			a1 = top of memory area to test + 1
+;			a6 = return to caller
+;
+;  Outputs:	d6.l is a failed bit mask
+;	    	a0,a1 still pointing to bottom and top of area to test
+;
+;  Register usage:
+;
+;	d0 =	test data register
+;	d1 =	test data register
+;	d2 =	test data register
+;	d3 =	test data register
+;	d4 =	test data register
+;	d5 =	test data register
+;	d6 =	failed bit mask
+;
+;	a0 =	pointer to bottom test area
+;	a1 =	pointer to top of test area
+;	a2 =	copy of a1
+;	a3 =	unused
+;	a4 =	unused
+;	a5 =	unused
+;
+;  This test writes a modulo 3 pattern to all of memory, then shifts the
+;  pattern by writing the appropriate starting pattern, reading the next
+;  in memory, exclusive oring this with the previous location, then writing
+;  it back to the same location.  Any errors while reading (or writing) are
+;  propagated to the beginning of memory.  At the end of the test the first 3
+;  long word entries must be as expected or an error has occurred.
+;
+;  In order to properly determine the failing bank with this test, it is best
+;  to call the test with a0/a1 set to test one bank at a time.
+;
+;  There are three cases that can occur at the end of memory, depending on
+;  what size memory is being tested.  Observe the last three long words:
+;
+;  Case 0: must write 3 more longs to fill memory, table offset = 8 for
+;	   correct final compare patterns.
+;
+;	(FIRST+0) $6BD6BD6B (FIRST+4) $BD6BD6BD (FIRST+8) $D6BD6BD6
+;		
+;  Case 1: must write 1 more long to fill memory, table offset = 4 for
+;	   correct final compare patterns.
+;
+;	(FIRST+0) $D6BD6BD6 (FIRST+4) $6BD6BD6B (FIRST+8) $BD6BD6BD
+;		
+;  Case 2: must write 2 more longs to fill memory, table offset = 0 for
+;	   correct final compare patterns.
+;
+;	(FIRST+0) $BD6BD6BD (FIRST+4) $D6BD6BD6 (FIRST+8) $6BD6BD6B
+;
+;  The first three longs are compared against the appropriate table entries
+;  based on the case determined when memory is filled the first time.
+;  On exit, D6 reflects any bad bits found.
+;
+;  This test should only be called with a0/a1 pointing at mod 4 bounds.  The
+;  code assumes this and tests accordingly on 32 bit longword bounds, however
+;  calling this test with other bounds will result in a bus error since non-
+;  existent memory may be addressed.  Also, upper - lower must be >= 24.
+;
+;  This test assumes interrupts are masked out with #$2500.
+;
+;---------------------------------------------------------------------------
+		align	4
+RevMod3Test
+
+@FillRegs	reg	d0/d1/d2/d3/d4/d5
+		movem.l	RevMod3Pat,@FillRegs	;load up 2 copies of the test patterns
+		movea.l	a1,a2					; starting address
+		adda.w	#120,a0					; add slop to loop terminator
+		bra.s	@Fill120Start
+@Fill120Loop
+		movem.l	@FillRegs,-(a2)
+		movem.l	@FillRegs,-(a2)
+		movem.l	@FillRegs,-(a2)
+		movem.l	@FillRegs,-(a2)
+		movem.l	@FillRegs,-(a2)
+@Fill120Start
+		cmpa.l	a2,a0
+		ble.s	@Fill120Loop			; fill until < 120 bytes remaining
+	
+		adda.w	#12-120,a0				; add slop to loop terminator
+		bra.s	@Fill12Start
+@Fill12Loop
+		movem.l	d0-d2,-(a2)
+@Fill12Start
+		cmpa.l	a2,a0
+		ble.s	@Fill12Loop				; fill until < 12 bytes remaining
+		suba.w	#12,a0					; restore bottom address
+
+; Now pick up the last maximum 8 bytes not written
+
+		moveq	#8,d4					;case 0, offset = 8
+		cmpa.l	a2,a0					;compare against real mem bottom
+		beq.s	@FillDone				;done filling memory
+		
+		move.l	d2,-(a2)				;write one more long
+		moveq	#4,d4					;case 1, offset = 4
+		cmpa.l	a2,a0					;compare against real mem bottom
+		beq.s	@FillDone				;done filling memory
+			
+		move.l	d1,-(a2)				;write one more long
+		moveq	#0,d4					;case 2, offset = 0
+	
+@FillDone		
+		movea.l	a1,a2					;copy ending address
+		subq.l	#4,a2					;adjust to last longint
+		
+; Memory is filled with the mod 3 pattern.  The pattern is sequenced through
+; three iterations for the test by exclusive oring in the following manner. 		
+
+		move.l	a2,d3					;first get the top boundary
+		sub.l	a0,d3					; = number of bytes to test
+		moveq.l	#$3F,d0					; mask for index into loop
+		and.w	d3,d0					; compute the index
+		neg.w	d0						; index backwards
+		lsr.l	#6,d3					; 64 bytes per loop
+	
+		eor.l	d1,(a2)					;write starting pattern
+		addi.l	#$FFFFFFFF,d5			;help any floating bits float up
+		jmp		@61(d0.w)				; jump to the correct starting position
+	
+@60		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+		move.l	(a2),d0					;read a pattern
+		eor.l	d0,-(a2)				;generate next pattern
+@61		dbra	d3,@60					; until done
+		subi.l	#$00010000,d3			; adjust outer loop count
+		bpl.s	@60
+	
+		cmp.w	#ErrParRAM,d7			;have we finished parity ram test?
+		beq	@exit						;yep, we're outta here
+
+;  Now the final pass through the test area.
+
+		cmp.l	d2,d1					; is this the second pass
+		beq.s	@62						; if so, we're done
+		move.l	d2,d1					; use pattern from D2 on final pass
+		bra.s	@FillDone				; make another pass
+@62
+
+; Now pick up the appropriate 3 longs nearest the end point.  These should	
+; match patterns based on the case in d4. If any error occurred during
+; eoring, it is propagated through to the end.
+
+		movem.l	(a0),d0-d2				;pickup first 12 bytes
+		movem.l	RevMod3Pat(d4.w),d3-d5	;get original test patterns
+		
+		eor.l	d3,d0
+		eor.l	d4,d1
+		eor.l	d5,d2		
+		or.l	d2,d0
+		or.l	d1,d0					;compile final "bad bit" mask
+		
+		or.l	d0,d6					;record for caller
+	
+		
+		btst	#parity,d7				;determine need for parity ram test
+		beq.s	@exit					;no parity ram, we're done
+		move.w	#ErrParRAM,d7			;set parity ram error code
+		movem.l	RevMod3Pat+4,@FillRegs	;load up 2 copies of the test patterns
+		bra		@FillDone				;do one more pass if parity ram installed	
+@exit	RTS6							;and return
+			
+RevMod3Pat			
+		dc.l	$6DB6DB6D				;case 2, offset = 0
+		dc.l	$B6DB6DB6				;case 0, offset = 4
+		dc.l	$DB6DB6DB				;case 1, offset = 8
+		dc.l	$6DB6DB6D
+		dc.l	$B6DB6DB6		
+		dc.l	$DB6DB6DB		
+		
+
+
+;---------------------------------------------------------------------------
+;  RomTest does a ROM checksum on the individual ROMs and returns an error
+;  code in d6 indicating any failed ROMs.  The checksums are located in the
+;  ROMs at dedicated addresses, forever defined to be as follows:
+;
+;		ROM 0	at ROMStart + $0030 - $0033
+;		ROM 1	at ROMStart + $0034 - $0037
+;		ROM 2	at ROMStart + $0038 - $003B
+;		ROM 3	at ROMStart + $003C - $003F
+;
+;  On entry:	d6 =	0
+;  On exit:		d6 =	$0000000X, where X = abcd, and 
+;								a means ROM 3, 
+;								b means ROM 2, 
+;								c means ROM 1, 
+;								d means ROM 0
+;
+;  This test assumes interrupts are masked out with #$2500.
+;
+;---------------------------------------------------------------------------
+RomTest	
+		WITH	ROMHeader				;										<12>
+		
+			BigLea	BaseOfROM,a0		;point to start of ROM code				<11>
+			lea		CheckSum0(a0),a1	;point to end of first area				<12><11>
+			move.l	ROMSize(a0),d0		;and size of ROM						<12><11>
+			lea.l	(a0,d0.l),a2		;calculate the end of ROM				<11>
+		
+		ENDWITH
+
+		clr.l	d0				;clear summing registers
+		clr.l	d1
+		clr.l	d2
+		clr.l	d3
+		clr.l	d4				;holds a byte from ROM to sum
+	
+		addq.l	#4,a0			;skip past first long word					<11>
+		
+@loop	move.b	(a0)+,d4		;											<11>
+		add.l	d4,d0			;sum the HHSB								<11>
+		move.b	(a0)+,d4		;											<11>
+		add.l	d4,d1			;sum the MHSB								<11>
+		move.b	(a0)+,d4		;											<11>
+		add.l	d4,d2			;sum the MLSB								<11>
+		move.b	(a0)+,d4		;											<11>
+		add.l	d4,d3			;sum the LLSB								<11>
+	
+		cmpa.l	a0,a1			;at checksum area yet?
+		bne.s	@checkTop		;no, see if at top
+		adda.l	#16,a0			;yes, skip over checksums
+		bra.s	@loop			;and continue summing
+@checkTop	
+		cmpa.l	a0,a2			;end of ROM yet?
+		bgt.s	@loop			;no, keep summing
+
+@compare
+
+	  IF forRomulator THEN		;									<1.2>
+		TestInRam   A0			; are we running in RAM? 			<1.2>
+		bne.s	@exit			; if so, force chksum good			<1.2>
+	  ENDIF						;									<1.2>
+	     
+@byte1	cmp.l	(a1)+,d0		;byte 0 expected checksum
+		beq.s	@byte2	
+		bset	#0,d6			;error, flag byte 0 checksum error
+@byte2	cmp.l	(a1)+,d1		;byte 1 expected checksum
+		beq.s	@byte3
+		bset	#1,d6			;error, flag byte 1 checksum error
+@byte3	cmp.l	(a1)+,d2		;byte 2 expected checksum
+		beq.s	@byte4
+		bset	#2,d6			;error, flag byte 2 checksum error
+@byte4	cmp.l	(a1)+,d3		;byte 3 expected checksum
+		beq.s	@exit
+		bset	#3,d6			;error, flag byte 3 checksum error
+      
+@exit	RTS6					;exit test
+
+
+
+;---------------------------------------------------------------------------
+;  StartUpROMTest is run normally only at system startup.  It uses the longword
+;  checksum residing in location 0.  The Test Manager also supports a checksum test
+;  that uses the 2 or 4 sums residing in locations ROMStart+$0030 through $003F
+;  as separate sums for each ROM chip.
+;
+;---------------------------------------------------------------------------
+StartUpROMTest
+		moveq.l	#0,d0			;clear checksum accumulator						<11>
+		moveq.l	#0,d1			;clear scratch									<11>
+		
+		WITH	ROMHeader			;											<12>
+			BigLea	BaseOfROM,a0	;point at ROM start, expected checksum		<11><v1.6><2.1>
+			move.l	ROMSize(a0),d3	;get the size of the ROM (in bytes)			<12><11>
+			subq.l	#4,d3			;subtract size of checksum					<11>
+			move.l	(a0)+,d4		;load up expected checksum					<11>
+		ENDWITH
+		
+@ROMLoop						;												<11>
+		move.w	(a0)+,d0		;fetch a ROM word								<11>
+		add.l	d0,d1			;add to checksum								<11>
+		subq.l	#2,d3			;decrement by 2 bytes							<11>
+		bne.s	@ROMLoop		;continue until done							<11>
+			
+		nop						;some nops for debug (leave these here for emulator use)	
+		nop						;some nops for debug	
+		
+		eor.l	d4,d1			;result should be zero
+		beq.s	@exit			;												<11>
+	
+	IF forRomulator THEN		;if we're built for the romulator, we'd never pass<T5>
+		bra.s	@exit			; therefore, force a good checksum				<2.4><T5>
+	ENDIF					;												<2.4>
+		
+		move.w	#$FFFF,d6		;set a failed code in result register 			[A310>
+
+@exit	RTS6					;and exit
+	
+
+
+
+;---------------------------------------------------------------------------
+;  ExtRAMTest is a March pattern for testing RAM.  The algorithm is:
+;
+;	a)	write zeros to all RAM incrementing addresses
+;	b)	read/verify/invert incrementing
+;	c)	read/verify/invert decrementing
+;	d)	read/verify/invert incrementing
+;	e)	read/verify decrementing
+;
+;  On entry:
+;
+;	a0 =	points to start of test area
+;	a1 =	points to end of test area
+;
+;  Register usage:
+;
+;	a0 = 	points to start of test area
+;	a1 = 	points to end of test area
+;	a2 = 	working address pointer
+;	
+;	d0 =	data pattern
+;	d1 =	inverted data pattern
+;	d2 =	loop counter
+;	d3 =	saved loop counter
+;
+;  This test assumes interrupts are masked out, except for power off in NuMac.
+;
+;---------------------------------------------------------------------------
+ExtRAMTest
+		moveq	#0,d0			;starting data = 0
+		moveq	#-1,d1			;inverted data = $FFFFFFFF
+		
+		move.l	a0,a2			;copy start area
+		
+		move.l	a1,d2			;first get the top boundary
+		sub.l	a0,d2			; = number of bytes to test
+		lsr.l	#2,d2			;divide by 4		
+		move.l	d2,d3			;and keep a copy
+
+@10		move.l	d0,(a2)+		;write a pattern
+		subq.l	#1,d2			;count it		
+		bne.s	@10				;until done	
+
+;  RAM is at all 0's now
+;  Now read/verify/invert incrementing
+
+		move.l	d3,d2			;get count
+		move.l	a0,a2			;and pointer
+@20		tst.l	(a2)			;read/verify
+		bne.s	@1000			;error
+		eor.l	d1,(a2)+		;read/invert to 1's
+		subq.l	#1,d2			;count it		
+		bne.s	@20				;until done	
+	
+;  RAM is at all 1's now
+;  Read/verify/invert decrementing, a2 points to 1 long past the top area
+
+		move.l	d3,d2			;get count
+@30		eor.l	d1,-(a2)		;read/invert to 0's
+		bne.s	@1000			;error
+		subq.l	#1,d2			;count it		
+		bne.s	@30				;until done	
+	
+;  RAM is at all 0's now
+;  Read/verify/invert incrementing, a2 points to start of test area
+
+		move.l	d3,d2			;get count
+@40		tst.l	(a2)			;read/verify
+		bne.s	@1000			;error
+		eor.l	d1,(a2)+		;read/invert to 1's
+		subq.l	#1,d2			;count it		
+		bne.s	@40				;until done	
+		
+;  RAM is at all 1's now
+;  Read/verify/invert decrementing, a2 points to 1 long past the top area
+
+		move.l	d3,d2			;get count
+@50		eor.l	d1,-(a2)		;read/invert to 0's
+		bne.s	@1000			;error
+		subq.l	#1,d2			;count it		
+		bne.s	@50				;until done	
+	
+;  RAM is at all 0's now
+;  Read/verify incrementing, a2 points to start of test area	
+
+		move.l	d3,d2			;get count	[C354>
+@60		tst.l	(a2)			;read/verify									<4>
+		bne.s	@1000			;Error if ≠ 0									<4>
+		addq.l	#4,a2			;Else, Increment a2 to point to next location	<5><4>
+		subq.l	#1,d2			;count it		
+		bne.s	@60				;until done	
+		RTS6					;return no error
+	
+@1000	or.l	(a2),d6			;or in bad bits
+	
+		RTS6
+
+
+;---------------------------------------------------------------------------
+;  AddrLineTest
+;
+;  This test writes a pattern in each memory address according to its address bit,
+;  then reads each back and verifies the pattern in reverse.
+;
+;  On entry:	a6   =	return address
+;
+;  On exit:	d6   =	failed bits of an address location, or error result from SizeMem	<8>
+;			d7.b =	if ≠ 0:	bank number which failed (1 = bank A)						<8>
+;					if = 0:	Size memory failed; d6 contains the error from size mem		<8>
+;			a6   =	return address
+;			(sp) =	pointer to memory location table
+;
+;	Destroys	a0-a3, d0, d5
+;
+;---------------------------------------------------------------------------
+AddrLineTest
+
+		move.b	#0,d7			;Initialize the bank counter					<8>
+		movea.l	a6,a4			;Save Return address							<7><SM5>
+		BSR6	SizeMemory		;Size all of memory								<7>
+		movea.l	a4,a6			;Restore the return address						<7><SM5>
+		bne.s	@VerError		;If size mem failed, error out					<8>
+		
+		move.l	(sp),a0			;move memory table pointer into a0				<7>
+		
+@NextBankFill
+		add.b	#1,d7			;Increment the bank counter						<7>
+		move.l	(a0)+,a1		;Get the start addr of this bank				<7>
+		cmpa.l	#-1,a1			;is this all the banks?							<7>
+		beq.s	@MemFilled		;go to check if so								<7>
+		
+		movea.l	(a0)+,a2		;Get length of bank								<7>
+		move.l	a1,(a1)			;Initialize the first location of the bank		<7>
+		moveq.l	#4,d5			;Start storing from offset 4					<7>
+		
+@Fill	move.l	d5,a3			;Get the starting offset						<7>
+		adda.l	a1,a3			;Add the base addr of this bank					<7>
+		move.l	a3,(a3)			;write test data to test address				<7>
+
+		lsl.l	#1,d5			;calculate next test data						<7>
+		cmp.l	a2,d5			;see if done									<7>
+		blt.s	@Fill			;Continue if not								<7>
+		bra.s	@NextBankFill	;Else go to next bank							<7>
+		
+; All banks now have the fill pattern.  Verify this in the reverse direction	<7>
+	
+@MemFilled
+		lea		-4(a0),a0		;point a0 to the 'end of chunk table' mark		<7>
+
+@NextBankCheck
+		sub.b	#1,d7			;Decrement the bank counter						<7>
+		movea.l	-(a0),a2		;Get the bank size from the chunk table			<7>
+		movea.l	-(a0),a1		;and the start address of this bank				<7>
+		moveq.l	#4,d5			;Initialize the starting offset					<7>
+		
+@adjust	lsl.l	#1,d5			;Shift the test offset							<7>
+		cmp.l	a2,d5			;Is it greater than the bank size?				<7>
+		blt.s	@adjust			;continue shifting if not						<7>
+
+@check	lsr.l	#1,d5			;Adjust the offset								<7>
+		move.l	d5,d0			;Calculate the test address						<7>
+		add.l	a1,d0			;												<7>
+		movea.l	d0,a3			;												<7>
+		move.l	(a3),d6			;Get the test data								<7>
+		eor.l	d0,d6			;Verify it										<7>
+		bne.s	@VerError		;Error out if not zero							<7>
+		cmp.l	#4,d5			;was that the last location?					<7>
+		bgt.s	@check			;Continue checking if not						<7>
+		tst.l	d5				;Have we tried an offset of zero yet?			<7>
+		beq.s	@CheckCont		;Continue if so									<7>
+		moveq.l	#0,d5			;Else, let's try an offset of zero				<7>
+		bra.s	@check			;												<7>
+
+@CheckCont		
+		cmpa.l	(sp),a0			;Are we done yet?								<7>
+		bgt.s	@NextBankCheck	;go on to next bank if not						<7>
+
+		move.b	#0,d7			;Success!  Zero out the bank counter			<7>
+		
+@VerError						;												<7>
+		RTS6					;Return											<7>
+	
+;---------------------------------------------------------------------------
+;  Data bus test walks 0 and 1 bits across the data buss to verify that
+;  memory can be accessed.
+;
+;  On entry, a6 = return to caller.
+;	     a0 = test address
+;
+;  On exit, d6 = failed bit mask.
+;
+;  Register usage:
+;
+;	d0 =	data bit register
+;	d1 =	data bit register
+;	d2 =	loop counter
+;
+;	a0 =	address pointer
+;
+;  This test assumes interrupts are masked out with #$2500.
+;---------------------------------------------------------------------------
+;
+DataBusTest
+		moveq	#1,d0			;first data pattern is 1 in 0's
+		moveq	#-2,d1			;next data pattern, $FFFFFFFE, 0 in 1's			[C660>/[C798>
+		move.w	#$00FF,d2		;loop counter = 256
+
+@10		movem.l	d0-d1,(a0)		;write test patterns
+		eor.l	d0,(a0)			;read and write low test location
+		or.l	(a0),d6			;if any bad bits, or to fail reg
+		eor.l	d1,4(a0)		;read and write high test loc
+		or.l	4(a0),d6		;if any bad bits, or to fail reg
+		
+		rol.l	#1,d0			;rotate the bit		
+		rol.l	#1,d1			;rotate the bit
+		
+		dbra	d2,@10			;continue until bit shifted to carry
+		
+		RTS6					;return to caller, no errors
+
+;---------------------------------------------------------------------------
+;---------------------------------------------------------------------------
+;---------------------------------------------------------------------------
+;---------------------------------------------------------------------------
+;dynamic bus sizing tests
+
+;table for dynamic bus-sizing test must be kept in this order
+
+dbs_table	
+		dc.l	$00112233		;pattern for 1st two lw's lw bound
+		dc.l	$88888888
+		
+		dc.l	$88001122		;lw+1(offset)
+		dc.l	$33888888		
+		
+		dc.l	$88880011		;lw+2(offset)
+		dc.l	$22338888		
+		
+		dc.l	$88888800		;lw+3(offset)
+		dc.l	$11223388
+
+		dc.l	$88888888		;lw+4(offset)
+		dc.l	$00112233
+
+
+;expected patterns for word accesses
+
+		dc.l	$00118888		;w+0(offset)
+		dc.l	$88888888
+		
+		dc.l	$88001188		;w+1(offset)
+		dc.l	$88888888		
+		
+		dc.l	$88880011		;w+2(offset)
+		dc.l	$88888888
+		
+		dc.l	$88888800		;w+3(offset)
+		dc.l	$11888888
+		
+		dc.l	$88888888		;w+4(offset)
+		dc.l	$00118888
+		
+;expected patterns for byte accesses
+
+		dc.l	$00888888		;b+0(offset)
+		dc.l	$88888888
+		
+		dc.l	$88008888		;b+1(offset)
+		dc.l	$88888888
+		
+		dc.l	$88880088		;b+2(offset)
+		dc.l	$88888888
+		
+		dc.l	$88888800		;b+3(offset)
+		dc.l	$88888888
+		
+		dc.l	$88888888		;b+4(offset)
+		dc.l	$00888888
+
+
+
+
+;=======================================================
+;
+; dynamic_bussize_test:	this test will verify that the dynamic bus sizing of the 
+;			68020/68030 and dram memory subsystem are working properly.
+;			this is accomplished by writing longword, word, and byte data
+;			to locations + offset within a constant field of two longwords 
+;			and then verifying that the correct bytes were written that 
+;			constant field of two longwords 
+;			
+;
+; entry:	a0.l = ptr to valid ram on longword boundary
+;			a6.l = return address for bsr6
+;
+; exit:		if pass
+;				d6.l = 0
+;
+;			else
+;				d6.l = bitmask of failures in the following format
+;
+;				bit 0 set means lw + 0 (offset) test failed
+;				bit 1 set means lw + 1 (offset) test failed
+;				.
+;				.
+;				.
+;				bit 14 set means byte + 4 (offset) test failed
+;
+;				see dbs_table for expected patterns
+;
+;				
+; altered:	d0.l - d6.l, a1.l - a2.l
+;
+;=======================================================
+		
+;do longwords 1st
+
+dynamic_bussize_test
+		move.l	#%0111111111111111,d6	;init failure mask
+		
+		lea.l	dbs_table,a1	;ptr to table of expected results
+		lea.l	dbs_table+4,a2	;ptr to background pattern
+		move.l	#$00112233,d0	;initialize write pattern
+		clr.l	d1				;init bit position holder and offset values
+dbs_lwb1	
+		move.l	(a2),(a0)		;write background pattern 2 longwords
+		move.l	(a2),4(a0)
+		
+
+		move.l	d0,(a0,d1.w)	;write pattern to ram lw + offset
+		movem.l	(a0),d2-d3		;read back lw's on lw bounds
+		movem.l	(a1)+,d4-d5		;get expected pattern from table
+		cmp.l	d4,d2			;does 1st lw match expected
+		bne.s	dbs_lwb2		;no, skip mask update
+		cmp.l	d5,d3			;how about 2nd lw
+		bne.s	dbs_lwb2		;no, skip mask update
+		swap	d1				;get bit position info to update fail bitmask
+		bclr.l	d1,d6			;clear appropriate bit to indicate pass this test
+		swap	d1				;restore offset to lower word
+dbs_lwb2	
+		addq.l	#1,d1			;bump address offset
+		swap	d1				;get bit position info to update fail bitmask
+		addq.w	#1,d1			;bump bit position to for next offset test
+		swap	d1				;restore offset to lower word
+		
+		cmpi.b	#4,d1			;all offsets tried
+		bls.s	dbs_lwb1		;no, do another
+
+
+;;;;;;;;;;;;;;
+
+;now do words
+
+dbs_word	
+		move.w	#$0011,d0		;initialize write pattern
+		clr.w	d1				;init bit position holder and offset values
+@dbs_lwb1	
+		move.l	(a2),(a0)		;write background pattern 2 longwords
+		move.l	(a2),4(a0)
+		
+
+		move.w	d0,(a0,d1.w)	;write pattern to ram lw + offset
+		movem.l	(a0),d2-d3		;read back lw's on lw bounds
+		movem.l	(a1)+,d4-d5		;get expected pattern from table
+		cmp.l	d4,d2			;does 1st lw match expected
+		bne.s	@dbs_lwb2		;no, skip mask update
+		cmp.l	d5,d3			;how about 2nd lw
+		bne.s	@dbs_lwb2		;no, skip mask update
+		swap	d1				;get bit position info to update fail bitmask
+		bclr.l	d1,d6			;clear appropriate bit to indicate pass this test
+		swap	d1				;restore offset to lower word
+@dbs_lwb2	
+		addq.l	#1,d1			;bump address offset
+		swap	d1				;get bit position info to update fail bitmask
+		addq.w	#1,d1			;bump bit position to for next offset test
+		swap	d1				;restore offset to lower word
+		
+		cmpi.b	#4,d1			;all offsets tried
+		bls.s	@dbs_lwb1		;no, do another
+
+;;;;;;;;;;;;;;;;;;;;;;;;
+
+;and finally bytes
+
+dbs_byte	
+		clr.l	d0				;initialize write pattern
+		clr.w	d1				;init bit position holder and offset values
+@dbs_lwb1	
+		move.l	(a2),(a0)		;write background pattern 2 longwords
+		move.l	(a2),4(a0)
+		
+
+		move.b	d0,(a0,d1.w)	;write pattern to ram lw + offset
+		movem.l	(a0),d2-d3		;read back lw's on lw bounds
+		movem.l	(a1)+,d4-d5		;get expected pattern from table
+		cmp.l	d4,d2			;does 1st lw match expected
+		bne.s	@dbs_lwb2		;no, skip mask update
+		cmp.l	d5,d3			;how about 2nd lw
+		bne.s	@dbs_lwb2		;no, skip mask update
+		swap	d1				;get bit position info to update fail bitmask
+		bclr.l	d1,d6			;clear appropriate bit to indicate pass this test
+		swap	d1				;restore offset to lower word
+@dbs_lwb2	
+		addq.l	#1,d1			;bump address offset
+		swap	d1				;get bit position info to update fail bitmask
+		addq.w	#1,d1			;bump bit position to for next offset test
+		swap	d1				;restore offset to lower word
+		
+		cmpi.b	#4,d1			;all offsets tried
+		bls.s	@dbs_lwb1		;no, do another
+		RTS6					;return to caller
+
+
+; From here to next <3> flag below was added for Ericson
+;---------------------------------
+; Moving Inversions Test (BIT).
+;---------------------------------
+;
+;
+;	Inputs:	a0 = bottom memory area to test
+;			a1 = top of memory area to test + 1
+;			a6 = return to caller
+;
+;	Output: d6 is the error accumulator.
+;
+MovInvTest	
+		move.l	a0,a5			; save starting address
+		move.l	a1,d3
+		sub.l	a0,d3			; size of block to test		
+
+
+
+@1      clr.l   (a0)+           ;set the memory to zero.
+        sub.l   #4,d3
+        bne     @1
+;
+; TOP OF FORWARD LOOP
+        clr.l   d1
+        move.w  #4,d1           ;Address increment, start at 4
+@2      move.l  #0,a2           ;Address offset value
+;
+; TOP OF ADDRESS INCREMENT LOOP
+@3      move.l  a5,a0           ;Starting address
+        adda.l  a2,a0           ;...plus offset
+;
+; TOP OF BIT SET LOOP
+        clr.l   d2              ;Bit to set
+        clr.l   d4              ;Expect pattern
+@4      move.l  a0,a3           ;Working start address
+;
+; TOP OF WORKING ADDRESS LOOP
+@5      move.l  (a3),d3         ;Read
+        cmp.l   d3,d4           ;...same as expected?
+        bne     @100            ;...no, flag as error
+        bset    d2,d3           ;Set the test bit
+        move.l  d3,(a3)         ;...write, with test bit set
+        move.l  (a3),d5         ;...read again
+        cmp.l   d5,d3           ;...same as written?
+        bne     @101            ;...no, flag as error
+        adda.l  d1,a3
+        cmp.l   a1,a3           ;At end of memory?
+        bmi     @5
+; BOTTOM OF WORKING ADDRESS LOOP
+;
+        move.l  d5,d4           ;New expect data
+        add.w  #1,d2            ;Next bit
+        cmp.w  #32,d2           ;...at end?
+        bne    @4
+; BOTTOM OF BIT SET LOOP
+;
+;
+; TOP OF BIT CLR LOOP
+        clr.l   d2              ;Bit to clear
+        move.l  #$FFFFFFFF,d4   ;Expect pattern
+@6      move.l  a0,a3           ;Working start address
+;
+; TOP OF WORKING ADDRESS LOOP
+@7      move.l  (a3),d3         ;Read
+        cmp.l   d3,d4           ;...same as expected?
+        bne     @100            ;...no, flag as error
+        bclr    d2,d3           ;Set the test bit
+        move.l  d3,(a3)         ;...write, with test bit set
+        move.l  (a3),d5         ;...read again
+        cmp.l  d5,d3           ;...same as written?
+        bne     @101            ;...no, flag as error
+        adda.l  d1,a3
+        cmp.l   a1,a3           ;At end of memory?
+        bmi     @7
+; BOTTOM OF WORKING ADDRESS LOOP
+;
+        move.l  d5,d4           ;New expect
+        add.w  	#1,d2            ;Next bit
+        cmp.w  	#32,d2           ;...at end?
+        bne     @6
+; BOTTOM OF BIT CLR LOOP
+;
+        adda.l 	#4,a2            ;Next address base offset
+        cmp.l 	 d1,a2            ;...done all offsets?
+        bne    	@3               ;...no, continue
+; BOTTOM OF ADDRESS INCREMENT LOOP
+;
+;
+        asl.l  #1,d1            ;New Address increment value
+        cmp.l  #$80000,d1       ;...at end?
+        bne    @2               ;...no, continue
+; BOTTOM OF FORWARD LOOP
+
+@99		move.l	a5,a0			; restore starting address
+		rts6
+;
+@100    eor.l   d3,d4           ;...same as expected
+        move.l  d4,d6
+        bra     @99
+;
+@101    eor.l   d5,d3
+        move.l  d3,d6
+        bra     @99
+
+; From here to next <3> flag above was added for Ericson
+;---------------------------------------------------------------------------
+;  No Test implemented
+;
+;---------------------------------------------------------------------------
+NoTest	
+		moveq	#0,d6
+		RTS6
+	
+	
+		ENDPROC
+

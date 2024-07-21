@@ -1,0 +1,453 @@
+;
+;	File:		MemoryMgrExtensions.a
+;
+;	Contains:	New routines for the Memory Mgr.
+;
+;	Written by:	A bunch of people. Merged into this file by Tim Nichols
+;
+;	Copyright:	© 1990-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM4>	 6/14/93	kc		Roll in Ludwig.
+;	   <LW2>	 5/11/93	chp		MoveHLow was depending on the CCR to indicate error conditions
+;									reported by _RecoverHandle. This weirdass trap only returns its
+;									result in MemErr, so insert an explicit test to avoid crashing
+;									in the subsequent _HGetState. Partial fix for RADAR #1081681.
+;	   <SM3>	10/22/92	CSS		Change some branch short instructions to word branches.
+;	   <SM2>	 7/10/92	RLM		add CycloneTranslate24To32
+;		<1>		 4/8/92		tcn		New today.  Code from MemoryMgrPatches.a
+;
+
+
+		load 'StandardEqu.d'
+
+				MACHINE	MC68020		;<SM2> RLM
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+;
+; MoveHLow
+;
+; entry:
+;			A0 - handle requested
+; exit:
+;			D0 - error (word)
+; internal:
+;			A4 - (long) handle to original block
+;			A3 - (long) pointer to new block
+;			D3 - (long) size of block
+;			D4 - (long) offset to block tags (24 = -8; 32 = -12)
+; info:	
+;			This code does the opposite in principle to MoveHHi.  The handle input
+;			is moved as low as possible in the heap that it belongs.  This call works
+;			with 24 and 32 bit zones.
+; to do:
+;		•	roving pointer point at newly freed block (is this good?)
+
+myError			EQU		nsStackErr	;QuickDraw error meaning not enough stack
+blkSize			EQU		-8			;note that this offset is the same for 24/32 bit zones
+StackSlop		EQU		(3*1024)	;3k slop for interupts and our minimal buffer
+BlockTagBits	EQU		$C0			;
+
+MakeBlocksNonPurgeableStack	record	{a6Link},decr
+startParams				equ		*
+paramSize				equ		startParams-*
+return					ds.l	1
+a6Link					ds.l	1
+HPurgeAddress			ds.l	1						;trap address for HPurge
+hNoPurgeAddress			ds.l	1						;trap address for HNoPurge
+RecoverHAddress			ds.l	1						;trap address for RecoverHandle
+HGetStateAddress		ds.l	1						;trap address for HGetState
+largestFreeSpace		ds.l	1						;size of largest free space available
+freeSpaceAccumulator	ds.l	1						;a place to add up free space
+keepCheckingFreeSpace	ds.w	1						;should we keep checking free space?
+passedOurBlock			ds.w	1						;are we past our block yet?
+localSize				equ 	*						;size of all the local variables
+						endR
+
+MoveHLow	Proc Export
+
+@Regs	REG	a3-a6/d3-d7
+
+		movem.l	@Regs,-(sp)						;save regs
+		move.l	theZone,-(sp)					;save theZone
+		move.l	a0,a4							;save callers A0,
+												; original MoveHHi did this
+
+	;check for nil master pointer
+		move.w	#nilHandleErr,MemErr			;
+		move.l	(a0),d0							;check for nil MP
+		beq		@RestoreZoneStateAndExit		;
+
+	;check for locked handle passed in, and save the state of the handle
+		;move.l	a4,a0							;get handle to original block
+		_HGetState								;
+		move.b	d0,d2							;save handle state of original block
+		move.w	#memLockedErr,MemErr			;
+		btst	#lock,d0						;
+		bne 	@RestoreZoneStateAndExit		; <SM3> CSS
+
+	;set theZone to zone that this handle lives in
+		move.l	a4,a0							;get handle to original block
+		_HandleZone								;
+		tst.w	d0								;
+		bne 	@RestoreZoneStateAndExit		; <SM3> CSS
+		move.l	a0,theZone						;temporarily set theZone to contain block
+
+	;set up offset in d4 to MemMgr Block tags (be 24/32 bit zone friendly)
+		moveq	#-8,d4							;-8 offset MemMgr Block tags in 24 zone
+		move.l	Lo3Bytes,d6						;setup mask for MakeBlocksNonPurgeable
+		tst.b	maxNRel(a0)						;check if 32 zone
+		beq.s	@not32bitzone					;
+		add.l	#-4,d4							;-12 offset MemMgr Block tags in 32 zone
+		moveq	#-1,d6							;setup mask for MakeBlocksNonPurgeable
+@not32bitzone
+
+	;mark all purgeable blocks as non-purgeable when/if we call Newptr
+	
+	;mark our block as non-purgeable
+		move.l	a4,a0							;get handle to original block
+		_HNoPurge
+
+	;always allocate a buffer on the stack
+		link	A6,#MakeBlocksNonPurgeableStack.localSize	;Unlk A6 happens in RestorePurgeableBlocks
+		clr.l	-(sp)							;ensure end of handle list is a nil
+		bsr 	MakeBlocksNonPurgeable			; <SM3> CSS
+		bne.s	@DoCommonExit					;condition codes are set for failure
+
+	;allocate block of same size in lower in this heap. (first get size of handle)
+		move.l	a4,a0							;get handle to original block
+		_GetHandleSize							;
+		move.l	d0,d3							;save size of block and check for error
+		bmi.s	@DoCommonExit					;
+		_NewPtr									;d0 from _GetHandleSize
+		bne.s	@DoCommonExit					;check for error
+		move.l	a0,a3							;save pointer to new block
+
+	;the result from NewPtr may actually be higher in memory than Handle passed in
+	;check for this and leave handle where it is
+		move.l	(a4),d0							;get pointer to old block
+		_StripAddress							;in 24 bit world, this call needed
+		cmp.l	a0,d0							;is new block higher in memory than old?
+		blt.s	@DisposeBlock					;yes, go dispose the new block
+
+	;copy junk from old handle to new pointer
+		move.l	a0,a1							;set up destination for blockmove
+		move.l	(a4),a0							;set up source for blockmove
+		move.l	d3,d0							;set up size for blockmove
+		_BlockMove
+
+	;make the handle point at the new block, and make the old block a pointer block
+		;fix relhandle
+		;move.l	(a4),a0							;point a0 at old block
+		move.l	-(a0),-4(a3)					;fix relhandle for new block
+		move.l	theZone,(a0)+					;change relhandle to pointer block info
+
+		;change master pointer to point at new
+		move.l	a3,(a4)							;no more references to old block
+
+		;mark old block as pointer block, and new block as relocateable
+		eori.b	#BlockTagBits,(a3,d4)			;toggle new block from nonrel to rel
+		eori.b	#BlockTagBits,(a0,d4)			;toggle old block from rel to nonrel
+
+	;Dispose of the old block (this frees the block)
+@DisposeBlock
+		_DisposePtr
+	;fall through to exit code (ResoreHandleStateAndExit)
+
+@DoCommonExit									;
+	;walk the heap to restore Purgeable Blocks and cleanup the stack
+		bsr		RestorePurgeableBlocks			;
+		move.l	(sp)+,d0						;remove the nil marker
+		unlk	a6								;distroy stack buffer
+		
+	;restore the master pointer flags
+		move.w	MemErr,d3						;preserve MemErr across _HSetState call
+		move.l	a4,a0							;get handle to new block
+		move.b	d2,d0							;restore handle state of original block
+		_HSetState								;
+		move.w	d3,MemErr						;restore MemErr after _HSetState call
+	;set up D0, fall through to exit code (RemoveStackBuffer)
+		moveq	#0,d0							;
+
+@RestoreZoneStateAndExit
+		move.l	(sp)+,theZone					;restore theZone
+		move.l	a4,a0							;preserve handle across MoveHHi
+		move.w	MemErr,d0						;make d0 agree with MemErr
+		movem.l	(sp)+,@Regs						;restore regs, leave cc's unchanged
+		rts										;return without calling through
+		
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+;
+; MakeBlocksNonPurgeable
+;
+; entry:
+;			theZone	- the zone we will walk
+;			d4		- negative size of heapblock header.
+; exit :
+;			a0-a1	- trashed
+;			a2-a3	- unchanged
+;			a4		- unchanged; handle of block passed to MoveHLow
+;			a5		- trashed, used to jump through as return address 
+;			a6		- should be used to unlink buffer on stack
+;			a7,sp	- points to buffer on stack (first long is number of entries)
+;			d0		- error (long) (0 means no error, else bail; leave buffer on stack)
+;			d1		- trashed
+;			d2		- unchanged
+;			d3		- address of block passed to MoveHLow
+;			d4-d6	- unchanged
+;			d7		- trashed
+;
+; info:
+;			Walk the heap and mark purgeable blocks Non-purgeable.  The problem is that
+;			the original MoveHHi did not purge any blocks.  We need to save all purgeable
+;			handles, make a NewPtr call, and then restore them.  Remember which
+;			blocks we change by putting the master pointers in a buffer on the stack.
+;			Warning!  This routine leaves a buffer on the stack, which will be
+;			removed by calling RestorePurgeableBlocks.  That means this routine
+;			can’t save anything on the stack except master pointers.
+;
+; todo:
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+		with MakeBlocksNonPurgeableStack
+MakeBlocksNonPurgeable
+		move.l	a3,d1							;preserve a3 across call
+		move.l (sp)+,a5							;get return address
+
+
+	;see if we can make a buffer with storage for at least entry
+		_StackSpace								;
+		sub.l	#StackSlop,d0					;need some slop on stack for interupts
+		bmi		@ErrorExit						;
+		
+	;initialize regs for @loop
+	;clear free space counters
+	;clear flags to see if we should check free space and if we’ve passed our block
+	;set up our block address for free space counter
+	;A1 points at end of stack buffer
+	;A3 points at first block in heap
+	;D7 points at end of heap
+		clr.l	largestFreeSpace(a6)			;start with zero as the largest free space
+		clr.l	freeSpaceAccumulator(a6)		;and the accumulator starts out empty, too
+		clr.w	keepCheckingFreeSpace(a6)		;clear the flag for free space checks
+		clr.w	passedOurBlock(a6)				;clear the flag for our block in the heap
+		move.l	sp,a1							;pointer to stack buffer
+		sub.l	d0,a1							;point to the end of the stack buffer
+		move.l	(a4),d0							;get address of our block
+		_StripAddress							;shave off nasty bits, ’cause we’re gonna compare against it
+		move.l	d0,d3							;keep block address in d3
+		move.l	theZone,a3						;get pointer to start of this zone
+		move.l	bkLim(a3),d7					;save end of heap
+		add.l	#heapData,a3					;skip past zone header
+		sub.l	d4,a3							;skip past heap block header
+	;this loop walks the heap, and marks all purgeable blocks non-purgeable
+@loop
+		cmp.l	a1,sp							;check if stack buffer is full
+		ble		@ErrorExit						;no more room in buffer, signal error
+		cmp.l	a3,d7							;check if end of heap
+		blt		@NormalExit						;successfull, exit loop
+		cmp.l	a3,d3							;check if we’re to our block
+		bgt.s	@pastCheckForOurBlock			;if we’re not there, then move on
+		move.w	#-1, passedOurBlock(a6)			;otherwise, set the flag that says we’re past our block
+	;now treat block passed in as a special case terminator for free space checks
+		cmp.l	a3,d3
+		beq.s	@resetFreeSpaceAccumulator
+@pastCheckForOurBlock
+
+	;low two bits in d0 will be the block type
+		move.b	(a3,d4),d0						;get the blocktype
+		lsr.b	#6,d0							;only use the tag bits
+
+	;if free d0 = 0
+		beq.s	@addToFreeSpaceAccumulator
+
+@notFreeBlock
+	;bail if pointer block
+		cmp.b	#tybkNRel,d0					;check if pointer block
+		beq.s	@resetFreeSpaceAccumulator		;advance to next block
+
+	;we are sure it is a relocateable block now, but check just in case.
+		cmp.b	#tybkRel,d0						;check if relocateable block
+		bne.s	@resetFreeSpaceAccumulator		;if not relocatateable, error, go next?
+		
+	;we have a pointer to the relocatable block, we need a handle to mark it non-purgeable
+		move.l	a3,a0							;set up pointer to block
+		_RecoverHandle							;if this fails, then this block is
+												;orphaned, and we can move it at will
+		tst.w	MemErr							;(RecoverHandle result in MemErr only!)			<LW2>
+		bmi.s	@pastFreeSpaceChecks			;
+
+	;if already locked, we don’t need to change its state
+		_HGetState								;
+		btst	#lock,d0						;check if handle is locked
+		bne.s	@resetFreeSpaceAccumulator		;is locked, go to nextBlock 
+
+	;last test, is it a purgeable block?
+		btst	#purge,d0						;check if handle is purgeable
+		beq.s	@pastFreeSpaceChecks			;if not purgable go to nextBlock 
+
+	;change its state, and save a handle to this block in our buffer.
+		_HNoPurge								;keep this block from purgeing
+		move.l	a0,-(sp)						;save handle to this block on stack
+		bra.s	@pastFreeSpaceChecks
+
+	;we found a relocatable or free block, so add this block to the possible space for our ptr
+@addToFreeSpaceAccumulator
+		move.l	blkSize(a3),d0					;get size of this block
+		and.l	d6,d0							;strip off tags 24 bit world (32 is ok)
+		tst.w	keepCheckingFreeSpace(a6)		;should we bother (have we passed our block)
+		bmi.s	@endOfLoop						;don’t bother if we’ve passed our block
+		add.l	d0, freeSpaceAccumulator(a6)	;and add the size to the free space for this island
+		bra.s	@endOfLoop
+		
+	;we ran across an immovable block, so reset our counter and update the largest free area we’ve found
+@resetFreeSpaceAccumulator
+		tst.w	keepCheckingFreeSpace(a6)		;should we bother with this? (past our block?)
+		bmi.s	@pastFreeSpaceChecks			;if the flag is set, skip the free space stuff
+		tst.w	passedOurBlock(a6)				;have we (just now) passed our block in the heap
+		beq.s	@pastPreflightCheck				;if the flag is not set, keep checking free spaces
+	;now comes the good part... should we bail out early because there isn’t sufficient free space
+	;lower that our block in the heap?
+		move.l	a3, -(sp)						;save block pointer, ’cause we need an address register
+		move.l	d3,a3							;put block passed in here
+		move.l	blkSize(a3),d0					;get size of our block
+		and.l	d6,d0							;strip off tags 24 bit world (32 is ok)
+		cmp.l	largestFreeSpace(a6),d0			;do we have room for our block lower in the heap?
+		move.l	(sp)+, a3						;put old block pointer back, don’t affect cc
+		bgt.s	@ErrorExit						;no room in heap, bail out!
+		move.w	#-1,keepCheckingFreeSpace(a6)	;now that we have good news, stop checking free space
+		bra.s	@pastFreeSpaceChecks
+@pastPreflightCheck
+		move.l	freeSpaceAccumulator(a6), d0	;get the space we counted this time
+		cmp.l	largestFreeSpace(a6), d0		;see if the largest is still king of the hill
+		ble.s	@pastFreeSpaceChecks			;if so, move on
+		move.l	d0, largestFreeSpace(a6)		;else make a new king
+		clr.l	freeSpaceAccumulator(a6)		;and clear the accumulator
+@pastFreeSpaceChecks
+		move.l	blkSize(a3),d0					;get size of this block
+		and.l	d6,d0							;strip off tags 24 bit world (32 is ok)
+
+	;end of @loop, bump a3 to point at next block
+@endOfLoop
+		add.l	d0,a3							;point at next block
+		bra		@loop							;loop back for more
+
+
+	;if error occured, we must signal error by putting a zero count into stack buffer
+@ErrorExit
+		move.w	#myError,d0						;signal an error to the main routine
+		move.w	d0,MemErr						;set MemErr
+		bra.s	@CommonExit						;exit through CommonExit
+
+@NormalExit
+		moveq	#0,d0							;signal no error to the main routine
+
+@CommonExit
+		;condition codes must be set at this point, caller depends on this
+		movea.l	d1,a3							;preserve a3 across call
+		jmp		(a5)							;rts
+		endwith
+
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+;
+; RestorePurgeableBlocks
+;
+; entry:
+;			A6 - should be used to unlink buffer on stack
+; exit :
+;			D1 - trashed
+;			A5 - trashed
+;			A6 - restored
+;
+; info:
+;			Traverse the stack buffer and restore the saved handles to their purgeable
+;			state.  Deallocate the stack buffer.
+;			Warning!  This routine removes the buffer on the stack.  This buffer was
+;			allocated by MakeBlocksNonPurgeable.
+; todo:
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+RestorePurgeableBlocks
+		move.l	(sp)+,a5						;get return address
+		
+@loop
+		tst.l	(sp)							;check for end of list
+		beq.s	@ExitRestorePurgeableBlocks		;nil meant end of list
+		move.l	(sp)+,a0						;get handle
+		_HPurge									;mark as purgeable, ignore any error
+		bra.s	@loop							;check if anymore
+
+@ExitRestorePurgeableBlocks
+		jmp		(a5)							;return to caller
+		EndProc
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+; •••••••••••••••••••••••••• Patch for CycloneTranslate24To32 ••••••••••••••••••••••••••  <P8> RMP
+;
+;  FUNCTION CycloneTranslate24To32(Addr24: long): Addr32;
+;
+;  Translate an Cyclone 24-bit address to a valid Cyclone 32-bit address.
+;  
+;		INPUT	D0=Addr24;
+;		OUTPUT	D0=Addr32;
+;
+;		All other registers preserved
+;
+;	Translation algorithm from Cyclone Hardware ERS:
+;
+;		Old first 3 nibbles		New first 3 nibbles
+;		-------------------		-------------------
+;				xx0						000
+;				 :						 : 
+;				xx7						007
+;				xx8						400-->408 for safety in 24 bit mode; also since the emulator doesn't alias
+;				xx9						409 second meg of ROM is in tradional slot 9 space.
+;				xxA						FA0
+;				 :						 :
+;				xxE						FE0
+;				xxF						500
+;
+;
+;
+;  NOTE:  Unlike _StripAddress, this routine does not necessarily
+;		  return an address which can also be used in 24 bit mode.
+;		  Furthermore, Translate24To32 can not be called meaningfully
+;		  with the result of a previous translation.
+;
+;
+;		
+		
+CycloneTranslate24To32		Proc		Export
+
+		AND.L	Lo3Bytes,D0						;Clean high byte for fast exit
+		BCLR	#23,D0							;Is the address in RAM?
+		BNE.S	@NotRam							;no, go patch up address
+		RTS										;quick exit
+
+@NotRam	MOVE.W	D1,-(SP)						;save a work register
+		SWAP	D0								;get relevant nibbles into low word
+		MOVE.W	D0,D1							;...and into index register
+		LSR.W	#4,D1							;move nibble 3 to use as index
+		AND.W	(@TABLE+2,PC,D1.W*4),D0			;mask off bits that will be added.
+		ADD.W	(@TABLE,PC,D1.W*4),D0			;translate by adding table value
+		SWAP	D0								;move translated nibbles back to high word
+		MOVE.W	(SP)+,D1						;restore work register
+		RTS
+
+@TABLE
+		DC.W	$4080,$FFFF						; 008x -> 408x
+		Dc.w	$4080,$FFFF						; 009x -> 409x
+		Dc.w	$FA00,$000F						; 00Ax -> FA0x
+		Dc.w	$FB00,$000F						; 00Bx -> FB0x
+		Dc.w	$FC00,$000F						; 00Cx -> FC0x
+		Dc.w	$FD00,$000F						; 00Dx -> FD0x
+		Dc.w	$FE00,$000F						; 00Ex -> FE0x
+		Dc.w	$5000,$000F						; 00Fx -> 500x
+
+		ENDPROC
+
+
+				end

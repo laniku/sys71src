@@ -1,0 +1,311 @@
+;
+;	File:		PPCBrowser.a
+;
+;	Contains:	Assembly routines for the PPCBrowser.
+;
+;	Written by:	Jeff Miller
+;
+;	Copyright:	© 1990, 1992 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 11/5/92	SWC		Changed PackMacs.a->Packages.a.
+;		 <6>	 9/16/90	JSM		Add ContainsWildcard.
+;		 <5>	 4/13/90	JSM		Don't need to uppercase strings in InsertListCell.
+;		 <4>	  4/5/90	JSM		Add PenPatGray.
+;		 <3>	  3/8/90	JSM		Change InsertListCell to return whether cell was unique.
+;		 <2>	 2/20/90	JSM		Change DispatchTable format.
+;		 <1>	 2/19/90	JSM		First checked in.
+;
+
+				TITLE		'PPCBrowser.a'
+				BLANKS		ON
+				STRING		ASIS
+				CASE		OBJ
+				CODEREFS	FORCEPC
+
+				SEG 		'Main'
+
+				PRINT		OFF
+
+				LOAD		'StandardEqu.d'
+				INCLUDE		'Packages.a'
+
+				PRINT		ON
+
+DoDebug			EQU			1
+
+;
+; Macro to put in debug symbols for MacsBug
+;
+				IF DoDebug THEN
+				MACRO
+				DoDebugSymbols &name
+				DC.B	$80 + &LEN(&name), '&name'
+				DC.W	$0000
+				ENDM
+				ENDIF
+
+;===============================================================================
+;
+;	PPCBrowser package header
+;
+;===============================================================================
+
+BrowsePackEntry	PROC		EXPORT
+
+				DC.W	$A9FF				; package entry point (unused now)
+				DC.B	'PACK'
+				DC.W	9					; package number
+				DC.W	0					; version
+
+;
+;				DispatchTable for DispatchHelper
+;
+MyDispatchTable
+				DC.W	0					; dispatchFlags (always 0)
+				DC.B	0					; first selector
+				DC.B	0					; last selector
+
+;
+; macro to build jump table
+;
+				MACRO
+				JT		&entry
+				IMPORT	&entry
+				DC.W	&entry - MyDispatchTable
+				ENDM
+
+				CASE		OFF					; following are Pascal routines
+
+				JT			MyPPCBrowser
+
+				CASE		OBJ
+				
+				ENDPROC
+
+;===============================================================================
+;
+;	short		InsertListCell(char *theStr, ListHandle theList, Boolean *Unique);
+;
+;				Inserts specified text alphabetically as a cell in specified list.
+;				Only inserts unique cells, sets unique to FALSE if cell already
+;				exists.  Returns row where cell was inserted, or where matching
+;				cell exists.  Algorithm stolen from the Chooser.
+;
+;				Note that IUMagString does the right thing always.  It will sort
+;				strings for keyboard navigation (i.e. Ab ab Ac instead of Ab Ac ab),
+;				and will mark strings as equal correctly for PPC ports (i.e.
+;				finder != Finder).  (Question: is this always true?  PPCToolbox
+;				does a byte compare for equality.)
+;
+; Register Usage:
+;
+;	A2 = theList
+;	A3 = theStr
+;	A4 = testCell
+;
+;	D3 = binary search lower bound, initially dataBounds.top
+;	D4 = binary search upper bound, initially dataBounds.bottom
+;	D5 = row to test between D3 and D4
+;
+;===============================================================================
+InsertListCell	PROC		EXPORT
+
+StackFrame		RECORD		{A6Link},DECR
+unique			DS.L		1
+theList			DS.L		1
+theStr			DS.L		1
+Return			DS.L		1
+A6Link			DS.L		1
+testCell		DS.B		34						; current cell data
+LocalSize		EQU			*
+				ENDR
+				
+				WITH		StackFrame
+				
+				LINK		A6,#LocalSize			; set up stack frame
+				MOVEM.L		A2-A4/D3-D5,-(SP)		; preserve registers
+				
+				MOVE.L		theList(A6),A2			; A2 = theList
+				MOVE.L		theStr(A6),A3			; A3 = theStr
+				LEA			testCell(A6),A4			; A4 = testCell
+
+				; set up for binary search
+
+				MOVE.L		(A2),A0					; A0 = list pointer
+				MOVE.W		dataBounds+top(A0),D3	; D3 = dataBounds.top
+				MOVE.W		dataBounds+bottom(A0),D4	; D4 = dataBounds.bottom
+
+@continueSearch
+				CMP.W		D3,D4					; no more rows?
+				BEQ.S		@foundRow				; yes, we're done
+				
+				; calculate a test row midway between current top and bottom
+				
+				MOVE.W		D4,D5					; calculate test row in D5
+				SUB.W		D3,D5					; D5 = currTop - currBottom
+				ASR.W		#1,D5					; DIV 2
+				ADD.W		D3,D5					; + currTop
+				
+				; get contents of test row
+
+				MOVE.W		#34,-(SP)				; max length to get
+				PEA			testCell+1(A6)			; retrieve cell here
+				PEA			4(SP)					; return length here
+				MOVE.W		#0,-(SP)				; get from column 0
+				MOVE.W		D5,-(SP)				; and the test row
+				MOVE.L		A2,-(SP)				; theList
+				_LGetCell
+				
+				MOVE.W		(SP)+,D0				; get length
+				MOVE.B		D0,(A4)					; and stuff it in testCell
+				
+				; compare the theStr and the current cell
+
+				MOVE.L		A4,A0					; get current cell data
+				MOVEQ		#0,D0
+				MOVE.B		(A0)+,D0				; get length
+
+				MOVE.L		A3,A1					; get theStr
+				MOVEQ		#0,D1
+				MOVE.B		(A1)+,D1				; get length
+				
+				SUBQ		#2,SP					; make room for integer result
+				MOVE.L		A0,-(SP)				; aStr = testCell
+				MOVE.L		A1,-(SP)				; bStr = theStr
+				MOVE.W		D0,-(SP)				; aLen = length of testCell
+				MOVE.W		D1,-(SP)				; bLen = length of theStr
+				_IUMagString
+				
+				MOVE.W		(SP)+,D0				; get result
+				BEQ.S		@notUnique				; testCell == theStr, don't insert
+				BMI.S		@afterCurr				; testCell < theStr, insert after
+				
+				MOVE.W		D5,D4					; testCell >= theStr, insert before
+				BRA.S		@continueSearch			; currBottom = test row
+
+@afterCurr
+				MOVE.W		D5,D3					; currTop = test row + 1
+				ADDQ		#1,D3
+				BRA.S		@continueSearch
+
+@notUnique
+				MOVE.W		D5,D4					; D4 = matching cell
+				MOVEQ		#0,D0					; return false => cell is not unique
+				BRA.S		@exit
+
+@foundRow
+				; add a row in the right place
+
+				SUBQ		#2,SP					; make room for integer result
+				MOVE.W		#1,-(SP)				; add one row
+				MOVE.W		D4,-(SP)				; at the right row
+				MOVE.L		A2,-(SP)				; theList
+				_LAddRow
+				ADDQ		#2,SP					; ignore result
+				
+				; put theStr in the new cell
+				
+				MOVE.L		A3,A0					; get theStr
+				MOVEQ		#0,D0
+				MOVE.B		(A0)+,D0				; get the length
+				
+				MOVE.L		A0,-(SP)				; the data for the cell
+				MOVE.W		D0,-(SP)				; length of data
+				MOVE.W		#0,-(SP)				; column 0
+				MOVE.W		D4,-(SP)				; the right row
+				MOVE.L		A2,-(SP)				; theList
+				_LSetCell
+				
+				MOVEQ		#1,D0					; return true => cell is unique
+				
+				; clean up and exit
+@exit
+				MOVE.L		unique(A6),A0			; set unique
+				MOVE.B		D0,(A0)
+				MOVE.W		D4,D0					; return row where inserted
+				MOVEM.L		(SP)+,A2-A4/D3-D5		; restore registers
+				UNLK		A6						; tear down stack frame
+
+				RTS
+				
+				ENDWITH								; StackFrame
+
+				IF DoDebug THEN
+				DoDebugSymbols	InsertListCell		; label for MacsBug
+				ENDIF
+
+				ENDPROC								; end of InsertListCell
+
+;===============================================================================
+;
+;	void		PenPatGray();
+;
+;				Set the pen pattern of the current port to gray.
+;				Written in assembly to get the QD globals and avoid use of
+;				GetIndPattern.
+;
+;===============================================================================
+PenPatGray		PROC		EXPORT
+				
+				MOVE.L		GrafGlobals(A5),A0		; get a pointer to the QD globals
+				PEA			gray(A0)				; push pointer to gray pattern
+				_PenPat								; and set it
+				
+				RTS
+
+				IF DoDebug THEN
+				DoDebugSymbols	PenPatGray			; label for MacsBug
+				ENDIF
+
+				ENDPROC								; end of PenPatGray
+
+;===============================================================================
+;
+;	Boolean		ContainsWildcard(char *theStr);
+;
+;				Searchs theStr for any occurence of NBP wildcard characters "="
+;				or "Å".  Assumes theStr is a pascal string.  Returns TRUE if
+;				a the string contains a wildcard character, FALSE otherwise.
+;
+; Register Usage:
+;
+;	A0 = current character to test
+;
+;	D1 = length of string left to test
+;
+;===============================================================================
+ContainsWildcard PROC		EXPORT
+
+				MOVEQ		#0,D0					; assume we return false
+				MOVE.L		4(SP),A0				; A0 = theStr
+				MOVEQ		#0,D1					; clear D1
+				MOVE.B		(A0)+,D1				; D0 = length of theStr
+				BEQ.S		@doReturn				; if empty, return
+				SUBQ.B		#1,D1					; predecrement for loop
+
+				; loop through string looking for wildcards
+@searchLoop
+				CMPI.B		#'=',(A0)				; is this '='?
+				BEQ.S		@returnTrue				; yes
+				CMPI.B		#'Å',(A0)+				; is this 'Å'?
+				BEQ.S		@returnTrue				; yes
+				DBRA		D1,@searchLoop			; no, keep looking
+
+@return
+				BRA.S		@doReturn				; wildcard not found, return false
+
+@returnTrue
+				MOVEQ		#1,D0					; return true
+
+@doReturn
+				RTS
+				
+				IF DoDebug THEN
+				DoDebugSymbols	ContainsWildcard	; label for MacsBug
+				ENDIF
+
+				ENDPROC								; end of ContainsWildcard
+
+				END

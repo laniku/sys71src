@@ -1,0 +1,152 @@
+;
+;	File:		LoadPatches.a
+;
+;	Contains:	data fork of the System file
+;
+;				Under newer systems (7.0 and newer) this is not used to do system patching.
+;				Instead, it writes the proper boot blocks to the disk, so that booting will occur
+;				with the StartSystem code (in the 'boot' 2 resource) which takes care of patching.
+;
+;				Under older systems this selects, loads and executes an appropriate ROM patch routine
+;				for the ROM version number. The ROM patch routines are stored as 'PTCH' resources in
+;				the System file with an ID = the ROM version number. It resides in the data fork of
+;				the system file. It is loaded and given control by StartBoot (or boot blocks) once
+;				the ROM system has been initialized.
+;
+;	Copyright:	© 1985-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		<15>	  4/3/91	dba		kill the fun
+;		<14>	 3/26/91	dba		gbm: correct size
+;		<13>	  3/4/91	dba		dty: get rid of SysVers conditionals
+;		<12>	 1/16/91	dba		(csd) no real change; we had to force the data fork to rebuild
+;									so it would use MakeSysDataFork
+;		<11>	  8/6/90	stb		move dsNeedToWriteBootBlocks to SysErr.a
+;		<10>	  5/1/90	BBM		enable linked patches on 6.0 class machines
+;		 <9>	 4/10/90	dba		7.0 version writes the correct boot blocks and restarts
+;		 <8>	 3/23/90	dba		dispose of our selves (a waste of system heap space)
+;		 <7>	 3/23/90	dba		fix so we don’t call EraseMyIcon on the SE
+;		 <6>	 3/22/90	HJR		Fix 6.0 build by adding MinSysExtra & SysPatch.
+;		 <5>	 3/22/90	dba		change name of LoadPatch to LoadLinkedPatches
+;		 <4>	 3/21/90	dba		take out the lingering Debugger statement
+;		 <3>	 3/21/90	dba		change to work with new boot blocks for 7.0
+;		 <2>	12/28/89	dba		use MAIN instead of PROC to get dead code stripping; also get
+;									rid of wierd header that was required by a strange build rule in
+;									the old Make file; a corresponding change was made in
+;									SysObj.Make
+;	   <1.5>	11/17/89	dba		got rid of checks for 64K ROMs
+;	   <1.4>	10/14/89	EMT		Always load in RAM cache in system 7.
+;	   <1.3>	  6/5/89	EMT		One more try.
+;	   <1.2>	  6/2/89	EMT		Fixed coding errors in 1.1.
+;	   <1.1>	  6/1/89	EMT		Removed ROM69 stuff. Bootstrap StripAddress if it doesn't exist.
+;									Use StripAddress before executing 'PTCH's.
+;	   <1.0>	11/16/88	CCH		Added to EASE.
+;	  <S174>	 4/10/87	bbm		Save off the A5 world for the inits. (Some inits relied on
+;									CurrentA5 to be set up.)
+;	  <S145>	 3/27/87	bbm		The algorithm that S115 used to grow the heap was to enlarge the
+;									heap by 16k or the size of the patch - whichever was bigger.
+;									What you really want is 16k free in addition to the size of the
+;									patch.
+;	  <S128>	 3/23/87	JTC		On 64K ROMs be sure not to use nonexistent traps (such as
+;									SizeRsrc) or resize heap (since boot blocks are loaded at 64K).
+;	  <S115>	 3/19/87	JTC		Ensure sufficient sys heap space before loading patches, using
+;									SizeResource to figure the local min. Then guarantee MinSysExtra
+;									space after loading last one. Code borrowed from INIT=31.
+;	  <S109>	 3/18/87	bbm		Added the code for ‘PTCH $FFFF’. This enables general patches
+;									for all machines before the patches are read in by ‘PTCH 0’ and
+;									general patches after the patches are read in by ‘PTCH $FFFF’.
+;	  <S108>	 3/17/87	bbm		For system heaps larger than 58k, rom69patch needed to move the
+;									boot code (the boot code is loaded in at $10000). Since the boot
+;									code has moved, the return address on the stack should be
+;									modified. If you change the nature of the stack — which rom69fix
+;									depends on - you must also modify rom69fix.a.
+;	  <P029>	 1/22/87	JTC		JTC The above dates should surely be ‘86 and the res type is now
+;									'PTCH', despite the above comments. This change is to
+;									accommodate the new PTCH=0 patch file for all systems.
+;				11/20/86	BB		Changed resource type for patch files from 'PTCH' to 'ptch'.
+;				11/15/86	BB		New today.
+;
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+; equates
+
+			load 'StandardEqu.d'
+
+bootBlocksSize	equ		1024				; two 512-byte disk blocks
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+SystemFileDataFork main
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+; The System file data fork will only be executed if we are executing an old version of boot blocks.
+; Write the correct boot blocks to the disk, and restart.
+
+			subq	#4,sp				; make room for a handle to the boot blocks
+			move.l	#'boot',-(sp)		; get the boot blocks resource
+			move.w	#1,-(sp)
+			_GetResource
+			move.l	(sp)+,d1			; got that resource
+			bz.s	Failed
+
+			lea		-ioHVQElSize(sp),sp	; make room for parameter block on the stack
+			move.l	sp,a0				; point to the parameter block
+
+			clr.l	ioFileName(a0)		; we don’t want the disk’s name
+			clr.w	ioVolIndex(a0)		; tell it to use a vRefNum
+			clr.w	ioVRefNum(a0)		; boot volume is the default volume
+			_HGetVInfo					; get the driver refNum and the drive number
+			bnz.s	FailedOSErr
+
+			move.w	ioVDrvInfo(a0),ioVRefNum(a0)	; get the drive number
+			bz.s	Failed				; in the wildly unlikely case the drive is off-line
+			move.w	ioVDRefNum(a0),ioRefNum(a0)		; get the driver refNum
+			move.l	d1,a1				; get the resource in an address register
+			move.l	(a1),a1				; and dereferenced
+			move.l	a1,ioBuffer(a0)		; and now it’s the buffer we write from
+			move.l	#bootBlocksSize,ioReqCount(a0)	; write the whole boot blocks
+			move.w	#fsFromStart,ioPosMode(a0)		; right at the start of the disk
+			clr.l	ioPosOffset(a0)
+			_Write						; write them boot blocks
+			bnz.s	FailedOSErr
+
+			move.l	ROMBase,a0			; point to the ROM
+			jmp		10(a0)				; restart the Macintosh
+
+FailedOSErr
+			cmp.w	#wPrErr,d0			; write protected error?
+			bne.s	Failed
+
+			moveq	#dsNeedToWriteBootBlocks,d0
+			_SysError
+
+Failed
+			moveq	#dsBadPatch,d0		; get the proper error code
+			_SysError
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+Copyright
+		string asis
+			dc.b	'© 1983, 1984, 1985, 1986, 1987, 1988, 1989, 1990, 1991 Apple Computer Inc.',13
+			dc.b	'All Rights Reserved.',13
+			dc.b	13
+			dc.b	'Help! Help! We’re being held prisoner in a system software factory!',13
+			dc.b	13
+			dc.b	'The Blue Meanies',13
+			dc.b	13
+			dc.b	'Darin Adler',13
+			dc.b	'Scott Boyd',13
+			dc.b	'Chris Derossi',13
+			dc.b	'Cynthia Jasper',13
+			dc.b	'Brian McGhie',13
+			dc.b	'Greg Marriott',13
+			dc.b	'Beatrice Sochor',13
+			dc.b	'Dean Yu',13
+		align
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+			end

@@ -1,0 +1,282 @@
+;———————————————————————————————————————————————————————————————————————————————————
+;
+;	File:		LateLoad.a
+;
+;	Contains:	LateLoad
+;
+;			This LinkedPatch is responsible for mounting slow 
+;			SCSI drives on TERROR machines.  Because TERROR waits for the default 
+;			Startup Drive instead of the "internal" drive, unlike older ROMs, LateLoad is 
+;			needed to make sure that the internal drive (or drives on Eclipse or similar) 
+;			are spun up.  This is done at LP time instead of at boot time because by then, 
+;			most drives will have spun up already and we won't have to wait at all.
+;
+;
+;	Written by:	Paul Wolf
+;
+;	Copyright:	© 1991-1992 by Apple Computer, Inc., All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 2/12/93	PW		Cleaned up
+;		 <1>	  2/8/93	KW		first checked in
+;		 <3>	  7/4/92	csd		#1033141 <gbm>: We’ve decided to take the fix to GetNewDriveList
+;									for Cube-E, so I removed the conditional for theFuture.
+;		 <2>	 6/22/92	csd		For theFuture: Fixed the bug in GetNewDriveList which would
+;									unbalance the stack.
+;		 <1>	10/24/91	SAM		Rolled in Regatta file.
+;		
+;	Regatta Change History:
+;
+;		 <3>	 8/29/91	SAM		(pdw) Added exception for portables.  They will no longer wait
+;									for any drives other than the "internal" drive.
+;		 <2>	 8/21/91	SAM		(pdw) Changed location of drive 0 bit in PRAM from bit 0 of byte
+;									3 to bit 6 of byte 8A.
+;		 <1>	 7/30/91	SAM		first checked in
+;		 <0>	  6/20/91	PDW		Created.
+;
+;	To Do:
+;__________________________________________________________________________________________________
+
+			BLANKS		ON
+			STRING		ASIS
+			PRINT		OFF
+			
+			LOAD		'StandardEqu.d'
+			INCLUDE		'HardwarePrivateEqu.a'
+			INCLUDE		'UniversalEqu.a'
+			INCLUDE		'FSEqu.a'			; for VCB and DrvQ stuff
+			INCLUDE		'SCSI.a'			; for SCSIDrvrs
+
+			PRINT		ON
+;			CASE		OBJECT				; use case as specified in source text, C
+
+
+;---------------------------------------------------------------------
+			MACRO
+			_WaitForSCSIDevs
+			exg.l	D0, A0
+			moveq	#10,D0				; WaitForSCSIDevs selector
+			_HWPriv
+			exg.l	D0, A0
+			ENDM				
+
+
+
+;————————————————————————————————————————————————————————————————————————————
+;	LateLoad
+;
+;
+;————————————————————————————————————————————————————————————————————————————
+LateLoad		proc		export	; TERROR machines only!
+
+;--- Get the stored list of drives to wait for
+
+			bsr.s	GetOldDriveList		; D1.b = list of drives to wait for
+
+;--- First, try just searching for these devices once, to see if they're there
+	
+			move.w	D1, D0				; search for these devices
+			swap	D0
+			move.w	#0, D0				; wait for no devices			
+			_WaitForSCSIDevs
+
+;--- If they are already mounted, don't do any more scans
+	
+			move.b	SCSIDrvrs, D0
+			and.b	D1, D0				; only test for those devices were interested in
+			cmp.b	D1, D0				; do we have them?
+			beq.s	@gotThem			; yes - update stored drive list
+	
+;--- If they didn't get mounted by now, wait for them while scanning all SCSI IDs
+			
+			move.w	#$FF, D0			; now search for all devices
+			swap	D0
+			move.w	D1, D0				; and wait for the stored list of devices
+			_WaitForSCSIDevs
+			
+@gotThem			
+;--- Determine which SCSI IDs have drives that we want to remember about
+	
+			bsr		GetNewDriveList		; D1.w=list
+
+;--- Update the stored drive list with the new configuration
+	
+			bsr.s	PutNewDriveList		; write changed drive list out to resource if needed
+@end
+			rts
+
+			
+;---------------------------------------------------------------------
+;
+;	Read the old drive list from PRAM.
+;
+;		D1.b <-- drive list
+;
+;---------------------------------------------------------------------
+DrvZeroBit		EQU		6				; Bit 6 in MMFlags PRAM byte 8A (for ID 0)		<2>
+
+GetOldDriveList	
+
+;--- Look at parameter RAM (1 byte at offset $89) for drives 1-6
+			moveq.l	#0, D1
+			
+			lea		-2(SP),SP			; make read area for _ReadXPram
+			move.l	sp,A0				; place to read
+			move.l	#$00010089, d0		; one byte, location 89 (Bits 2-7)
+			_ReadXPRam					; trashes D0, puts byte in (a0)
+			move.b	(sp)+,D1			; "pop" the return value
+			lsr.b	#2,D1				; move the upper 6 bits right two places
+			lsl.b	#1,D1				; shift them all left 1 leaving a zero in bit 0
+
+			bsr.s	GetDriveZeroBit				
+			beq.s	@exit
+			
+			bset	#0, D1
+@exit
+			rts
+
+
+
+;---------------------------------------------------------------------
+;
+;	Put the new drive list wherever (how about a resource, no make it 
+;	PRAM, no a resource, no ...).
+;
+;		D1.b --> drive list
+;
+;---------------------------------------------------------------------
+PutNewDriveList
+	
+;--- Update the "is SCSI ID 0 spinning" PRAM byte ---
+
+			bsr.s	GetDriveZeroByte	; returns byte in D2						<2> thru next <2>
+
+			btst	#0, D1				; is drive 0 spun up?
+			beq.s	@disableZero		; -> Nope, clear bit zero	
+@enableZero
+			bset	#DrvZeroBit, D2		; yes, wait for it next time too
+			bra.s	@1
+@disableZero
+			bclr	#DrvZeroBit, D2		; no, don't wait for it next time
+@1	
+			bsr.s	PutDriveZeroByte	; accepts byte in D2						<2> from last <2>
+
+;--- Update the bitmap of SCSI ids 1-6 in PRAM ---
+
+			lea		-2(SP),SP			; make read area for _ReadXPram
+			move.l	SP,A0				; place to read
+			move.l	#$00010089,D0		; one byte, location 89 (Bits 2-7)
+			_ReadXPRam					; trashes D0, puts byte in (a0)
+			move.b	(SP)+,D0			; "pop" the return value
+			
+			and.b	#%11111110,D1		; Mask out drive zero's bit (bit zero) from the drive mask
+			lsl.b	#1,D1				; Shift the 6 bits left 1
+			and.b	#%00000011,D0		; Mask out the serial bits from the PRAM byte $89
+			or.b	D0,D1				; Add our 6 bits to the 2 bits already there
+			
+			move.b	D1, -(SP)			; push new value on stack
+			move.l	SP, A0				; address of new PRAM value
+			move.l	#$00010089, D0		; write 1 bytes of PRAM to offset 3
+			_WriteXPRam					; save the IDs in parameter RAM
+			move.b	(SP)+, D1
+			
+			rts
+			
+			
+;---------------------------------------------------------------------					<2> thru next <2>
+GetDriveZeroBit
+GetDriveZeroByte
+;---------------------------------------------------------------------
+;--- Look at parameter RAM (1 byte at offset 8a) for drive 0
+			
+			lea		-2(sp), sp			; make space for PRAM SCSI id
+			move.l	sp, A0				; address of PRAM return buffer
+
+			move.l	#$0001008A,D0		; read 1 byte of PRAM at offset 8a
+			_ReadXPRam					; get the byte
+			move.b	(sp)+, D2			; 
+			btst	#DrvZeroBit, D2		; return Z flag according to drive 0 bit
+			rts
+
+
+;---------------------------------------------------------------------
+PutDriveZeroByte
+;---------------------------------------------------------------------
+;--- Modify parameter RAM (1 byte at offset 8a) for drive 0
+			
+			move.b	D2, -(SP)			; push new value on stack
+			move.l	SP, A0				; address of new PRAM value
+			move.l	#$0001008A, D0		; write 1 byte of PRAM to offset 8a
+			_WriteXPRam					; save the IDs in parameter RAM
+			move.w	(SP)+, D2
+
+			rts					;											<2> from last <2>
+
+
+;---------------------------------------------------------------------
+GetNewDriveList
+;---------------------------------------------------------------------
+;		WITH	scsiGlobalRecord
+		
+			bsr.s	FindFixedDrives		; Find all SCSI ID's with fixed drives in DrvQ
+
+;--- if we are on a portable then strip all bits except for internal drive's	<3> to next <3>
+
+			TestFor	hwCbPwrMgr
+			beq.s	@exit
+
+; Look at parameter RAM (byte at offset 3) for internal drive's SCSI id
+
+			subq.l	#2, sp				; make space for PRAM SCSI id
+			move.l	sp, A0				; address of PRAM return buffer
+
+			move.l	#$00010003, D0		; read 1 byte of PRAM at offset 3 (internal drive)
+			_ReadXPRam					; get the SCSI id
+			move.b	(sp), D0			; check high bits for validity
+			and.b	#$78, D0			; mask upper bits 
+			cmp.b	#$48, D0			; equal to magic pattern?
+			beq.s	@continue			; <2> if so, go do the real stuff
+			addq.w	#2, sp				; <2> remove the answer from the stack
+			bra.s	@exit				; <2> and just bail
+@continue
+			move.b	(sp)+, D0			; check high bits for validity
+			and.w	#$07, D0			; mask lower 3 bits 
+			
+			moveq.l	#0, D3
+			bset	D0, D3				; set only internal drive's bit in mask
+			and.b	D3, D1				; clear all but that drive's bit
+@exit									;										<3> from last <3>
+			rts
+
+;		ENDWITH
+
+
+;---------------------------------------------------------------------
+FindFixedDrives
+;---------------------------------------------------------------------
+			move.b	#0, D1				; we start with no fixed disks
+			move.l	DrvQHdr+qHead, A0	; point to DrvQHdr (which points to 1st Qel)
+			
+@loop
+			move.b	-3(A0), D0			; is it fixed?
+			and.b	#$0f, D0
+			cmp.b	#$08, D0
+			bne.s	@next
+			move.w	dqRefNum(A0), D0
+			not.w	D0
+			sub.w	#$20, D0
+			blt.s	@next				; not a SCSI driver
+			cmp.b	#$7, D0
+			bgt.s	@next
+			bset.l	D0, D1				; set the bit for this drive(r)
+@next
+			move.l	qLink(A0), A0		; is this the end of the linked list?
+			move.l	A0, D3				; (test for zero link)
+			bne.s	@loop
+@exit
+			rts
+			
+			ENDP
+			END.
+

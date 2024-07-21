@@ -1,0 +1,363 @@
+;
+;	File:		CMMAINT.a
+;
+;	Written by:	Bill Bruffey
+;
+;	Copyright:	© 1984-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <2>	 9/10/91	JSM		Add a header.
+;	   <1.3>	  3/2/89	DNF		removed references to forROM; HFS now builds identically for ram
+;									or rom
+;	   <1.2>	11/21/88	CCH		Replaced references to forRAM with ÒNOT forROM.Ó
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	  <¥1.1>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				10/27/86	BB		Vectored LocCRec routine.
+;				 9/25/86	BB		Updated to use new MPW equate files.
+;				10/16/85	BB		Modified all routines to use new new MOVEQ error code equates.
+;				  9/9/85	BB		Added UpdCName and modified BuildKey to use it.
+;				 8/29/85	BB		Blockmove arg fix.
+;				 7/29/85	BB		Modified CMKeyCmp to use RelString.
+;				 7/24/85	BB		Modified BuildKey to truncate CNames to max length
+;				 7/10/85	BB		Added CMFlush routine.
+;				 6/22/85	PWD		Changed to force keys in root's parent to full length for easy
+;									replacement.
+;				 6/13/85	BB		Cleaned it up some.
+;				 3/15/85	BB		Modified to use A6 stack.
+;				  3/7/85	BB		Modified to support the existence of a root directory record.
+;				 2/13/85	BB		Added CM key compare routine.
+;				  1/2/85	BB		Re-worked adding LocCRec.
+;				12/17/84	BB		Added LocCNode.
+;				12/13/84	BB		Birth.
+;
+
+;_________________________________________________________________________________
+;
+; External
+;  Routines:	 BuildKey  -  Constructs a catalog key record (ckr) given the
+;							  parent directory ID and CName.
+;				 CMFlush   -  Flushes the catalog for a specified volume.
+;				 CMKeyCmp  -  Compares two catalog keys.
+;				 LocCNode  -  Locates the catalog record for an existing directory
+;							  or file CNode.
+;				 LocCRec   -  Locates a catalog record in the catalog BTree file.
+;				 UpdCName  -  Updates a CName.
+;
+; Function: 	 These routines provide low level utility functions used to
+;				 maintain the file catalog.
+;
+;_________________________________________________________________________________
+
+
+
+
+			BLANKS		ON
+			STRING		ASIS
+
+			PRINT		OFF
+			LOAD		'StandardEqu.d'
+			PRINT		ON
+			PRINT		NOGEN
+
+CMMaint 	PROC	 EXPORT 
+
+			EXPORT	 BuildKey,CMFlush,CMKeyCmp,LocCNode,LocCRec,UpdCName
+
+			EXPORT	vLocCRec											;<27Oct86>
+
+			IMPORT	 BTFlush,BTSearch,BTUpdate,MarkVCB,FlushMDB
+
+
+;_________________________________________________________________________________
+;
+; Routine:		BuildKey
+;
+; Function: 	Constructs a catalog key record (ckr) given the parent
+;				directory ID and CName.
+;
+; Input:		D0.L  -  parent directory id
+;				A0.L  -  addr(CName)
+;				A1.L  -  addr(ckr buffer)
+;
+; Output:		A1.L  -  addr(ckr buffer) containing key record
+;_________________________________________________________________________________
+
+BuildKey
+			MOVEM.L  D0/A0-A1,-(SP) 	; save regs
+
+			MOVE.B	 #6,ckrKeyLen(A1)	; initial key length
+			CLR.B	 ckrResrv1(A1)		; clear unused byte
+			MOVE.L	 D0,ckrParID(A1)	; parent ID
+			CLR.B	 ckrCName(A1)		; assume null CName
+
+			MOVE.L	 A0,D0				; CName given?
+			BEQ.S	 BKExit 			; no, all done ->
+
+			MOVE.L	 A1,-(SP)			; save ptr to ckr				<09Sep85>
+			LEA 	 ckrCName(A1),A1	; dest = CName in ckr buffer	<09Sep85>
+			BSR 	 UpdCName			; move in the CName 			<09Sep85>
+
+			MOVE.B	 (A1),D0			; get CName length				<09Sep85>
+			MOVEA.L  (SP)+,A1			; restore ptr to ckr			<09Sep85>
+			ADD.B	 D0,ckrKeyLen(A1)	; add CName length to key length  <09Sep85>
+BKExit
+			MOVEM.L  (SP)+,D0/A0-A1 	; restore regs
+			RTS 						; exit BuildKey
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		CMFlush (CM Flush)
+;
+; Function: 	Flushes the catalog for a specified volume.
+;
+; Input:		A2.L  -  VCB pointer
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 other = error
+;_________________________________________________________________________________
+
+CMFlush
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1/A1,-(A6) 		; save registers
+
+			MOVE.W	VCBCTRef(A2),D1 	; D1 = refnum of catalog file
+
+			MOVE.W	D1,D0				; flush the catalog BTree
+			JSR 	BTFlush 			;
+			BNE.S	CFExit1 			; error ->
+
+			MOVEA.L FCBSPtr,A1			; FCB dirty?
+			BTST	#FCBModBit,FCBMdRByt(A1,D1.W) ;
+			BEQ.S	CFExit				; no, all done ->
+
+			JSR 	MarkVCB 			; mark the VCB dirty
+			JSR 	FlushMDB			; flush the MDB
+			BNE.S	CFExit1 			; error ->
+CFExit
+			CLR.W	D0					; result ='ok'
+CFExit1
+			MOVEM.L (A6)+,D1/A1 		; restore registers
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit CMFlush
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		CMKeyCmp (CM Key Compare)
+;
+; Function: 	Compares two catalog keys (a search key and a trial key).
+;
+; Input:		A0.L  -  search key pointer
+;				A1.L  -  trial key pointer
+;
+; Output:		D0.W  -  result code
+;							 +n  search key > trial key
+;							  0  search key = trial key
+;							 -n  search key < trial key
+;
+; Called By:	SearchNode (in BTMaint2)
+;_________________________________________________________________________________
+
+CMKeyCmp
+			MOVEM.L D1-D2/A0-A3,-(SP)	; save registers
+			MOVEA.L A0,A2				; A2 = ptr(search key)
+			MOVEA.L A1,A3				; A3 = ptr(trial key)
+;
+; compare DirID's first
+;
+			MOVE.L	 ckrParID(A2),D0	; compare parID's
+			CMP.L	 ckrParID(A3),D0	;
+			BHI.S	 KCIsGT 			; search ParID > trial parID ->
+			BLO.S	 KCIsLT 			; search ParID < trial parID ->
+;
+; ParID's are equal, compare the CNames
+;
+KCCmpName
+			LEA 	 ckrCName(A2),A0	; ptr(CName string) for search key
+			LEA 	 ckrCName(A3),A1	; ptr(CName string) for trial key
+			MOVEQ	 #0,D0				; D0(high order word) = length(search key)
+			MOVE.B	 (A0)+,D0			;
+			SWAP	 D0 				; D0(low order word) = length(trial key)
+			MOVE.B	 (A1)+,D0			;
+
+			_RelString					; compare the CNames
+
+			BEQ.S	 KCIsEQ 			; search CName = trail CName ->
+			BGT.S	 KCIsGT 			; search CName > trail CName ->
+KCIsLT
+			MOVEQ	 #-1,D0 			; result = "less than"
+			BRA.S	 KCExit
+KCIsEQ
+			MOVEQ	 #0,D0				; result = "equal"
+			BRA.S	 KCExit
+KCIsGT
+			MOVEQ	 #1,D0				; result = "greater than"
+KCExit
+			MOVEM.L (SP)+,D1-D2/A0-A3	; restore registers
+			TST.W	 D0 				; set up condition codes
+			RTS 						; exit CMKeyCmp
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		LocCNode (Locate CNode)
+;
+; Function: 	Locates the catalog record for an existing directory or file
+;				CNode and returns pointers to the key and data records.
+;
+;
+; Input:		A2.L  -  VCB pointer
+;				A4.L  -  ptr(CM vars)
+;				D0.L  -  DirID or parent DirID
+;				A0.L  -  CName pointer
+;				D2.L  -  catalog hint (node address)
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 CMnotfound = CNode not found
+;							 -n = IO error
+;				A0.L  -  pointer to catalog key record (ckr)
+;				A1.L  -  pointer to catalog data record (cdr)
+;				D1.W  -  size of catalog data record
+;				D2.L  -  catalog hint
+;				A2.L  -  VCB pointer
+;				A4.L  -  ptr(CM vars, contains key record)
+;_________________________________________________________________________________
+
+LocCNode
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+;
+; locate catalog record using given CNode specification
+;
+			JSR 	 LocCRec			; locate the record
+			BNE.S	 LCExit 			; didn't find it ->
+			CMPI.B	 #cdrThdRec,cdrType(A1) ; thread record ?
+			BNE.S	 LCExit 			; no, all done ->
+;
+; thread record found, locate corresponding directory record
+;
+			LEA 	 thdCName(A1),A0	; addr(directory CName)
+			MOVE.L	 thdParID(A1),D0	; parent directory ID
+			BSR 	 LocCRec			; locate directory record
+;
+; clean up and exit
+;
+LCExit
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit LocCNode
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		LocCRec (Locate Catalog Record)
+;
+; Function: 	Locates an catalog record in the catalog BTree file and returns
+;				a pointers to the key and data records.  If DirID is specified,
+;				the corresponding thread record is located.  If ParID/CName is
+;				specified, the corresponding directory or file record is located.
+;
+; Input:		A2.L  -  VCB pointer
+;				A4.L  -  ptr(CM vars)
+;				D0.L  -  DirID or parent DirID
+;				A0.L  -  CName pointer
+;				D2.L  -  catalog hint
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 CMnotfound = CNode not found
+;							 -n = IO error
+;				A0.L  -  pointer to catalog key record (ckr)
+;				A1.L  -  pointer to catalog data record (cdr)
+;				D1.W  -  size of catalog data record
+;				D2.L  -  catalog hint
+;				A2.L  -  VCB pointer
+;				A4.L  -  ptr(CM vars, contains key record)
+;_________________________________________________________________________________
+
+LocCRec
+			MOVE.L	jLocCRec,-(SP)		; jump table entry for vLocCRec 	<27Oct86>
+			RTS 						; go there							<27Oct86>
+vLocCRec								; 'vectored' LocCRec routine		<27Oct86>
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+;
+; build key record
+;
+			LEA 	 ckrOff(A4),A1		; addr(key record buffer)
+			JSR 	 BuildKey			; build key record
+;
+; locate catalog record in BTree
+;
+			MOVE.L	 A0,D0				; CName given?
+			BNE.S	 @1 				; yes, use hint ->
+			CLR.L	 D2 				; no, dont't use hint
+@1			LEA 	 ckrOff(A4),A0		; addr(key record)
+			MOVE.W	 vcbCtRef(A2),D0	; catalog file refnum
+			JSR 	 BTSearch			; locate record in BTree
+			BEQ.S	 LRExit 			; found it ->
+			CMP.W	 #BTnotfound,D0 	; record not found?
+			BNE.S	 LRExit 			; no, some other error ->
+			MOVEQ	 #CMnotfound,D0 	; set CM result code			<16Oct85>
+;			BRA.S	LRExit 				; exit ->						<25Sep86>
+;
+; found the record, set return stuff and exit
+;
+LRExit
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit LocCRec
+
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		UpdCName
+;
+; Function: 	Updates a CName.
+;
+; Input:		A0.L  -  pointer to source CName
+;				A1.L  -  pointer to destination CName
+;
+; Output:		none
+;_________________________________________________________________________________
+
+UpdCName
+			MOVEM.L  D0-D1/A0-A1,-(SP)	; save regs 				<09Sep85>
+
+			MOVEQ	 #0,D0				; D0 = source CName length	<09Sep85>
+			MOVE.B	 (A0)+,D0			;							<09Sep85>
+			MOVEQ	 #CMMaxCName,D1 	; D1 = max CName length 	<09Sep85>
+			CMP.W	 D1,D0				; CName length > max?		<09Sep85>
+			BLE.S	 @1 				; no -> 					<09Sep85>
+			MOVE.W	 D1,D0				; yes, truncate to max		<09Sep85>
+@1			MOVE.B	 D0,(A1)+			; set length byte			<09Sep85>
+			_BlockMove					; copy CName to dest		<09Sep85>
+
+			MOVEM.L  (SP)+,D0-D1/A0-A1	; restore regs				<09Sep85>
+			RTS 						; exit UpdCName 			<09Sep85>
+
+			END 
+
+

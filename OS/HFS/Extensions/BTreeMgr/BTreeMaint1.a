@@ -1,0 +1,537 @@
+;
+;	File:		BTreeMaint1.a
+;
+;	Contains:	These routines provide multiple-node BTree maintenance
+;				functions.
+;
+;	Copyright:	© 1984-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM1>	 4/1/92		kc		Changed the name prefex used to distinguish
+;									 routines used by the external B-Tree manager
+;									from the versions used by the File System.									
+;									¥ Pre-SuperMario comments follow ¥
+;		 <3>	 9/13/91	JSM		Cleanup header.
+;		 <2>	 2/22/90	KST		Adding for the first time.
+;	   <1.1>	  8/7/89	KST		Code cleanup.
+;	   <1.0>	 6/14/89	KST		New file added for the new implementation of BTreeMgr.
+;				10/27/86	BB		Vectored ExtTreeSearch routine.
+;				 9/25/86	BB		Updated to use new MPW equate files.
+;				12/19/85	BB		ExtSplitLT now checks for errors returned from ExtInitNode (not
+;									patched in ROm75).
+;				10/25/85	BB		Made RotRecLt into an internal subroutine. It is only called by
+;									RotatLt.
+;				10/10/85	BB		Added use of new MOVEQ equates for GetBlock and RelBlock. Did
+;									some minor code clean up.
+;				 10/1/85	LAK		Changed to .Include TFSEqu for cache, BTree equates.
+;				  8/9/85	BB		Modifed ExtSplitLT to set up node height.
+;				  8/7/85	BB		Added deep shit error call to ExtRotateLt.
+;				  8/6/85	BB		Updated to use equates for index and leaf node types.
+;				  8/4/85	BB		Fixed fit calculation bug in ExtRotateLt.
+;				 7/17/85	BB		ReWorked rotate algorithm in ExtRotateLt.
+;				  7/8/85	BB		Modified ExtTreeSearch to no longer set up left and right sibling
+;									node addresses in the TPT.
+;				  7/8/85	BB		Modified ExtSplitLT to maintain links for index nodes.
+;				 6/10/85	BB		Cleaned up some.
+;				 3/15/85	BB		Modified to use A6 stack.
+;				 2/25/85	BB		Modified ExtRotateLt and ExtSplitLT to return the node number and
+;									record index of new (inserted) record.
+;				 1/17/85	BB		Removed use of BTree Global area (BTG).
+;				11/10/84	BB		Re-worked virtual index logic.
+;				10/11/84	BB		Added ExtTreeSearch.
+;				 10/3/84	BB		Added ExtRotateLt and ExtSplitLT.
+;				 10/1/84	BB		Split off from BTmaint.
+;
+
+;__________________________________________________________________________________
+;
+; External
+;  Routines:	ExtRotateLt   -  Inserts a record into a BTree node via rotation
+;							  of records into the left sibling node.
+;				ExtSplitLT    -  Inserts a new record into a BTree node by inserting
+;							  an empty left node and then using ExtRotateLt to insert
+;							  the new record.
+;				ExtTreeSearch -  Searches BTree for a specified key setting up the
+;							  Tree Path Table (TPT) to reflect the search path.
+;
+; Internal
+;  Subroutines: RotRecLt   -  Rotates one record from the right node into the
+;							  left node.
+;
+;__________________________________________________________________________________
+
+
+			BLANKS		ON
+			STRING		ASIS
+
+			PRINT		OFF
+			LOAD		'StandardEqu.d'			; common equates
+			PRINT		ON
+			PRINT		NOGEN
+
+ExtBTMaint1	PROC	EXPORT	
+
+			EXPORT	ExtRotateLt,ExtSplitLT,ExtTreeSearch
+
+			IMPORT	ExtAllocNode, ExtGetNode, ExtRelNode		;				<SM1>
+			IMPORT	ExtDeleteRec,ExtGetNodeSiz,ExtGetRecA,ExtInitNode,ExtInsertRec
+			IMPORT	ExtLocRec,ExtLocTPR,ExtSearchNode
+
+
+
+;__________________________________________________________________________________
+;
+; Routine:		ExtRotateLt
+;
+; Function: 	Inserts a record into a BTree node via rotation of records
+;				into the left sibling node.
+;
+; Input:		A0.L  -  pointer to record
+;				D0.W  -  size of record
+;				A2.L  -  pointer to left node buffer
+;				A3.L  -  pointer to right node buffer
+;				D1.W  -  index of insert point (in right node)
+;				A4.L  -  pointer to BTCB
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							-1 = won't fit
+;				A1.L  -  ptr(node buffer) containing new record
+;				D1.W  -  index of new record
+;
+; Called by:	BTInsert
+;__________________________________________________________________________________
+
+ExtRotateLt
+			MOVEM.L  D2-D7/A2-A5,-(SP)	; save regs
+;
+; set up some common stuff
+;
+			MOVEA.L  A0,A5				; A5 = ptr(new record)
+			MOVE.W	 D0,D5				; D5 = size of new record
+;
+; calculate split point
+;
+			MOVEA.L  A2,A1				; point to left node
+			JSR 	 ExtGetNodeSiz 		; get its size
+			MOVE.W	 D0,D2				; D2 = left node size
+
+			MOVEA.L  A3,A1				; point to right node
+			JSR 	 ExtGetNodeSiz 		; get its size
+
+			ADD.W	 D2,D0				;  right size + left size
+			ADD.W	 D5,D0				;	 + (new record size + 2)
+			ADDQ.W	 #2,D0				;	 = total data size
+			LSR.W	 #1,D0				; total size / 2  = split point
+			MOVE.W	 D0,D6				; D6 = split point
+;
+; simulate left rotation to determine best fit
+;
+			MOVE.W	 NDNRecs(A2),D3 	; D3 = init virt indx = #recs in lt node
+			MOVE.W	 D1,D4				; D4 = virtual insert index
+			ADD.W	 D3,D4				;	   = rt insert indx + #recs in lt node
+			MOVEQ	 #-1,D7 			; no current fit or previous fit
+RLFitLoop
+			CMP.W	 D3,D4				; at insert point ?
+			BNE.S	 @2 				; no,  ->
+
+			ADD.W	 D5,D2				; include new record in lt size
+			BRA.S	 @4 				; ->
+
+@2			MOVE.W	 D3,D0				; convert virtual index
+			SUB.W	 NDNRecs(A2),D0 	;
+			CMP.W	 D4,D3				;
+			BLE.S	 @3 				;
+			SUBQ.W	 #1,D0				; ...to a right node index
+@3			JSR 	 ExtGetRecA			; get record size
+			ADD.W	 D0,D2				; include record in lt size
+
+@4			ADDQ.W	 #2,D2				; include offset also
+;
+; check for a fit after simulated rotation of each record.
+;
+RLChkFit
+			MOVE.W	 BTCNodeSize(A4),D1 ; max node size
+			SUBI.W	 #(lenND+2),D1		;	- length(ND) - 2 = max data size
+
+			CMP.W	 D1,D2				; left node fit?
+			BLE.S	 @1 				; yes ->
+			SWAP	 D7 				; have previous fit?
+			TST.W	 D7 				;
+			BGE.S	 RLRotate			; yes, use it ->
+			MOVEQ	 #-1,D0 			; result = 'won't fit'
+			BRA 	 RLExit1			; exit ->
+
+@1			MOVE.W	 D6,D0				; split point
+			LSL.W	 #1,D0				;	X 2 = total data size
+			SUB.W	 D2,D0				;	- lt size = rt size
+
+			CMP.W	 D1,D0				; right node fit?
+			BGT.S	 RLCkSplit			; no ->
+
+			MOVE.W	 D3,D7				; save virtual index for this fit
+;
+;  select best fit if we have reached split point
+;
+RLCkSplit
+			CMP.W	 D6,D2				; reached split point ?
+			BLT.S	 @2 				; no ->
+			BEQ.S	 @1 				; right on the money ->
+			SWAP	 D7 				; past split point, try previous fit first
+
+@1			TST.W	 D7 				; have a fit?
+			BGE.S	 RLRotate			; yes, use it ->
+			SWAP	 D7 				; no, get previous fit
+			TST.W	 D7 				; have one?
+			BGE.S	 RLRotate			; yes, use it ->
+
+@2			SWAP	 D7 				; previous fit = current fit
+			MOVE.W	 #-1,D7 			; no current fit
+			ADDQ.W	 #1,D3				; bump index to next record
+			MOVE.W	 NDNRecs(A2),D1 	; max virtual index
+			ADD.W	 NDNRecs(A3),D1 	;	= #recs in lt node + #recs in rt node
+			CMP.W	 D1,D3				; any more records?
+			BLE.S	 RLFitLoop			; yes, keep trying ->
+
+			MOVEQ	 #-1,D0 			; result = 'won't fit'
+			BRA.S	 RLExit1			; exit ->
+;
+; we have a fit, do the actual rotation
+;
+RLRotate
+			MOVE.W	 NDNRecs(A2),D3 	; init virt indx = 1st rec in rt node
+
+@1			CMP.W	 D3,D4				; at insert point ?
+			BNE.S	 @2 				; no ->
+
+			MOVEA.L  A2,A1				; ptr(left node)
+			MOVEA.L  A5,A0				; ptr(new record)
+			MOVE.W	 D5,D0				; size of new record
+			MOVE.W	 NDNRecs(A1),D1 	; insert index = end of node
+			JSR 	 ExtInsertRec		; insert new record in left node
+			BNE.S	 RLDeepShit 		; trouble ->
+			MOVEA.L  A1,A5				; save ptr(node buffer) and index
+			MOVE.W	 D1,D5				; ...for new record
+			BRA.S	 @3 				; ->
+
+@2			MOVEA.L  A2,A0				; ptr(left node)
+			MOVEA.L  A3,A1				; ptr(right node)
+			BSR 	 RotRecLt			; rotate 1st record in right node
+			BNE.S	 RLDeepShit 		; trouble ->
+
+@3			CMP.W	 D7,D3				; reached split index ?
+			BEQ.S	 RLCheckRt			; yes ->
+			ADDQ.W	 #1,D3				; bump record index
+			BRA.S	 @1 				; rotate another one ->
+;
+; check if new record goes in right node
+;
+RLCheckRt
+			CMP.W	 D7,D4				; insert index > split index ?
+			BLE.S	 RLExit 			; no, not in right node ->
+
+			MOVEA.L  A3,A1				; ptr(right node)
+			MOVEA.L  A5,A0				; ptr(new record)
+			MOVE.W	 D5,D0				; size of new record
+			MOVE.W	 D4,D1				; insert index
+			SUB.W	 D7,D1				;	= virt insert index
+			SUBQ.W	 #1,D1				;	   - split index - 1
+			JSR 	 ExtInsertRec		; insert new record in right node
+			BNE.S	 RLDeepShit 		; all done ->
+			CLR.W	 D0 				; result = 'ok'
+			BRA.S	 RLExit1			; exit ->
+RLDeepShit
+			MOVEQ	 #dsBadRotate,D0	; result = 'bad rotate'
+			_SysError					; give up
+;
+; clean up and exit
+;
+RLExit
+			CLR.W	 D0 				; result = ok
+			MOVEA.L  A5,A1				; return ptr(node buffer) and index
+			MOVE.W	 D5,D1				; ...for new record
+RLExit1
+			MOVEM.L  (SP)+,D2-D7/A2-A5	; restore regs
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit ExtRotateLt
+
+
+
+
+
+;__________________________________________________________________________________
+;
+; Routine:		ExtSplitLT (Split Left)
+;
+; Function: 	Inserts a new record into a BTree node by first inserting a
+;				empty left node and then using ExtRotateLt to insert the new
+;				record.
+;
+; Input:		A0.L  -  ptr(record)
+;				D0.W  -  size of record
+;				A2.L  -  pointer to left node buffer
+;							0 = no left node
+;				A3.L  -  pointer to right node buffer
+;				D1.W  -  index of insert point (in right node)
+;				A4.L  -  pointer to BTCB
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							+1 = won't fit
+;							-n = IO error
+;				A1.L  -  ptr(node buffer) containing new record
+;				D1.W  -  index of new record
+;				A2.L  -  ptr(new left node)
+;				D2.L  -  node number of new left node
+;
+; Called by:	BTInsert
+;__________________________________________________________________________________
+
+ExtSplitLT
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D3-D7/A3,-(A6) 	; save regs
+;
+; set up some common stuff
+;
+			MOVE.L	 A0,D7				; D7 = ptr(record)
+			MOVE.W	 D0,D6				; D6 = size of record
+			MOVE.W	 D1,D5				; D5 = insert index
+			MOVE.W	 BTCLevel(A4),D0	; locate TPR
+			JSR 	 ExtLocTPR 			; ... for current level
+			MOVE.L	 TPRNodeN(A0),D4	; D4 = right node number
+;
+; allocate a new disk node
+;
+			MOVE.W	 BTCRefNum(A4),D0	; volume refnum
+			JSR 	 ExtAllocNode		; allocate the node
+			BNE.S	 SLExit1			; error ->
+
+			MOVE.L	 D1,D3				; D3 = new left node number
+;
+; update forward link in original left node and release it
+;
+			MOVE.L	 A2,D0				; have a left node ?
+			BEQ.S	 SLInit 			; no ->
+			MOVE.L	 D3,NDFlink(A2) 	; left forward link = new node number
+
+			MOVEQ	 #kRBDirty,D1		; indicate dirty buffer 			 <10Oct85>
+			MOVEA.L  A2,A0				; ptr(left node buffer)
+			JSR 	 ExtRelNode			; release left node
+			BNE.S	 SLExit1			; error ->
+;
+; initialize a new left node
+;
+SLInit
+			MOVE.L	 D3,D1				; new node number
+			JSR 	 ExtInitNode		; get an initialized node
+			BNE.S	 SLExit1			; error ->							 <19Dec85>
+
+			MOVEA.L  A0,A2				; A2 = ptr(new left node)
+
+			MOVE.B	 NDType(A3),NDType(A2) ; set to same type as right node
+
+			MOVE.L	 NDBlink(A3),NDBlink(A2) ; finish updating
+			MOVE.L	 D4,NDFlink(A2) 	;...
+			MOVE.L	 D3,NDBlink(A3) 	;... links
+
+			MOVEQ	 #1,D0				; node height
+			ADD.W	 BTCDepth(A4),D0	;	= tree depth + 1
+			SUB.W	 BTCLevel(A4),D0	;	- current level
+			MOVE.B	 D0,NDNHeight(A2)	;
+
+			CMPI.B	 #NDLeafNode,NDType(A2) ; adding a new leaf node?
+			BNE.S	 SLRotate			; no ->
+			TST.L	 NDBlink(A2)		; new 1st node?
+			BNE.S	 SLRotate			; no ->
+			MOVE.L	 D3,BTCFNode(A4)	; yes, update 1st node pointer
+;
+; insert new record via rotate left
+;
+SLRotate
+			MOVEA.L  D7,A0				; ptr(new record)
+			MOVE.W	 D6,D0				; size of new record
+			MOVE.W	 D5,D1				; insert index
+			JSR 	 ExtRotateLt			; insert via rotate left
+			BEQ.S	 SLExit 			; ok ->
+			BRA.S	 SLExit1			; oh shit!!!
+;
+; clean up and exit
+;
+SLExit
+			CLR.W	 D0 				; result = ok
+			MOVE.L	 D3,D2				; return left node number in D2
+SLExit1
+			MOVEM.L  (A6)+,D3-D7/A3 	; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit ExtSplitLT
+
+
+
+
+
+;__________________________________________________________________________________
+;
+; Routine:		ExtTreeSearch
+;
+; Function: 	Searches BTree for a specified key, setting up the Tree Path
+;				Table (TPR) to reflect the search path.
+;
+; Input:		A0.L  -  ptr(search key)
+;				A4.L  -  pointer to BTCB
+;
+; Output:		D0.W  -  result code
+;							 0 = ok (record found)
+;							 BTnotfound = record not found
+;							 other = error
+;				A1.L  -  ptr(node buffer)
+;				D1.W  -  index
+;							record index if found
+;							insert index if not found
+;				D2.L  -  node number of target leaf node
+;
+; Called by:	BTDelete,BTInsert,BTSearch
+;__________________________________________________________________________________
+
+ExtTreeSearch							;								<SM1>
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D3-D7/A2-A3,-(A6)	; save regs
+;
+; set up some common stuff
+;
+			MOVE.L	 A0,D7				; D7 = ptr(search key)
+
+			TST.W	 BTCDepth(A4)		; tree empty ?
+			BGT.S	 @1 				; no ->
+			MOVEQ	 #BTnotfound,D0 	; result = 'not found'			<14Oct85>
+			SUBA.L	 A1,A1				; no node buffer
+			CLR.L	 D1 				; index = 0
+			CLR.L	 D2 				; node number = 0
+			CLR.W	 BTCLevel(A4)		; current level = 0
+			BRA.S 	 TSExit 			; exit ->
+
+@1			MOVEQ	 #1,D6				; start at level 1
+			MOVE.L	 BTCRoot(A4),D3 	; root node number
+;
+; get the node and search for key
+;
+TSLoop
+			MOVEQ	 #0,D1				; no GetBlock options		 <10Oct85>
+			MOVE.L	 D3,D2				; node number
+			JSR 	 ExtGetNode			; get the node
+			BNE.S 	 TSExit 			; error ->
+			MOVEA.L  A0,A1				; A1 = ptr(node buffer)
+
+			MOVEA.L  D7,A0				; ptr(search key)
+			JSR 	 ExtSearchNode 		; search node for key
+			MOVE.W	 D0,D5				; D5 = search result
+			MOVE.W	 D1,D4				; D4 = index
+;
+; update up TPR info
+;
+TSUpdTPR
+			MOVE.W	 D6,D0				; locate TPR
+			JSR 	 ExtLocTPR 			; ...for this level
+			MOVEA.L  A0,A3				; A3 = ptr(TPR)
+			MOVE.L	 D3,TPRNodeN(A3)	; set node number
+
+			MOVE.W	 D4,D2				; assume parent index = insert index
+			TST.W	 D5 				; key found ?
+			BEQ.S	 @1 				; yes ->
+			SUBQ.W	 #1,D2				; parent index = insert index - 1
+			BGE.S	 @1 				; parent index >= 0, ok ->
+			MOVE.W	 D4,D2				; use insert index
+@1			MOVE.W	 D2,TPRRIndx(A3)	; set record index
+
+			CMP.W	 BTCDepth(A4),D6	; at leaf level ?
+			BEQ.S	 TSDone 			; yes, all done ->
+;
+; move to next level down
+;
+TSNxtLev
+			MOVE.W	 D2,D1				; parent index				   <10Oct85>
+			MOVE.L	 A1,-(SP)			; save ptr to node buffer	   <10Oct85>
+			JSR 	 ExtLocRec 			; locate child record		   <10Oct85>
+			MOVE.L	 (A1),D3			; D3 = child node number	   <10Oct85>
+			MOVEA.L  (SP)+,A1			; restore ptr to node buffer   <10Oct85>
+
+			MOVEQ	 #0,D1				; no RelBlock options		   <10Oct85>
+			MOVEA.L  A1,A0				; ptr(node buffer)
+			JSR 	 ExtRelNode			; release current node
+
+			ADDQ.W	 #1,D6				; bump level count
+			BRA.S	 TSLoop 			; continue the search
+;
+; at leaf level set up return info
+;
+TSDone
+			MOVE.W	 D6,BTCLevel(A4)	; initialize current level
+			MOVE.W	 D4,D1				; return insert index in D1
+			MOVE.W	 D5,D0				; return search result in D0
+			MOVE.L	 D3,D2				; return node number in D2
+TSExit
+			MOVEM.L  (A6)+,D3-D7/A2-A3	; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set up condition codes
+			RTS 						; exit ExtTreeSearch
+
+
+
+
+
+;__________________________________________________________________________________
+;
+; Internal Subroutines
+;__________________________________________________________________________________
+
+
+;__________________________________________________________________________________
+;
+; Routine:		RotRecLt
+;
+; Function: 	Rotates one record from the right node into the left node.
+;
+; Input:		A0.L  -  ptr(left node)
+;				A1.L  -  ptr(right node)
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							-1 = won't fit
+;
+; Called by:	ExtRotateLt
+;__________________________________________________________________________________
+
+RotRecLt
+			MOVEM.L  A2-A3,-(SP)		; save registers
+;
+; insert first record of right node at the end of the left node
+;
+			MOVEA.L  A0,A2				; A2 = ptr(lt node)
+			MOVEA.L  A1,A3				; A3 = ptr(rt node)
+			MOVEQ	 #0,D0				; index of 1st record
+			JSR 	 ExtGetRecA			; get the record size
+			LEA 	 lenND(A1),A0		; ptr(1st record) in rt node
+			MOVEA.L  A2,A1				; A1 = ptr(left node)
+			MOVE.W	 NDNRecs(A1),D1 	; insert index into left node
+
+			JSR 	 ExtInsertRec		; insert record in left node
+			MOVEA.L  A3,A1				; A1 = ptr(right node)
+			BEQ.S	 RRLDelete			; insert ok ->
+			MOVEQ	 #-1,D0 			; result = "won't fit"
+			BRA.S	 RRLExit			; exit ->
+;
+; delete record from right node
+;
+RRLDelete
+			CLR.W	 D1 				; index = 0
+			JSR 	 ExtDeleteRec		; delete it
+			CLR.W	 D0 				; result = ok
+RRLExit
+			TST.W	 D0 				; set condition codes
+			MOVEM.L  (SP)+,A2-A3		; restore registers
+			RTS 						; exit RotRecLt
+
+			END 
+
+

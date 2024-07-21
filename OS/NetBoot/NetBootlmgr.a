@@ -1,0 +1,453 @@
+;
+;	File:		NetBootlmgr.a
+;
+;	Written by:	Pat Dyson
+;
+;	Copyright:	й 1989-1992 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	10/28/92	SWC		Changed the INCLUDEs to a LOAD of StandardEqu.d. Changed
+;									ATalkEqu.a->AppleTalk.a and ShutdownEqu.a->Shutdown.a.
+;		 <9>	10/14/91	JSM		Remove unneeded include of ATalkEqu2.a, add comment about things
+;									we need to do.
+;		 <7>	 6/12/91	LN		removed include 'HardwareEqu.a'
+;		 <6>	 6/12/91	LN		removed INCLUDE 'rtmpdefs.a'
+;		 <5>	 5/21/91	gbm		Nail a couple of warnings
+;		 <4>	 1/19/91	mbs		Include ATalkPrivateEQU.a to get some non-public equates that
+;									were moved out of ATalkEQU.a
+;		 <3>	 2/20/90	PWD		Removed Include dependency for XO build.
+;		 <2>	12/19/89	PD		Adding to bbs.
+;	   <1.2>	12/12/89	PWD		Added support for self-authenticating images
+;	   <1.1>	 11/1/89	PWD		Fixed bug on Elsie with old AppleTalk.
+;	   <1.8>	10/27/89	PWD		Changed to be included in the ATBoot Driver, work with net
+;									Booting
+;	To Do:
+;
+;		This file uses includes copied from the AppleTalk sources into :OS:NetBoot:ATIncludes.
+;		We need a better place to keep these files, preferably getting them from the AppleTalk
+;		source tree itself. (JSM 10/14/91)
+
+; COPIED FROM APPLETALK SOURCES 10/27/1989
+;	lmgr.a
+
+;	This file creates the LAP Manager initialization resource 'lmgr', located in the
+;	AppleTalk file. It is loaded by INIT (18) and executed. It initializes the LAP manager,
+;	and loads .MPP and .ATP via DrvrInstall.
+
+			INCLUDE		'mppflags2.a'
+
+			PRINT		OFF
+			LOAD		'StandardEqu.d'
+			INCLUDE		'ShutDown.a'
+
+			INCLUDE		'802Equ.a'
+			INCLUDE		'AppleTalk.a'					; AppleTalk equates
+			INCLUDE		'ATalkPrivateEqu.a'				; non-public AppleTalk equates
+			INCLUDE		'ENETEqu.a'						; Ethernet driver equates
+			INCLUDE		'AARPEqu.a'						; AARP equates
+
+			INCLUDE 	'vardefs2.a'    				; Definitions of MPP local variables
+			INCLUDE 	'LapVars2.a'
+
+			PRINT		ON, NOGEN
+			INCLUDE		'LAPMgrEqu.a'					; LAP manager equates
+
+DoOpenLap		PROC		EXPORT
+;еееееееееееееееееееееееееееееееееееееееееееееееееееееееееееее
+;	The following pieces are loaded at startup for AppleTalk:
+
+;	INIT18 gets loaded by the system INIT processing. That process inserts the ROM resource
+;	map and performs a _GetResource. Thus looking both in ROM and the System File. To over-
+;	ride INIT18 then, one only needs to place a ROVR for it and its replacement resource in
+;	the System file.
+
+;	LMGR (this code) gets loaded by whatever technique INIT18 uses. It may be loaded out of
+;	ROM or the AppleTalk file depending on the INIT18. As a general rule, if INIT18 is in ROM,
+;	LMGR is loaded from ROM, and if INIT18 is in the system file, LMGR is loaded from the
+;	AppleTalk file.
+
+;	.MPP/.ATP drivers are loaded from ROM or the AppleTalk file. For each one, the ROM resource
+;	map is inserted and a _Get1Resource is performed. If that finds the driver AND it's version
+;	is acceptable, it is used from ROM, otherwise a _Get1Resource is performed on the AppleTalk
+;	file and another version check is made. If neither yields a driver resource, an initial-
+;	zation error is assumed.
+
+;	Built-in ATLK is searched for in ROM and the system file by inserting the ROM resource map
+;	and using _GetResource. To overide it, one needs to provide a ROVR and replacement resource
+; 	in the System File. A file version of the code is NEVER used.
+
+;	ALL other ATLK files are searched for first in ROM then in an ADEV file in the System folder.
+;	Any alternate ROM ATLK is overidden in the same manner as the Built-in ATLK.
+;_____________________________________________________________
+;
+; The actual INIT code - this code allocates our variables and
+;	installs us in the LAPWrite hook.	The LAP manager code
+;	starts at the address pointed to by the hook, plus 2.
+;_____________________________________________________________
+
+InitCode
+
+			BSR			InstallDRVRs					; install .MPP and .ATP (don't _Open)
+			BNE			InitRTS							; could not do it
+
+			BSR			ReadPRAM						; D1 = logical AppleTalk info
+			MOVEQ		#1,D2							; Assume just one port
+
+			MOVEQ		#PESize,D0						; size for ONE port entry
+@3
+			ADD			#PETblStart,D0					; Add in room for rest of variables
+			_NewPtr		,SYS,CLEAR						; A0 -> our variables
+			BNE			InitRTS							; If can't get, go away
+
+			MOVE		D2,NumPorts(A0)					; Set number of ports we support
+			MOVEA.L		ExpandMem,A1					; A1 -> expanded memory
+			LEA			ExpandMemRec.emLMgrGlobals(A1),A1 ; A1 -> our variable pointer
+			MOVE.L		A0,(A1)							; Save it
+
+			MOVE.L		D1,-(SP)						; Save D1 (PRAM value)
+; <1.8>			BSR			LoadSTRs						; load strings for alerts
+
+			MOVEA.L		ExpandMem,A0					; A0 -> expanded memory
+			MOVEA.L		ExpandMemRec.emLMgrGlobals(A0),A0 ; A0 -> our variables
+			LEA			ATalkHk2,A1						; A1 -> LAP write hook
+			MOVEA.L		UTableBase,A2					; A2->unit table
+			MOVEQ		#MPPUnitNum*4,D1				; D1=offset to .MPP DCE
+			MOVEA.L		(A2,D1.W),A2					; A2=MPP DCE handle
+			MOVEA.L		(A2),A2							; deref
+			MOVEA.L		dCtlDriver(A2),A2				; A2=.MPP pointer
+			MOVE.W		drvrOpen(A2),D1					; D1=offset to .MPP open code
+			MOVE.W		-2(A2,D1.W),D1					; D1=offset to LAP Manager code
+			LEA			(A2,D1.W),A3					; A3 -> the LAP mgr code
+			MOVE.L		A3,D0
+			_StripAddress								; get real address
+			MOVE.L		D0,(A1)							; Set in LAPWrite hook
+
+			MOVEQ		#LInit,D0						; init run time
+			JSR			LAPMgrCall(A3)
+
+			MOVEA.L		ExpandMem,A3					; A3 -> expanded memory
+			MOVEA.L		ExpandMemRec.emLMgrGlobals(A3),A3 ; A3 -> our variables
+; <1.8>
+;			PEA			BrdgName(A3)					; Push where to put name
+;			MOVE		#BridgeSTR,-(SP)				; Push STR# resource ID
+;			MOVE		#BridgeNameSTR,-(SP)			; Push index for file name
+;			JSR			GetIndString					; Get it (nil if not found)
+; <1.8>
+			MOVE.L		(SP)+,D1						; Restore D1
+			TST.B		D1								; Printer port AppleTalk?
+			BNE.S		DoAltATlk						; no, this is alternate atlk
+			BSR			InstallPrintAtlk				; Go get proper Printer Port AppleTalk
+			BRA.S		FinishUp
+DoAltATlk
+			BSR			ATlkInit						; Otherwise initialize the alternate
+FinishUp
+			LEA			PETblStart(A3),A3				; A3->port rec
+			TST.L		PEpRAM(A3)						; using built-in?
+			BNE.S		@useAtlk						; no
+			BSET		#LWSrvrWks,PEOurFlags(A3)		; localtalk honors server/wks addresses
+@useAtlk
+InitRTS
+			RTS											; That's it
+
+;_____________________________________________
+;
+; ATlkInit - not built-in AppleTalk.	Install alternate.
+;
+;	<1.8> If an error occurs, default to the built in and reopen
+;
+;	D1 = pRAM value
+;	A3 -> our variables
+;_____________________________________________
+
+ATlkInit	MOVE.L		D4,-(SP)						; Save some registers
+
+;			CMP.B		#BridgeAtlk,D1					; Are we configured for a bridge?
+;			BEQ.S		BridgeInit						; If so, do different initialization
+			MOVEQ		#-1,D4							; Indicate install is for non-bridge
+			BSR			InstallADEV						; Install AppleTalk indicated by D1
+			MOVE.L		D1,PETblStart+PEpRAM(A3)		; Save our pRAM value
+@5			TST			D0								; Installed ok?
+			BEQ.S		ATlkIDone						; <1.8>
+			BSR			InstallE						; <1.8> process error - reset to built-in
+														; <1.8> and reopen
+ATlkIDone	MOVE.L		(SP)+,D4						; Restore registers
+			RTS											; And return
+
+
+;_____________________________________________
+;
+; InstallE - process an installation error
+;
+;	Uses:
+;	D0-D1,A3
+;_____________________________________________
+
+InstallE
+			MOVEQ		#0,D1							; Set pRAM back to zero
+			BSR			WritePRAM						; Write it
+			BSR			InstallPrintAtlk				; Go install proper Printer Port AppleTalk
+			MOVEA.L		ExpandMem,A3					; A3 -> expanded memory
+			MOVEA.L		ExpandMemRec.emLMgrGlobals(A3),A3 ; A3 -> our variables
+			CLR.L		PETblStart+PEpRAM(A3)			; Set port 0 pRAM value
+			MOVE		#1,NumPorts(A3)					; We can only support one port
+			RTS											; Return
+
+;__________________________________________________________
+;
+; InstallADEV - perform alternate AppleTalk installation
+;
+;	Call:
+;	A3 -> our variables
+;	D1 (long) = pRAM value (low byte is atlk resource ID)
+;	D4 (word) = port number to install on (-1 for non-bridge)
+;
+;	Return:
+;	D0 = error code
+;	D1 = new pRAM value (if bridge, must be same as old one)
+;	D2 = 0 if couldn't find adev file; otherwise error was from AInstall
+;	Uses D3,A0-A2
+;
+; NOTE: trashes the application heap
+;__________________________________________________________
+
+InstallPrintAtlk
+			move.w		#LAPPrinter,d0					; Printer atlk ID
+			bsr.s		GetRomAtlk						; get ROM atlk resource handle
+			move.l		a0,d0							; is there a ROM atlk?
+			beq.s		@Xit							; no, leave it to Builtin
+@useRomPrinter
+			move.l		#'SC  ',d1						; set up printer port atlk special value in d1
+			move.w		#$101,d1						; includes LAPPrinter value in low byte
+			move.w		#-1,d4							; Builtin => non-Router
+			bsr.s		InstallTheAtlk					; go install atlk
+@Xit
+			rts
+
+
+;__________________________________________________________________
+;
+; GetRomAtlk - try to load ROM 'atlk' resource
+;
+;    Call:
+;	D0 (word) = atlk resource ID
+;
+;    Return:
+;	A0 (long) = handle returned by GetResource
+;__________________________________________________________________
+
+GetRomAtlk
+			move.l		d2,-(sp)						; save d2
+			move.w		#mapTrue,RomMapInsert			; map ROM into Resource Chain
+			subq		#4,sp							; Make room for handle
+			move.l		#'atlk',-(sp)					; Push resource type
+			move.w		d0,-(sp)						; Push resource ID
+			_GetResource								; get atlk from ROM or from System file
+			move.l		(sp)+,a0						; get result
+			move.l		(sp)+,d2						; restore d2
+			rts
+
+
+;__________________________________________________________________
+;
+; InstallTheAtlk - make install call to atlk
+;
+;    Call:
+;	a0 (long) = handle to atlk
+;	d1 (long) = value from parameter RAM with Resource ID in low byte
+;	d4 (word) = port number to install on (-1 for non-bridge)
+;
+;    Return:
+;	d0 (word) = result
+;		noErr => atlk installed successfully
+;		negative => error
+;	condition codes reflect result in D0
+;__________________________________________________________________
+
+InstallTheAtlk
+			movem.l		a0/a2/a3/d2-d4,-(sp)			; Save registers
+			movea.l		a0,a3							; Pass handle in a3
+			move.l		(a0),a0							; A0 -> atlk code
+			tst.w		d4								; is this a router?
+			bpl.s		@installIt						; yes, d4 is proper port
+			moveq		#0,d4							; no, indicate port 0
+@InstallIt
+			moveq		#AInstall,d0					; Set code to do installation
+			jsr			atlkCall(a0)					; Call it (returns D1 = pRAM value)
+			movem.l		(sp)+,a0/a2/a3/d2-d4			; Restore registers
+			tst.w		d0								; Set Condition Codes
+			rts
+
+
+;__________________________________________________________
+;
+; InstallADEV - perform alternate AppleTalk installation
+;
+;	Call:
+;	A3 -> our variables
+;	D1 (long) = pRAM value (low byte is atlk resource ID)
+;	D4 (word) = port number to install on (-1 for non-bridge)
+;
+;	Return:
+;	D0 = error code
+;	D1 = new pRAM value (if bridge, must be same as old one)
+;	D2 = 0 if couldn't find adev file; otherwise error was from AInstall
+;	Uses D3,A0-A2
+;
+; NOTE: trashes the application heap
+;__________________________________________________________
+
+InstallADEV
+			MOVEQ		#0,D2							; init part of return code
+
+			CLR.W		D0								; Prepare word for atlk Resource ID
+			MOVE.B		D1,D0							; Resource ID of atlk is low byte of PRAM
+			BSR.S		GetRomAtlk						; Try to get from ROM
+			MOVE.L		A0,D0							; Did we get it?
+			BEQ.S		@done							; <1.8> no, punt
+
+			MOVE.L		D1,D3							; D3 = current pRAM value
+			BSR.S		InstallTheAtlk					; an atlk was in ROM, use it
+			BEQ.S		@checkRomAtlk					; installation was successful
+@installFailed
+			MOVE.W		D0,D2							; indicate installation failed
+			BRA.S		@done							; and exit
+@checkRomAtlk
+			BSR.S		CheckPramVal					; go check pRam value
+			BNE.S		@installFailed					; pRam changed when it shouldn't have been
+			CMP.L		D1,D3							; Changed pRAM value?
+			BEQ.S		@okRomAtlk						; Branch if not
+			BSR			WritePRAM						; Write it out
+@okRomAtlk
+			MOVEQ		#0,D0							; Indicate no error
+@done
+			TST.W		D0								; Set condition codes
+			RTS											; That's it
+
+;______________________________________________________________________
+;
+; CheckPramVal - If running Router don't allow atlk to change PRAM value
+;
+;	Call:
+;		D1 = value returned by atlk install
+;		D3 = current PRAM value
+;		D4 = port number to install (-1 for non-bridge)
+;
+;	Return:
+;		D0 = error code
+;		Condition codes set for value in D0
+;
+;______________________________________________________________________
+
+CheckPramVal
+			MOVEQ		#0,D0							; Assume successful completion code
+			MOVE.B		D3,D1							; Low pRAM byte must be resource ID
+			TST			D4								; For a non-bridge?
+			BMI.S		@letsRts						; If so no need to check
+			CMP.L		D1,D3							; Did atlk change pRAM?
+			BEQ.S		@letsRts						; Branch if not
+			MOVE.L		(A0),A0							; A0 -> atlk code again
+			BSR			DoAShutdown						; Shut it down
+			MOVEQ		#ChangedPRAMErr,D0				; Set error code
+@letsRts
+			TST.W		D0								; Set condition codes
+			RTS											; And return result
+
+;
+; DoAShutdown - issue a shutdown call.	A0 -> atlk code.
+;
+DoAShutdown MOVEM.L		A0-A3/D0-D3,-(SP)				; Save registers
+			MOVEQ		#AShutdown,D0					; D0 = code for shutdown
+			JSR			atlkCall(A0)					; Make the shutdown call
+			MOVEM.L		(SP)+,A0-A3/D0-D3				; Restore registers
+			RTS											; And return
+
+			; EJECT
+;______________________________________________________________________
+;	Load and lock .MPP and .ATP drivers and setup DCE entries.
+
+InstallDRVRs
+			MOVEQ		#-(ATPUnitNum+1),D3
+			BSR.S		@LoadAndLock					; load .ATP
+			BNE.S		@BadInstall
+
+			MOVEQ		#-(MPPUnitNum+1),D3				; D3=refnum
+			BSR.S		@LoadAndLock					; load .MPP
+			BNE.S		@BadInstall						; failed
+			MOVEQ		#0,D0
+			RTS											; good install
+@BadInstall
+; <1.8>			BSR			CloseAppleTalk					; close down AppleTalk
+@IError
+			MOVEQ		#-1,D0
+			RTS
+@LoadAndLock											; D3=refnum
+
+			MOVE.W		#mapTrue,RomMapInsert			; map ROM into Resource Chain
+			SUBQ		#4,SP							; Make room for handle
+			MOVE.L		#'DRVR',-(SP)					; Push resource type
+			MOVE.W		D3,-(SP)						; Push resource ID
+			NOT.W		(SP)							; id
+			_GetResource								; get atlk only from ROM
+			MOVE.L		(SP)+,A0						; get result
+
+			MOVE.L		A0,-(SP)						; Keep on stack
+			MOVE.L		A0,D0							; Did we get ROM resource?
+			BEQ.S		@IError							; no, check file load
+
+			MOVE.W		D3,D0
+			DC.W		$A43D							; _DrvrInstall,LOCK - make a DCE
+
+			MOVEA.L		UTableBase,A0					; A0->unit table
+			NOT.W		D3								; convert D3 to unit number
+			LSL.W		#2,D3							; convert to offset
+			MOVEA.L		(A0,D3.W),A0					; A0=DCE handle
+			MOVEA.L		(A0),A0							; A0->DCE
+			MOVE.L		(SP)+,A1						; A1 is handle to driver resource
+;	Set a pointer and keep ram bit clear even if we are in RAM due to unlocking of MPP by IOcore.
+			MOVE.L		(A1),dCtlDriver(A0)				; set POINTER to DRVR in DCE
+
+			MOVEA.L		dCtlDriver(A0),A1				;A1->driver code
+			MOVE.B		drvrFlags(A1),dCtlFlags(A0)		; copy flag byte from driver
+			BCLR		#dRAMBased,dCtlFlags+1(A0)		; simulate being in ROM
+			MOVEQ		#0,D0							; good return
+			RTS
+
+;__________________________________________________________________
+;
+; ReadPRAM - read from our PRAM
+;
+;	D1 = value of PRAM
+;	Uses A0, D0
+;__________________________________________________________________
+
+ReadPRAM
+			CLR.L		-(SP)							; Allocate room for read
+			BTST		#14,HWCfgFlags					; New clock chip?
+			BEQ.S		@10								; Assume built-in if not
+			MOVE.L		SP,A0							; A0 -> where to read PRAM
+			MOVE.L		#4*256*256+ATalkPRAM,D0			; D0 = read length and offset
+			_ReadXPRam									; Do the read
+@10			MOVE.L		(SP)+,D1						; D1 = value from parameter RAM
+			RTS
+
+;__________________________________________________________________
+;
+; WritePRAM - write to our PRAM
+;
+;	D1 = value to write
+;	Uses D0
+;__________________________________________________________________
+
+WritePRAM	MOVE.L		A0,-(SP)						; Save A0
+			MOVE.L		D1,-(SP)						; Set value on stack
+			MOVE.L		SP,A0							; A0 -> where to write from
+			MOVE.L		#4*256*256+ATalkPRAM,D0			; D0 = count and offset
+			_WriteXPRam									; Write to PRAM
+			ADDQ		#4,SP							; Pop word written
+			MOVE.L		(SP)+,A0						; Restore A0
+@10			RTS											; That's it
+
+			ENDP
+			END
+

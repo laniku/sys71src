@@ -1,0 +1,454 @@
+;------------------------------------------------------------------------
+;
+;	File:		GestaltGlue.a
+;
+;	Contains:	Glue for Gestalt traps.
+;
+;	Written by:	Carl C. Hewitt
+;
+;	Copyright:	© 1990 by Apple Computer, Inc., all rights reserved.
+;
+;   This file is used in these builds: ROM System
+;
+;	Change History (most recent first):
+;
+;		 <8>	 6/12/91	LN		added #include 'SysPrivateEqu.a'
+;		 <7>	 1/14/91	SAM		Updated ‘mach’ glue so that it works on Mac Plus and SEs.
+;		 <6>	 6/15/90	CCH		Took out unconditional branch left over from testing.
+;		 <5>	 6/13/90	CCH		Added glue for gestaltLogicalRAM and gestaltPhysicalRAM
+;									selectors.
+;		 <4>	 4/18/90	CCH		The result code from _Gestalt is no longer trashed.
+;		 <3>	 4/11/90	CCH		NewGestalt and ReplaceGestalt glue will now work correctly on
+;									machines that implement the Gestalt trap.
+;		 <2>	  3/9/90	CCH		Added glue to allow support certain Gestalt calls if the trap is
+;									unimplemented. Currently, SysEnvirons equivalents are supported.
+;
+;	To Do:
+;
+;------------------------------------------------------------------------
+
+*************************************************************************
+* Pascal Declarations:
+*
+* FUNCTION Gestalt(selector : OSType; VAR result : LONGINT) : OSErr;
+* FUNCTION NewGestalt(selector : OSType; gestaltFunction : ProcPtr) : OSErr;
+* FUNCTION ReplaceGestalt(selector : OSType; gestaltFunction : ProcPtr; VAR oldGestaltFunction : ProcPtr) : OSErr;
+*
+*************************************************************************
+* C Prototypes:
+*
+* pascal OSErr Gestalt(OSType selector, long *result);
+* pascal OSErr NewGestalt(OSType selector, ProcPtr gestaltFunction);
+* pascal OSErr ReplaceGestalt(OSType selector, ProcPtr gestaltFunction, ProcPtr *oldGestaltFunction);
+*
+*************************************************************************
+
+  				MC68881
+				INCLUDE	'Traps.a'
+				INCLUDE	'SysEqu.a'
+				INCLUDE	'SysPrivateEqu.a'
+				INCLUDE	'MMUEqu.a'
+				INCLUDE	'InternalOnlyEqu.a'
+				INCLUDE	'SysErr.a'
+				INCLUDE	'GestaltEqu.a'
+				INCLUDE	'GestaltPrivateEqu.a'
+
+HWCfgFlags		EQU 	$b22  				; (word) HW Configuration flags
+hwCbFPU   		EQU 	12        			; FPU chip present.
+
+Unimplemented	EQU		$a89f				; unimplemented trap number
+GestaltTrap		EQU		$a0ad				; gestalt trap number
+
+;--------------------------------------------------------------------------------------
+; Stack frame for Gestalt and NewGestalt calls
+;--------------------------------------------------------------------------------------
+
+gestaltParmFrame record	{oldA6},decrement
+result			ds.w	1	; OSErr
+argSize			equ	*-8
+selector		ds.l	1	; packed array [1..4] of char
+responsePtr		ds.l	1	; addr of longint result for Gestalt
+procPtr			equ		*	; addr of gestalt function for NewGestalt
+return			ds.l	1
+oldA6			ds.l	1
+localFrame		equ	*
+				endR
+
+;--------------------------------------------------------------------------------------
+; Stack frame for ReplaceGestalt calls
+;--------------------------------------------------------------------------------------
+
+replaceGestaltFrame record	{oldA6},decrement
+result			ds.w	1	; OSErr
+argSize			equ	*-8
+selector		ds.l	1	; packed array [1..4] of char
+procPtr			ds.l	1	; address of new gestalt function
+oldProcPtr		ds.l	1	; ptr to addr of old gestalt function
+return			ds.l	1
+oldA6			ds.l	1
+localFrame		equ	*
+				endR
+
+;--------------------------------------------------------------------------------------
+; NewGestalt Glue
+;--------------------------------------------------------------------------------------
+
+NewGestalt		PROC		EXPORT
+
+				with	gestaltParmFrame
+				link	a6,#localFrame
+
+				move.l	#Unimplemented,d0	; get unimplemented trap number
+				_GetTrapAddress newTool		; find out it's address
+				move.l	a0,-(sp)			; save the unimplemented trap address
+				move.l	#GestaltTrap,d0		; get Gestalt's trap number
+				_GetTrapAddress newOS		; find out it's address
+				cmpa.l	(sp)+,a0			; are they the same?
+
+				beq.s	@noGestalt			; IF gestalt exists THEN
+				move.l	selector(a6),d0		;   put selector into d0
+				move.l	procPtr(a6),a0		;   put proc ptr into a0
+				_NewGestalt					;   call NewGestalt trap
+				move.w	d0,result(a6)		;	return the result to our caller
+				bra.s	@newGestaltExit		;	clean up and exit
+@noGestalt									; ELSE
+				move.w	#unimpErr,result(a6) ;	return unimplemented core routine result
+											; ENDIF
+@newGestaltExit								;
+				unlk	a6					; get rid of our local frame
+				move.l	(sp)+,a0			; get return value
+				add.l	#argSize,sp			; restore stack pointer
+				jmp		(a0)				; return
+				
+				ENDP
+
+
+;--------------------------------------------------------------------------------------
+; ReplaceGestalt Glue
+;--------------------------------------------------------------------------------------
+
+ReplaceGestalt	PROC		EXPORT
+
+				with	replaceGestaltFrame
+				link	a6,#localFrame
+
+				move.l	#Unimplemented,d0	; get unimplemented trap number
+				_GetTrapAddress newTool		; find out it's address
+				move.l	a0,-(sp)			; save the unimplemented trap address
+				move.l	#GestaltTrap,d0		; get Gestalt's trap number
+				_GetTrapAddress newOS		; find out it's address
+				cmpa.l	(sp)+,a0			; are they the same?
+
+				beq.s	@noGestalt			; IF gestalt exists THEN
+				move.l	selector(a6),d0		;   put selector into d0
+				move.l	procPtr(a6),a0		;   put proc ptr into a0
+				_ReplaceGestalt				;   call NewGestalt trap
+				move.w	d0,result(a6)		;	return the result to our caller
+				movea.l	oldProcPtr(a6),a1	;	get address to place old proc ptr
+				move.l	a0,(a1)				;	return old proc ptr to our caller
+				bra.s	@repGestaltExit		;	clean up and exit
+@noGestalt									; ELSE
+				move.w	#unimpErr,result(a6) ;	return unimplemented core routine result
+											; ENDIF
+@repGestaltExit								;
+				unlk	a6					; get rid of our local frame
+				move.l	(sp)+,a0			; get return value
+				add.l	#argSize,sp			; restore stack pointer
+				jmp		(a0)				; return
+				
+				ENDP
+
+
+;--------------------------------------------------------------------------------------
+; Gestalt Glue
+;--------------------------------------------------------------------------------------
+
+Gestalt			PROC	EXPORT
+
+				with	gestaltParmFrame
+				link	a6,#localFrame
+
+				move.l	#Unimplemented,d0	; get unimplemented trap number
+				_GetTrapAddress newTool		; find out it's address
+				move.l	a0,-(sp)			; save the unimplemented trap address
+				move.l	#GestaltTrap,d0		; get Gestalt's trap number
+				_GetTrapAddress newOS		; find out it's address
+				cmpa.l	(sp)+,a0			; are they the same?
+
+				beq.s	@fakeGestalt		; IF gestalt exists THEN
+				move.l	selector(a6),d0		;   put selector into d0
+				_Gestalt					;   call Gestalt trap
+				move.l	responsePtr(a6),a1	; get address of result						<4>
+				move.l	a0,(a1)				; put result into result area				<4>
+				bra.s	gestaltGlueExit		; ELSE										<4>
+@fakeGestalt	lea		selectorTable,a0	;	get address of supported selectors
+				move.w	#gestaltUndefSelectorErr,d0	; assume we won't find it
+				move.l	selector(a6),d1		; get selector in d1
+@selectorLoop								; LOOP
+				cmp.l	(a0)+,d1			;   found one we're looking for?
+				beq.s	@foundIt			;	>>EXITROUTINE if we did
+				tst.l	(a0)+				;	at end of table?
+				beq.s	gestaltGlueExit		;	>>EXITROUTINE if so
+				bra.s	@selectorLoop		; END
+@foundIt
+				lea		selectorTable,a1	; get address of table
+				add.l	(a0),a1				; get address of requested routine
+				jmp		(a1)				; go to it
+				
+gestaltGlueCommon				
+				move.l	responsePtr(a6),a1	; get address of result
+				move.l	d0,(a1)				; put result into result area
+				move.w	#noErr,d0			; return no error
+gestaltGlueExit
+				move.w	d0,result(a6)		; put the error result
+				unlk	a6
+				move.l	(sp)+,a0			; get return value
+				add.l	#argSize,sp			; restore stack pointer
+				jmp		(a0)				; return
+
+gestaltUnknown	move.w	#gestaltUnknownErr,d0	; return unknown error
+				bra.s	gestaltGlueExit
+
+				ENDWITH
+
+selectorTable
+				dc.l	gestaltVersion, 			getVersion-selectorTable
+				dc.l	gestaltMachineType, 		getMachineType-selectorTable
+				dc.l	gestaltSystemVersion, 		getSysVersion-selectorTable
+				dc.l	gestaltProcessorType, 		getProcessor-selectorTable
+				dc.l	gestaltFPUType, 			getFPUType-selectorTable
+				dc.l	gestaltQuickdrawVersion,	qdVersion-selectorTable
+				dc.l	gestaltKeyboardType, 		getKeyboard-selectorTable
+				dc.l	gestaltAppleTalkVersion,	getATalkVersion-selectorTable
+				dc.l	gestaltMMUType, 			getMMUType-selectorTable
+				dc.l	gestaltPhysicalRAMSize, 	getRAMSize-selectorTable
+				dc.l	gestaltLogicalRAMSize, 		getRAMSize-selectorTable
+				dc.l	0, 0
+
+
+GestaltProcParms	RECORD	0,INCREMENT
+returnAddr			DS.L	1
+resultPtr			DS.L	1
+selector			DS.L	1
+error				DS.W	1
+					ENDR
+
+				WITH	GestaltProcParms, ExpandMemRec, GestaltGlobals
+
+************************************************************************
+*	Version
+************************************************************************
+
+getVersion		Moveq	#1,d0					; return current version
+				bra.s	gestaltGlueCommon		; save result and exit						<2.9>
+
+
+************************************************************************
+*	Machine Type
+************************************************************************
+
+getMachineType	move.l	ROMBase,A1				; Get base address of ROM					<7>
+				moveq	#gestaltMacPlus,D0		; Assume MacPlus							<7>
+				
+				cmp.w	#$0075,8(A1)			; Is this a Plus?							<7>
+				beq.s	@machineDone			; -> Yes, say so							<7>
+				cmp.w	#$0276,8(A1)			; Howa bout an SE?							<7>
+				bne.s	@useBoxFlag				; -> no, it's ok to use BoxFlag				<7>
+				addq	#1,D0					; Bump result up to gestaltMacSE			<7>
+				bra.s	@machineDone			; -> exit.									<7>
+
+@useBoxFlag		move.b	BoxFlag,d0				; put machineType in result
+				addq.l	#6,d0					; convert to Gestalt result
+@machineDone	bra.s	gestaltGlueCommon		; save result and exit						<2.9>
+
+
+************************************************************************
+*	System Version
+************************************************************************
+
+getSysVersion	clr.l	d0						; clear result register						<2.9>
+				Move.w	SysVersion,d0			; save system version in lsw of result
+				bra		gestaltGlueCommon		; save result and exit						<2.9>
+
+
+************************************************************************
+*	Processor Type
+************************************************************************
+
+getProcessor	moveq.l	#0,d0					; clear d0
+				Move.b	CPUFlag,D0				; get processor type
+				Addq	#1,D0					; adjust to make it the correct result #
+				bra		gestaltGlueCommon		; save result and exit						<2.9>
+
+
+************************************************************************
+*	FPU Type
+************************************************************************
+
+getFPUType		cmp.b	#cpu68040,CPUFlag		; are we on an 040?
+				beq.s	@on040					; if so, we know what kind we have
+				Btst	#hwCbFPU-8,HWCfgFlags	; check for FPU  -- if bit set, we have FPU (-8 'cuz 
+												; equates for HwCfgFlags are based on 16-bit word)
+				Beq.s	@noFPU					; we have one, now figure out which one
+				Move.l	SP,A0					; get base of (soon to be) FPU state frame
+				FNop							; synchronize FPU with us
+				FSave	-(SP)					; get an "idle" state frame
+				Move.w	(SP),D0					; get format word for this state frame
+				Move.l	A0,SP					; restore stack pointer
+				Cmp.w	#$1f18,D0				; an 881?
+				Beq.s	@M68881
+				Cmp.w	#$3f18,D0				; this also indicates an 881
+				Beq.s	@M68881
+				Cmp.w	#$3f38,D0				; how 'bout an 882?
+				Beq.s	@M68882
+				Cmp.w	#$1f38,D0				; this is also an 882
+				Beq.s	@M68882
+				move.l	#0,d0					; assume no FPU	<3>
+				bra.s	@fpuExit
+
+@M68881			Move.l	#gestalt68881,D0		; we have an 881
+				Bra.s	@fpuExit
+@M68882			Move.l	#gestalt68882,D0		; we have an 882
+				Bra.s	@fpuExit
+@on040			move.l	#gestalt68040FPU,d0		; we know what kind of FPU it has
+				bra.s	@fpuExit
+
+@noFPU			Move.l	#gestaltNoFPU,D0		; no FPU installed
+
+@fpuExit		bra		gestaltGlueCommon		; save result and exit
+
+
+************************************************************************
+*	QD Version
+************************************************************************
+
+qdVersion		
+				cmp.w	#$3fff,Rom85			; do we have color quickdraw?
+				bgt.s	@noCQD					; nope..
+				Move.w	#Unimplemented,D0		; get loc of unimplemented trap
+				_GetTrapAddress ,newTool		; get the address into A0
+				Move.l	A0,D2					; save it for a sec
+				Move.l	#$AB03,D0				; trap ID to check for 32-bit QD
+				_GetTrapAddress ,newTool		; get the address of it
+				Move.l	#gestalt8BitQD,D0		; assume 8-bit CQD
+				Cmp.l	A0,D2					; is it unimplemented?
+				Bne.s	@fullCQD				; Yep..
+				bra.s	qdDone
+
+@noCQD			move.l	#gestaltOriginalQD,d0	; original qd, fall through
+				bra.s	qdDone
+
+@fullCQD		Move.l	#gestalt32BitQD,D0		; we have 32-bit cqd..
+		
+qdDone			bra		gestaltGlueCommon		; save result and exit						<2.9>
+
+
+************************************************************************
+*	Keyboard Type
+*	Note:	To add new keyboards, simply add types to table before EOT.
+************************************************************************
+
+getKeyboard		Move.b	KbdType,D0				; get keyboard type
+				Lea		keyBdTable,A0			; get table into A0
+				move.l	a0,a1					; save a copy
+				
+keyBdLoop		Move.b	(A0)+,D1				; get an entry from table
+				Beq		gestaltUnknown			; if we get to the end, unknown keyboard	<2.9>
+				Cmp.b	D0,D1					; does our keyboard match this entry?
+				Bne.s	keyBdLoop				; yep, we found it
+
+keyBdFound		Sub.l	A1,A0					; get the index into the table
+				Move.l	A0,D0					; get ready to store the result
+
+keyBdDone		bra		gestaltGlueCommon		; save result and exit						<2.9>
+
+keyBdTable		DC.B	$03						; Macintosh Keyboard
+				DC.B	$13						; Macintosh keyboard & keypad
+				DC.B	$0B						; Mac Plus Keyboard
+				DC.B	$02						; Apple Extended Keyboard
+				DC.B	$01						; Standard Apple Keyboard
+				DC.B	$06						; Standard Portable ADB Keyboard
+				DC.B	$07						; Portable ISO ADB Keyboard
+				DC.B	$04						; Standard ISO ADB Keyboard
+				DC.B	$05						; Extended ISO ADB Keyboard
+				DC.B	$08						; Elmer ADB Keyboard
+				DC.B	$09						; Elmer ISO ADB Keyboard
+				DC.B	$00						; EOT
+
+
+************************************************************************
+*   AppleTalk Driver Version Number
+************************************************************************
+	
+getATalkVersion	
+
+			;Is the B serial port in use?
+		
+				Clr.l	D0						; assume it's not installed
+				Tst.b	PortBUse				; if so, this will be positive.
+				Bmi.s	ATalkVersDone			; oops - not in use, I thought so, return 0
+		
+			;Port B is in use. Is it in use by AppleTalk?
+			
+				Move.b	SPConfig,D1				; get port configuration info
+				And.b	#$0F,D1					; mask off to Port B info only
+				Cmp.b	#useATalk,D1			; is it AppleTalk?
+				Bne.s	ATalkVersDone			; nope, return 0
+	
+			;Port B is in use by AppleTalk. Get the DCE pointer
+			
+				Move.l	ABusDCE,A0				; get .MPP's DCE pointer
+				Move.b	DCtlQueue+1(A0),D0		; put version number in D0
+
+ATalkVersDone	bra		gestaltGlueCommon		; save result and exit						<2.9>
+
+
+************************************************************************
+*	MMU Type
+************************************************************************
+
+getMMUType		Cmp.b	#cpu68020,CPUFlag		; should we bother to find out?
+				Blt.s	@noMMU					; nothing before Mac II can have one
+				Clr.l	D0						; start clean
+				Move.b	MMUType,D0				; get MMU
+				cmp.b	#HMMU,d0				; is it an AMU?
+				beq.s	@MMUDone				; then we're done
+				cmp.b	#PMMU851,d0				; then make sure there is one at all
+				Blt.s	@noMMU					; no mmu
+				Subq	#1,D0					; convert to right format
+				Bra.s	@MMUDone				; go return result
+
+@noMMU			Move.l	#gestaltNoMMU,D0		; tell the user we don't have one
+
+@MMUDone		bra		gestaltGlueCommon		; save result and exit
+
+
+************************************************************************
+*	RAM Size
+************************************************************************
+OSDispatchTrap 	EQU  	$A88F     				;MultiFinder trap
+
+getRAMSize		
+				move.w	#Unimplemented,D0		; get loc of unimplemented trap
+				_GetTrapAddress ,newTool		; get the address into A0
+				move.l	A0,D2					; save it for a sec
+				move.l	#OSDispatchTrap,D0		; trap ID to check for multifinder
+				_GetTrapAddress ,newTool		; get the address of it
+				move.l	MemTop,d0				; assume multifinder is not running
+				cmp.l	A0,D2					; is it unimplemented?
+				beq.s	@ramDone				; if not, we're done
+				subq.l	#4,sp					; make room for result
+				move.w	#$0016,-(sp)			; selector for total physical memory				
+				_OSDispatch						; get the value
+				move.l	(sp)+,d0				; get it into d0
+
+@ramDone		bra		gestaltGlueCommon		; save result and exit
+
+
+				ENDWITH
+
+
+				ENDP
+		
+	
+				END

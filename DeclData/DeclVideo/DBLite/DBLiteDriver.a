@@ -1,0 +1,1292 @@
+;
+;	File:		DBLite.a
+;
+;	Contains:	This file contains the video driver for use by the Macintosh
+;				OS for the GSC hardware (PowerBooks 160, 180, Duo 210, Duo 230).
+;
+;	Written by: Mike Puckett
+;
+;	Copyright:	© 1991-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM5>	12/13/93	PN		Roll in KAOs and Horror changes to support Malcom and AJ
+;									machines
+;	   <SM4>	 11/5/92	SWC		Changed VideoEqu.a->Video.a and ShutdownEqu.a->Shutdown.a.
+;	   <SM3>	 11/2/92	kc		Don't include SonicEqu.a.
+;		<SM7>	10/22/92	CSS		Fix short branch to regular branch.
+;		 <1>	 10/6/92	GDW		New location for ROMLink tool.
+;	   <SM5>	09-03-92	jmp		Clean-up some mistakes in <SM4>’s check-in comments.
+;	   <SM4>	09-03-92	jmp		(SWC,H18) DBLite once again uses a Time Manager task instead of
+;									the GSC interrupt because we were seeing cursor breakup at the
+;									top of the screen.
+;									(SWC,H17) Rolled the refresh/skew table lookup code back in (it
+;									seems to have been deleted sometime between <H10> and now...)
+;									Hopefully now using the final GSC refresh/skew values for
+;									DBLite.
+;									(jmp,H16) Corrected .s vs. non-.s branches.
+;									(djw,H15) Removed DBLiteGetVidAttributes call to avoid adding
+;									new Apple "required" calls to video drivers.
+;									(HJR,H14) Removed control LowPwrSelect since it may cause too
+;									much confusion between dimming and sleep.
+;									(HJR,H13) Added new control call, LowPwrSelect for dimming. Also
+;									fixed a bug in SetDepth whether there was improper register useage.
+;									(djw,H12) Added DBLiteGetVidAttributes status call with a
+;									negative csCode (-16384).  Fix bug in Control and status common
+;									dispatcher	dealing with the extended table.  Fixed bug in
+;									DBLiteBlankScreen control routine.
+;									(HJR,H11) Added DBLiteBlankScreen routine to clear the screen.
+;									Added a 33 millisecond delay in SetDepth to help with a DSack
+;									problem. Modifies DBLiteCSCommon to handle additional Cntrl and
+;									Status calls. In DBLiteVidClose, turn off the backlight driver
+;									and blank the screen. In DBLiteVidOpen, open the backlight
+;									driver.
+;									(SWC,H10) Changed bit depth code to change both the skew and
+;									refresh rate together since the two values are interdependent.
+;	   <SM3>	 5/16/92	kc		Roll in Horror Changes. Comments follow:
+;		<H9>	 4/16/92	SWC		Added adjustment of the GSC's skew register based on the bit
+;									depth.
+;		<H8>	 3/12/92	SWC		Save D0 across the StripAddress in the control/status code so
+;									that we can return the correct error code. Fixed a bug in
+;									GetEntries that always caused us to return the 1-bit entry
+;									table.
+;		<H7>	 2/13/92	HJR		Fix header in <H6>.
+;		<H6>	 2/13/92	HJR		Added Time Manager pseudo panel interrupts to Niagra machines
+;									since it does not support real interrupts from the GSC.
+;		<H5>	 1/16/92	SWC		Did a bit more driver cleanup.
+;		<H4>	 1/13/92	SWC		Removed the GrayScreen call in SetDepth since we ended up with a
+;									gray screen instead of "real stuff" when exiting Macsbug.
+;									Replace the Time Manager pseudo panel interrupts with the real
+;									thing from the GSC. Cleaned up the driver code a bit.
+;		<H3>	12/10/91	HJR		Fixed some minor table lookup bugs.
+;		<H2>	11/26/91	jmp		Added VERY preliminary support for the GSC.
+;		 <2>	 3/31/92	JSM		Rolled this file into Reality.
+;		 <2>	 5/22/91	jmp		Code Review changes:  For consistency, did a StripAddress on
+;									VidOpen’s copy of the privates; eliminated the redundant clears
+;									and checks for the the driver copy of the fixed-entry clut; and
+;									replaced #0’s with #noErr’s where appropriate.
+;		 <1>	 5/15/91	jmp		first checked in
+;
+
+				STRING 	C
+
+				PRINT	OFF
+				LOAD	'StandardEqu.d'
+
+				INCLUDE 'DockingEqu.a'
+				INCLUDE	'EgretEqu.a'
+				INCLUDE	'GestaltEqu.a'
+				INCLUDE	'GestaltPrivateEqu.a'
+				INCLUDE 'HardwarePrivateEqu.a'
+				INCLUDE	'IOPrimitiveEqu.a'
+				INCLUDE	'PowerPrivEqu.a'
+				INCLUDE 'ROMEqu.a'
+				INCLUDE	'Video.a'
+				INCLUDE	'SlotMgrEqu.a'
+				INCLUDE	'ShutDown.a'
+	;			INCLUDE	'SonicEqu.a'
+				INCLUDE	'UniversalEqu.a'
+				
+				INCLUDE	'DepVideoEqu.a'
+				PRINT	ON
+
+				SEG		'_sDBLiteDriver'
+
+					BLANKS		ON
+					STRING		ASIS
+					MACHINE		MC68020
+
+
+kDBLiteVBLTime		EQU			-16626		; 60.14742 Hz using the microsecond timer.
+
+; This is device storage which is stored in the dCtlStorage field of the AuxDCE.
+
+DBLiteVidPrivates	RECORD		0
+saveBaseAddr 		DS.L		1			; the screen base address
+saveGSCAddr			DS.L		1			; the ‘VDAC’ (GSC) base address
+saveFixedCLUT		DS.L		1			; pointer to fixed-entry CLUT
+saveNumFixedEntries	DS.W		1			; number of entries in fixed CLUT (zero based)
+GFlags				DS.W		1			; flags word (hi-order byte, actually)
+saveMode			DS.W		1			; the current mode setting
+TTask				DS.B		tmXQSize	; extended time manager task block
+IntDisableFlag		DS.W		1			; this word is non-zero when the VBL interrupt
+DBLiteVidPrivSize	EQU			*
+					ENDR
+
+
+
+LDBLiteDriver		MAIN	EXPORT
+
+;-------------------------------------------------------------------
+;	Video Driver Header
+;-------------------------------------------------------------------
+;
+DBLiteDrvr	DC.W	$4C00						; ctl,status,needsLock
+			DC.W	0,0,0						; not an ornament
+
+; Entry point offset table
+
+			DC.W	DBLiteVidOpen-DBLiteDrvr 	; open routine
+			DC.W	DBLiteDrvr-DBLiteDrvr		; no prime
+			DC.W	DBLiteVidCtl-DBLiteDrvr		; control
+			DC.W	DBLiteVidStatus-DBLiteDrvr	; status
+			DC.W	DBLiteVidClose-DBLiteDrvr	; close
+
+			STRING	Pascal
+DBLiteVidTitle	DC.B	'.Display_Video_Apple_GSC'		
+			ALIGN	2							; make sure we're word aligned
+			DC.W	CurGSCDrvrVersion			; version
+			STRING	ASIS
+			
+;
+; According to CARDS & DRIVERS, video drivers are supposed to shut off
+;	video at close time “to avoid the persistence of the desktop
+;	during reboots.”  Since we can’t really turn DBlite’s video off,
+;	we must simulate it by turning off the backlighting and writing
+;	white (because it’s an LCD screen) to the frame buffer.  Also,
+;	because the video driver might be closed and then re-opened
+;	prior to a reboot (AUX?), we must always re-open the backlight
+;	driver in the video driver’s open routine.  And, for this reason,
+;	when we close the backlight driver, we do NOT remove it’s DCE,
+;	and do we don’t dispose of the driver.  NOTE:  On the first
+;	time thru (i.e., after startup or restart), the Backlight driver
+;	will not have been installed yet, so our attempting to open it
+;	in our open routine will fail, which is okay.  This may change
+;	in the future.
+;
+
+			String	Pascal
+DBLiteBackLite	Dc.b	'.Backlight'			; Name of Backlight Driver for DBLite.
+			String	Asis
+			Align	2
+;
+; The following table is used by the GrayScreen routine for drawing the 50% gray pattern
+;	at the appropriate bit depth.  The “number of rows” entry is for future expansion --
+;	that is, if we ever need to distinguish between 640x400 vs. 640x480 panels.
+;
+
+DBGrayTblRec	Record	0
+grayTblPat		Ds.l	1	; The bit-pattern to use at this depth.
+grayTblRow		Ds.w	1	; The (number of longwords)-1 at this depth.
+grayTblCol		Ds.w	1	; The (number of rows)-1 at this depth.
+DBGrayTblSize	Equ		*
+				Endr
+
+DBLiteGrayTbl
+				Dc.l	OneBitGray							; 1bpp
+				Dc.w	(OBMLCDRB/4)-1,defmBounds_BLCD-1	;
+				
+				Dc.l	TwoBitGray							; 2bpp
+				Dc.w	(TBMLCDRB/4)-1,defmBounds_BLCD-1	;
+				
+				Dc.l	FourBitGray							; 4bpp
+				Dc.w	(FBMLCDRB/4)-1,defmBounds_BLCD-1	;												<H3>
+
+;
+; In order to save the state of the GSC across the sleep/wake transition, we need
+;	to write out the registers themselves.
+;
+
+GSCRegs			Dcb.b	10,0								; The GSC reg save/restore area.
+
+
+			WITH	DBLiteVidPrivates,VDPageInfo,DBGrayTblRec
+
+
+**********************************************************************
+*
+* DBLiteVidOpen allocates private storage for the device in the AuxDCE and locks
+*	it down for perpetuity. Also, install the simulated interrupt handler and 
+*	start it going.
+*
+* Entry:	A0 = param block pointer
+*			A1 = AuxDCE pointer
+*
+* Locals:	A3 = pointer to private storage
+*
+**********************************************************************
+
+DBLiteVidOpen
+		
+;
+; Allocate private storage (since block is CLEAR, GFlags are zeroed) and get
+;	a pointer to it in A3.
+;
+
+			MOVEQ	#DBLiteVidPrivSize,D0		; get size of parameters
+			_ResrvMem  ,SYS 					; make room as low as possible
+			MOVEQ	#DBLiteVidPrivSize,D0		; get size of parameters
+			_NewHandle ,SYS,CLEAR				; get some memory for private storage
+			BNE.S  	@OpError1					; => return an error in open
+			MOVE.L	A0,dCtlStorage(A1)			; save returned handle in AuxDCE
+			_HLock								; and lock it down forever (this includes a Time Mgr QElem)
+			MOVE.L	(A0),D0						; get a 32-bit clean pointer…
+			_StripAddress						;	…to our privates into A3
+			MOVEA.L	D0,A3
+			
+;
+; Remember the VDAC (GSC) and framebuffer base addresses since they’re fairly painful to look up.
+;
+			With	ProductInfo,DecoderInfo,VideoInfo
+			
+			Move.l	UnivInfoPtr,A0				; Get a pointer to the universal data.
+			Move.l	A0,-(Sp)					; Save it temporarily on the stack.
+			Adda.l	DecoderInfoPtr(A0),A0		; Point to the base address table.
+			Move.l	VDACAddr(A0),saveGSCAddr(A3) ; Save pointer to GSC (“VDAC”).
+			
+			Move.l	(Sp)+,A0					; Point back at the universal data.
+			Adda.l	VideoInfoPtr(A0),A0			; Point to the VideoInfo record.							<H3>
+			Move.l	VRAMLogAddr32(A0),saveBaseAddr(A3) ; Save pointer to the framebuffer base.
+			
+			Endwith
+
+; 	The Niagra board does not support a real interrupt for doing VBLs, 
+;	so we simulate them by using a Time Manager task that is set at 60.14742 Hz.
+;	While the DBLite board -does- support GSC interrupts, we found we had problems
+;	with cursor breakup at the top of the screen, so we now use a Time Manager
+;	task as well.
+
+			LEA		TimeManagerIH,A0			; get a pointer to the interrupt simulation timer task code
+			MOVE.L	A0,tmAddr+TTask(A3)			; put it in the time task
+			LEA		TTask(A3),A0				; get a pointer to the timer queue element
+			Move.l	#'eada',(A0)				; Put in the magic signature to prevent VM from deferring us.
+			_InsXTime							; Install the task (fixed frequency).						<H6>
+
+			BSR		DBLiteEnableVGuts			; do it
+			BNE.S 	@OpError2
+			
+; Attempt to re-open the Backlight driver because it might have been closed								<H11>
+;	if someone (AUX?) closed us and then tried to reopen us prior to									  |
+;	rebooting.  Currently, this call will fail the first time thru										  v
+;	because video is installed before backlighting on boot.
+;
+			Moveq	#(ioQElSize/2)-1,D0				; Set up init-loop counter.
+@ClrBlk		Clr.w	-(Sp)							; Allocate and clear param block.
+			DBra	D0,@ClrBlk						; Do it one word at a time.
+			Lea		DBLiteBackLite,A0				; Point to Backlight driver name.
+			Move.l	A0,ioFileName(Sp)				; Load it into param block.
+			Movea.l	Sp,A0							; Get param block pointer into A0.
+			_Open									; Open driver to get the refNum.
+			
+			Adda.w	#ioQElSize,Sp					; Restore the stack.
+
+; All done!																								<H11>
+;
+			MOVEQ	#noErr,D0					; no error
+			RTS
+
+@OpError2	MOVE.L	dCtlStorage(A1),A0			; get the private storage back
+			_DisposHandle						; release the driver private storage
+@OpError1	MOVEQ	#OpenErr,D0					; say can't open driver
+			RTS
+
+
+**********************************************************************
+*
+* VideoClose releases the device's private storage and removes the 
+*		interrupt handler.
+*
+*
+* Entry:	A0 = param block pointer
+*			A1 = AuxDCE pointer
+*
+* Other:	A2 = temporary AuxDCE pointer copy
+*
+**********************************************************************
+
+DBLiteVidClose		
+			
+			MOVE.L	dCtlStorage(A1),A3				; A3 <- Ptr to private storage
+			MOVE.L	(A3),D0							;
+			_StripAddress							;
+			MOVE.L	D0,A3							;
+			
+; Close the Backlight driver.
+;
+			Moveq	#(ioQElSize/2)-1,D0				; Set up init-loop counter.
+@ClrBlk		Clr.w	-(Sp)							; Allocate and clear param block.
+			DBra	D0,@ClrBlk						; Do it one word at a time.
+			Lea		DBLiteBackLite,A0				; Point to Backlight driver name.
+			Move.l	A0,ioFileName(Sp)				; Load it into param block.
+			Movea.l	Sp,A0							; Get param block pointer into A0.
+			_Open									; Open driver to get the refNum.
+			Bne.s	@SkipClose						; If open fails, don’t try to close it.
+			_Close									; Otherwise, close it.
+@SkipClose			
+			Adda.w	#ioQElSize,Sp					; Restore the stack.
+			
+; Blank the screen.
+;
+			Movea.l	saveGSCAddr(A3),A0				; Point to the GSC base address.
+			Bclr	#GSCBlankCtl,GSCGrayScale(A0)	; Blank video.
+			
+; Disable cursor interrupts.
+;
+			MOVE.W	#-1,IntDisableFlag(A3)			; set this word to “disable” interrupts
+			LEA		TTask(A3),A0					; get the time manager task block
+			_RmvTime								; remove this element from the queue
+			
+; Disable fixed-clut table if necessary.
+;
+			Move.l	saveFixedCLUT(A3),D0			; If we haven’t loaded our fixed-entry CLUT,
+			Beq.s	@EndFixed						;	then just go on.
+			Move.l	D0,A0							; Otherwise, dispose of it.
+			_DisposPtr
+@EndFixed
+
+; Dispose of private storage.
+;
+			MOVE.L	dCtlStorage(A1),A0				; Dispose of the private storage
+			_DisposHandle							;
+
+			MOVEQ	#noErr,D0						; no error
+			RTS										; and return
+
+
+**********************************************************************
+*
+* Video Driver Control Call Handler.  There are ten calls:
+*
+*	(0)  Reset (VAR mode, page: INTEGER; VAR BaseAddr: Ptr);
+*	(1)  KillIO
+*	(2)	 SetMode(mode, page: INTEGER; VAR BaseAddr: Ptr);
+*	(3)	 SetEntries ( Table: Ptr; Start,Count : integer );
+*	(4)	 SetGamma ( Table : Ptr );
+*   (5)  GrayPage (page);
+*   (6)  SetGray (csMode = 0 for color, 1 for gray)
+*	(7)	 SetInterrupt ( csMode = 0 for enable, 1 for disable)
+*	(8)	 DirectSetEntries (not implemented)
+*	(9)	 SetDefaultMode 
+*
+*   Entry: 	A0 		= param block pointer
+*			A1 		= AuxDCE pointer
+*	Uses:	A2		= ptr to cs parameters (ie. A2 <- csParam(A0))
+*			A3 		= scratch (doesn't need to be preserved)
+*			A4		= scratch (must be preserved)
+*			D0-D3 	= scratch (don't need to be preserved)
+*
+*	Exit:	D0	  	= error code
+*
+**********************************************************************
+
+DBLiteVidCtl
+			LEA		@ctlJumpTbl-2,A4				; point to the Control dispatch table
+			MOVEQ	#controlErr,D0					; default error if it's a bad opcode
+			BRA.S	DBLiteCSCommon					; jump to common Control/Status code
+
+			DC.W	(@StdctlJumpTblEnd-2-@ctlJumpTbl)/2; highest control call we support
+@ctlJumpTbl	DC.W	DBLiteVidReset-@ctlJumpTbl		; $00 => VidReset
+			DC.W	DBLiteKillIO-@ctlJumpTbl		; $01 => KillIO
+			DC.W	DBLiteSetVidMode-@ctlJumpTbl	; $02 => SetVidMode
+			DC.W	DBLiteSetEntries-@ctlJumpTbl	; $03 => SetEntries			••• MacsBug Hack •••
+			DC.W	DBLiteCSDone-@ctlJumpTbl		; $04 => SetGamma			(not needed)
+			DC.W	DBLiteGrayPage-@ctlJumpTbl		; $05 => GrayPage
+			DC.W	DBLiteCSDone-@ctlJumpTbl		; $06 => SetGray			(not needed) 
+			DC.W	DBLiteSetInterrupt-@ctlJumpTbl	; $07 => SetInterrupt
+*			DC.W	DBLiteCSDone-@ctlJumpTbl		; $08 => DirectSetEntries	(not needed)
+*			DC.W	DBLiteCSDone-@ctlJumpTbl		; $09 => SetDefaultMode		(not needed)
+@StdctlJumpTblEnd
+			DC.W	cscSleepWake,DBLiteSetSleepWake-@ctlJumpTbl ; SleepWake
+			DC.W	0								; end-of-table marker
+
+**********************************************************************
+*
+* Video Driver Status Call Handler.  Right now there are ten calls:
+*
+*	(0)  Error
+*	(1)  Error
+*	(2)	 GetMode
+*	(3)  GetEntries
+*	(4)	 GetPage
+*	(5)	 GetPageBase
+*	(6)  GetGray
+*	(7)	 GetInterrupt
+*	(8)	 GetGamma
+*	(9)  GetDefaultMode
+*
+*   Entry: 	A0 		= param block
+*			A1 		= AuxDCE pointer
+*	Uses:	A2		= cs parameters
+*			A3 		= pointer to private storage
+*			D0-D3 	= scratch (don't need to be preserved)
+*
+*	Exit:	D0	  	= error code
+*
+**********************************************************************
+
+DBLiteVidStatus
+			LEA		@statJmpTbl-2,A4				; point to the Status dispatch table
+			MOVEQ	#statusErr,D0					; default error if it's a bad opcode
+			BRA.S	DBLiteCSCommon
+
+			DC.W	(@StdstatJmpTblEnd-2-@statJmpTbl)/2; highest status call we support
+@statJmpTbl	DC.W	DBLiteCSDone-@statJmpTbl		; $00 => Error
+			DC.W	DBLiteCSDone-@statJmpTbl		; $01 => Error
+			DC.W	DBLiteGetMode-@statJmpTbl		; $02 => GetMode
+			DC.W	DBLiteGetEntries-@statJmpTbl	; $03 => GetEntries
+			DC.W	DBLiteGetPage-@statJmpTbl		; $04 => GetPage
+			DC.W	DBLiteGetPageBase-@statJmpTbl	; $05 => GetPageBase
+			DC.W	DBLiteGetGray-@statJmpTbl		; $06 => GetGray
+			DC.W	DBLiteGetInterrupt-@statJmpTbl	; $07 => GetInterrupt
+			DC.W	DBLiteCSDone-@statJmpTbl		; $08 => GetGamma			(not needed)
+			DC.W	DBLiteGetDefaultMode-@statJmpTbl; $09 => GetDefaultMode
+@StdstatJmpTblEnd
+			DC.W	cscSleepWake,DBLiteGetSleepWake-@statJmpTbl ; SleepWake
+			DC.W	0								; end-of-table marker
+
+DBLiteCSCommon
+			MOVE.W	csCode(A0),D1					; get the opcode
+			MOVE.W	(A4)+,D2						; get size of StdTable									<H11>
+			CMP.W	D2,D1							; IF inStdRange THEN									  |
+			BLS.S	@DoCall							;	use StdTable and Do CntrCall						  v
+			MOVE.W	D2,D3							; Get end of StdTable
+			SUBQ.W	#1,D3							; adjust for first element in extended tbl				<H12>
+@Loop		ADDQ.W	#2,D3							; Increment counter
+			MOVE.W	(A4,D3.W*2),D2					; Get routine code
+			BEQ.S	@BadCode						; End of list Reached… Bad Code
+			CMP.W	D2,D1							; IF csCode == TableCode THEN
+			BNE.S	@Loop							;	Use Extended Range
+
+			MOVE.W	D3,D1							; Use new index
+			ADDQ.W	#1,D1							; increment it for proper table entry					<H11>
+			
+@DoCall		MOVEA.L	csParam(A0),A2					; point to parameters
+			MOVE.L	D0,-(SP)						; save the error code
+			MOVEA.L	dCtlStorage(A1),A3				; point to our storage
+			MOVE.L	(A3),D0							;  and de-reference the handle
+			_StripAddress							; make sure the pointer is 32-bit clean
+			MOVEA.L	D0,A3							; save the 32-bit clean pointer
+			MOVE.L	(SP)+,D0						; restore error code
+			MOVEM.L	A0-A3,-(SP)						; save exit registers
+			MOVE.W	(A4,D1.W*2),D1					; get the relative offset to the routine
+			JSR		0(A4,D1.W)						; Go do it
+			MOVEM.L	(SP)+,A0-A3						; restore exit registers.
+
+			Move.w	csCode(A0),D1					; Get the routine selector.
+			Cmpi.w	#cscSetMode,D1					; If it’s the SetMode routine,
+			Beq.s	@EndBlnkChk						;	then don’t unblank the display.
+			Cmpi.w	#cscSleepWake,D1				; If it’s the Sleep/Wake routine,
+			Beq.s	@EndBlnkChk						;	then don’t unblank the display.
+			Bclr	#InBlanking,GFlags(A3)			; Say that we want the screen unblanked now.
+			Bsr		DBLiteBlankCtl					; And do it.
+@EndBlnkChk
+@BadCode	BTST	#NoQueueBit,ioTrap(A0)			; no queue bit set?
+			BNE.S	DBLiteCSDone					; -> yes, it's an immediate call, so just exit
+			MOVE.L	jIODone,-(SP)					; otherwise exit thru IODone
+DBLiteCSDone
+			RTS
+
+**********************************************************************
+*
+*	Control Routines
+*
+**********************************************************************
+
+
+DBLiteVidReset
+;---------------------------------------------------------------------
+;
+;	Reset the card to its default
+;
+;---------------------------------------------------------------------
+		
+			MOVE.W	#FirstVidMode,csMode(A2)		; return default mode
+			MOVE.W	#FirstVidMode,saveMode(A3)		; remember FirstVidMode as the requested mode
+			MOVEQ	#0,D1							; get default depth in D1 (#firstVidMode-#firstVidMode)
+			MOVEQ	#0,D0							; get page in D0
+			MOVE.W	D0,csPage(A2)					; return the page
+		
+			BSR		DBLiteSetDepth					; set the depth	from D1 (also grays the screen)
+			
+			MOVE.L	saveBaseAddr(A3),csBaseAddr(A2) ; return the base address
+DBLiteKillIO
+			MOVEQ	#NoErr,D0
+			RTS	
+
+
+DBLiteSetVidMode
+;---------------------------------------------------------------------
+;
+;	Set the card to the specified mode and page.  Only page zero is
+;		possible, so we need to check that the request was OK.
+;
+;   If the card is already set to the specified mode, then do nothing.
+;
+;---------------------------------------------------------------------
+			
+			Move.w	csMode(A2),D1					; D1 = mode.
+			BSR		DBLiteChkMode					; check mode and convert
+			BHI.S	@BadParam						; => not a valid mode
+			
+			Tst.w	csPage(A2)						; only page zero is valid
+			BNE.S	@BadParam						; => not a valid page
+			
+; Only set if the mode has changed.
+
+			Move.w	csMode(A2),D2					; get the mode spID (D1 has the zero-base mode)
+			Cmp.w	saveMode(A3),D2					; has the mode changed?
+			Beq.s	@ModeOK							; if not, just return the baseAddr
+			
+; Remember the newly requested mode, and switch depths with our utility.
+
+			Bset	#InBlanking,GFlags(A3)			; Say that we want the screen to be blanked.
+			Bsr		DBLiteBlankCtl					; And go do it.
+			
+			Move.w	D2,saveMode(A3)					; remember requested mode
+			Bsr		DBLiteSetDepth					; switch depths
+			
+			Move.l	saveFixedCLUT(A3),D0			; If we’ve haven’t loaded the fixed-entry CLUT,
+			Beq.s	@ModeOK							;	just go on.
+			
+			Move.l	D0,A0							; Otherwise, set up to throw it away.
+			_DisposPtr								; Throw it away…
+			Clr.l	saveFixedCLUT(A3)				; …and remember that it’s gone.
+			
+@ModeOK		Move.l	saveBaseAddr(A3),csBaseAddr(A2)	; return the base address
+			MOVEQ	#NoErr,D0
+@BadParam	RTS	
+
+
+DBLiteSetEntries
+;---------------------------------------------------------------------
+;
+;	Since DBLite has no color table, there’s nothing to do here.  We
+;	don’t do this in the dispatcher above so that the BlankShading
+;	works with MacsBug around.
+;
+;---------------------------------------------------------------------
+			
+			Moveq	#controlErr,D0					; Say that we don’t do entries.
+			Rts										; And vamoose.
+
+DBLiteSetGamma
+;---------------------------------------------------------------------
+;
+;	Since DBLite has no color table, there's no opportunity to set the
+;	gamma correction in this hardware.  Return a bad result but
+;	do it up above in the control dispatcher, since it saves a few bytes.
+;
+;---------------------------------------------------------------------
+			
+
+DBLiteGrayPage											
+;---------------------------------------------------------------------
+;
+;	Clear the specified page in the current mode to gray
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+		
+			Move.w	saveMode(A3),D1					; D1 = mode
+			Bsr		DBLiteChkMode					; convert mode to depth in D1
+			BHI.S	@BadParam						; => not a valid depth
+			
+			TST.W	csPage(A2)						; Is it requesting page zero?
+			BNE.S	@BadParam						; -> nope
+
+			BSR		DBLiteGrayScreen				; paint the screen gray
+			MOVEQ	#NoErr,D0
+@BadParam	RTS	
+		
+
+DBLiteSetGray
+;---------------------------------------------------------------------
+;
+;	Since DBLite has no color table, there's no opportunity to set
+;	luminence mapping in this hardware.  Return a bad result but
+;	do it up above in the control dispatcher, since it saves a few bytes.
+;
+;---------------------------------------------------------------------
+			
+
+DBLiteSetInterrupt
+;---------------------------------------------------------------------
+;
+;	Enable (csMode = 0) or disable (csMode = 1) VBL interrupts
+;
+;   As a future performance enhancement, interrupts on the card can be
+;	disabled or enabled from software. For instance, if the cursor is
+;	not on a screen, and there is nothing in the Slot Interrupt Queue
+;	for that device, interrupts may be disabled reducing interrupt 
+;	overhead for the system.
+;
+;	The slot interrupt queue element is always allocated by the Open call.
+;	This routine just inserts and removes it from the slot interrupt task queue.
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+			
+			
+			Tst.b	csMode(A2)						; Check to see which way we’re going.
+			Bne.s	DBLiteDisableVGuts				; If non-zero, disabling.
+			Bra.s	DBLiteEnableVGuts				; Otherwise, enabling.
+
+DBLiteDisableVGuts
+			Move.w	#-1,IntDisableFlag(A3)			; Remember that we’re disabling things.
+			MOVEQ	#NoErr,D0
+			RTS
+
+	
+DBLiteEnableVGuts	
+			Clr.w	IntDisableFlag(A3)				; Remember that we’re enabling things.
+			MOVE.L	A1,-(SP)						; jPrimeTime trashes A1
+			LEA		TTask(A3),A0					; get time task block in A0
+			MOVE.L	#kDBLiteVBLTime,D0				; delay for about 1/60th of a second
+			MOVE.L	jPrimeTime,A1					; point straight at the Time Manager dispatch vector
+			JSR		(A1)							; start the delay going
+			MOVEA.L	(SP)+,A1						;
+			Moveq	#NoErr,D0						; say we’re okay
+			RTS										; return home					
+
+
+DBLiteSetDefaultMode
+;---------------------------------------------------------------------
+;
+;	Since DBLite has no sRsrc families, just return bad result 
+;	but do it up above in the control dispatcher, since it saves a
+;	few bytes.
+;
+;---------------------------------------------------------------------
+
+
+DBLiteSetSleepWake
+;---------------------------------------------------------------------
+;
+;	SleepWake  <csCode = 134> -  save or restore operating state across
+;			sleep/wake transition. This routine is called by the sleep or wake
+;			I/O Primitive code.
+;
+;	Input:	A1 = ptr to AuxDCE
+;			A2 = ptr to csParams
+;			A3 = ptr to driver globals
+;
+;	csParams:	csMode.b	0 = sleep, non-zero = wake
+;
+;---------------------------------------------------------------------
+
+; Check to see if we even need to be here or not…
+;
+			Moveq	#controlErr,D0					; Assume we’ll fail for now.
+			
+			Tst.b	csMode(A2)						; If the request was to sleep, then
+			Beq.s	@ChkSleep						;	make sure it’s okay.
+			
+			Btst	#IsSleeping,GFlags(A3)			; Otherwise, if we’re not already awake, then
+			Bne.s	@DoWakeup						;	go do the wakeup code.
+			Rts										; Otherwise, something’s wrong.
+			
+@DoWakeup	Bsr		DBLiteRestoreState				; Go restore the state of the world.
+			Bsr		DBLiteEnableVGuts				; Turn cursor interrupts back on.
+			Moveq	#noErr,D0						; And return…
+			Rts										; …happy.
+			
+@ChkSleep	Btst	#IsSleeping,GFlags(A3)			; If we’re not already sleeping, then
+			Beq.s	@DoSleep						; 	go do the sleep code.
+			Rts										; Otherwise, something’s wrong.
+			
+@DoSleep	Bsr		DBLiteDisableVGuts				; Turn off cursor interrupts for good measure.
+			Bsr		DBLiteSaveState					; Save the state of the world.
+			Moveq	#noErr,D0						; And return…
+			Rts										; …happy.
+
+
+**********************************************************************
+*
+*	Status Routines
+*
+**********************************************************************
+
+
+DBLiteGetMode
+;---------------------------------------------------------------------
+;
+;	Return the current mode
+;
+;		Inputs : A2 = pointer to csParams
+;				 A3 = pointer to private storage
+;
+;---------------------------------------------------------------------
+		
+			Tst.w	saveMode(A3)					; If saveMode has been set,
+			Bne.s	@ModeOK							;	then just go on.
+			Move.w	#FirstVidMode,saveMode(A3)		; Otherwise, just set it to 1bpp (non-GSC case).
+		
+@ModeOK		MOVE.W	saveMode(A3),csMode(A2)			; return the mode
+			CLR.W	csPage(A2)						; return the page number
+			MOVE.L	saveBaseAddr(A3),csBaseAddr(A2)	; and the base address
+
+			MOVEQ	#NoErr,D0
+			RTS
+	
+
+DBLiteGetEntries
+;---------------------------------------------------------------------
+;
+;	Fake the current contents of the CLUT.  There isn't really a clut around,
+;	but that's no reason not to return a reasonable looking response
+;
+;		Inputs:	 A1 = pointer to AuxDCE
+;			     A2 = pointer to csParams
+;				 A3 = pointer to privates
+;
+;	For DBLite the color table is fixed.  So, we’ll always return good values
+;	as long as there is a reasonable looking color table around.
+;
+;	Idea:	If we’re in indexed mode, we’ll cycle thru the input
+;			table.  While doing this, we’ll ignore all entries
+;			whose value fields are out of range.  For entries
+;			whose value field are in range, we’ll return the
+;			appropriate rgb fields.
+;
+;			If we’re in sequential mode, we just need to write out
+;			the number of entries we know about.
+;
+;---------------------------------------------------------------------
+
+			Move.l	csTable(A2),D1					; If we were handed a nil table pointer,
+			BEQ		@GEDone							;	then just exit
+			MOVE.L	D1,D0
+			_StripAddress							; Otherwise, make table pointer 32-bit clean
+			MOVE.L	D0,D3							;  and save it for later
+
+			Tst.l	saveFixedClut(A3)				; If we’ve already loaded the CLUT for this depth,
+			Bne.s	@GEStart						;	then just go on.
+
+			With	SpBlock
+			
+			LEA		-spBlockSize(SP),SP				; Make an SpBlock on the stack and
+			Move.l	Sp,A0							;	get a pointer to it into A0.
+			
+			Clr.b	spSlot(A0)						; We’re always in slot 0.
+			Move.b	dCtlSlotID(A1),spID(A0)			; Get the spID of the video sRsrc.
+			Clr.b	spExtDev(A0)					; 
+			_sRsrcInfo								; Try to get the spsPointer.
+			Bne.s	@GESlotErr						; If failed, then quit.
+			
+			Move.w	saveMode(A3),D0					; If the current mode has been set,						<H8>
+			Bne.s	@ModeOK							;	then go on.
+			Move.b	#FirstVidMode,D0				; Otherwise, assume 1bpp (non-GSC case).
+			
+@ModeOK		Move.b	D0,spID(A0)						; Look for our mode entry.
+			_sFindStruct							; If it’s not there,
+			Bne.s	@GESlotErr						;	then quit.
+			
+			Move.b	#mTable,spID(A0)				; Get our fixed-entry CLUT.
+			_sGetBlock								; If it’s not there,
+			Bne.s	@GESlotErr						; 	then quit.
+			
+			Move.l	spResult(A0),A0					; Get a pointer to our fixed-entry CLUT.
+			Move.w	ctSize(A0),saveNumFixedEntries(A3) ; Save the number of entries.
+			Lea		ctTable(A0),A0					   ; Get a ptr to the table, and
+			Move.l	A0,saveFixedCLUT(A3)			   ;	save it.
+
+@GESlotErr	LEA		spBlockSize(SP),SP				; clean up the stack
+			TST.W	D0								; was there an error?
+			BNE.S	@GEDone							; -> yes, bail
+			
+			EndWith
+
+; Calculate the index range…
+;
+@GEStart	MOVEQ	#statusErr,D0
+			Move.l	D3,A0							; get pointer to input table.
+
+			Move.w	saveNumFixedEntries(A3),D3		; Get number of entries to check against.
+			
+			Move.w	csCount(A2),D4					; Get the number of entries to change,
+			Bmi		@GEDone							; 	and hike if it’s out of range.
+			Cmp.w	D3,D4							; If D4-D3 > 0 (count - range > 0),
+			Bhi		@GEDone							;	then hike.
+			Tst.w	csStart(A2)						; If we’re doing indexed entries (-1),
+			Bmi.s	@skipStartChk					;	then just go on.
+			Add.w	csStart(A2),D4					; Adjust count for starting position.
+			Cmp.w	D3,D4							; If D4-D3 > 0 (count - range > 0),
+			Bhi		@GEDone							;	then hike.
+
+@skipStartChk
+
+			Move.w	csCount(A2),D2					; Remember the csCount.
+			
+			Cmpi.w	#indexEntries,csStart(A2)		; If table accesses are to be indexed,
+			Beq.s	@GECom							; 	then go on.
+
+;	The following code is BAD, BAD, BAD!  We should build our own table here so
+;	as to NOT mess up the user’s data.  But all the previous Apple video drivers
+;	have done the same thing, so we’ll continue the trend for now.
+
+			Move.w	D2,D1							; Get count.
+
+@TableLoop	Move.w	D4,value(A0,D1*colorSpecSize)	; Write the index into the table.
+			Subq	#1,D4							; Decrement index.
+			Dbra	D1,@TableLoop
+
+@GECom		
+@Repeat		Move.w	value(A0),D1					; Get the NEXT table position into D1.
+			Cmp.w	D3,D1							; If this position is out of range,
+			Bhi.s	@Until							;	then go on.
+			
+			Movea.l	saveFixedCLUT(A3),A1			; Point to start of fixed CLUT.	
+			Lea		(A1,D1*colorSpecSize),A1		; Index into right entry.
+
+			Move.w	rgb+red(A1),rgb+red(A0)			; Copy	red,
+			Move.w	rgb+green(A1),rgb+green(A0)		; 		green,
+			Move.w	rgb+blue(A1),rgb+blue(A0)		;		blue.
+
+@Until		Addq	#colorSpecSize,A0				; Point to next entry in input ColorTable.
+			Dbra	D2,@Repeat
+
+			MOVEQ	#NoErr,D0						; success
+@GEDone		RTS
+
+
+DBLiteGetPage
+;---------------------------------------------------------------------
+;
+;	Return the number of pages in the specified mode.  
+;
+;---------------------------------------------------------------------
+		
+			Move.w	csMode(A2),D1					; get the mode
+			BSR.S	DBLiteChkMode					; is this mode OK?
+			BHI.S	@BadMode						; => not a valid mode
+			
+ 			MOVE.W	#defPagesLCD,csPage(A2)			; return page count
+			MOVEQ	#NoErr,D0
+@BadMode	RTS
+
+
+DBLiteGetPageBase
+;---------------------------------------------------------------------
+;
+;	Return the base address for the specified page in the current mode
+;
+;---------------------------------------------------------------------
+		
+			TST.W	csPage(A2)						; are we returning page zero info?
+			BNE.S	@BadPage						; => no, just return			
+			MOVE.L	saveBaseAddr(A3),csBaseAddr(A2)	; return the base address
+			MOVEQ	#NoErr,D0
+@BadPage	RTS
+			
+			
+DBLiteGetGray
+;---------------------------------------------------------------------
+;
+;	No CLUT, but this routine always returns a non-zero value (1)
+;	to indicate that gray mode is on (forever).
+;
+;---------------------------------------------------------------------
+
+			Move.b	#1,csMode(A2)					; Say that gray mode is on.
+			Moveq	#noErr,D0
+			Rts
+
+
+DBLiteGetInterrupt
+;---------------------------------------------------------------------
+;
+;	Return a boolean in csMode, set true if VBL interrupts are disabled
+;
+;---------------------------------------------------------------------
+				
+			Tst.w	IntDisableFlag(A3)				; If the interrupt state is enabled,
+			Beq.s	@IsOn							;	then say so.
+			Move.b	#1,csMode(A2)					; Otherwise, return disabled.
+			Bra.s	@Done							; And leave.
+
+@IsOn		Clr.b	csMode(A2)						; Return enabled state.
+
+@Done		Moveq	#noErr,D0						; Return noErr.
+			Rts										; And leave.
+		
+
+DBLiteGetGamma
+;---------------------------------------------------------------------
+;
+;	No CLUT, so this routine returns an status error.  It's implemented
+;	in the Status dispatch table above.
+;
+;---------------------------------------------------------------------
+
+
+DBLiteGetDefaultMode
+;---------------------------------------------------------------------
+;
+;	Read the card default mode from slot pRAM.
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+
+; For most video drivers, we look in pRAM to see what the last
+;	configuration set was.  However, for DBLite, we just need
+;	to return our current functional sRsrc ID (i.e., there are
+;	no family modes here).
+
+			MOVE.B	dCtlSlotID(A1),csMode(A2)		; return the result
+			MOVEQ	#NoErr,D0
+			RTS
+
+
+DBLiteGetSleepWake
+;---------------------------------------------------------------------
+;
+;	GetSleepWake
+;
+;	Reads the default family mode from slot pRAM.
+;
+;	Input:	A1 = ptr to AuxDCE
+;			A2 = ptr to csParams
+;			A3 = ptr to driver globals
+;
+;	csParams:	csMode.b	<-	0 = sleep, non-zero = wake
+;
+;---------------------------------------------------------------------
+				
+				Btst	#IsSleeping,GFlags(A3)				; Test the sleep/wake flag.
+				Seq		csMode(A2)							; Return result.
+				Moveq	#noErr,D0							; Vamoose.
+				Rts
+
+;=====================================================================
+;
+;	Utilities
+;
+;=====================================================================
+
+
+DBLiteChkMode
+;---------------------------------------------------------------------
+;
+;	ChkMode
+;
+;	Verifies the requested mode is legal.  Converts spID in D1 into 
+;	zero-based mode number since lots of people want it that way.
+;
+;	<->	D1: Mode
+;
+;	Returns BHI if mode is invalid.
+;
+
+				SUBI.W		#FirstVidMode,D1		; make mode zero-based.
+				CMPI.W		#ThirdVidMode-FirstVidMode,D1 ; valid mode values are 0-2
+				RTS
+
+
+DBLiteSetDepth
+;---------------------------------------------------------------------
+;
+;	SetDepth
+;
+;	Set the requested frame buffer depth.
+;
+;			D1 = spID of the depth - FirstVidMode
+;			A1 = AuxDCEPtr
+;			A2 = param block pointer
+;			A3 = dCtlStorage pointer
+;
+;	All registers are preserved.
+			
+			Movem.l			D0/D2/A0,-(Sp)			; Save work registers.
+
+;	Raise the interrupt level to level 2 so that VBL and timer tasks will not run
+
+			Move.w			SR,-(Sp)				; Get the status register on stack.						<H11>
+			Moveq			#7,D0					; Get mask into D0.										  |
+			And.b			(SP),D0					; Get the interrupt level.								  v
+			Subq.b			#2,D0					; 
+			Bge.s			@OK						; If ≥, then don't change.
+			Ori.w			#$0200,SR				; Raise above level-2.
+			Andi.w			#$FAFF,SR				; Make it level-2										<H11>
+@OK
+			Move.l			saveGSCAddr(A3),A0		; Get the GSC base address.
+			Move.b			GSCGrayScale(A0),D0		; Get the current value.					<H13>
+			
+;	The GSC has a problem where DSACK may not happen after the last register access.  If					<H11>
+;	we delay 2 frame times (approx. 32ms), then the GSC corrects itself, otherwise we will					  |
+;	get a bus timeout bus error waiting for DSACK.  This problem is particularly annoying					  v
+;	because the GSC may decide to give DSACK at sometime later which would really screw us up.
+
+			Moveq			#33,D2					; Initialize loop for 33 milliseconds
+@DelayLoop	Swap			D2						; get low word for millisecond delay
+			Move.w			TimeDbra,D2				; how many spins???
+@mSecDelay	Dbra			D2,@mSecDelay			; Delay 1 millisecond
+			Swap			D2						; Get out loop counter
+			Dbra			D2,@DelayLoop			; spin													<H11>
+			
+			Bfins			D1,D0{GSCLevelBits,GSCLevelWidth} ; Switch depths.
+			Move.b			D0,GSCGrayScale(A0)		;
+
+			MOVEQ			#7,D2					; mask off the display ID,								<H10>
+			AND.B			GSCPanelID(A0),D2		;														<H10>
+			
+			Cmpi.b			#5,D2					; If this isn’t the Dart FSTN panel,
+			Bne.s			@NotDartFSTN			;	then just go on.
+			Move.b			@polyAdj(D1),GSCPolyAdj(A0) ; Otherwise, set the m and n values.
+			Bra.s			@NotTFT					; Skip TFT code.
+@NotDartFSTN
+			Cmpi.b			#1,D2					; If this isn’t the TFT display,
+			Bne.s			@NotTFT					;	then just go on.
+			Move.b			#$0B,GSCDiag2(A0)		; Invert VRAM data.
+			Clr.b			GSCPanelAdj(A0)			; Invert LCD.
+@NotTFT
+			MULU			#3,D2					;  multiply panel ID by 3 to use as a table index,		<H10>
+			ADD.W			D1,D2					;   and add in the bit depth							<H10>
+
+			MOVE.B			@refreshReg(D2),GSCRefreshRate(A0)	; adjust the display refresh rate			<H10>
+			MOVE.B			@skewReg(D2),GSCPanelSkew(A0)		;  and the panel skew						<H10>
+
+			Move.w			(Sp)+,SR				; restore interrupt level
+			Movem.l			(Sp)+,D0/D2/A0			; Restore work registers.
+			Rts
+
+
+;	values for the refresh register based on the display mode
+;
+;							1-bit	2-bit	4-bit
+
+@refreshReg	DC.B			  5,	  3,	  3		; ID=0: TFT 1-bit										<H10>
+			DC.B			  5,	  3,	  3		; ID=1: TFT 3-bit										<H10>
+			DC.B			  5,	  3,	  3		; ID=2: TFT 4-bit										<H10>
+			DC.B			  5,	  3,	  3		; ID=3: TFT (unassigned)								<H10>
+			DC.B			  5,	  3,	  3		; ID=4: STN (unassigned)								<H10>
+			DC.B			  5,	  3,	  3		; ID=5: STN - Tim										<H10>
+			DC.B			  5,	  3,	  3		; ID=6: STN - DBLite									<H10>
+			DC.B			  5,	  3,	  3		; ID=7: no display										<H10>
+
+;	values for the skew register based on the display mode
+;
+;							1-bit	2-bit	4-bit
+
+@skewReg	DC.B			160,	 64,	 64		; ID=0: TFT 1-bit				(60Hz, 87Hz,  87Hz)		<H10>
+			DC.B			240,	240,	 240	; ID=1: TFT 3-bit				(70Hz, 70Hz,  70Hz)		<H20>
+			DC.B			255,	128,	 64		; ID=2: TFT 4-bit				(68Hz, 87Hz,  87Hz)		<H10>
+			DC.B			255,	128,	 64		; ID=3: TFT (unassigned)		(60Hz, 87Hz,  87Hz)		<H10>
+			DC.B			160,	 64,	 64		; ID=4: STN (unassigned)		(60Hz, 87Hz,  87Hz)		<H10>
+			DC.B			161,	 65,	  4		; ID=5: STN - Tim				(??Hz, ??Hz,  ??Hz)		<H20>
+			DC.B			156,	 64,	  3		; ID=6: STN - DBLite			(62Hz, 87Hz, 120Hz)		<H17>
+			DC.B			160,	 64,	 64		; ID=7: no display										<H10>
+
+;	values for the m&n polyadj register based on the display mode
+;
+
+@polyAdj	Dc.b			 99,	130,	 99		; ID=5: STN - TIM 										<H20>	
+
+			DC.B			 00						;padding ??? PN
+DBLiteGrayScreen
+;---------------------------------------------------------------------
+;
+;	Fill the screen with a 50% dithered gray pattern.
+;
+;			D1 = spID of screen depth - FirstVidMode
+;			A3 = driver private storage
+;
+;	All registers are preserved.
+;
+
+				MOVEM.L		D0/D2/D3/A0-A1,-(SP)	; save work registers
+
+				Moveq		#true32b,D0				; Set up to flip into 32-bit mode.
+				_SwapMMUMode						; Flip.
+				Move.b		D0,-(Sp)				; Save previous mode.
+
+				Lea			DBLiteGrayTbl,A0		; Point to the table of graying data,			
+				Lea			(A0,D1*DBGrayTblSize),A0; 	and load the right entry.							<H3>
+
+				MOVE.L		saveBaseAddr(A3),A1		; Get the frame buffer base address.
+				MOVE.W		grayTblCol(A0),D0		; Get the number of rows to do.
+				Move.l		grayTblPat(A0),D3		; Get the bit-pattern.
+
+@NxtRow			MOVE.W		grayTblRow(A0),D2		; Get the number of longwords per row.
+@NxtLong		MOVE.L		D3,(A1)+				; Write gray…
+				DBRA		D2,@NxtLong				; …for each scanline.
+				NOT.L		D3						; Invert pattern on the next row.
+				DBRA		D0,@NxtRow				; Loop until done.
+
+				Move.b		(Sp)+,D0				; Restore previous addressing mode.
+				_SwapMMUMode
+				
+				MOVEM.L		(SP)+,D0/D2/D3/A0-A1	; restore registers
+				RTS
+				
+DBLiteSaveState
+;---------------------------------------------------------------------
+;
+; 	SaveState saves the operating state of the framebuffer controller,
+;		CLUT/DAC, etc…, for the sleep/wake transition.
+;
+; 		A1 = AuxDCE POINTER
+; 		A2 = parameter block pointer
+; 		A3 = dCtlStorage pointer
+;
+;	Preserves all registers
+;
+
+				
+				Bset	#IsSleeping,GFlags(A3)			; Remember that we’ve been asked to sleep.
+				
+				Movem.l	D0-D1/A0/A4,-(Sp)				; Save some working registers.
+				
+				Movea.l	saveGSCAddr(A3),A0				; Point to the GSC base address.
+				Addq	#GSCPanelControl,A0				; Point to the first reg to save.
+				
+				Lea		GSCRegs,A4						; Point to the register holder area.
+				
+; Save the state of the Registers…
+;			
+				MOVE.W	(A0)+,(A4)+						; panel control, panel setup
+				MOVEQ	#$7F,D0							; mask off the interrupt status bit
+				AND.B	(A0)+,D0						;  in the gray scale register
+				MOVE.B	D0,(A4)+						; gray scale
+				MOVE.L	(A0)+,(A4)+						; polynomial adjust, panel adjust, ACDCLK, refresh rate
+				MOVE.W	(A0)+,(A4)+						; blank shade, panel skew
+				
+; Gray the VRAM…
+;
+				Move.w	saveMode(A3),D1					; Get the current mode.
+				Subi.w	#FirstVidMode,D1				; Normalize it.
+				Bsr		DBLiteGrayScreen				; Gray the screen.
+				
+				Movem.l	(Sp)+,D0-D1/A0/A4				; Restore the working registers.
+				Rts
+
+DBLiteRestoreState
+;---------------------------------------------------------------------
+;
+; 	RestoreState restores the operating state of the framebuffer controller,
+;		CLUT/DAC, etc…, for the sleep/wake transition.
+;
+; 		A1 = AuxDCE POINTER
+; 		A2 = parameter block pointer
+; 		A3 = dCtlStorage pointer
+;
+;	Preserves all registers
+;
+
+				Movem.l	D0-D1/A0/A4,-(Sp)				; Save some working registers.
+				
+				Movea.l	saveGSCAddr(A3),A0				; Point to the GSC base address.
+				Addq	#GSCPanelControl,A0				; Point to the first reg to restore.
+				
+				Lea		GSCRegs,A4						; Point to the register holder area.
+				
+; Save the state of the Registers…
+;			
+				MOVE.W	(A4)+,(A0)+						; panel control, panel setup
+				MOVE.B	#(1<<7),(A0)					; reset the VBL interrupt pin
+				MOVE.B	(A4)+,(A0)+						; gray scale
+				MOVE.L	(A4)+,(A0)+						; polynomial adjust, panel adjust, ACDCLK, refresh rate
+				MOVE.W	(A4)+,(A0)						; blank shade, panel skew
+				
+				Movea.l	saveGSCAddr(A3),A0				; Repoint to the GSC base address.
+				MOVEQ	#7,D1							; Panel IDs are only 3-bits wide.
+				And.b	GSCPanelID(A0),D1				; Get the PanelID.
+				Cmpi.b	#1,D1							; If this isn’t the TFT display,
+				Bne.s	@NotTFT							;	then just go on.
+				Move.b	#$0B,GSCDiag2(A0)				; Otherwise, invert VRAM data.
+				Bra.s	@EndRegs						;
+@NotTFT
+				Move.b	#$03,GSCDiag2(A0)				; Who knows?
+@EndRegs
+
+; Gray the VRAM…
+;
+				Move.w	saveMode(A3),D1					; Get the current mode.
+				Subi.w	#FirstVidMode,D1				; Normalize it.
+				Bsr		DBLiteGrayScreen				; Gray the screen.
+				
+				Movem.l	(Sp)+,D0-D1/A0/A4				; Restore the working registers.
+				Bclr	#IsSleeping,GFlags(A3)			; Remember that we’re no longer asleep.
+				Rts
+
+DBLiteBlankCtl			
+;---------------------------------------------------------------------
+;
+;	BlankCtl exists only because MacsBug draws the user framebuffer
+;		BEFORE calling SetMode when it is switching depths.  Because
+;		we want to simulate the effect of a CLUT (by having a solid
+;		gray during depth switches), we use the blankshade register.
+;		Normally, we’d couple this with a call to GrayScreen, but
+;		we can’t because of the order in which MacsBug calls SetMode
+;		and redraws the screen.  To get around this problem, we
+;		temporarily say we have a CLUT, which forces MacsBug
+;		to call us back (with SetEntries), and that’s where we
+;		unblank the screen and re-assert ourselves as a Fixed
+;		gDevice.  Ugh!
+;
+; 		A1 = AuxDCE POINTER
+; 		A2 = parameter block pointer
+; 		A3 = dCtlStorage pointer
+;
+;	Preserves all registers
+;
+				Movem.l	D0-D1/A0,-(Sp)					; Save some working registers.
+				
+				Move.l	Devicelist,D0					; If the DeviceList Handle is nil, then
+				Beq.s	@Done							;	we can’t do anything useful here.
+				
+				Movea.l	saveGSCAddr(A3),A0				; Point to the GSC base address.
+				Btst	#InBlanking,GFlags(A3)			; If we’re supposed to be blanking the LCD,
+				Bne.s	@BlankIt						;	then do it.
+				Bset	#GSCBlankCtl,GSCGrayScale(A0)	; Otherwise, unblank it.
+				Bra.s	@EndBlank						; Move along.
+@BlankIt		Bclr	#GSCBlankCtl,GSCGrayScale(A0)	; Blank the screen.
+@EndBlank
+				Move.w	dCtlRefNum(A1),D1				; Get the driver’s refNum.
+@DevLoop		Movea.l	D0,A0							; Get Handle to gDevice.
+				Movea.l	(A0),A0							; Make it a pointer.
+				Cmp.w	gdRefNum(A0),D1					; If this isn’t our gDevice,
+				Bne.s	@NextGD							;	then just go on.
+				
+				Btst	#InBlanking,GFlags(A3)			; If we’ve blanked the screen, then
+				Bne.s	@ClutIt							;	temporarily act like we’ve got a CLUT.
+				Move.w	#fixedType,gdType(A0)			; Otherwise, put things back.
+				Bra.s	@Done							; Vamoose.
+@ClutIt			Move.w	#clutType,gdType(A0)			; MacsBug is happier this way.
+				Bra.s	@Done							; Vamoose.
+				
+@NextGD			Move.l	gdNextGD(A0),D0					; If the next gDevice’s Handle isn’t nil,
+				Bne.s	@DevLoop						; 	then loop until done
+
+@Done			Movem.l	(Sp)+,D0-D1/A0					; Restore working registers.
+				Rts
+
+
+;-----------------------------------------------------------------------------
+;	The Interrupt handler for Time Manager Task Built-In Video
+;-----------------------------------------------------------------------------
+;
+; The new time manager sets A1 to point to the TTask block on entry
+;
+
+TimeManagerIH										;																	<H6> Thru next <H6>
+				MOVE.L	A1,-(SP)					; save A1 (it's trashed by JVBLTask)
+				
+				CLR.W	D0							; set slot zero in D0	
+				MOVE.L	JVBLTask,A0					; call the VBL task manager
+				JSR		(A0)						; with slot # in D0
+				MOVEA.L	(SP)+,A1					; restore A1 (ptr to TTask block)									<3> djw
+				
+				TST.W	tmXQSize(A1)				; test the flag word to see if “interrupts” are on
+													;	WARNING! - this field must be immediately after the TTask elem
+				BNE.S	@Done						; if ≠ 0, then “interrupts” are disabled, so don't reprime
+				
+				MOVEA.L	A1,A0						; get time task block addr in A0									<3> djw
+				MOVE.L	#kDBLiteVBLTime,D0			; delay for about 1/60th of a second
+				MOVE.L	jPrimeTime,A1				; point straight at the Time Manager dispatch vector
+				JSR		(A1)						; start the delay going
+@Done			
+				RTS									; and return to caller												<H6>
+
+
+			ENDWITH
+	END
+		

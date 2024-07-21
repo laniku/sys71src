@@ -1,0 +1,737 @@
+;
+;	File:		SonyFormat.a
+;
+;	Contains:	Sony Format/Verify routines
+;
+;	Written by:	Larry Kenyon, Steve C, Gary D, ...
+;
+;	Copyright:	© 1982-1990, 1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM10>	 1/10/93	RC		Added nop for Smurf
+;	   <SM9>	12/14/92	RC		Restore Pre-PDM D2 With Horror Roll in
+;	   <SM7>	 12/9/92	rab		Fixed a bug I introduced rolling in DoFormatEndPatch. Was
+;									branching back into the SWIM code instead of doing an RTS.
+;	   <SM6>	 12/7/92	rab		Roll in Horror changes. Comments follow…
+;		 <5>	11/14/91	SWC		Shortened the DoFormat patches for SWIM2 to save patch space.
+;									Converted the SCC polling code to a macro so it's easier to
+;									overpatch.
+;      <SM5>	12/02/92	HY		Added hasPwrControls conditionals.
+;	   <SM4>	10/18/92	CCH		Added nop's for systems with non-serial writes to IO space.
+;		 <5>	 7/14/92	CSS		Fixed the comment below so an exact version of this
+;									file could be copied into SuperMario.
+;		 <4>	 4/27/92	JSM		Get rid of conditionals: supportsPWM is always false,
+;									hasPowerMgr, hasPwrControls, supportsMFM, and isUniversal are
+;									always true (although hasPowerMgr currently isn’t for the ROM,
+;									it will be and was always ORed with hasPwrControls here anyway).
+;									This file now has no conditionals.
+;		 <3>	 5/11/90	MSH		Converted all onHcMac or hasPowerMgr conditionals to universal
+;									versions.  Test is based on the existence of the power manager
+;									bit in the config word.
+;		 <2>	  2/2/90	GMR		Fixed Format bugs where it used DskErr as a completion flag when
+;									making synchronous calls to DiskSel,PowerUp.
+;	   <2.4>	 5/23/89	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <2.3>	 4/29/89	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <2.2>	 4/10/89	gmr		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <2.1>	 2/21/89	GGD		Increased default GapSync from 7 to 8, to allow more optimal
+;									sector spacing, and more margin if 1 to 1 writes are attempted.
+;	   <2.0>	12/15/88	GGD		Changed some machine based conditionals to feature based.
+;	   <1.1>	11/11/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.9>	 9/29/88	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <1.8>	 9/19/88	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <1.7>	 8/16/88	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <1.6>	 7/15/88	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <1.5>	 6/15/88	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <1.4>	 5/25/88	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <1.3>	 5/24/88	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <1.2>	  5/3/88	GGD		No changes, entire sony driver checked out and in as a group.
+;	   <1.1>	 4/18/88	GGD		Merged in MFM support <C437> by Steve Christensen Turned IWM on
+;									earlier in Format for HcMac
+;	   <1.0>	 2/12/88	BBM		Adding file for the first time into EASE…
+;				11/18/87	SWC		Check to see if the disk is write-protected on a Format request,
+;									and if so, return an error.
+;	  <C907>	10/12/87	MSH		For HcMac: Add call to turn on IWM upon entry.
+;				 10/8/87	SWC		Fixed check for 720K disks.
+;				 9/30/87	SWC		Don't call SetChipMode if an IWM is installed and SetIWMMode
+;									wouldn't have been called anyway.
+;				  5/1/87	SWC		Patched Format to support the format version numbers returned by
+;									the Passport/InterFile/... status call.
+;	  <C437>	11/21/86	SWC		Patched Format and Verify to jump to their MFM counterparts if
+;									we're running in MFM mode.
+;	  <A351>	 11/5/86	TJ		Text cleanup.
+;	  <A302>	10/30/86	TJ		Removed IWM absolute address references.
+;		<C1>	 4/25/86	RDC		Deleted tach frequency table for old MidMac project
+;				10/30/85	LAK		Fixed bug in read-verify (wasn't getting rid of poll stack data
+;									when it saw a sector it already had).
+;				10/25/85	LAK		Skip speed check for 2-sided drives. Use NewIntf rather than
+;									Sides to determine whether drive has new interface.
+;				 7/29/85	RDC		Added changes for MidMac: - changed interrupt level settings to
+;									use equates - adjusted frequency count table - assume no speed
+;									errors for now
+;
+;_______________________________________________________________________
+;
+; Routine:		CtlFormat
+; Arguments:	  A0.L (in)  -- param block ptr
+;				  A1.L (in)  -- driver locals ptr
+;				  D1.W (in)  -- drive vars offset
+;				  Drive (in) -- set to correct drive
+;				  D0.W (out) -- result code (0 if correctly formatted)
+;_______________________________________________________________________
+
+			BLANKS ON
+			STRING ASIS
+
+SyncTbl
+AdrMkTbl
+	DC.B	$FF,$3F,$CF,$F3,$FC,$FF 	; self-sync pattern
+	DC.B	$D5,$AA,$96,$00,$00,$00,$00 ; addr mk skeleton
+	DC.B	$00,$DE,$AA,$FF
+	DC.B	$FF,$3F,$CF,$F3,$FC,$FF 	; self-sync pattern
+	DC.B	$D5,$AA,$AD,$00,$00 		; data mark header
+
+CtlFormat	SUB 	#512,SP 			; get space for buffers we need off stack
+			MOVE.L	SP,DiskBuffer(A1)	; StackBuf for mark, block buffer
+
+		IF hasPwrControls THEN			;									<SM5>
+			TestFor	hwCbPwrMgr
+			BEQ.S	@pmgrdone
+			BSR		TurnIWMon			; Turn IWM on with pmgr call		<1.1/01mar88>
+@pmgrdone
+		ENDIF							;									<SM5>
+
+			MOVE.W	csParam(A0),D4		;Use current format?				<C437/25aug87>
+			BEQ.S	@0					;-> yes, don't change anything		<C437/25aug87>
+
+			MOVEQ	#numSDFmts-1,D3		;Assume no SWIM or SuperDrive		<C437/25aug87>
+			MOVE.B	isSWIM(A1),D0		;Is a SWIM connected AND			<C437/25aug87>
+			AND.B	mfmDrive(A1,D1),D0	; is this a SuperDrive?				<C437/25aug87>
+			BPL.S	@00					;									<C437/25aug87>
+			MOVEQ	#numSDFmts,D3		;Yes, we can do MFM!!				<C437/25aug87>
+			TST.B	twoMegFmt(A1,D1)	;Is this a double-density disk?		<C437/25aug87>
+			BPL.S	@00					;									<C437/25aug87>
+			MOVEQ	#numDDFmts,D3		;Yes, it must be 1440K				<C437/25aug87>
+@00										;									<C437/25aug87>
+
+			MOVEQ	#paramErr,D0		;Assume format type is outta range	<C437/25aug87>
+			CMP.W	D3,D4				;Well, is it?						<C437/25aug87>
+			BHI		FmtVerExit			;-> yep, just exit					<C437/25aug87>
+
+			CMPI.W	#NumSDFmts,D4		;(thanks, Mr. Davidian, sir)		<C437/08oct87>
+			SEQ		D0					;MFM format if it's the last SD one	<C437/25aug87>
+			OR.B	twoMegFmt(A1,D1),D0	; or it's double-density?			<C437/25aug87>
+			SMI		mfmDisk(A1,D1)		;									<C437/25aug87>
+@0			TST.B	isSWIM(A1)			;Is a SWIM installed?				<C437/30sep87>
+			BPL.S	@01					;-> no, skip						<C437/30sep87>
+			BSR		SetChipMode			;Set up the mode for MFM or GCR		<C437/25aug87>
+			BNE		FmtVerExit			;-> couldn't initialize the chip	<C437/25aug87>
+@01										;									<C437/30sep87>
+			BSR		DiskSelect			;Re-select the interface			<C437/25aug87>
+			TST.B	mfmDisk(A1,D1)		;Are we in MFM mode?				<C437/25aug87>
+			SMI		TwoSided(A1)		;									<C437/25aug87>
+			BMI.S	@1					;-> yes, we're 2-sided				<C437/25aug87>
+
+			TST.B	Sides(A1,D1)		; for now, format according to drive
+			SMI 	TwoSided(A1)		; $00 for 1-sided format
+			BPL.S	@1					; <21Jun85> br if one-sided			<C437/25aug87>
+			SUBQ.W	#1,D4				; <21Jun85> format 2-sided as 1-sided?<C437/25aug87>
+			BNE.S	@1					; <21Jun85> br if not				<C437/25aug87>
+			CLR.B	TwoSided(A1)		; <21Jun85> force one-sided
+
+@1			TST.B	TwoSided(A1)		; <21Jun85> so, 1-sided or 2-sided?	<C437/25aug87>
+			SNE 	TwoSideFmt(A1,D1)	; <21Jun85> update it for future
+										; interested parties . . .
+
+			MOVE.W	#8,GapSync(A1)		; start with 8 sync groups before sector	<2.1>
+
+			BSR 	FVPowerUp			; start up the drive (synchronously)
+
+			MOVEQ	#WrProtAdr,D0		;Is the disk write-protected?		<C437/18nov87>
+			BSR 	AdrAndSense 		;									<C437/18nov87>
+			BMI.S	@11					;-> nope, onward!					<C437/18nov87>
+			MOVEQ	#wPrErr,D0			;Return a write-protect error		<C437/18nov87>
+			BRA.S	FmtVerExit			;someone OBVIOUSLY wasn't checking--<C437/18nov87>
+@11										;(massive finger pointing--Scott?)	<C437/18nov87>
+
+			MOVE.L	SonyVars,A1 		;
+			MOVE.L	DiskBuffer(A1),A0	; now fill stack buffer with blank marks
+			LEA 	AdrMkTbl,A1
+			MOVEQ	#12-1,D0			; marks for 12 sectors				<C437/25aug87>
+
+@2			MOVEQ	#27-1,D1			; 27 bytes per sector				<C437/25aug87>
+			MOVE.L	A1,A2				; point A2 to blank image
+
+@3			MOVE.B	(A2)+,(A0)+			;									<C437/25aug87>
+			DBRA	D1,@3				;									<C437/25aug87>
+			DBRA	D0,@2				;									<C437/25aug87>
+
+			BSR 	GetDrv1
+			CLR.W	SideTrack(A1)		; start with track 0
+
+TrackLoop
+			BSR.S	SpdSeek 			; seek to track and adjust speed if needed
+			BNE.S	FmtVerExit			; exit on errors
+
+			BSR		GetDrv1				;									<C437/21nov86>
+			TST.B	mfmDisk(A1,D1)		;Are we in MFM mode?				<C437/21nov86>
+			BPL.S	@00					;-> no, do the regular format		<C437/21nov86>
+			BSR		mFmtTrack			;Format the track (MFM style)		<C437/21nov86>
+			BRA.S	@0					;									<C437/21nov86>
+@00										;									<C437/21nov86>
+
+			BSR 	FormatTrack 		; format the track
+@0			BNE.S	FmtVerExit			; exit on errors
+			BSR 	GetDrv1
+
+			BCLR	#3,SideTrack(A1)	; clear 'side' bit
+			ADDQ	#1,SideTrack(A1)	; go on to the next track
+			CMP 	#80,SideTrack(A1)	; until we're done with all 80
+			BLT.S	TrackLoop
+
+FmtVerOK	MOVEQ	#0,D0				; successful exit
+FmtVerExit	ADD 	#512,SP 			; clean up the stack
+			BRA 	DskRWOff			;Share SonyRWT exit routine			<C437/20aug87>
+										;(sets up the power down time)		<C437/20aug87>
+	eject								;									<A351/05nov86>
+;_______________________________________________________________________
+;
+; Routine:		SpdSeek
+; Arguments:	 A1,D1 (input)	-- ptr to drive vars
+;				 D0.W (output)	-- result code (0 if speed ok)
+; Function: 	This routine seeks to a track and checks speed if changing
+;				track speed class boundary.
+;_______________________________________________________________________
+
+
+; table of frequency counts for 15 tach pulses, each of the 5 speed classes
+			
+SpdSeek 	MOVE.B	BadSpdInit(A1),BadSpdCnt(A1)
+
+CkDrift 	MOVE.W	SideTrack(A1),D6	; seek . . . synchronously
+			BSR 	FmtVerSeek			; seek to desired track
+			BSR 	GetDrv1
+			MOVE.W	Track(A1,D1),D6 	; track is negative on seek errors
+			BMI.S	SpdSeekXit			; exit on seek errors
+
+SpdSeekOK	MOVEQ	#0,D0
+
+SpdSeekXit	RTS
+	eject								;									<A351/05nov86>
+;_______________________________________________________________________
+;
+; Routine:	FormatTrack
+; Arguments:	  D0.W (output) -- result code (0 if format ok)
+; Function: This routine formats a track (both sided for double-sided
+;		disks), verifying that sync is evenly spread between the
+;		sectors.
+;_______________________________________________________________________
+
+FormatTrack BSR 	GetDrv1
+			MOVE.W	SideTrack(A1),D6	; current side/track
+
+			MOVE.W	D6,D1
+			BCLR	#11,D1				; clear side bit
+			LSR.W	#4,D1				; speed class
+			MOVEQ	#12,D0				; 12 sectors in outside tracks
+			SUB.W	D1,D0				; reduce by 1 per speed class inward
+			MOVE.W	D0,SectCnt(A1)		; save for later
+
+			BSR 	FillInMarks 		; update mark buffer for this track/side
+										; (pass D0=sector count,D6=side/track)
+FmtTrk1
+			BSR.S	DoFormat			; format the track (disables interrupts)	<C437/10feb88>
+			BEQ.S	@1					; br if ok
+			BSR 	toEmptyPD			; get rid of poll data
+			ANDI	#$F8FF,SR			; open up interrupts
+			BRA 	FTExit				; exit immediately for write errors
+
+; now we check the intersector gap (keep poll data on the stack . . .)
+
+@1			BSR 	RdAddr				; get next address mark
+			BMI.S	@2					; br if error
+			TST.B	D2					; should be sector 0
+			BEQ.S	@2
+			MOVEQ	#Fmt1Err,D0 		; set "not sector 0" error otherwise
+
+@2			BSR 	toEmptyPD			; get rid of poll data (preserves D0)
+			ANDI	#$F8FF,SR			; open up interrupts
+
+			LEA 	GapSync(A1),A0		; useful addr
+			TST.W	D0					; check error code							<2>
+			BMI.S	DecrSn1 			; br on error (change amt of sync in case
+										;  erase turn-off glitched us out or not
+										;  sector 0 - wrote too much sync)
+
+			MOVE.L	#MustFindCt+4,D2	; nibble must find count, adjusted
+			SUB.W	D0,D2				; nybble gap before sector 0
+			DIVU	#5,D2				; sync group count
+			MOVE.W	#Fmt2Err,DskErr 	; assume "not enuf sync"
+
+			SUB.W	(A0),D2 			; groups more than the standard GapSync
+			BMI.S	DecrSync			; br if too little
+
+			EXT.L	D2
+			DIVU	SectCnt(A1),D2		; divide by groups per sector
+			BEQ.S	FTExitOK			; br if ok
+			SUBQ.W	#1,D2				; don't increase if only by 1
+			BEQ.S	FTExitOK
+			ADDQ.W	#1,(A0) 			; increase GapSync by 1 only
+
+FTExitOK	BSR 	GetDrv1 			; set A1,D1 to point to drive vars
+			BSET	#3,SideTrack(A1)	; are we on the second side already?
+			BNE.S	@1					; br if so
+			TST.B	TwoSided(A1)		; format two-sides?
+			BNE 	FormatTrack 		; br if so and format the other side
+
+@1			CLR.W	DskErr				; success!
+
+FTExit		MOVE.W	DskErr,D0
+			RTS
+
+DecrSync
+			ADDQ.W	#1,D2				; if only one, don't worry
+			BEQ.S	FTExitOK
+
+DecrSn1
+			SUBQ.W	#1,(A0) 			; decrement GapSync
+			CMP.W	#minSync,(A0)		; not below the minimum tho
+			BLT.S	FTExit
+
+			BRA.S	FmtTrk1 			; otherwise, go again				<C437/10feb88>
+	eject								;									<A351/05nov86>
+;_____________________________________________________________________
+;
+; Routine:	DoFormat
+; Arguments:
+;		 A5.L (input) --
+;		 A6.L (input) --
+; Function: Formats the current track; the disk is assumed to be up
+;		to speed and correctly positioned, and interrupts disabled.
+;
+;		write 200 sync groups (get something on the disk)
+;		start with sector 0: do 2-1 soft interleave
+;
+;	 loop:	intersector gap sync groups
+;		10 $A9 nybbles (only before sector 0)
+;		1 sync group (6)
+;		D5 AA 96 trk sec side vol cksum DE AA FF (11)
+;		1 sync group (6)
+;		D5 AA AD sec (4)
+;
+;		703 96 nibbles
+;		DE AA FF
+;		loop for all sectors
+;_____________________________________________________________________
+
+adrBytCnt	EQU 	27					; bytes in buffer for a sector adr mark
+syncBytCnt	EQU 	6					; bytes in a sync group
+dataBytCnt	EQU 	703 				; number of $96 nibbles in an address mk
+strtSync	EQU 	200 				; number of sync groups to initially write
+
+DoFormat
+			MOVE.L	(SP)+,DskRtnAdr 	; strip return address
+			MOVEQ	#RdDtaAdr,D0		; PAL address for side 0
+			MOVE.L	SonyVars,A1
+			TST.B	TwoSided(A1)
+			BEQ.S	@1
+			BTST	#11,D6				; side 1?
+			BEQ.S	@1					; br if not
+			MOVEQ	#RdDta1Adr,D0
+@1			BSR 	AdrDisk
+
+			MOVEQ	#4,D0
+			BSR 	SetUpPoll			; set up A5,A6, PollStack
+			move.l  IWM,A4              ; initially A4 is IWM				<A302/30oct86>
+			lea     Q6H(A4),A3			; set up Q6H pointer (do Q6L later) <A302/30oct86>
+
+			MOVE.L	DiskBuffer(A1),A0	; point to nibble buffer
+			MOVE.W	SectCnt(A1),D0		; number of sectors to write here
+
+;_______________________________________________________________________
+;
+;	D7 =						A7 = stack (where poll data is pushed)
+;	D6 =						A6 = ptr to SCC chan A data reg
+;	D5 =						A5 = ptr to 6522 A-reg
+;	D4 = scratch				A4 = ptr to Q6L (initially IWM)
+;	D3 = scratch				A3 = ptr to Q6H
+;	D2 = working buffer count	A2 = working buffer pointer
+;	D1 = sync group count		A1 = pointer to sync group, data mk slip
+;	D0 = sector count			A0 = pointer to mark buffer
+;_______________________________________________________________________
+
+			MOVE.W	GapSync(A1),D1		; set up D1 now
+			SUBQ.W	#2,D1				; adjust for DBRA and adr mk sync
+
+			MOVE.W	#strtSync-1,D3
+
+			TST.B	mfmMode(A1)			; are we in ISM mode?					<SM6>
+			LEA 	SyncTbl,A1			;										<SM6>
+			BPL.S	@NotSWIM2			; -> no, it's either an IWM or SWIM		<H4><SM6>
+			LEA		wData(A4),A3		; point to the write data and			<SM6>
+			LEA		rHandshake(A4),A4	; handshake registers for speed			<SM6>
+			TST.B	rError-wData(A3)		; clear the error register			<SM6>
+			MOVE.B	#$18,wZeroes-wData(A3)	; clear the write and action bits	<SM6>
+			MOVE.B	#$10,wOnes-wData(A3)	; set the write bit					<SM6>
+			MOVE.B	#$01,wOnes-wData(A3)	; toggle the clFIFO bit to clear out<SM6>
+			MOVE.B	#$01,wZeroes-wData(A3)	;  any data in the FIFO				<SM6>
+			TST.B	rError-wData(A3)		; clear the error register again	<SM6>
+			MOVE.B	D3,(A3)				; write garbage to FIFO					<SM6>
+			MOVE.B	#$08,wOnes-wData(A3); turn on the action bit: GO!			<SM6>
+			BRA.W	WrStrtSync			;										<H4><SM6>
+@NotSWIM2
+			TST.B	(A3)				; first byte written is a bit wierd
+			move.b  D3,Q7H(A4)			; write garbage to start			<A302/30oct86>
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			lea     Q6L(A4),A4			; set up Q6L pointer				<A302/30oct86>
+
+WrStrtSync	MOVE.L	A1,A2				; write a sync group
+			MOVEQ	#(syncBytCnt/2)-1,D2 ;
+
+WSS1		MOVE.B	(A2)+,D4			; prefetch
+
+@0			TST.B	(A4)				; check write handshake
+			BPL.S	@0					;
+			MOVE.B	D4,(A3) 			; write out next header nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			MOVE.B	(A2)+,D4			; prefetch
+			_PollSCC					; poll the SCC modem port			<H5><SM6>
+
+@2			TST.B	(A4)				; check write handshake
+			BPL.S	@2					;
+			MOVE.B	D4,(A3) 			; write out next header nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			DBRA	D2,WSS1
+			DBRA	D3,WrStrtSync
+
+WrNxtSect	MOVE.W	D1,D3				; number of sync groups - 1
+
+@1			MOVE.L	A1,A2				; write a sync group
+			MOVEQ	#syncBytCnt-1,D2
+
+@2			TST.B	(A4)				; check write handshake
+			BPL.S	@2					;
+			MOVE.B	(A2)+,(A3)			; write out next gap nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			_PollSCC					; poll the SCC modem port			<H5><SM6>
+@3			DBRA	D2,@2
+			DBRA	D3,@1
+
+			MOVEQ	#adrBytCnt-1,D2
+@4			TST.B	(A4)				; check write handshake
+			BPL.S	@4					;
+			MOVE.B	(A0)+,(A3)			; write out next adr mk nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			_PollSCC					; poll the SCC modem port			<H5><SM6>
+@5			DBRA	D2,@4
+
+			MOVE.W	#dataBytCnt-1,D2
+@6			TST.B	(A4)				; check write handshake
+			BPL.S	@6					;
+			MOVE.B	#$96,(A3)			; write out next data mk nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			_PollSCC					; poll the SCC modem port			<H5><SM6>
+@7			DBRA	D2,@6
+
+			MOVEQ	#3,D2
+			ADDQ	#8,A2				; point to bit slip marks . . .
+@8			TST.B	(A4)				; check write handshake
+			BPL.S	@8					;
+			MOVE.B	(A2)+,(A3)			; write out next bit slip nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D2,@8
+			SUBQ.W	#1,D0
+			BGT.S	WrNxtSect			; write all sectors
+
+			MOVEA.L	SonyVars,A1			;									<SM6>
+			TST.B	mfmMode(A1)			; are we in ISM mode?				<SM6>
+			BPL.S	@NotSWIM2			; -> no, it's either an IWM or SWIM	<H4><SM6>
+			MOVEQ	#3-1,D2				; now write out three more gap bytes to fully clear the FIFO	<SM6>
+@11			TST.B	(A4)				; check write handshake				<SM6>
+			BPL.S	@11					;									<SM6>
+			MOVE.B	#$FF,(A3)			; write out next gap nibble			<SM6>
+			DBRA	D2,@11				;									<SM6>
+
+			MOVE.B	(A4),D0 			; read write handshake reg for status	<SM6>
+			MOVEQ	#0,D2				; assume no underrun				<SM6>
+			BTST	#5,D0				; any errors?						<SM6>
+			BEQ.S	@12					; branch if no underrun was detected<SM6>
+			MOVEQ	#WrUnderRun,D0		; underrun error					<SM6>
+			BRA.S	@13					;									<SM6>
+@12			MOVEQ	#0,D0				; no errors							<SM6>
+@13										;									<SM6>
+			MOVE.B	#$18,wZeroes-wData(A3)	;Clear the write and action bits<SM6>
+		if NonSerializedIO then
+				nop							; force write to complete		<SM5>
+		endif
+			MOVE.L	DskRtnAdr,-(SP)		; push DoFormat's return address	<SM6>
+			TST.W	D0					; set CCR							<SM6>
+			RTS							;									<SM7>
+@NotSWIM2								;									<SM6>
+			MOVE.B	(A4),D0 			; read write handshake reg for status
+			MOVEQ	#0,D2				; assume no underrun
+			BTST	#6,D0				; any errors?
+
+			BNE.S	@9					; branch if no underrun was detected
+			MOVEQ	#WrUnderRun,D0		; underrun error
+			BRA.S	@10
+@9			MOVEQ	#0,D0				; no errors
+@10			tst.b   Q7L-Q6H(A3)			; get out of write mode after half	<A351/05nov86><A302/30oct86>
+										; of garbage nibble is written
+			MOVE.L	DskRtnAdr,-(SP)
+			TST.W	D0					; set CCR
+			RTS
+	eject								;									<A351/05nov86>
+;_____________________________________________________________________
+;
+; Routine:	FillInMarks
+; Arguments:	 A0.L (input)  -- buffer pointer (must be 27*number of sectors)
+;		 D0.W (input)  -- number of sectors
+;		 D6.W (input)  -- side - track
+;		 all registers are preserved
+; Function: Fills in the buffer with the address marks (buffer is already
+;		filled with appropriate sync bytes . . .)
+;
+;			1 sync group (6)
+;			D5 AA 96 trk sec side vol cksum DE AA FF (11)
+;			1 sync group (6)
+;			D5 AA AD sec (4)
+;
+;_____________________________________________________________________
+
+TrkOffset	EQU 	9
+SecOffset	EQU 	10
+SidOffset	EQU 	11
+VolOffset	EQU 	12
+CkSumOffset EQU 	13
+DSecOffset	EQU 	26
+
+FillInMarks
+			MOVEM.L A0-A1/D0-D7,-(SP)
+			MOVE.L	SonyVars,A1
+			MOVE.L	DiskBuffer(A1),A0	; stack buffer
+			MOVEQ	#FmtByte,D3 		; 1-sided format byte
+			TST.B	TwoSided(A1)		; use 2-sided format?
+			BEQ.S	@0					; br if 1-sided
+			MOVEQ	#Fmt2Byte,D3		; 2-sided format byte
+
+@0			MOVE.L	NiblTbl,A1			; nibble code table
+
+			MOVE.B	0(A1,D3),D7 		; D7 holds encoded volume byte
+			MOVE.B	D3,D5				; start checksum
+
+			MOVEQ	#$3F,D3 			; 6-bit mask
+			AND.B	D6,D3				; get track low 6 bits
+			MOVE.B	0(A1,D3),D2 		; D2 holds encoded track number
+			EOR.B	D3,D5				; add it to checksum
+
+			LSR.W	#6,D6				; get track high bits/side
+			EOR.B	D6,D5				; add it to checksum
+			MOVE.B	0(A1,D6),D6 		; D6 holds encoded side/trk
+
+			MOVE.W	D0,D1				; number of sectors
+			SUBQ.W	#1,D1
+			LSR.W	#1,D1
+			ADDQ.W	#1,D1				; second sector number
+			SWAP	D1
+			CLR.W	D1					; first sector number is always zero . . .
+
+@1			MOVE.B	0(A1,D1),D3 		; D1 = next sector number
+			MOVEQ	#0,D4				; zero high byte
+			MOVE.B	D5,D4				; checksum minus sector nibble
+			EOR.B	D1,D4				; add it in
+
+			ADD 	#TrkOffset,A0		; bump to track
+			MOVE.B	D2,(A0)+			; encoded track
+			MOVE.B	D3,(A0)+			; encoded sector
+			MOVE.B	D6,(A0)+			; encoded side
+			MOVE.B	D7,(A0)+			; encoded volume
+			MOVE.B	0(A1,D4),(A0)+		; checksum
+			ADD 	#12,A0				; point to data mark sector nibble
+			MOVE.B	D3,(A0)+
+
+			ADDQ.W	#1,D1				; bump to next even/odd sector
+			SWAP	D1					; toggle between odd and even
+			SUBQ.W	#1,D0
+			BNE.S	@1
+
+			MOVEM.L (SP)+,A0-A1/D0-D7
+			RTS
+	eject								;									<A351/05nov86>
+;_______________________________________________________________________
+;
+; Routine:		CtlVerify
+; Arguments:	  A0.L (in)  -- param block ptr
+;				  A1.L (in)  -- driver locals ptr
+;				  D1.W (in)  -- drive vars offset
+;				  Drive (in) -- set to correct drive
+;				  D0.W (out) -- result code (0 if correctly formatted)
+; Function: 	This routine reads all sectors on the newly formatted
+;				diskette to verify correct format.
+;_______________________________________________________________________
+
+; change to work with 2-sided drives . . . allow to miss a couple sectors
+; first spin (in case of serial data coming in . . .)
+
+CtlVerify								; (add vector??)
+			SUB 	#512,SP 			; get space for buffers we need off stack
+			MOVE.L	SP,DiskBuffer(A1)	; StackBuf for mark, block buffer
+
+		IF hasPwrControls THEN			;									<SM5>
+			TestFor	hwCbPwrMgr
+			BEQ.S	@pmgrdone
+			BSR		TurnIWMon			; Turn IWM on with pmgr call		<1.1/01mar88>
+@pmgrdone
+		ENDIF							;									<SM5>
+
+			TST.B	isSWIM(A1)			;Is a SWIM installed?				<C437/30sep87>
+			BPL.S	@00					;-> no, skip						<C437/30sep87>
+			BSR		SetChipMode			;Initialize the chip's registers	<C437/21nov86>
+			BNE		FmtVerExit			;-> couldn't do it					<C437/21nov86>
+@00										;									<C437/30sep87>
+
+			BSR 	FVPowerUp			; make sure we're powered (synchronously)
+
+			MOVEQ	#4,D2				; 5 speed classes
+			MOVE.W	#$007F,D4			; sector map track 79 (almost)
+			MOVEQ	#79,D6				; and track number 79
+
+NxtVClass	LSL.W	#1,D4				; sectors map this track speed class
+			ADDQ	#1,D4				; set low bit
+			MOVEQ	#15,D3				; tracks this speed class
+
+NxtVTrk 	MOVEM.L D2-D6,-(SP)
+			BSR 	FmtVerSeek			; seek to desired track (synchronous)
+			MOVEM.L (SP)+,D2-D6
+			BSR 	GetDrv1
+			MOVE.W	Track(A1,D1),D0
+			BMI.S	@1					;									<C437/21nov86>
+
+			TST.B	mfmDisk(A1,D1)		;Are we in MFM mode?				<C437/21nov86>
+			BPL.S	@00					;-> no, do a regular verify			<C437/21nov86>
+			BSR		mVerTrack			;Verify the track (MFM style)		<C437/21nov86>
+			BRA.S	@0					;									<C437/21nov86>
+@00										;									<C437/21nov86>
+
+			BSR.S	VerTrack			; verify the track (GCR)
+@0			BNE.S	@1					; exit on errors					<C437/21nov86>
+
+			SUBQ.W	#1,D6				; next track
+			DBRA	D3,NxtVTrk			; end of speed class?
+			DBRA	D2,NxtVClass		; move to next speed class
+
+@1			BRA 	FmtVerExit			;									<C437/21nov86>
+
+VerTrack	MOVEM.L D2-D6,-(SP)
+			ORI 	#HiIntMask,SR		; no interrupts 					<29Jul85>
+			LEA 	SectMapSave(A1),A0	; [map side 0][max tries][map side 1][max tries]
+			MOVE.W	D4,(A0) 			; save sector map
+			MOVEQ	#12,D3
+			SUB 	D2,D3				; sectors this track
+			LSL.W	#2,D3				; allow some slop (may not get 1-1) <25Oct85>
+			MOVE.W	D3,2(A0)
+			MOVE.L	(A0)+,(A0)+ 		; duplicate for side 1
+			BCLR	#3,SideTrack(A1)	; go for side 0
+
+VTLoop		MOVE.L	D1,D6				; <21Jun85> save drive offset
+			BSR 	RdAddrSetup 		; get next address mark
+			BPL.S	@1					; br if ok
+			BSR.S	toEmptyPD			; get rid of poll data
+			ANDI	#$F8FF,SR			; open up interrupts
+			BRA.S	VTExit
+
+@1			LEA 	SectSave(A1),A0
+			MOVE.W	D2,(A0)+			; save sector number
+			MOVE.W	(A0)+,D0			; sector map
+			BCLR	D2,D0				; did we get this sector already?
+			BNE.S	@2					; br if not
+
+			BSR.S	toEmptyPD			; get rid of poll data					<30Oct85>
+			ANDI	#$F8FF,SR			; open up interrupts					<30Oct85>
+			LEA 	SectMapSave+2(A1),A0 ; point to max retries 				<30Oct85>
+			BRA.S	@3					; rejoin RdData for loop timeout check	<30Oct85>
+
+@2			CMP.B	#$1F,D3 			; <21Jun85> check format type
+			SGT 	TwoSideFmt(A1,D6)	; <21Jun85>  to determine 2-sided
+
+; check track, side??
+
+			MOVE.L	DiskBuffer(A1),A0	; get someplace to stick data
+			CLR.B	DskVerify			; never verify for this one
+			BSR 	RdData				; read in a sector
+			BSR.S	toEmptyPD			; get rid of data
+			TST.W	D0					; read ok?
+			BNE.S	VTExit
+
+			LEA 	SectSave(A1),A0
+			MOVE.W	(A0)+,D2			; sector we just read
+			MOVE.W	(A0),D0 			; sector map
+			BCLR	D2,D0				; mark this sector gotten
+			MOVE.W	D0,(A0)+			; stash bitmap back
+			BEQ.S	VTExitOK			; exit if now zero
+
+@3			SUBQ.W	#1,(A0) 			; decrement sector count			<30Oct85>
+			BNE.S	VTLoop				; loop until done
+			MOVEQ	#VerErr,D0			; should get 1-1 ok reads
+			BRA.S	VTExit
+
+VTExitOK	BSR 	GetDrv1 			; <21Jun85>
+			TST.B	TwoSideFmt(A1,D1)	; <21Jun85> two-sided format?
+			BEQ.S	@1					; br if not
+			BSET	#3,SideTrack(A1)	; just finished second side?
+			BNE.S	@1					; br if so
+			ADDQ	#2,A0				; point to sectmap/count copy
+			MOVE.L	(A0),-(A0)			; and copy it back
+			BRA.S	VTLoop				; and go for side 1
+
+@1			MOVEQ	#0,D0
+VTExit		ANDI	#$F8FF,SR
+			MOVEM.L (SP)+,D2-D6
+			TST.W	D0
+			RTS
+
+toEmptyPD	MOVE.W	D0,DskErr			; save error code
+			BRA 	EmptyPD
+
+FmtVerSeek	LEA 	Seek,A0 			; a synchronous seek
+
+SyncCall	subq.b	#1,Active(a1)		; use this to flag seek done . . .			<2>
+			BSR.S	@2
+@1			cmpi.b	#$FF,Active(a1)		; done?										<2>
+			bne.s	@1					; br if not									<2>
+			RTS
+
+@2			JSR 	(A0)
+			addq.b	#1,Active(a1)		; when we get back here we are done . . .	<2>
+			RTS
+
+FVPowerUp	LEA 	RWPowerUp,A0		; do the RW powerup trip synchronously
+			BRA.S	SyncCall
+

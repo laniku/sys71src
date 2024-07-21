@@ -1,0 +1,803 @@
+;
+;	File:		CSCPrimaryInit.a
+;
+;	Written by:	Mike Puckett, December 20, 1992.
+;
+;	Copyright:	© 1991-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	12/13/93	PN		Roll in KAOs and Horror changes to support Malcom and AJ
+;									machines
+;		 <1>	01-12-93	jmp		first checked in
+;		<H2>	01-05-93	jmp		Added some temporary family modes to test out 16bpp.
+;		 <1>	12-23-92	jmp		first checked in
+
+				PRINT	OFF
+				LOAD	'StandardEqu.d'
+
+				INCLUDE 'HardwarePrivateEqu.a'
+				INCLUDE 'ROMEqu.a'
+				INCLUDE	'Video.a'
+				INCLUDE	'SlotMgrEqu.a'
+				INCLUDE	'SonicEqu.a'
+				INCLUDE	'UniversalEqu.a'
+				INCLUDE	'DockingEqu.a'
+				INCLUDE	'PowerPrivEqu.a'
+				
+				INCLUDE	'DepVideoEqu.a'
+				PRINT	ON
+
+				SEG		'_sCSCPrimaryInit'
+
+				BLANKS		ON
+				STRING		ASIS
+				MACHINE		MC68020
+				
+CSCPrimaryInit	Main	Export
+
+;---------------------------------------------------------------------
+;	Header
+;---------------------------------------------------------------------
+				
+				Dc.b	sExec2								; Header
+				Dc.b	sCPU68020
+				Dc.w	0
+				Dc.l	BeginCSCInit-*
+
+;---------------------------------------------------------------------
+;	Local variables, definitions, etc....
+;---------------------------------------------------------------------
+
+				With	SEBlock,SPBlock
+
+CSCFrame		Record	{A6Link},Decrement
+Return			Ds.l	1									; Return address.
+A6Link			Ds.l	1									; Saved A6.
+spBlk			Ds		SPBlock								; SpBlock for generic use.
+sPRAMBlk		Ds.b	SizeSPRAMRec						; sPRAMRec for generic use.
+configParamsPtr	Ds.l	1									; Pointer to configruation parameters.
+vidParamsPtr	Ds.l	1									; Pointer to video parameters.
+mscBaseAddr		Ds.l	1									; Don’t want to look up MSC’s address more than once.
+prodID			Ds.b	1									; For easily distinguishing between products.
+disableLCD		Ds.b	1									; When true, we’re shutting the LCD down.
+CSCFSize		Equ		*
+				Endr
+
+				Endwith
+				
+CSCProdCnfgRec	Record	0									;
+memConfig		Ds.b	1									; Physical VRAM configuration type.
+refreshRate		Ds.b	1									; The desired refresh rate.
+vramControl		Ds.b	1									; CPU/VRAM interface control.
+				Ds.b	1									; <pad>
+CSCProdCnfgSize	Equ		*
+				Endr
+
+CSCVRAMCnfgRec	Record	0									; 
+sRsrcID			Ds.b	1									; sRsrc ID for this VRAM configuration.
+modeID			Ds.b	1									; Favored modeID (depth).
+boxID			Ds.b	1									; BoxFlag to write out.
+				Ds.b	1									; <pad>
+familiesOffset	Ds.w	1									; Offset to family mode table.
+CSCVRAMCnfgSize Equ		*
+				Endr
+
+				With	MiniGamma,CSCVRAMCnfgRec
+
+CSCCnfgRec		Record	0
+gammaTbl		Ds.b	GT_Size								; Mini-gamma table (defined in PrimaryInit.a).
+CSCCnfgHdrSize 	Equ		*
+csc512KVRAM		Ds.b	CSCVRAMCnfgSize						; 512K vRAM preferences.
+CSCCnfgRecSize	Equ		*
+				Endr
+
+CSCCnfgTblSize	Equ		(8*CSCCnfgRec.CSCCnfgRecSize)		; 0..7 (8) Panel IDs per table.
+				
+				Endwith
+
+;---------------------------------------------------------------------
+;	Utils
+;---------------------------------------------------------------------
+
+;---------------------------------------------------------------------
+;
+;	PruneList
+;
+;	Loops thru a table of sRsrcIDs comparing the “keeper” with each
+;		of the entries in the table.  Those IDs that don’t match
+;		the keeper are pruned.
+;
+;	->	D0:	sRsrcID of the “keeper”
+;	->	A0:	pointer to appropriately filled-out SpBlock
+;	->	A1:	pointer to list of sRsrcIDs
+;
+;	Trashes: D0-D1/A1.
+;
+				With	SpBlock
+
+CSCPruneList
+				Move.b	D0,-(Sp)							; Remember the ID of the “keeper.”							
+				Move.w	(A1)+,D1							; Get the zero-based counter into D1.
+
+@Repeat			Move.b	(A1)+,D0							; Get an sRsrc ID.
+				Cmp.b	(Sp),D0								; If it’s the keeper,
+				Beq.s	@Until								;	then don’t prune it.
+				Move.b	D0,spID(A0)							; Otherwise, prune it.
+				_sDeleteSRTRec
+@Until			Dbra	D1,@Repeat							; Loop until done.
+
+				Tst.b	(Sp)+								; Clean up the stack.
+				Rts											; Return to caller.
+				
+				Endwith
+				
+;---------------------------------------------------------------------
+;
+;	BuildFamilyList
+;
+;	Loops thru a table of sRsrcIDs comparing the “keeper” with each
+;		of the entries in the table.  Those IDs that don’t match
+;		the keeper are inserted back in as disabled.
+;
+;	->	D0:	sRsrcID of the “keeper”
+;	->	A0:	pointer to appropriately filled-out SpBlock
+;	->	A1:	pointer to list of sRsrcIDs
+;
+;	Trashes: D0-D1/A1.
+;
+				With	SpBlock
+
+CSCBuildFamilyList
+				Move.b	D0,-(Sp)							; Remember the ID of the “keeper.”							
+				Move.w	(A1)+,D1							; Get the zero-based counter into D1.
+
+@Repeat			Move.b	(A1)+,D0							; Get an sRsrc ID.
+				Cmp.b	(Sp),D0								; If it’s the keeper,
+				Beq.s	@Until								;	then leave it alone.
+				Move.b	D0,spID(A0)							; Otherwise, load that sRsrc ID.
+				Clr.l	spsPointer(A0)						; Tell the Slot Manager that it’s in ROM.
+				Move.l	#1,spParamData(A0)					; Say that we want it disabled.
+				Clr.w	spRefNum(A0)						; Say that there’s no driver yet.
+				_InsertSRTRec								; Do it!
+@Until			Dbra	D1,@Repeat							; Loop until done.
+
+				Tst.b	(Sp)+								; Clean up the stack.
+				Rts											; Return to caller.
+				
+				Endwith
+
+;---------------------------------------------------------------------
+;	Main
+;---------------------------------------------------------------------
+
+				With	SEBlock,SPBlock,CSCFrame
+
+BeginCSCInit
+
+;
+; Set up initial “vendor” status.
+;
+				Link	A6,#CSCFSize						; Allocate stack space for locals.
+				Move.w	#seSuccess,seStatus(A0)				; Just say that we’re okay.
+				
+;
+; Perform some generic initializations.
+;
+				Clr.b	spBlk.spSlot(A6)					; Built-in video is always Slot $0.
+				Clr.b	spBlk.spExtDev(A6)					; Why ask why? Just clear this guy.
+				
+				Move.l	UnivInfoPtr,A4						; Keep a pointer to ProductInfo.
+				
+;
+; Initialize the BoardID part of the Slot $0 pRAM if necessary, and prune the board sResources.
+;
+				With	SP_Params,ProductInfo,VideoInfo
+				
+				Lea		spBlk(A6),A0						; Point A0 at our local SpBlock.
+				Lea		sPRAMBlk(A6),A2						; Get a pointer to our local SPRAMBlock.
+				Move.l	A2,spResult(A0)						; Put our pointer in the SpBlock.
+				_sReadPRAMRec								; Read Slot $0’s pRAM.
+				
+				Move.l	A4,A3								; Copy the ProductInfo pointer.
+				Adda.l	VideoInfoPtr(A3),A3					; Point to the VideoInfo record.
+				
+				Tst.w	SP_BoardID(A2)						; If the board ID is non-zero,
+				Bne.s	@PruneBoardSRsrc					;	then just go on.
+				
+				Move.b	BoardSRsrcID(A3),spID(A0)			; Get the appropriate board sRsrc ID.
+				_sRsrcInfo									; Get the spsPointer.
+				
+				Move.b	#BoardID,spID(A0)					; Set up to get the correct board ID.
+				_sReadWord									; Get it.
+				
+				Move.w	spResult+2(A0),SP_BoardID(A2)		; Save the board ID into pRAM.
+				Move.l	A2,spsPointer(A0)					; Point to the pRAM param block.
+				_InitSlotPRAM								; Write it out.
+				
+@PruneBoardSRsrc
+				Lea		CSCSpIDTbl,A1						; Point to the table of supported board sRsrcs.
+				Move.b	BoardSRsrcID(A3),D0					; Get the sRsrc ID of the keeper into D0.
+				Move.b	D0,prodID(A6)						; (Remember the sRsrc ID for later.)
+				Bsr.s	CSCPruneList						; Call our pruning utility.
+
+;
+; Set up the right CPU sResource.  We only recognize ’030 and ’040 CPUs; all others
+;	are ignored (i.e., the CPU sResources are all deleted in that case).
+;
+
+				Move.b		CPUFlag,D1					; Get the CPUFlag (680x0-flag) for compares.
+				
+				Lea			@CPUTable,A1				; Get pointer to the table of valid CPU types.
+@CPULoop		Move.b		(A1)+,D0					; Pick up the next CPU type.
+				Beq.s		@EndPruneCPUSRsrcs			; If we’re done, leave.
+				Move.b		(A1)+,spID(A0)				; Assume we won’t find a match.
+				Cmp.b		D0,D1						; But, if they do match,
+				Beq.s		@SkipDelete					;	then just go on.
+				_sDeleteSRTRec							; Otherwise, delete non-matching CPU sRsrc type.
+@SkipDelete		Bra.s		@CPULoop					; And loop until done.
+
+@CPUTable		Dc.b		cpu68030,sRsrc_CPUMac030
+				Dc.b		cpu68040,sRsrc_CPUMac040
+				Dc.b		0,0
+
+@EndPruneCPUSRsrcs
+
+;
+; Here’s where we actually get the CSC video going, or we decide whether to just shut
+;	things down.  We’ll end up shutting things down if we either don’t recognize the
+;	type of LCD attached (which is highly unlikely, since the LCDs are built-in), or
+;	the LCD is currently in an unuseable state.  For example, Escher could be
+;	docked into a Gemini or an Atlantis, or, in Blackbird’s case, the lid could
+;	just be closed.
+;
+CSCVideoInit
+				Clr.l	vidParamsPtr(A6)					; Don’t try to throw away non-existent storage.
+
+; Get some useful values up front.
+;
+				Movea.l	A4,A3								; Copy the ProductInfo pointer.
+				Adda.l	ProductInfo.DecoderInfoPtr(A3),A3	; Point to the base address table.
+				Movea.l	DecoderInfo.VDACAddr(A3),A3			; Get the CSC base address into A3.
+				
+; First, disable the video interrupts sources as well as the power planes.
+;
+				TestFor	MSCChipBit							; If we don’t have an MSC,
+				Beq.s	@NoMSC								;	then just go on.
+				
+				Movea.l	A4,A2								; Copy the ProductInfo pointer.
+				Adda.l	ProductInfo.DecoderInfoPtr(A2),A2	; Point to the BaseAddr table.
+				Movea.l	DecoderInfo.RBVAddr(A2),A2			; Point to the MSC’s base address.
+				Move.l	A2,mscBaseAddr(A6)					; Save it for later.
+				Move.b	#(0<<ifIRQ)|(1<<RvIRQ0En),MSCSlotIER(A2) ; Disable CSC interrupts.
+				Bclr	#MSCLCDReset,MSCClkCntl(A2)			; Turn off CSC clock input…
+				_CSCMinDelay								; …wait for at least 32 PixClks, and
+				Bset	#MSCLCDReset,MSCClkCntl(A2)			; …turn CSC clock input back on to complete reset.
+@NoMSC			
+				Clr.b	CSCDisplayStatus(A3)				; Disable CSC interrupt source.
+				Clr.b	CSCPanelSetup(A3)					; Disable the panel power.
+
+; Size the amount of VRAM.  When done, D4 is set to one of {0,1}, where 0=512K,1=1024K.
+;	(Note:  CSC supports a variety of VRAM types and configuration.  At the moment,
+;	 though, we’ll just simply say there’s 512K.)
+;
+;
+				With	CSCProdCnfgRec
+				
+				Lea		CSCProdTable,A1						; Point to the CSC ProductTable.
+				Move.w	#CSCProdCnfgSize,D0					; Get the size of each entry into D0.
+				Moveq	#0,D1								; Clear D1 for good measure.
+				Move.b	prodID(A6),D1						; Get the product ID.
+				Subq	#1,D1								; Normalize it.
+				Mulu	D1,D0								; Multiply by the right entry.
+				Adda.w	D0,A1								; Skip to the entry we want.
+				
+				Move.b	memConfig(A1),CSCMemConfig(A3)		; Set up for the right VRAM configuration.
+				Move.b	refreshRate(A1),CSCRefreshRate(A3)	; Set up the refresh rate.
+				Move.b	vramControl(A1),CSCVRAMControl(A3)	; Interface the VRAM correctly to the CPU.
+				
+				Moveq	#0,D4								; Just say there’s 512K of VRAM for now.
+
+				Endwith
+				
+; Sense the type of panel to drive.  For now, we have no extended-sense panels, so we just
+;	do a passive read of the panel senselines.
+;
+				Moveq	#0,D6								; Initialize the senseline register.
+				Move.b	#tristateCSC,CSCPanelIDControl(A3)	; Make the senselines inputs.
+				_CSCMinDelay								; Wait a moment.
+				Move.b	CSCPanelID(A3),D6					; Read ’em.
+				
+; Pick up the favored configuration based on the amount of VRAM and the type of display sensed or assumed.
+;
+				With	CSCVRAMCnfgRec,CSCCnfgRec
+
+				Lea		CSCConfigTable,A1					; Point to the CSC configuration table.
+				Move.w	#CSCCnfgTblSize,D0					; Get the size of each table into D0.
+				Moveq	#0,D1								; Clear D1 for good measure.
+				Move.b	prodID(A6),D1						; Get the product ID.
+				Subq	#1,D1								; Normalize it.
+				Mulu	D1,D0								; Multiply by the right entry.
+				Adda.w	D0,A1								; Skip to the entry we want.
+				
+				Move.w	#CSCCnfgRecSize,D0					; Get the size of each entry into D0.
+				Mulu	D6,D0								; Multiply it by the right entry.
+				Adda.w	D0,A1								; Skip to the entry we want.
+				Move.l	A1,configParamsPtr(A6)				; Save it for later.
+				Adda.w	#CSCCnfgHdrSize,A1					; Skip past the header.
+				Move.w	#CSCVRAMCnfgSize,D0					; Get the size of the VRAM entries.
+				Mulu	D4,D0								; Multiply by the right entry.
+				Adda.w	D0,A1								; Skip to the right VRAM entry.
+				
+				Move.b	modeID(A1),D7						; Get the default mode (depth).
+				Move.b	sRsrcID(A1),D5						; Get the default sRsrcID.
+				
+				Cmp.b	#sRsrc_CSC_NeverMatch,D5			; If we’ve come up with an unknown configuration,			<K18>
+				Beq.s	@NoAdjustBoxflag					;	then skip boxflag adjustment.							<K18>
+				Move.b	boxID(A1),BoxFlag					; Set the BoxFlag value based on the PanelID.
+@NoAdjustBoxflag				
+				
+				Endwith
+				
+; Next, check to see whether or not we should even bring up the CSC.
+;
+				WITH	PMgrRec, pmCommandRec
+				
+				Movea.l	PMgrBase,A2							; point to Power Manager variables
+				Bclr	#ignoreClamshell,PmgrFlags3(A2)		; reset ignore clamshell							
+				
+				Subq	#4,Sp								; Make room for the docking result.
+				Move.l	#dockDockingAttr,-(Sp)				; Say that we want the attributes.
+				Clr.l	-(Sp)								; No params.
+				_DockingDispatch							; Call the Docking Manager.
+				Move.l	(Sp)+,D0							; Get the attributes.
+				Btst	#dockNoLCDScreen,D0					; Find out if the LCD is in a useable state.
+				Beq.s	@ClamLook							; can use LCD, but check clamshell first
+				Bra.s	@ClamDone							; set the flag to ignore LCD
+				
+;------------------------------------------------------------------------------------------------------	<H28>
+; this code checks to see if we're docked, if we have external video, and if the clamshell is closed:	  |
+; in such a case, we want to allow the system to boot on the external monitor but disable the internal	  v
+; monitor and ignore the state of the clamshell switch
+
+
+@ClamLook		Subq.w	#4,SP								;  result
+				Move.l	#dockHardwareAttr,-(SP)				;  docking selector = get hardware attributes
+				Clr.l	-(SP)								;  params = nil
+				_DockingDispatch							; call the handler
+				Move.l	(SP)+,D0
+				Btst	#dockHasVideo,D0					; do we have external video power?
+				Beq.s	@EndDockChk							; nope, so skip case to ignore clamshell
+				
+				Clr.w	-(SP)
+				Move.l	SP,-(SP)							;  pmRBuffer
+				Move.l	(SP),-(SP)							;  pmSBuffer
+				Clr.w	-(SP)								;  pmLength = 0
+				Move.w	#readExtSwitches,-(SP)				;  pmCommand
+				Movea.l	SP,A0								; point to the parameter block
+				_PMgrOp										; get the clamshell info
+				Lea		pmRBuffer+4(SP),SP					; toss the parameter block
+				Btst	#clamshell,(SP)+					; is the clamshell closed?
+				Beq.s	@EndDockChk							; -> nope, all done
+
+				Bset	#ignoreClamshell,PmgrFlags3(A2)		; set ignore clamshell							
+@ClamDone		St		disableLCD(A6)						; don't use internal LCD
+				Move.b	#sRsrc_CSC_NeverMatch,D5			; Make sure all the sResources get pruned.
+				Bra		@SetConfig							; Skip the dynamic config code.
+@EndDockChk
+			
+;------------------------------------------------------------------------------------------------------	<H28>
+
+				ENDWITH
+			
+; Initialize built-in video’s pRAM.
+;
+				With	SP_Params
+@InitPRAM			
+				Lea		sPRAMBlk(A6),A2						; Point to the sPRAM block.
+				
+				Move.b	SP_Flags(A2),D0						; Copy the flags byte.
+				Bfins	D4,D0{spVRamBits:numSPVRamBits}		; Load the amount of VRAM.
+ 				Move.b	D0,SP_Flags(A2)						; Remember how much VRAM we setup for.
+				Bclr	#spFamilyChanged,SP_Flags(A2)		; Always reset the family-changed bit.
+				Beq.s	@EndScrnChk							; If it was already reset, then just go on.
+				Move.w	#drHwCSC,ScrnInval					; Remind ourselves to manually update the 'scrn' resource (so disk can make things right).
+@EndScrnChk		Move.b	D6,SP_MonID(A2)						; Remember which panel we sensed (or assumed).
+				
+				Cmp.b	SP_DfltConfig(A2),D5				; If this is the same configuration/family we had last time,
+				Beq.s	@WritePRAM							;	then just write out the minimal pRAM info.
+				
+				Move.b	D5,SP_LastConfig(A2)				; Set the identification configuration.
+				Move.b	D5,SP_DfltConfig(A2)				; Set the default/family configuration.
+				
+				Move.b	D7,SP_Depth(A2)						; Set the default depth for this configuration.
+
+@WritePRAM		Lea		spBlk(A6),A0						; Point to the slot param block.
+				Move.l	A2,spsPointer(A0)					; Set up the pRAM parameter block.
+				_sPutPRAMRec								; Write out Slot $0’s pRAM.
+				
+				Move.b	SP_LastConfig(A2),D5				; Get the right (family member) sRsrc into D5. 				
+				
+				Endwith
+
+; First, prune all of the video sResources except for the selected one.  If there are no families, then we’re done.
+;	Otherwise, we’re either done (because we’ve come up with an unknown configuration), or we re-insert all the members
+;	of the selected configuration’s family as disabled.
+;
+				With	CSCVRAMCnfgRec,CSCCnfgRec
+@SetConfig
+				Lea		spBlk(A6),A0						; Point A0 at our local SpBlock.
+				Lea		CSCModeList,A1						; Point to the table of supported video sRsrcs.
+				Move.b	D5,D0								; Get the sRsrcID of the keeper into D0.
+				Bsr		CSCPruneList						; Call our pruning utility.
+				
+				Cmp.b	#sRsrc_CSC_NeverMatch,D5			; If we’ve come up with an unknown configuration,
+				Beq		CSCExit								;	then we’re now done.
+
+				Move.l	configParamsPtr(A6),A1				; Point to this config’s parameters.
+				Adda.w	#CSCCnfgHdrSize,A1					; Skip past the header.
+				Move.w	#CSCVRAMCnfgSize,D0					; Get the size of the VRAM entries.
+				Mulu	D4,D0								; Multiply by the right entry.
+				Adda.w	D0,A1								; Skip to the right VRAM entry.
+				Move.w	familiesOffset(A1),D0				; If there aren’t any families,
+				Beq.s	@EndConfig							;	then just go on.
+				
+				Move.l	configParamsPtr(A6),A1				; Point back to this config’s parameters.
+				Adda.w	D0,A1								; Point to the table of supported families.
+				Move.b	D5,D0								; Get the sRsrcID of the keeper into D0.
+				Bsr		CSCBuildFamilyList					; Call our family-building utility.
+@EndConfig				
+				Endwith
+				
+; Initialize the video hardware.
+;
+				With	CSCVidParams,MiniGamma
+				
+				Clr.w	spID(A0)							; Start looking at spID 0, no external devices.
+				Clr.b	spTBMask(A0)						; Only look for the board sRsrc.
+				Move.w	#catBoard,spCategory(A0)			; Look for:	catBoard,
+				Move.w	#typBoard,spCType(A0)				;			typBoard,
+				Clr.w	spDrvrSW(A0)						;			0,
+				Clr.w	spDrvrHW(A0)						;			0.
+				Clr.l	spParamData(A0)						; (The board sRsrc must be enabled.)
+				Bset	#foneslot,spParamData+3(A0)			; Limit search to this slot 0.
+				_GetTypeSRsrc								; Get the spsPointer.
+				
+				Move.b	#sVidParmDir,spID(A0)				; Look for the video parameters directory.
+				_sFindStruct
+				
+				Move.b	D5,spID(A0)							; Look in the directory for this config’s params.
+				_sGetBlock
+				
+				Move.l	spResult(A0),A1						; Get a pointer to the vidParams.
+				Move.l	A1,vidParamsPtr(A6)					; Save for later disposal.
+
+; Set up the CSC and the Palette (if necessary).
+;
+				Move.b	cscvpPanelType(A1),CSCPanelType(A3)	; Set up for the attached panel.
+				Move.b	cscvpPanelSetup(A1),CSCPanelSetup(A3) ;
+				
+				Move.b	cscvpDataOutForm(A1),CSCDataOutputForm(A3) ; Set up the framebuffer.
+				Move.b	cscvpGFRCControl(A1),CSCFRCControl(A3) ;
+				Move.b	cscvpGPolyMAdj(A1),CSCPolyMAdj(A3)	;
+				Move.b	cscvpGPolyNAdj(A1),CSCPolyNAdj(A3)	;
+				
+				Move.b	cscvpHSkewHi(A1),CSCHSkewHi(A3)		; Set up the H/V timing.
+				Move.b	cscvpHSkewLo(A1),CSCHSkewLo(A3)		;
+				Move.b	cscvpVSkewHi(A1),CSCVSkewHi(A3)		;
+				Move.b	cscvpVSkewLo(A1),CSCVSkewLo(A3)		;
+				
+				Move.b	cscvpACDClkHi(A1),CSCACDClkHi(A3)	; Set up the clocking.
+				Move.b	cscvpACDClkLo(A1),CSCACDClkLo(A3)	;
+				Move.b	cscvpLPStart(A1),CSCLPStart(A3)		;
+				Move.b	cscvpLPWidth(A1),CSCLPWidth(A3)		;
+				Move.b	cscvpFLMControl(A1),CSCFLMControl(A3) ;
+
+				Clr.b	CSCDisplayDataForm(A3)				; Set the panel into 1-bpp mode.
+				Clr.b	CSCGTweak(A3)						; Clear the GTweak register.
+				
+				Cmpi.b	#sRsrc_Vid_CSC_G_D_STN_400,D5		; If we’re on a fixed panel,
+				Beq.s	@STNTweak							; 	then just go gray the screen.
+				Cmpi.b	#sRsrc_Vid_CSC_G_D_STN_400y,D5		;
+				Beq.s	@STNTweak							; 
+				Cmpi.b	#sRsrc_Vid_CSC_G_D_STN_480,D5		;
+				Beq.s	@STNTweak							; 
+				Cmpi.b	#sRsrc_Vid_CSC_G_S_TFT_400,D5		;
+				Beq.s	@TFTTweak							; 
+				Cmpi.b	#sRsrc_Vid_CSC_G_S_TFT_400y,D5		;
+				Beq.s	@TFTTweak							; 
+
+				Move.b	#CSCNoMask,CSCMaskReg(A3)			; Enable all video data in the Palette.
+				
+				Move.l	A3,A2								; Copy the base address of CSC.
+				Adda.w	#CSCDataReg,A2						; Point to the Palette data register.
+				Move.l	configParamsPtr(A6),A5				; Point to the config parameters.
+				
+				Move.b	#$00,CSCAddrRegW-CSCDataReg(A2)		; Setup to write 1bpp white.
+				Move.b	whiteRed(A5),(A2)					; Write:  Red,
+				Move.b	whiteGreen(A5),(A2)					;		  Green,
+				Move.b	whiteBlue(A5),(A2)					;		  Blue.
+				
+				Move.b	#$80,CSCAddrRegW-CSCDataReg(A2)		; Setup to write 1bpp black.
+				Move.b	blackRed(A5),(A2)					; Write:  Red,
+				Move.b	blackGreen(A5),(A2)					;		  Green,
+				Move.b	blackBlue(A5),(A2)					;		  Blue.
+				Bra.s	@GrayScreen							;
+
+; Gray the VRAM.
+;
+@TFTTweak		Bset	#CSCInvertVRAM,CSCGTweak(A3)		; Invert the VRAM data (for double blacks).
+@STNTweak		Bset	#CSCBetterDither,CSCGTweak(A3)		; Make the dither patterning look better!	
+
+@GrayScreen		Movea.l	A4,A2								; Copy the ProductInfo pointer.
+				Adda.l	ProductInfo.VideoInfoPtr(A2),A2		; Point to the VideoInfo record.
+				Move.l	VideoInfo.VRAMLogAddr32(A2),A2		; Point to the base of VRAM.
+				
+				Moveq	#true32b,D0							; Set up to flip into 32-bit addressing mode.
+				_SwapMMUMode								; Do flip.
+				Move.b	D0,-(Sp)							; Save previous addressing mode.
+				
+				Move.w	cscvpNumRows(A1),D3					; Get the number of rows.
+				Move.w	D3,D0								; Remember them.
+				Move.l	#OneBitGray,D2						; Set the 1bpp gray pattern.
+				
+@NxtRow			Move.w	#(OBMLCDRB/4-1),D1					; Get the number of longwords/row.
+@NxtLong		Move.l	D2,(A2)+							; Write out gray to the frame buffer…
+				Dbra	D1,@NxtLong							; …for each scanline.
+				Not.l	D2									; Invert the pattern for the next row.
+				Dbra	D3,@NxtRow							; Repeat for each row.
+				
+				Cmpi.w	#(defmBounds_BLCD-1)-1,D0			; If we’re not doing the 16bpp “400-line” panel,
+				Bne.s	@SwapBack							;	then just go on.
+				
+				Moveq	#IndexedBlack,D2					; Set up to write out black to the bottom-most line.
+				Move.w	#(OBMLCDRB/4-1),D1					; Get the number of longwords/row.
+@LastLine		Move.l	D2,(A2)+							; Write out black to the last line of…
+				Dbra	D1,@LastLine						; …to whole last line.
+				
+@SwapBack		Move.b	(Sp)+,D0							; Set up to flip back to previous addressing mode.
+				_SwapMMUMode								; Do flip.
+				
+				Move.b	#CSCUnblank,CSCDisplayStatus(A3)	; Unblank the video display.
+				Bset	#CSCPnlPwr,CSCPanelSetup(A3)		; Turn on the power.
+				_CSCMaxDelay								; Wait 50 ms.
+				
+				Endwith
+				
+; Now that the CSC is set up (i.e., either fully programmed for the attached LCD, or is
+;	completely shutdown), we need to make sure that the panel’s backlighting is
+;	appropriately set up.
+;
+CSCExit
+				TestFor	MSCChipBit							; If we don’t have an MSC,
+				Beq.s	@NoMSC								;	then just go on.
+				
+				Movea.l	mscBaseAddr(A6),A0					; Get the MSC base address.
+				Tst.b	disableLCD(A6)						; If we’ll be using the LCD screen,
+				Beq.s	@UseLCD1							; 	then just go on.
+				Bclr	#MSCLCDReset,MSCClkCntl(A0)			; Otherwise, turn off CSC clock input.
+				Bra.s	@Dont								; And keep the CSC interrupts off.
+
+@UseLCD1		Move.b	#(1<<ifIRQ)|(1<<RvIRQ0En),MSCSlotIER(A0) ; Allow CSC interrupts to occur.
+@Dont
+
+@NoMSC			Moveq	#screenOn-256,D0					; Assume we’ll be using the LCD.
+				Tst.b	disableLCD(A6)						; If we are, then
+				Beq.s	@UseLCD2							;	just go on.
+				Moveq	#screenOff,D0						; Otherwise, say that we’re shutting it down.
+@UseLCD2
+				Move.b	D0,-(Sp)							; Put the on/off switch into the buffer.
+				Move.l	Sp,-(Sp)							; pmRBuffer
+				Move.l	(Sp),-(Sp)							; pmSBuffer
+				Move.w	#1,-(Sp)							; pmLength = 1
+				Move.w	#power1Cntl,-(Sp)					; pmCommand
+				Movea.l	Sp,A0								; Point to the param block.
+				_PMgrOp										; Turn the LCD screen on/off.
+				Lea		pmCommandRec.pmRBuffer+4+2(Sp),Sp	; Toss the param block.
+
+; Clean up and go home.
+;
+				Move.l	vidParamsPtr(A6),D0					; If the vidParamsPtr is nil,
+				Beq.s	@CSCDone							;	then just leave.
+				
+				Movea.l	D0,A0								; Dispose of the vidParams pointer.
+				_DisposPtr
+				
+@CSCDone		
+				Unlk	A6									; De-allocate local stack frame.
+				Rts											; Return to caller.
+				
+				Endwith
+
+;---------------------------------------------------------------------
+;	Data
+;---------------------------------------------------------------------
+
+				Align	4
+
+; The CSCSpIDTbl is a list of all the board sRsrcIDs supported in the CSC
+;	sRsrc directory.  It is used to prune all the unnecessary board sRsrcs.
+;
+; The CSCModeList is used to prune the various functional sRsrcs.
+;
+
+CSCSpIDTbl	Dc.w	EndCSCSpIDTbl-BeginCSCSpIDTbl-1
+BeginCSCSpIDTbl
+				Dc.b	sRsrc_BdEscher
+				Dc.b	sRsrc_BdBlackBird
+				Dc.b	sRsrc_BdYeager
+				Dc.b	0
+EndCSCSpIDTbl
+
+				Align	4
+
+CSCModeList		Dc.w	EndCSCML-BeginCSCML-2
+BeginCSCML
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_399,sRsrc_Vid_CSC_C_S_TFT_480		; Escher
+				Dc.b	sRsrc_Vid_CSC_G_D_STN_400
+				Dc.b	sRsrc_Vid_CSC_G_S_TFT_400
+
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_399a,sRsrc_Vid_CSC_C_S_TFT_480a	; Blackbird
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_399b,sRsrc_Vid_CSC_C_S_TFT_480b
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_399c,sRsrc_Vid_CSC_C_S_TFT_480c
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_399d,sRsrc_Vid_CSC_C_S_TFT_480d
+				Dc.b	sRsrc_Vid_CSC_C_D_STN_480
+				Dc.b	sRsrc_Vid_CSC_G_D_STN_480
+				Dc.b	sRsrc_Vid_CSC_G_S_TFT_480
+				
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_399y,sRsrc_Vid_CSC_C_S_TFT_480y	; Yeager
+				Dc.b	sRsrc_Vid_CSC_G_D_STN_400y
+				Dc.b	sRsrc_Vid_CSC_G_S_TFT_400y
+				
+				Dc.b	0														; Pad for word-alignment.
+EndCSCML
+
+				Align	4
+	
+; In order to support family modes, we list all the members of each
+;	family in a table.  These tables are below.
+; 
+
+C_S_TFT_480_L	Dc.w	EndC_S_TFT_480-BeginC_S_TFT_480-1
+BeginC_S_TFT_480
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_480,sRsrc_Vid_CSC_C_S_TFT_399
+EndC_S_TFT_480
+
+C_S_TFT_480_AL	Dc.w	EndC_S_TFT_480a-BeginC_S_TFT_480a-1
+BeginC_S_TFT_480a
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_480a,sRsrc_Vid_CSC_C_S_TFT_399a
+EndC_S_TFT_480a
+
+C_S_TFT_480_BL	Dc.w	EndC_S_TFT_480b-BeginC_S_TFT_480b-1
+BeginC_S_TFT_480b
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_480b,sRsrc_Vid_CSC_C_S_TFT_399b
+EndC_S_TFT_480b
+
+C_S_TFT_480_CL	Dc.w	EndC_S_TFT_480c-BeginC_S_TFT_480c-1
+BeginC_S_TFT_480c
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_480c,sRsrc_Vid_CSC_C_S_TFT_399c
+EndC_S_TFT_480c
+
+C_S_TFT_480_DL	Dc.w	EndC_S_TFT_480d-BeginC_S_TFT_480d-1
+BeginC_S_TFT_480d
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_480d,sRsrc_Vid_CSC_C_S_TFT_399d
+EndC_S_TFT_480d
+
+				Align	4
+				
+; The CSCProdTable is an array of configuration parameters indexed by
+;	bthe board sRsrc ID.  This allows us to distinguish between the various
+;	CSC-based CPUs by product.  At the moment, there are only Eschers
+;	and Blackbirds, and both of their tables are the same for now.
+;
+
+CSCProdTable
+;						Mem,Refresh,VRAM,<pad>
+;						-----------------
+				Dc.b	$02,$02,$00,0								; Escher Configuration.
+				Dc.b	$02,$02,$05,0								; Blackbird.
+				Dc.b	$02,$02,$02,0								; Yeager.
+				
+				Align	4
+				
+; The CSCConfigTable is an array of configuration parameters indexed
+;	by panel ID.  Within each set of panel parameters is a set of parameters
+;	that are indexed by the amount of VRAM available.  These parameters
+;	are used in setting up the intial values of the Palette and selecting
+;	the right functional sRsrc per panel per VRAM configuration.
+;
+
+				With	CSCCnfgRec
+
+CSCConfigTable
+
+C_S_TFT_480_Tbl	Dc.b	$00,$FF,$00,$FF,$00,$FF,0,0					; Mini-gamma table.			[Color, TFT, Single-Drive, 640x480, Sharp]
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_480,FourthVidMode		; 512K VRAM prefs.
+				Dc.b	boxPowerBookDuo270c,0								; BoxFlag.
+				Dc.w	C_S_TFT_480_L-C_S_TFT_480_Tbl				; Offset to family modes.
+
+				Dcb.b	CSCCnfgRecSize,sRsrc_CSC_NeverMatch			; ID=1						[Unused]
+				Dcb.b	CSCCnfgRecSize,sRsrc_CSC_NeverMatch			; ID=2						[Unused]
+				Dcb.b	CSCCnfgRecSize,sRsrc_CSC_NeverMatch			; ID=3						[Unused]
+				
+G_S_TFT_400_Tbl	Dc.b	$00,$FF,$00,$00,$00,$00,0,0					; Mini-gamma table.			[Gray, TFT, Single-Drive, 640x400, Hosiden]
+				Dc.b	sRsrc_Vid_CSC_G_S_TFT_400,ThirdVidMode		; 512K VRAM prefs.
+				Dc.b	boxPowerBookDuo270c,0								; BoxFlag.
+				Dc.w	0											; No family modes.
+				
+				Dcb.b	CSCCnfgRecSize,sRsrc_CSC_NeverMatch			; ID=5						[Unused]
+
+G_D_STN_400_Tbl	Dc.b	$00,$FF,$00,$00,$00,$00,0,0					; Mini-gamma table.			[Gray, STN, Dual-Drive, 640x400, Sharp]
+				Dc.b	sRsrc_Vid_CSC_G_D_STN_400,SecondVidMode		; 512K VRAM prefs.
+				Dc.b	boxPowerBookDuo270c,0								; BoxFlag.
+				Dc.w	0											; No family modes.
+				
+				Dcb.b	CSCCnfgRecSize,sRsrc_CSC_NeverMatch			; ID=7, No-Connect.			[No Panel Connected]
+
+;---------------------------------------------------------------------
+
+C_S_TFT_480_A	Dc.b	$00,$FF,$00,$FF,$00,$FF,0,0					; Mini-gamma table.			[Color, TFT, Single-Drive, 640x480, Sharp]
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_480a,FourthVidMode	; 512K VRAM prefs.
+				Dc.b	boxBlackbird,0								; BoxFlag.
+				Dc.w	C_S_TFT_480_AL-C_S_TFT_480_A				; Offset to family modes.
+
+C_D_STN_480		Dc.b	$00,$FF,$00,$FF,$00,$FF,0,0					; Mini-gamma table.			[Color, STN, Dual-Drive, 640x480, Sharp]
+				Dc.b	sRsrc_Vid_CSC_C_D_STN_480,FourthVidMode		; 512K VRAM prefs.
+				Dc.b	boxBlackbird,0								; BoxFlag.
+				Dc.w	0											; No family modes.
+				
+C_S_TFT_480_B	Dc.b	$00,$FF,$00,$FF,$00,$FF,0,0					; Mini-gamma table.			[Color, TFT, Single-Drive, 640x480, NEC]
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_480b,FourthVidMode	; 512K VRAM prefs.
+				Dc.b	boxBlackbird,0								; BoxFlag.
+				Dc.w	C_S_TFT_480_BL-C_S_TFT_480_B				; Offset to family modes.
+
+C_S_TFT_480_C	Dc.b	$00,$FF,$00,$FF,$00,$FF,0,0					; Mini-gamma table.			[Color, TFT, Single-Drive, 640x480, Hosiden]
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_480c,FourthVidMode	; 512K VRAM prefs.
+				Dc.b	boxBlackbird,0								; BoxFlag.
+				Dc.w	C_S_TFT_480_CL-C_S_TFT_480_C				; Offset to family modes.
+				
+C_S_TFT_480_D	Dc.b	$00,$FF,$00,$FF,$00,$FF,0,0					; Mini-gamma table.			[Color, TFT, Single-Drive, 640x480, Toshiba]
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_480d,FourthVidMode	; 512K VRAM prefs.
+				Dc.b	boxBlackbird,0								; BoxFlag.
+				Dc.w	C_S_TFT_480_DL-C_S_TFT_480_D				; Offset to family modes.
+				
+G_D_STN_480_Tbl	Dc.b	$00,$FF,$00,$00,$00,$00,0,0					; Mini-gamma table.			[Gray, STN, Dual-Drive, 640x480, Sharp]
+				Dc.b	sRsrc_Vid_CSC_G_D_STN_480,SecondVidMode		; 512K VRAM prefs.
+				Dc.b	boxBlackbird,0								; BoxFlag.
+				Dc.w	0											; No family modes.
+				
+G_S_TFT_480_Tbl	Dc.b	$00,$FF,$00,$00,$00,$00,0,0					; Mini-gamma table.			[Gray, TFT, Single-Drive, 640x480, Hosiden]
+				Dc.b	sRsrc_Vid_CSC_G_S_TFT_480,FourthVidMode		; 512K VRAM prefs.
+				Dc.b	boxBlackbird,0								; BoxFlag.
+				Dc.w	0											; No family modes.
+				
+				Dcb.b	CSCCnfgRecSize,sRsrc_CSC_NeverMatch			; ID=7, No-Connect.			[No Panel Connected]
+				
+;---------------------------------------------------------------------
+
+C_S_TFT_480_Y	Dc.b	$00,$FF,$00,$FF,$00,$FF,0,0					; Mini-gamma table.			[Color, TFT, Single-Drive, 640x480, Sharp]
+				Dc.b	sRsrc_Vid_CSC_C_S_TFT_480,FourthVidMode		; 512K VRAM prefs.
+				Dc.b	boxYeagerC,0								; BoxFlag.
+				Dc.w	C_S_TFT_480_L-C_S_TFT_480_Y					; Offset to family modes.
+
+				Dcb.b	CSCCnfgRecSize,sRsrc_CSC_NeverMatch			; ID=1						[Unused]
+				Dcb.b	CSCCnfgRecSize,sRsrc_CSC_NeverMatch			; ID=2						[Unused]
+				Dcb.b	CSCCnfgRecSize,sRsrc_CSC_NeverMatch			; ID=3						[Unused]
+				
+G_S_TFT_400_Y	Dc.b	$00,$FF,$00,$00,$00,$00,0,0					; Mini-gamma table.			[Gray, TFT, Single-Drive, 640x400, Hosiden-Yeager]
+				Dc.b	sRsrc_Vid_CSC_G_S_TFT_400y,ThirdVidMode		; 512K VRAM prefs.
+				Dc.b	boxYeagerG,0								; BoxFlag.
+				Dc.w	0											; No family modes.
+				
+				Dcb.b	CSCCnfgRecSize,sRsrc_CSC_NeverMatch			; ID=5						[Unused]
+
+G_D_STN_400_Y	Dc.b	$00,$FF,$00,$00,$00,$00,0,0					; Mini-gamma table.			[Gray, STN, Dual-Drive, 640x400, Sharp-Yeager]
+				Dc.b	sRsrc_Vid_CSC_G_D_STN_400y,SecondVidMode	; 512K VRAM prefs.
+				Dc.b	boxYeagerFSTN,0								; BoxFlag.					<H45>
+				Dc.w	0											; No family modes.
+				
+				Dcb.b	CSCCnfgRecSize,sRsrc_CSC_NeverMatch			; ID=7, No-Connect.			[No Panel Connected]
+				
+				Endwith
+				
+				End

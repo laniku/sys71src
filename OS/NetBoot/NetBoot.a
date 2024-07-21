@@ -1,0 +1,239 @@
+;__________________________________________________________________________________________________
+;
+;	File:		netBoot.a
+;
+;	Contains:	This is the driver that is pointed to (refnum) by the drive queue element
+;				installed at _NetBootInit time. It will be called (Read) to read in the
+;				first two blocks of the disk (the "boot blocks");
+;
+;				The idea is that we find an, or the, preffered boot protocol and open its
+;				boot driver. We then issue a getBootImage control call to it. If these
+;				are successful we go on to execute the boot image, replacing ourselves
+;				with the driver that it returns.
+;
+;				We accept:
+;					read	- the os initial read for the blocks
+;					control	- an "eject" call
+;					open,
+;					close	- our init and ending routines
+;
+;	Written by:	Patrick Dyson
+;
+;	Copyright © 1989-1990, 1992 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 11/5/92	SWC		Changed INCLUDEs to a LOAD of StandardEqu.d.
+;		 <7>	 2/20/90	PWD		Fixed dynamic heap sizing to re-init the         app heap and
+;									update applzone and thezone         appropriately.
+;		 <6>	  2/1/90	PWD		Fixed dynamic heap sizing to re-init the app heap and update
+;									applzone and thezone appropriately
+;		 <5>	  1/2/90	PWD		Adding back in support for an eject control call.
+;		 <4>	12/28/89	SWC		Fixed header and set tabs to 4.
+;		 <3>	12/19/89	PWD		Adding to bbs
+;	   <1.1>	12/12/89	PWD		Added support for self-authenticating images
+;	   <1.0>	10/30/89	PWD		Adding to EASE
+;__________________________________________________________________________________________________
+
+;Include files
+
+			PRINT	OFF
+			LOAD	'StandardEqu.d'
+			INCLUDE	'AppleTalk.a'					; AppleTalk equates
+			INCLUDE	'NetBootEqu.a'					; Net Boot equates
+			PRINT	ON
+
+
+NBSubVersion EQU	2								; our sub version number
+
+;_________________________________________________
+
+netBOOT		PROC	EXPORT
+
+			IMPORT	findNOpenDriver					; our open guts
+			IMPORT	DoClose							; our close guts
+			IMPORT	DoRead							; our read guts
+			IMPORT	DoOpen
+			STRING	PASCAL
+			MACHINE	MC68000
+
+; *****************************************
+; *                                       *
+; *       Start of Boot driver            *
+; *                                       *
+; *****************************************
+
+;
+;	Driver header
+;
+			DC.W	$4000+$0400+$0100				; control,locked,read
+			DC.W	0,0								; No time, no events
+			DC.W	0								; No menu
+
+;
+;	Entry points offset table
+;
+			DC.W	NBOpen-netBOOT					; open offset
+			DC.W	NBRead-netBOOT					; prime (read,write)
+			DC.W	NBControl-netBOOT				; control (eject only ?)
+			DC.W	NBAnRTS-netBOOT					; status
+			DC.W	NBClose-netBOOT					; close
+
+			DC.W	'.netBOOT'						; Driver name
+
+			DC.B	NBSubVersion					; Sub version number
+			DC.B	0								; No main version number
+
+
+;________________________________________________________________________
+;
+; Open - initialize the BOOT driver
+;
+;	Called:
+;			D0 = 0
+;			A0 -> queue element
+;			A1 -> DCE
+;
+;	Usage:
+;			D1 = pointer to our globals
+;			A2 = queue element
+;________________________________________________________________________
+NBOpen
+			MOVE.L	A1,-(SP)						; save DCE
+			MOVE.L	dCtlStorage(A1), D1				; get our globals
+			BNE.S	Xit								; punt if already opened
+			MOVE.L	A0,A2							; save queue element
+		
+		IF	&ForRAM		THEN
+			LEA		netBOOT, A0						; pick up our pointer
+			_RecoverHandle	,SYS					; make it a handle
+			move.l	a0,-(SP)
+			_DetachResource
+		ENDIF
+			MOVE.L	#dGlobalsSize, D0				; size of globals
+			_NewPtr	,SYS,CLEAR						; get it
+			BNE.S	ErrXit
+			MOVE.L	A0,D1							; put it where we want it
+			move.l	(SP), a1						; restore a1
+			MOVE.L	A0,dCtlStorage(A1)				; and where we can get it later
+
+			MOVEQ.L	#0,D0
+			MOVE	ioRefNum(A2),D0
+			MOVE.L	A0, -(SP)						; push the globals
+			MOVE.L	D0,-(SP)						; and our refnum
+			JSR		DoOpen							; call the C glue
+			ADDQ.L	#8,SP							; clean up stack
+
+;
+; We have now installed an entry in the drive queue, and pointed its refNum at
+; this driver. The read routine will be the next called, for the boot blocks.
+;
+Xit			MOVEQ	#0,D0							; Indicate no error
+			ADDQ.L	#4,SP							; pop saved DCE
+			RTS										; And return
+ErrXit		MOVE.L	(SP)+, A1						; pop saved DCE
+			MOVE.L	dCtlStorage(A1),D1
+			BEQ.S	@1
+			MOVE.L	D1,A0
+			_DisposPtr								; indicate we didn't open right
+
+@1			MOVE.W	#openErr,D0
+			RTS
+
+			RTS
+			EJECT
+;________________________________________________________________________
+;
+; Close - close the BOOT driver.
+;
+;	We need to clean up the boot protocol driver, if it is open, and
+;	remove the drive queue entry, deallocate our globals, and return
+;
+;	A1 -> DCE
+;________________________________________________________________________
+
+NBClose		MOVE.L	dCtlStorage(A1),D1				; get our storage
+			BEQ.S	NBAnRTS							; punt if already closed ??
+			MOVE.L	A1, -(SP)						; save across call
+			MOVE	dCtlRefNum(A1),D0				; D0 clear from above
+			MOVE.L	D0, -(SP)						; push the refnum (long in C)
+			MOVE.L	D1, -(SP)						; push our globals
+			JSR		DoClose							;
+			ADDQ.L	#8, SP							; clean up after C
+			MOVE.L	(SP)+, A1						; restore
+			CLR.L	dCtlStorage(A1)					; make sure this doesn't get called again
+			TST.L	D0								; check for error
+			BEQ.S	OkExit							; go home
+			MOVE.L	#closErr, D0					; whoops, make the error known
+OkExit												;
+NBAnRTS		RTS										; And return
+
+;________________________________________________________________________
+;
+; NBControl - close the BOOT driver.
+;
+;	We need to clean up the boot protocol driver, if it is open, and
+;	remove the drive queue entry, deallocate our globals, and return
+;
+;	A1 -> DCE
+;________________________________________________________________________
+
+NBControl
+			MOVE.W	#offLinErr, D0					; we don't eject
+			BRA.S	GoHome							; return via jIODone
+
+;________________________________________________________________________
+;
+; Read - get the boot image (Actually a prime call)
+;
+; This routine clears the queued param block and the driver active bit before
+; it actually completes to allow the called routines to make control calls on
+; us.
+;
+;	A0 -> queue element
+;	A1 -> DCE
+;________________________________________________________________________
+
+; equates for the boot image directory
+;
+; moved to BootEqu.a
+			CASE	OBJ
+NBRead
+			IMPORT	myGrowZone						; from BootUtils.a
+
+controlBit	EQU		3								; Bit for control key down
+controlByte	EQU		7								; Byte for control keys
+
+			BTST	#controlBit,KeyMap+controlByte	; Control key skips boot
+			BEQ		NBDontSkip						; Branch if not down
+
+			MOVE.W	#offLinErr, D0					; try again later (sadistic)
+			BRA		GoHome
+NBDontSkip
+
+			MOVE.L	dCtlStorage(A1), D1				; pick up our globals
+			BEQ.S	GoHome							; punt if null
+
+			MOVEM.L	A0-A1, -(SP)					; save DCE, IOPB accross call
+
+			MOVE.L	SysZone, A1						; pick up system heap pointer
+			move.l	a1,TheZone						; <PWD 5>set default to system heap
+
+			MOVE.L	gzProc(A1), -(SP)				; save old grow zone
+			LEA		myGrowZone, A2					; pick up my grow zone proc
+			MOVE.L	A2, gzProc(A1)					; tell the memory manager
+
+			MOVE.L	A0, -(SP)						; set up for doread, below
+			MOVE.L	D1, -(SP)
+			JSR		DoRead							; go do it
+			ADD.L	#8, SP							; clean up stack
+
+			MOVE.L	SysZone, A0						; pick up system heap pointer
+			MOVE.L	(SP)+,gzProc(A0)				; restore old grow zone
+
+NBRestore	MOVEM.L	(SP)+, A0-A1					; restore A0, A1
+GoHome		MOVE.W	D0,IOResult(A0)					; show that call done
+			MOVE.L	JIODone,A3						; This is how we exit (Prime, Control, Status)
+			JMP		(A3)
+
+			END

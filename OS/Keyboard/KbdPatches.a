@@ -1,0 +1,153 @@
+;__________________________________________________________________________________________________
+;
+;	File:		KbdPatches.a
+;
+;	Contains:	Linked Patches for ADB keyboards.
+;
+;	Written by:	Sam Barone
+;
+;	Copyright:	© 1991, 1993 by Apple Computer, Inc., All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 11/9/93	KW		added some eieioSTP macros.  Only expands for CygnusX1 ROM
+;		 <3>	10/28/91	SAM/KSM	Rolled in Regatta file.
+;		
+;	Regatta Change History:
+;
+;		 <4>	 9/11/91	SAM		We now check for the existence of a Keyswitch and if its is off
+;									then putter patch is not executed (because in secure mode, ADB
+;									calls made asychronously will not get their completion routines
+;									called, ever.  This is bad.)
+;		 <3>	 7/17/91	SAM		Making the PutterKbd fix not run under A/UX.
+;		 <2>	  6/30/91	SAM		Moved to its own file.  Boot time linked patch that sends
+;									Talk R3 commands to the connected keyboard to wake up a “Putter” 
+;									ISO keyboard if it is there & asleep.
+;		 <1>	  6/30/91	SAM		First checked in..
+;
+;	To Do:
+;__________________________________________________________________________________________________
+
+				LOAD 		'StandardEqu.d'
+				INCLUDE 	'LinkedPatchMacros.a'
+				INCLUDE		'HardwarePrivateEqu.a'
+				INCLUDE		'UniversalEqu.a'
+
+
+
+;______________________________________________________________________________________________________
+;	ADB Putter Keyboard Fix:
+;	A bit of history:	This INIT fixes a bug in the Elmer keyboard.  On powerup, Elmer does not 
+;	scan for keys in it's idle loop, and when it's not scanning it may fail to recognize 
+;	the ATTN pulse on commands.  Scanning is only enabled after it recognizes a command
+;	addressed to it.  On Mac powerup, when the ADB bus is initialized, the Mac will send one 
+;	talk R3 to each ADB address, looking for devices on the bus.  If Elmer missed it's talk, it
+;	will never enable key scanning (though it seems to interpret mouse data (rarely)
+;	as a talk to it), so the keyboard won't work.
+;
+;	The INIT attempts to fix the problem in the following way:  it first checks to see if
+;	a keyboard was actually present at boot time, and if so, the INIT just exits.  
+;	If a keyboard was not found, it will issue up to 8 talk R3 commands to the keyboard,
+;	checking for a response.  If no response after 8 tries, the INIT just exits.  If one of
+;	the talk commands returned with a response, it will then call ADBReInit to fix up the 
+;	ADB device list.
+;
+; Modification History:
+;	gmr-90oct07		New today.
+;______________________________________________________________________________________________________
+
+
+tryCount	EQU		8					; issue up to 8 talks to addr 2 to enable kbd scanning (kbd bug fix)
+hasDev		EQU		332					; offset into ADB vars (ADB devices found bit mask)
+
+;______________________________________________________________________
+;	Stack frame equates for this patch
+
+
+aGlobPtr	EQU		-4
+aCompRtn	EQU		aGlobPtr-4
+aBufPtr		EQU		aCompRtn-4			; used for ADBOp call
+sFrame		EQU		aBufPtr
+
+;______________________________________________________________________
+PutterFix	InstallProc	(SE,II,IIci,notAUX)	; Run this on all machines with ADB without built-in keyboards (if the
+											; machine has a built-in keyboard Putter will wake up by itself)
+											; Dont load under A/UX because we cannot make ADBOp calls and the
+											; boot system should have awakened the kbd anyway.				<1><3>
+
+			move.l	ROMBase,A0			; Get base of ROM													<4>
+			cmpi.w	#$067C,8(A0)		; Do we have universal flags? (this should be more a more general check...)
+			bne.s	@doThePatch			; -> No universal, no Keyswitch, run the patch						<4>
+			
+			move.l	#KeyswMask,d0		; get isolation mask ready											<4>
+			and.l	UnivROMFlags,d0		; grab keyswitch bits in UnivROMFlags								<4>
+			sub.l	#KeyswCaboose,d0	; Do we have a Keyswitch?											<4>
+			bne.s	@doThePatch			; -> No, run the patch.												<4>
+			
+		eieioSTP
+			movea.l	VIA2RBV,a0					; Get the address of VIA2									<4>
+		eieioSTP
+			btst.b	#v2Keyswitch,VBufB(a0)		; Is the keyswitch SECUREd? (0 = secure)					<4>
+			beq.s	@Done						; -> Yes, do not run the patch.  Exit						<4>
+
+@doThePatch
+			link	a6, #sFrame			; Make a stack frame
+
+			move.l	ADBBase,a0			; get ptr to ADBBase
+			btst.b	#2,hasDev+1(a0)		; does a keyboard exist?
+			bne.s	@exit				; yes, don't do anything...
+			
+			moveq	#tryCount,d2		; else, send up to n talks to the keyboard 
+										; to enable it's keyboard scanning...(keyboard bug fix)
+@talkLoop	lea		aFlag,a0
+			clr.b	(a0)				; reset our 'done' flag
+			move.l	a0,aGlobPtr(a6)		; save ptr to aFlag
+
+			lea		ourComp,a0			; get address of our completion rtn
+			move.l	a0,aCompRtn(a6)		; stuff it in param block
+
+			lea		aBuffer,a0			; get ptr to our data buffer
+			move.l	a0,aBufPtr(a6)		; save in param block
+
+			lea		aBufPtr(a6),a0
+			moveq	#%00101111,d0		; talk Addr 2, Reg 3
+			_ADBOp						; issue it
+
+			lea		aFlag,a0
+@wait		tst.b	(a0)				; finished?
+			beq.s	@wait				; no, wait for the ADB command to complete
+
+			dbpl	d2,@talkLoop		; yes, retry until count expires or it responds...
+			bmi.s	@exit				; didn't respond after n trys, just exit
+			
+; the keyboard talked... now ReInit the bus...
+
+			_ADBReInit					; yes, it responded, reinit the bus (should work now)
+
+@exit		unlk	a6
+@Done		rts
+
+
+
+;______________________________________________________________________
+; This is our Talk completion routine.
+;
+;	Inputs:	D0	-	command number
+;			a0	-	ptr to talk data (len,d0..d7)
+;			a1	-	ptr to this rtn
+;			a2	-	ptr to data area (the aFlag byte)
+;______________________________________________________________________
+ourComp		move.b	(a0),(a2)			; copy byte count to our 'done' flag
+			bne.s	@exit				; if it responded, exit   (#$02)
+			st.b	(a2)				; else, return bad result (#$FF)
+@exit		rts
+
+;______________________________________________________________________
+;	here are some temp globals for this patch...
+
+aBuffer		ds.b	10					; talk buffer
+aFlag		ds.w	1					; async flag
+
+
+			ENDPROC
+			END.

@@ -1,0 +1,571 @@
+;
+;	File:		SCSIPriv.a
+;
+;	Contains:	SCSI Mgr-specific variable and constant definitions
+;
+;	Written by:	Jerry Katzung
+;
+;	Copyright:	© 1989-1992 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM7>	11/20/92	SWC		Rolled in changes from Horror.
+;		<H4>	 6/10/92	BG		Added global sdmStack for DB Lite SCSI Disk Mode. Added global
+;									for DREQ bit position within DREQ access location. Added tail
+;									bytes to SCSIGlobals for expansion and updated file from Reality
+;									SCSIPriv.a .
+;		<H3>	 2/28/92	SWC		Removed temporary DBLite equates.
+;		<H2>	 2/10/92	SWC		jab/Added base address storage for external c80 in DB Lite.
+;	   <SM6>	 7/28/92	PW		Added Cousin Itt stuff: xptGlobals (ptr) and RecorderPtr (for
+;									debugging).
+;	   <SM5>	 7/7/92		CSS		Updated from Reality:
+;									<17> 5/22/92 DTY	#1029009 <jab>: Added global for DREQ bit position within DREQ
+;														access location.
+;	   <SM4>	 5/17/92	kc		Remove conditionals.
+;	   <SM3>	  5/1/92	JSM		Roll-in changes from Reality:
+;									<16>	  5/1/92	JSM		We need to define Max020030BusErrs because it's sometimes wrong
+;																to use MaxBusErr since CPU is set to 00 for System builds.
+;									<15>	  4/7/92	pvh		Fill in vectors jvUnused10-jvUnused 16 for the SCSI Manager
+;																(these are what were added to HORROR's SCSIPriv.a) Per James
+;																Blair.
+;	   <SM2>	  3/3/92	kc		Add TransactionFlag, and FreeHookPending to SCSIGlobals.
+;		<14>	12/26/91	RB		Include PowerPrivEqu.a for Power Manager definitions.
+;		<13>	12/21/91	RB		Need to add definition for scsiNewSCSIMax for the ROM to build.
+;		<12>	11/25/91	DTY		Added bit flags for transaction table.
+;		<11>	10/28/91	SAM/KSM	Rolled in Regatta file.
+;										(pdw) Added all of the lo-mem SCSI Globals that were defined in
+;										the TERROR version of this file. Also added several others that
+;										are unique to the Regatta version of the c96 SCSIMgr.
+;		<10>	 8/22/91	JSM		Clean up header.
+;		 <9>	 6/12/91	LN		added #include 'InternalOnlyEqu.a'
+;		 <8>	 1/30/91	gbm		sab, #38: Change the ‘already including this file’ variable to
+;									all uppercase (for security reasons)
+;		 <7>	12/14/90	dnf		Add dispatch selector and macro for _SCSIBusy
+;		 <6>	 9/14/90	MSH		Added to conditional list that extends the local storage to
+;									accomodate spinning down the hard disk.
+;		 <4>	 2/21/90	CCH		Removed Max040BusErrs from conditional.
+;		 <3>	 2/20/90	BG		Added 040 BusErr retry constant.
+;		 <2>	 1/18/90	JWK		Needed for Zone5 - Added equates for SCSIStat fix and new
+;									watchdog timeout value.
+;	   <1.4>	12/10/89	jwk		NEEDED FOR F19 - Additional locals to DMA in old SCSI Mgr
+;	   <1.3>	 9/11/89	jwk		NEEDED FOR F19 - Added Bus Dev Rst, support for SE and Plus
+;	   <1.2>	 7/15/89	jwk		NEEDED FOR AURORA - Minor changes for intr handling
+;	   <1.1>	 6/29/89	jwk		NEEDED FOR AURORA - Added equates to help with System patch
+;									builds
+;	   <1.0>	 6/13/89	jwk		Reorganizing SCSI sources to be Universal-ROM friendly
+;
+
+	IF &TYPE('__INCLUDINGSCSIPRIV__') = 'UNDEFINED' THEN
+__INCLUDINGSCSIPRIV__	SET	1
+
+;	This is the SCSIPriv.a file
+;																							<start>
+
+			BLANKS		ON
+			STRING		ASIS
+
+			INCLUDE 'InternalOnlyEqu.a'
+			INCLUDE	'PowerPrivEqu.a'		; <14> rb
+
+	IF	Cpu ≥ 020	THEN
+			MACHINE		MC68020				; for '020 instructions	<C846>
+	ENDIF
+
+scsiNewSCSIMax	EQU		2					; <13> rb, maximum selector supported in motherboard
+
+	;
+	; Stack frame definitions (frame allocated in StdEntry)
+	;
+
+OldBusErrVct	EQU		-4					; long	<C789>
+BusErrCount		EQU		-6					; word	<C846>
+LocalSize		EQU		-6					; total	<C789>
+
+		IF	Cpu ≥ 020	THEN
+MaxBusErr		EQU		5
+		ELSE
+MaxBusErr		EQU		2
+		ENDIF
+
+Max020030BusErrs	EQU		5				; same as MaxBusErr when Cpu ≥ 020				<16> 
+Max040BusErrs	EQU		1					; only once because of Instruction Restart		<3><4>
+
+	;
+	; Additional stack frame definitions for SCSI DMA chip support in the old SCSI Mgr		<v1.4>
+	;																						<start>
+AddLocalSize	EQU		20					; 5 longs
+vAddr			EQU		0					; virtual address
+vCount			EQU		4					; virtual buffer length
+pAddr			EQU		8					; physical address								<end>
+pCount			EQU		12					; physical buffer length						<v1.4>
+
+;=======================================================================================
+;	Private Old SCSI Manager Related Stuff
+
+scsiBusy	Equ		14				; SCSIBusy routine selector								<7> djw
+
+ 				macro				; check if SCSI mgr is busy or free						<7> djw
+  				_SCSIBusy
+  				move.w		#scsiBusy,-(sp)
+  				_SCSIDispatch
+  				endm
+
+;	Bit flags for transaction table
+
+fDoFreeHook		equ		0					; set = execute "jSCSIFreeHook"
+fSetTransFlag	equ		1					; set = set "TransactionFlag"
+fClearTransFlag	equ		2					; set = clear "TransactionFlag" unconditionally
+fClearTransErr	equ		3					; set = clear "TransactionFlag" if function error
+
+;
+;	Trap number for the new SCSI Manager trap
+;
+TrapNum			EQU		$A089				; _NewSCSI
+_NewSCSI		OPWORD	$A089				; the exciting, powerful, new SCSI Mgr traps
+;
+;	These are the private fields in the parameter block
+;
+scsiPrivPB		RECORD	0, INCREMENT
+scsiPrivLink	DS.L	1					; link to next SCSI Mgr private record
+scsiFlags		DS.B	1					; SCSI Mgr operation flag bits
+scsiState		DS.B	1					; SCSI Message Out state machine
+scsiFlag1		DS.B	1					; flag expansion
+scsiFlag2		DS.B	1					; flag expansion
+scsiTime		DS.L 	1					; timeout time
+scsiCmdOffs		DS.L	1					; value of command buffer ptr between interrupts
+scsiTempErr		DS.W	1					; current error message							<v1.2>
+scsiFiller		DS.W	1					; future expansion								<v1.2>
+scsiDCSaved		DS.L	1					; part of Saved Data Pointer
+scsiDCOffs		DS.L	1					; value of data pointer between interrupts
+scsiMoveOffs	DS.L	1					; partial "dcMove" count between interrupts
+scsiVAddr		DS.L	1					; virtual address for Logical/Physical translation
+scsiVCount		DS.L	1					; virtual count for Logical/Physical translation
+scsiPAddr		DS.L	1					; physical address from Logical/Physical translation
+scsiPCount		DS.L	1					; physical count from Logical/Physical translation
+scsiPrivPBSize	EQU		*-scsiPrivPB		; size of SCSI Mgr private storage (per active request)
+				ENDR
+;
+;	Version number of the SCSI Mgr
+;
+mgrVersion		EQU		1		; brand new SCSI Mgr 2
+;
+;	Valid ID and LUN values are from 0-7 inclusive.
+;
+LUNMask			EQU		7		; mask for valid logical unit numbers (0-7)
+;
+;	SCSI protocol equates
+;
+minSnsLen		EQU		4		; minimum sense buffer length
+allocLen		EQU		4		; offset to alloc length byte in auto Req Sense cmd
+;
+;	These bits are used to indicate information in the "state1" global variable
+;
+dtEnqueued		EQU		7		; Deferred Task already enqueued
+dataSem			EQU		3		; SCSI Mgr data structures inconsistent
+doingDMA		EQU		1		; SCSIDMA chip is DMAing (don't let SCSIStat touch it)		<2>
+waitingForIRQ	EQU		0		; waiting for an intr - DMA in progress,					<v1.3>
+								;						or waiting for Loss of BSY			<v1.3>
+;
+;	This constant is used to set up the watchdog timer to timeout after 250ms.
+;	This value was chosen as the timeout value since 250ms is much more lenient than
+;	the current 16us on the MacII-class machines.  It is equal to the Mac SE timeout,
+;	and is much greater than the effective 20us timeout of the Mac Plus.
+;	
+sc250msTicks	EQU		2500000	; 250ms * 10000 watchdog timer ticks/ms						<2>
+;
+;	interrupt level of the SCSI chip -- will be moved to HardwareEqu.a (???)
+;
+scsiIntMask		EQU		$0200	; on Rom32 machines
+;
+;	Currently the watchdog timer goes off every five seconds.
+;
+WDTO			EQU		5000	; watchdog timeout value in milliseconds (word)
+
+bDBP			EQU		0		; bit test for *DBP - add to xHardwareEqu.a
+
+								; Location of Mac Plus SCSIGlobals ptr 						<v1.1>
+SCSIDispVct		EQU		$000c54	; address of _SCSIDispatch vector in trap dispatch table
+SCSIPtr			EQU		-4		; offset from _SCSIDispatch code to SCSI Mgr globals ptr
+
+;
+;	Base addresses for the Mac Plus.  The Mac Plus doesn't actually have
+;	hardware-handshaking circuitry, but using the pseudo-DMA base address
+;	in place of the hhsk base address makes the data transfer code simpler.
+;
+plusSCSIBase	EQU		$580000	; read base address of Mac Plus SCSI chip					<v1.2>
+plusSCSIDMA		EQU		$580200	; pseudo-DMA read base address of Mac Plus SCSI chip		<v1.2>
+plusSCSIHsk		EQU		$580200	; fake "hardware-handshake" read base address				<v1.2>
+
+macPlusSCSIDB	EQU		$00db	; trial-and-error value for Mac Plus					<v1.2><v1.3>
+macSeSCSIDB		EQU		$00fc	; trial-and-error value for Mac SE						<v1.2><v1.3>
+
+OldTimeSCSIDB	EQU		$da6	; SCSI DBRA's per millisecond on all machines
+
+scsiOldSCSIErr	EQU	-1			; old SCSI Mgr called ClearState							<v1.2>
+
+;
+;	SCSI Mgr flags:
+;
+scsiFInUse		EQU		$01		; SCSI Mgr private storage record is in use
+scsiFAutoSns	EQU		$02		; parameter block for automatic Request Sense
+scsiFComp		EQU		$10		; Perform a read-compare (old requests only)
+scsiFStatus		EQU		$20		; Device has gone through Status phase
+scsiFPtyErr		EQU		$40		; a parity error has occurred
+scsiFTagged		EQU		$80		; request is in danger of timing out
+;	SCSI Mgr bits:
+scsiBInUse		EQU		0		; SCSI Mgr private storage record is in use
+scsiBAutoSns	EQU		1		; parameter block for automatic Request Sense
+scsiBComp		EQU		4		; Perform a read-compare (old requests only)
+scsiBStatus		EQU		5		; Device has gone through Status phase
+scsiBPtyErr		EQU		6		; a parity error has occurred
+scsiBTagged		EQU		7		; request is in danger of timing out
+;
+; 	Message Out state machine state variable values
+;
+scsiMOID		EQU		$00		; "ID" state  - normal Identify sequence
+scsiMOMR		EQU		$01		; "MR" state  - Message Reject sequence
+scsiMOInvalid	EQU		$02		; "Invalid" state - bad state machine sequence
+scsiMOKIO		EQU		$03		; "KIO" state - Kill I/O sequence
+scsiMONOP		EQU		$04		; "NOP" state - unexpected Message Out, send No Op's
+scsiMOBDR		EQU		$05		; "Bus Device Reset" state - send a BDR message		<v1.3>
+
+;
+;	Messages - used as an index into a jump table of message-handler routines
+;
+scsiCmdComplete		EQU	$00		; Command Complete
+scsiExtendedMsg		EQU	$01		; Extended Message
+scsiSaveDataPtr		EQU	$02		; Save Data Pointer
+scsiRestorePtrs		EQU	$03		; Restore Pointers
+scsiDisconnect		EQU	$04		; Disconnect
+scsiIDetectErr		EQU	$05		; Initiator Detected Error
+scsiAbort			EQU	$06		; Abort
+scsiMsgReject		EQU	$07		; Message Reject
+scsiNoOperation		EQU	$08		; No Operation
+scsiMsgParityErr	EQU	$09		; Message Parity Error
+scsiLnkCmdCpl		EQU	$0A		; Linked Command Complete
+scsiLnkCmdCplFlg	EQU	$0B		; Linked Command Complete (with flag)
+scsiBusDevReset		EQU	$0C		; Bus Device Reset
+scsiIdentFlg		EQU	$80		; Identify flag
+scsiIdentBit		EQU	7		; Identify bit
+scsiReselFlg		EQU	$40		; "Initiator supports Reselection" flag
+scsiReselBit		EQU	6		; "Initiator supports Reselection" bit
+scsiIdentifyIn		EQU	$0D		; vector number for Identify message (pseudo-message)
+scsiMsgRejectOut	EQU	$0E		; vector number for an invalid message (pseudo-message)
+
+;
+;	declaration of SCSI Manager globals
+;
+scsiGlobalRecord	RECORD	0, INCREMENT
+;
+;	SCSI Manager "G_State" flags
+;
+;sBusy			EQU 	1		; used for G_State field -- SCSI Mgr is busy (non-zero)
+;sFree			EQU		0		; used for G_State field -- SCSI Mgr is free
+scPending		EQU		7		; bit in G_State -- an old request is spinning in SCSIGet
+scBusy			EQU		0		; bit in G_State -- an old request is pending/in progress
+;
+;	old SCSI Manager globals
+;
+numVectors		EQU		24				; 24 4-byte jump table vectors
+numSCSIVect		EQU		numVectors		; number of SCSI Mgr vectors
+jmpTblSize		EQU		numVectors*4	; 24 4-byte jump table vectors
+G_JmpTbl						; 24 4-byte jump table vectors
+jvReset			DS.L	1		; SCSIReset vector
+jvGet			DS.L	1		; SCSIGet vector
+jvSelect		DS.L	1		; SCSISelect vector
+jvCmd			DS.L	1		; SCSICmd vector
+jvComplete		DS.L	1		; SCSIComplete vector
+jvRead			DS.L	1		; SCSIRead vector
+jvWrite			DS.L	1		; SCSIWrite vector
+jvInstall		DS.L	1		; SCSI installation vector (for debugging purposes)
+jvRBlind		DS.L	1		; SCSIRBlind vector
+jvWBlind		DS.L	1		; SCSIWBlind vector
+jvStat			DS.L	1		; SCSIStat vector
+jvSelAtn		DS.L	1		; SCSISelAtn vector
+jvSMsgIn		DS.L	1		; SCSIMsgIn vector
+jvSMsgOut		DS.L	1		; SCSIMsgOut vector
+;
+firstPrivate	DS.L	1		; ptr to SCSI Mgr private storage record circularly linked list
+nextPrivate		DS.L	1		; ptr to next available SCSI Mgr private storage record
+base5380		DS.L	1		; SCSI read base address
+pdma5380		DS.L	1		; SCSI pseudo-DMA read base addr
+hhsk5380		DS.L	1		; SCSI hardware-handshaked read base addr
+wrOffset		DS.W	1		; write offset relative to "base5380"
+scsiQHdr						; 10-byte OS queue header - SCSI request queue
+scsiQFlags		DS.W	1		; flags for SCSI request queue
+scsiQHead		DS.L	1		; ptr to head of SCSI request queue
+scsiQTail		DS.L	1		; ptr to tail of SCSI request queue
+activeReq		DS.L	1		; ptr to currently active SCSI request
+timeout			DS.L	1		; next timeout should occur at this time
+;
+G_ID			DS.B	1		; initiator's SCSI ID mask
+G_State			DS.B	1		; SCSI Mgr state (free/busy)
+G_Async			DS.W	1		; unused - $62
+;G_CompTicks					; when request finished (unpatched SE only) 			<v1.1>
+G_Reserved0		DS.L	1		; box number in high byte. HW flags in low bytes 		<v1.1>
+pageFault						; ptr to page fault SCSI PB								<v1.1>
+G_Reserved1		DS.L	1		; used for storing timer value							<?> pdw
+G_Reserved2		DS.L	1		; machine-specific storage								<v1.1>
+RecorderPtr		DS.L	1		; debugging event recorder pointer $70				<SM6> pdw
+;G_ExtPtr		DS.L	1		; unused (saved for future expansion)
+;
+;	extended SCSI manager globals
+;
+numExtVec		EQU		96		; 96 new vectors
+discLUN			DS.B	8		; bitmaps of disconnected LUN's by SCSI ID
+discID			DS.B	1		; bitmap of disconnected SCSI ID's
+state1			DS.B	1		; dTask enqueued, data structures inconsistent, DMA in progress
+state2			DS.B	1		; SCSI Mgr interface level
+state3			DS.B	1		; SCSI DMA ?
+busTO			DS.L	1		; byte-to-byte timing in microseconds
+phaseTable						; 8-entry jump table for phase handler routines
+jvDataOut		DS.L	1		; Data Out phase handler
+jvDataIn		DS.L	1		; Data In phase handler
+jvCommand		DS.L	1		; Command phase handler
+jvStatus		DS.L	1		; Status phase handler
+jvIllegal1		DS.L	1		; Illegal phase - reset the bus
+jvIllegal2		DS.L	1		; Illegal phase - reset the bus
+jvMsgOut		DS.L	1		; Message Out phase handler
+jvMsgIn			DS.L	1		; Message In phase handler
+dataTable						; 16-entry jump table for data-transfer routines
+jvVSR			DS.L	1		; virtual slow reads
+jvVSW			DS.L	1		; virtual slow writes
+jvVFR			DS.L	1		; virtual fast reads
+jvVFW			DS.L	1		; virtual fast writes
+jvUnused1		DS.L	1		; unused (illegal)
+jvUnused2		DS.L	1		; unused (illegal)
+jvPFR			DS.L	1		; physical fast reads	(DMA)
+jvPFW			DS.L	1		; physical fast writes	(DMA)
+jvVSRO			DS.L	1		; virtual slow reads
+jvVSWO			DS.L	1		; virtual slow writes
+jvVFRO			DS.L	1		; virtual fast reads	(hhsk)
+jvVFWO			DS.L	1		; virtual fast writes	(hhsk)
+jvCSO			DS.L	1		; virtual slow compare	("p" bit redefined to mean "compare")
+jvUnused3		DS.L	1		; unused
+jvCFO			DS.L	1		; virtual fast compare	("p" bit redefined to mean "compare")
+jvUnused4		DS.L	1		; unused
+scsiReadSlow	EQU		jvVSRO	- jvVSR		; offset to old slow read routine		<v1.2>
+scsiWriteSlow	EQU		jvVSWO	- jvVSR		; offset to old slow write routine		<v1.2>
+scsiReadFast	EQU		jvVFRO	- jvVSR		; offset to old slow read routine		<v1.2>
+scsiWriteFast	EQU		jvVFWO	- jvVSR		; offset to old slow write routine		<v1.2>
+scsiCompBit		EQU		scsiBPhysical		; bit to select old SCSI Mgr "scComp" operation
+;
+msgTable						; 32-entry jump table for different messages
+jvInvalidIn		DS.L	1		; Invalid Message In
+jvIdentifyIn	DS.L	1		; Identify Message In
+jvCmdComplete	DS.L	1		; Command Complete
+jvExtendedMsg	DS.L	1		; Extended Message
+jvSaveDataPtr	DS.L	1		; Save Data Pointer
+jvRestorePtrs	DS.L	1		; Restore Pointers
+jvDisconnect	DS.L	1		; Disconnect
+jvMsgRejIn		DS.L	1		; Message Reject In
+jvLCCF			DS.L	1		; Linked Command Complete with (or without) flag
+
+; Base addresses for dual c80 SCSI Bus
+sdmStack		DS.L	1		; SCSIDiskMode stack global for DB Lite 			<H5> jab
+base5380_1		DS.L	1		; SCSI read base address (internal) 				<H2>
+pdma5380_1		DS.L	1		; SCSI pseudo-DMA read base addr (internal)			<H2>
+hhsk5380_1		DS.L	1		; SCSI hardware-handshaked read base addr (internal)<H2>
+base5380_2		DS.L	1		; SCSI read base address (external)					<H2>
+pdma5380_2		DS.L	1		; SCSI pseudo-DMA read base addr (external)			<H2>
+hhsk5380_2		DS.L	1		; SCSI hardware-handshaked read base addr (external)<H2>
+
+jvIdentifyOut	DS.L	1		; Identify Message Out
+jvMsgRejOut		DS.L	1		; Message Reject Out
+jvInvalidOut	DS.L	1		; Invalid Message Out
+jvKillIO		DS.L	1		; Kill I/O
+jvNoOp			DS.L	1		; No Operation
+jvBusDevRstOut	DS.L	1		; Bus Device Reset Out								<v1.3>
+
+; SUPPORT FOR 5396 (13C bytes from the base)										<T3>
+;		(These used to be jvUnused23-30)											<T3>
+G_SCSIDREQ		DS.L	1		; SCSI DREQ base address							<T3><T4>
+G_TargetID		DS.L	1		; Target ID											<T3>
+G_FakeStat		DS.L	1		; Fake state										<T3>
+G_OldTrapAdrs	DS.L	1		; contains the old SCSIMgr address					<T3>
+G_OldIntHnd		DS.L	1		; contains old intrp level 2 handler				<T3>
+G_IntrpCount	DS.L	1		; counts total # of intrps							<T3>
+G_IntrpStat		DS.L	1		; Status read by Intrp routine						<T3>
+G_State96		DS.L	1		; Bits to make c96 backwards compatible				<T10> pdw
+
+BootCfgFlags	DS.L	1		; copy of d2 passed to InitHW_SCSI96 at boot (used by jvInitHW) <T10> pdw
+G_bitDREQ		DS.B	1		; Bit position at DREQ location						<17> jab
+jvUnused32		DS.B	1		; Future expansion 									<17> jab
+jvUnused33		DS.W	1		; Future expansion									<17> jab 
+;																							<?> from prev <?>
+jvIntHnd		DS.L	1		; 24-entry jump table -- interrupt handler
+jvMessage		DS.L	1		; Send a message to the deferred task
+jvClearIRQ		DS.L	1		; Clear the SCSI interrupt (and VIA, if necessary)
+jvDisEnable		DS.L	1		; Enable/disable interrupts routine
+jvLogError		DS.L	1		; Record error for the PB							<v1.2>
+jvSCSIDT		DS.L	1		; Deferred Task for all other interrupts
+jvFind			DS.L	1		; Find a request to process
+jvSetup			DS.L	1		; Setup active request
+jvPreflight		DS.L	1		; Preflight the parameter block
+jvEnDequeue		DS.L	1		; Enqueue/dequeue a parameter block
+jvArb			DS.L	1		; Arbitrate for the SCSI bus
+jvSel			DS.L	1		; Select a SCSI device
+jvDelay22		DS.L	1		; Delay 2.2 microseconds
+jvClearState	DS.L	1		; Remove the current request
+jvTransfer		DS.L	1		; Transfer data using the primitive routines
+jvSetTimer		DS.L	1		; Set the timer
+jvResetBus		DS.L	1		; Reset SCSI bus and kill all requests
+jvClearBus		DS.L	1		; Clear the SCSI bus
+jvBusErr		DS.L	1		; Bus error handler
+jvDataDMA		DS.L	1		; DMA-related data-chaining interpreter				<v1.2>
+xptGlobals		DS.L	1		; pointer to Cousin Itt's XPT globals $1b4			<SM6> pdw
+;																							<?> thru next <?> 
+; More Space for the new SCSI96 Manager(1B8 bytes from the base)							<T3>
+;		(these used to be jvUnused 47-53)													<T3>
+blindBusTO		DS.L	1		; number of ticks to wait for blind transfer bytes (after 1st byte)
+transferType	DS.W	1		; Type of data transfer to perform (used in Transfer_96, BusError)
+lastINTread		DS.B	1		; Value of rINT at last valid interrupt read
+lastSTAread		DS.B	1		; Value of rSTA at last valid interrupt read
+yeOldeBusErrVct	DS.L	1		; temp storage while we insert our buserr handler 	<T10> pdw
+base539x0		DS.L	1		; SCSI  539x base address, bus0								<T3><T4>
+base539x1		DS.L	1		; SCSI  539x base address, bus1								<T3><T4>
+G_SCSIDevMap0	DS.L	1		; SCSI Device Map for the Internal SCSI Bus					<T3>
+G_SCSIDevMap1	DS.L	1		; SCSI Device Map for the External SCSI Bus					<T3>
+
+jvErr			DS.L	1			; SCSI96 Error, used to be jUnused 54			<T6>											<T6>
+jvEscLoop		DS.L	1			; SCSI Escape Loop Vector						<T7>
+jvCyclePhase	DS.L	1			; Bitbuckets or fills bytes to get target to Status phase (was jvUnused49)
+jvInitSCSIHW	DS.L	1			; init SCSI chip		(was jvUnused57)		<T10> pdw 	
+;																							<?> from prev <?>
+;
+newSCSIDisp
+jvSCSIRequestIO	DS.L	1			; SCSIRequestIO
+jvSCSIKillIO	DS.L	1			; SCSIKillIO
+jvSCSIBusInfo	DS.L	1			; SCSIBusInfo
+
+newSCSI96Disp						; used to be jvUnused63-jvUnused66						<?> thru next <?>
+jvSCSIBusy		DS.L	1			; SCSIBusy vector, selector 14
+jvSel15			DS.L	1			; SCSI vector for selector 15
+jvSel16			DS.L	1			; SCSI vector for selector 16
+jvSel17			DS.L	1			; SCSI vector for selector 17
+jvAltBusCall	DS.L	1			; Call to alternate SCSI bus							<?> from prev <?>
+;
+numMsgVct		EQU		36			; number of message routing vectors
+msgInTbl		DS.B	numMsgVct	; dispatch table for Messages 00H-23H (Msg In)
+msgOutTbl		DS.B	numMsgVct	; dispatch table for Messages 00H-23H (Msg Out)
+;
+dtQElSize		EQU		20			; temporary
+dTask			DS.B	dtQElSize	; Deferred Task Mgr task record
+;
+tmQSize			EQU		14			; Time Mgr task record size
+timer			DS.B	tmQSize		; Time Mgr task record for request timing
+;
+RSCmd			DS.B	6			; Request Sense command buffer
+RSDC			DS.L	12			; data-chaining block for Request Sense command
+;
+dummy			DS		scsiPB		; dummy parameter block
+;
+dummyPriv		DS		scsiPrivPB	; dummy private storage
+faultPriv		DS		scsiPrivPB	; private storage for page-fault handling
+firstPriv		DS		scsiPrivPB	; private storage for request processing
+				DS		scsiPrivPB	; private storage for request processing
+				DS		scsiPrivPB	; private storage for request processing
+				DS		scsiPrivPB	; private storage (machine-specific storage follows)
+TransactionFlag	DS.L	1			; location to store SCSI transaction flag	<2> kc
+FreeHookPending	DS.L	1			; location of pending free-hook flag		<2> kc
+
+GlobalSize		EQU		*-scsiGlobalRecord	; size of SCSI Mgr globals
+				ENDR
+
+;
+;	Machine-specific structure
+;
+machSpecRecord	RECORD	0, INCREMENT
+
+		 IF	tmQSize > SleepqRec.SleepqSize	THEN	; use the larger of the two data structures	<14> rb
+sleep								; 12-byte sleep queue element (onHcMac) OR
+timer2			DS.B	tmQSize		; 14-byte intr polling timer (onMac)			<v1.1>
+		 ELSE
+sleep								; 12-byte sleep queue element (onHcMac) OR
+timer2			DS.B	SleepqSize	; 14-byte intr polling timer (onMac)			<v1.1>
+		 ENDIF
+machSpecSize	EQU		*-machSpecRecord	; size of machine-specific record
+				ENDR
+
+;
+;	Find selector (passed in d0.l)
+;
+findAny			EQU		-1		; find first non-disconnected request
+findAnyFlag		EQU		31		; find first non-disconnected request flag (bit 31)
+
+;
+;	EnDequeue selector (passed in d0.l)
+;
+enqNormal		EQU		-1		; enqueue at end of queue
+enqFront		EQU		-2		; enqueue at front of queue ("immediate" function, page fault)
+deqNormal		EQU		1		; dequeue one request (linked commands are elevated)
+deqLinked		EQU		2		; remove a series of linked commands (to cleanly kill linked cmds)
+enqueueFlag		EQU		31		; enqueue/dequeue selection flag (bit 31)
+
+;
+; Masks for the interrupt handler.  They are used to determine the interrupt type.
+; These masks are the concatenation of the Bus and Status Register with the
+; Current SCSI Bus Status Register.  The BSR is the most-significant byte.
+;
+mReselect		EQU		$F5E2	; mask to clear don't cares for Reselect interrupt
+iReselect		EQU		$1002	; bit image for a Reselect intr. with don't care bits reset
+scResel			EQU		7		; bit in "dtParm" for Reselect interrupts
+mEOP			EQU 	$F6C2	; mask to clear don't cares for EOP intr (PM is don't care) <v1.2>
+iEOP			EQU		$9040	; bit image for EOP intr. with don't care bits cleared
+scEOP			EQU		6		; bit in "dtParm" for Reselect interrupts
+mPhaseMm		EQU		$BDE2	; mask to clear don't cares for Phase Mismatch Error intr.
+iPhaseMm		EQU		$1060	; bit image for Phase Mismatch Error without don't care's
+scPhaseMm		EQU		5		; bit in "dtParm" for Reselect interrupts
+mLossBsy		EQU		$F7FF	; mask to clear don't cares for Loss of BSY interrupts
+iLossBsy		EQU		$1400	; bit image for Loss of BSY intr. without don't care's
+scLossBsy		EQU		4		; bit in "dtParm" for Reselect interrupts
+mBusReset		EQU		$F77F	; mask to clear don't cares for SCSI Bus Reset interrupt
+iBusReset		EQU		$1000	; bit image for SCSI Bus Reset intr. with don't care's reset
+scBusReset		EQU		3		; bit in "dtParm" for Reselect interrupts
+mParity			EQU		$BCC2	; mask to clear don't cares for Parity Error interrupt
+iParity			EQU 	$3840	; bit image for Parity Error intr. with don't care's reset
+scParity		EQU		2		; bit in "dtParm" for Reselect interrupts
+scNewRequest	EQU		1		; bit in "dtParm" indicating a new request to process
+
+;
+;	Register saving convention
+;
+scsiRegs		REG		a0-a5/d1-d7	; standard register saving convention (result in d0)
+intrRegs		REG		a0-a5/d0-d7	; interrupt handler register saving convention
+zeroReg			EQU		d7			; quick source of zeroes (CLR won't work on SCSI chip)
+
+;
+;	Old SCSI Mgr equates -- temporary, since SCSIEqu.a has the public portion of the PB
+;
+
+maxOpcode		EQU		8		; highest numbered TIB opcode (from PatchIIROM.a)
+
+													;										<v1.6>
+													;										<end>
+;
+;	Here we redefined the Universal ROM's hardware feature bits to serve our own twisted
+;	purposes.  If we're building for a System Disk, then these bits in the "G_Reserved0"
+;	variable in the globals reflect the low memory data structures defined for the ROM's.	<v1.1>
+;																							<start>
+;	NOTE that these are also defined in SCSIMgrFlags.a, so if you change 'em here....
+;
+sHWCbPwrMgr		equ		0				; see if we have a Power Mgr
+sOSSExists		equ		1				; do we have an OSS ?
+sRBVExists		equ		2				; do we have an RBV ?
+sVIA2Exists		equ		3				; do we have a second VIA ?
+sSCSIDMAExists	equ		4				; do we have a SCSI DMA chip ?
+isMacPlus		equ		5				; are we on a Mac Plus ?
+is68000			equ		6				; are we on a 68000 ?								<v1.1>
+sDeferUserFn	equ		7				; is _DeferUserFn defined ?							<end>
+;sSCSI96_1		equ		8				; do we have 1st SCSI96 chip						<T3>
+;sSCSI96_2		equ		9				; do we have 2nd SCSI96 chip?						<T3>
+;sSCSI96_1		equ		8				; do we have 1st SCSI96 chip						<T3>
+;sSCSI96_2		equ		9				; do we have 2nd SCSI96 chip?						<T3>
+
+
+numSelectorsDB	equ		2				; we only patch three SCSI Mgr routines				<H2>
+
+cTargSetup		equ		$40				; setup target mode for DBLite's dual bus DiskMode	<H2>
+
+
+	ENDIF	; ...already included

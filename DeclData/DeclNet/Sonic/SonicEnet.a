@@ -1,0 +1,1825 @@
+;
+;	File:		EtherNet.a -> SonicEnet.a
+;
+;	Contains:	Shell for Ethernet driver
+;
+;	Written by:	Sean Findley
+;
+;	Copyright:	© 1990-91 by Apple Computer, Inc., all rights reserved.
+;
+;
+;	Change History (most recent first):
+;
+;	   <SM4>	 1/29/93	RB		Do not move #$2600 to the status register, always do an ORI.W
+;									with it so that NuKernel works and the stack is not changed.
+;	   <SM3>	10/28/92	SWC		Changed the INCLUDEs to a LOAD of StandardEqu.d.
+;	   <SM2>	10/26/92	mal		Updated controltable COMMENTS with correct snmp enet control
+;									codes, 238-242; note, these snmp enet control codes are still
+;									unimplemented and return controlerr.
+;		 <1>	 10/6/92	GDW		New location for ROMLink tool.
+;	   <SM2>	 6/22/92	mal		Changed Open so ptr and size to data passed to LOOPBACKTEST;
+;									added SNMP control calls to control table but don't support yet.
+;		 <1>	 6/12/92	RLM		first checked in
+;		<P3>	 5/13/92	KW		(JC,H5) Change driver to support configuration information
+;									obtained from ecfg resource rather than from using boxflag
+;									driven tables.
+;									(JC,H4) Add support for new machines to boxflag driven tables.
+;		<P2>	02/07/92	jmp		(jmp,H3/BG/SJF,Z12) Added fixes for the possible loss of
+;									transmit buffers.  Also turn off interrupts around processing
+;									the CAM.
+;		 <1>	  2/4/92	mal		first checked in
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;	  Pre-Pandora ROM comments begin here.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;		<11>	10/22/91	SAM		Added Sean Findley's changes to correct an interaction problem
+;									with VM/Ethernet.  From Zydeco-Terror ROM.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;	  Pre-Zydeco ROM comments begin here.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;		<10>	 5/22/91	BG		Removed a _DetachResource in the driver that Sean says shouldn't
+;									be there. Also changed a BEQ to a BEQ.S to LoopError in Open.
+;		 <9>	 4/21/91	CCH		Rolled in Sean Findley's changes.
+;		 <8>	  4/2/91	CCH		Added a cache flush after the blockmove to the write buffer.
+;		 <7>	 3/19/91	BG		Enabled the _MemoryDispatch call for logical-to-physical
+;									translation in TranslateAddress.  Previously, it was returning
+;									the logical address since it knew that logical=physical in the
+;									Eclipse/Spike cases.
+;		 <6>	 3/14/91	BG		(for SJF) A number of changes:
+;									-  Driver variables now allocated via _NewPtr to save
+;									   space on disk.
+;									-  When installing/removing a SlotMgr interrupt routine
+;									   the slot number is not hard-coded to 9.
+;									-  Removed all calls to _SwapMMUMode since the Sonic
+;									   base address is accessible in both 24- and 32-bit modes.
+;									-  Implement VM support
+;									-  Activate the "extended Motorola mode" for the AVF
+;									   SONIC parts.
+;		 <5>	 2/26/91	JK		Added extended Motorola mode code, and GetPhysical call.
+;		 <4>	  2/1/91	JK		Rolled in Ethernet code review changes.
+;		 <3>	 1/31/91	JK		Hacked in call to LockMemoryContiguous.
+;		 <2>	  1/9/91	JK		Fixed to use Ethernet address PROM on Eclipse motherboard.
+;		 <1>	12/14/90	JK		Added to build
+;
+
+			TITLE   	'Ethernet Driver'
+;___________________________________________________________________________
+;
+; Ethernet Data Link Level Driver
+;
+; Sean Findley
+; January 1990
+
+			PRINT   	OFF
+			LOAD		'StandardEqu.d'
+			INCLUDE 	'Slots.a'     					; Slot interrupt equates
+			INCLUDE		'GestaltEqu.a'
+
+			INCLUDE 	'ATalkMacros.a' 				; Nifty Macros
+
+			PRINT		NOGEN,NOMDIR,ON
+			INCLUDE 	'ENETEqu.a'     				; Driver definitions
+			INCLUDE		'SonicEqu.a'					; SONIC chip definitions
+			EJECT
+
+RxParms 	RECORD		{A6Link}						; stack frame for received packets				<T6> thru next <T6>
+Size		EQU 		*
+InUse		EQU			*								; in use flag (long)
+A6Link		DS.L		1
+Return		DS.L		1
+Status		DS.L		1								; status of recv
+Length		DS.L		1								; length of packet
+Data		DS.L		1								; data pointer
+DCE 		DS.L		1								; DCE pointer
+RxDesc		DS.L		1								; buffer descriptor pointer
+ParmsSz		EQU			* - Status						; positive size of frame
+			ENDR
+
+NumBuffers	EQU 		8								; "optimal" number of buffers						
+
+; Sonic Configuration Record																			<H5 begin>
+SCFG			RECORD		0							; Config values from config rsrc
+SONICBase24		DS.L		1							; Base address of SONIC in 24 bit mode
+SONICBase32		DS.L		1							; Base address of SONIC in 32 bit mode
+EnetPROM		DS.L		1							; base address of Address Prom in 32 bit mode
+DataCfgLpBk		DS.L		1							; DataConfig reg values during loopback tests
+DataCfgRun		DS.L		1							; DataConfig reg values during normal operation
+DataCfg2		DS.L		1							; DataConfig 2 reg
+SONICSlot		DS.B		1							; Logical slot of SONIC for the slot manager
+SmartMMU		DS.B		1							; Non-zero if system has smart MMU code 
+													; The following are optional values; ignored if zero
+EnetAddr		DS.B		6							; Alternate Ethernet Address, overrides Address PROM
+NumRxBuffs		DS.W		1							; Alternate number of receive buffers
+NumTxBuffs		DS.W		1							; Alternate number of transmit buffers
+CfgSize			EQU			*
+				ENDR									;												<H5 end>
+
+OurV		RECORD		0								; our variables
+OurDCE		DS.L		1								; Offset to our DCE pointer in variables
+InfoStart	EQU 		*								; Start of returned info
+OurAddr 	DS.B		EAddrSz 						; Our Ethernet address
+OverWrtCnt	DS.L		1								; Count of number of overwrites (long)
+TimeoutCnt	DS.L		1								; Count of timeouts on writes (long)
+BadDestCnt	DS.L		1								; Count of packets received not to us (long)
+InfoEnd 	EQU 		*								; End of returned info
+MaxData 	DS.W		1								; Max data size for write
+RHA 		DS.B		EHdrSize						; Read Header Area
+;___________________________________________________________________________
+;
+; The LAP protocol handler table starts here. Format:
+;	.BYTE InUseFlag1,..., InUseFlagN	; Entry in use flag
+;	.WORD ProtCode1, ..., ProtCodeN   	; Protocol type codes
+;         .LONG PHAddr1, ..., PHAddrN        	; Protocol handler addresses
+;         .LONG RdQueueHd1, ..., RdQueueHdN       ; Read queue heads
+;___________________________________________________________________________
+LAPTblSz	EQU 		16                  			; Size of LAP protocol handler table (even)
+InUseFlag	DS.B		LAPTblSz						; Entry in use flag
+Protocols	DS.W		LAPTblSz						; List of active protocols
+Handlers	DS.L		LAPTblSz						; List of handler addresses
+RdQueueHd	DS.L		LAPTblSz						; Read queue heads
+LAPTblEnd	EQU 		*								; End of LAP table
+
+;___________________________________________________________________________
+;
+; Multicast address table.  Entry format:
+;	Ethernet address (6 bytes)
+;	Use count (1 byte). Zero means entry free.
+;	Unused (1 byte)
+;___________________________________________________________________________
+
+MTblSz  	EQU 		8   							; Size (in entries) of multicast address table (???)
+MEntrySz	EQU 		8   							; Size of an entry (power of 2)
+MUseCount   EQU 		EAddrSz     					; Offset to use count in entry
+
+MultiCTbl	DS.B		MTblSz*MEntrySz 				; A list of valid addresses
+EtherStats	DS			NetStats						; SONIC network statistics
+SONICmem	DS.L		1								; header to xmit buffer list
+deferCtl	DS.W		1								; flag=true if deferring ctl call
+VBLQEL		DS.B		14								; VBL for ctl call deferrals
+AddrMask	DS.L		1								; 32 bit mask for addresses
+BlockMove	DS.L		1								; trap address of block move
+LastRxDesc	DS.L		1								; current rx descriptor address
+WrBuffHdr	DS.L		1								; header to free xmit buffers
+XmitWait	DS.W		1								; flag to indicate write waiting for buffers
+XmitBuffs	DS.L		1								; # of xmit buffers
+PLTable 	DS.L		1								; ptr to address translation table
+MachID		DS.W		1								; id of CPU (from Gestalt)
+DataCache	DS.L		1								; stored value of data cache reg on LC 030
+CacheCount	DS.L		1								; use count for cache
+SONICCfg	DS			SCFG							; SONIC config data from config rsrc	<H5>
+; ¥¥¥¥¥¥¥¥ WARNING ¥¥¥¥¥¥¥¥¥
+;	The following array MUST be the LAST item in the vars list. It is used only if VM is
+;	running. If not, it is trimmed off the required memory for the driver.
+RxDefBuffs	DS.B		RxParms.ParmsSz * NumBuffers	; if VM running, only Numbuffers max. allowed
+
+DataSize	EQU 		*								; End of variables
+			ENDR
+
+;_______________________________________
+;
+; Other definitions
+;_______________________________________
+
+OneWdsSz	EQU			8								; single fragment wds size
+
+PtoL		RECORD		0
+Physical	DS.L		1								; physical address of xmit buffer
+Logical		DS.L		1								; associated logical addr
+Size		EQU			*
+			ENDR
+
+XmitRec		RECORD		0								;										<Z12>
+			DS.B		Max_Pkt_Size+OneWdsSz+PtoL.Size	; memory for each xmit buffer			<Z12>
+			ALIGN		4								; make sure MOD 4 size					<Z12>
+Size		EQU			*								;										<Z12>
+			ENDR										;										<Z12>
+			
+AMaxDataSz  EQU 		768-EHdrSize    				; Maximum data size for AppleTalk mode
+
+IntLockOut	EQU			$400							; SR value to lock interrupts			<SM4> rb
+
+BlockMoveTrap EQU		$A02E							; trap value for _BlockMove
+
+
+Configrsrc	EQU 		'ecfg'							; rsrc type for sonic config data rsrc	<H5>
+
+
+NeedDefer	EQU			5								; bit indicates VM is running			<H5>
+			EJECT
+
+ENETDriver	MAIN		EXPORT
+
+			STRING  	PASCAL
+			MACHINE 	MC68020
+
+			IMPORT		SONICINIT,SONICXMIT,SONICCAMLOAD,SONICFREEBUFF,SONICHALT
+			IMPORT		ResetSONIC,RestartSONIC
+			IMPORT		LOOPBACKTEST
+
+			WITH		SONICRegs,OurV
+
+; *****************************************
+; *                                       *
+; *       Start of ENET driver            *
+; *                                       *
+; *****************************************
+ENET
+;
+;	Driver header
+;
+			DC.W		$4400                   		; Control, Locked, no Goodbye
+			DC.W		0,0                     		; No time, no events
+			DC.W		0                       		; No menu
+
+;
+;         Entry points offset table
+;
+			DC.W		Open-ENET
+			DC.W		AnRTS-ENET
+			DC.W		Control-ENET
+			DC.W		AnRTS-ENET
+			DC.W		Close-ENET
+
+			DC.W		'.ENET'     					; Driver name
+			ALIGN		2
+
+			INCLUDE		'VersionEclipse.a'
+
+;________________________________________________________________________
+;
+; Open - initialize the ENET driver
+;
+;    Called:
+;	D0 = 0
+;	A0 -> queue element
+;         A1 -> DCE
+;________________________________________________________________________
+
+
+
+Open
+			LINK		A6,#0							; mark the stack for easy exit
+
+			MOVE.L		A1,-(SP)						; save DCE pointer					<T6>
+
+			MOVE.L		#gestaltVMAttr,D0				; see if VM is running				<T6>
+			_Gestalt									;									<T6>
+			BNE.S		@noVM							; it isn't if call failed			<T6>
+			MOVE.L		A0,D0							;									<T6>
+			BEQ.S		@noVM							; zero result means no VM running	<T6>
+
+			BSET		#NeedDefer,dCtlStorage(A1)		; indicate VM is running			<T6>
+			BSET		#VMImmuneBit,dCtlFlags+1(A1)	; tell VM to leave our calls alone	<T6>
+@noVM													;									<T6>
+
+			LEA 		OurVarPtr,A3    				; A3 -> variable pointer
+;
+; Allocate our variables
+;
+			MOVE.L		#DataSize,D0					; variables size
+			BTST		#NeedDefer,dCtlStorage(A1)		; is VM running?
+			BNE.S		@10								; yes, get full memory
+			SUBI.L		#RxParms.ParmsSz * NumBuffers,D0	
+														; adjust memory requirement
+@10 		
+			_NewPtr		,SYS,CLEAR						; get memory
+			BNE			OpenError
+			
+			MOVE.L		A0,(A3)							; save variable pointer
+			MOVEA.L		A0,A2							; A2 -> variable space
+
+			MOVE.B		SonicEnet,DCtlQueue+1(A1) 		; Version number goes here
+			
+			MOVE.L		A1,D0
+			_StripAddress
+			MOVE.L		D0,OurDCE(A2)					; Save our DCE address				<H5>
+
+			MOVE.W		#BlockMoveTrap,D0
+			_GetTrapAddress
+			MOVE.L		A0,BlockMove(A2)				; save trap address in our vars
+
+			MOVE		#EMaxDataSz,MaxData(A2) 		; Set AppleTalk mode max data size
+;
+; Look for a SONIC configuration resource for this CPU										<H5 begin>
+;
+			MOVE.L		#gestaltMachineType,D0
+			_Gestalt									; get our machine type
+			MOVE.L		A0,D0
+			MOVE		D0,MachID(A2)					; save our machine ID
+			
+			SUBQ		#4,SP							; Make room for handle
+			MOVE.L		#Configrsrc,-(SP)				; Push resource type
+			MOVE		D0,-(SP)						; Set machine ID as resource ID
+			_GetResource								; Get it from system file
+			MOVE.L		(SP)+,D0						; D0 = handle to config resource
+			BNE.S		@21								; Bra if we found it
+			
+			SUBQ		#4,SP							; Make room for handle
+			MOVE.L		#Configrsrc,-(SP)				; Push resource type
+			MOVE		MachID(A2),-(SP)				; Set machine ID as resource ID
+			MOVE		#MapTrue,ROMMapInsert			; Look for resource in sys ROM
+			_GetResource								; Get it from ROM
+			MOVE.L		(SP)+,D0						; D0 = handle to config resource
+			BNE.S		@21							
+			MOVEQ		#-1,D0							; return with generic error (D0=-1)
+			BRA			OpenError						; return, config rsrc not found		
+
+@21			MOVEA.L		D0, A3							; Save handle to resource
+
+			MOVEA.L		(A3), A0 						; A0-> config resource
+			LEA			SONICCfg(A2), A1				; A1-> space in our vars
+			MOVE.L		#SCFG.CfgSize, D0
+			_BlockMove									; Copy data from rsrc to our vars
+			
+			MOVE.L		A3, -(SP)						; push handle
+			_ReleaseResource							; We're thru with config resource
+			
+			LEA			SONICCfg.EnetAddr(A2), A0		; A0-> alternate ethernet address
+			TST.L		(A0)							; Check address
+			BNE.S		@22
+			TST			4(A0)
+			BEQ.S		@23								; Ignore if all zeros
+@22
+			BTST		#0,(A0) 						; Make sure it's not a multicast addr
+			BNE.S		@23 							; Ignore it if it is
+			MOVE.L		(A0)+,OurAddr(A2)				; Move four bytes to our address
+			MOVE		(A0)+,OurAddr+4(A2) 			; Move the last two bytes
+@23
+			MOVEQ		#NumBuffers,D2					; set desired # of buffers
+			MOVE.L		D2,D3							; D2=xmit,D3=recv
+
+			MOVE		SONICCfg.NumTxBuffs(A2),D0		; get alternate # xmit buffers
+			BEQ.S		@24								; don't override if zero
+			MOVE		D0, D2							; override default # xmit buffers
+@24			
+			BTST		#NeedDefer,([OurDCE,A2],dCtlStorage) ; is VM running?
+			BNE.S		@25								; Yes, don't override # recv buffers
+			
+			MOVE		SONICCfg.NumRxBuffs(A2),D0		; get alternate # recv buffers
+			BEQ.S		@25								; don't override if zero
+			MOVE		D0, D3							; override default # recv buffers		<H5 end>
+@25		
+
+; D2=# xmit buffers to allocate, D3=# recv buffers to allocate
+
+@GetMemory
+			CMPI.W		#Min_Rx_Buffs,D3				; have mininum number of buffers?
+			BLO.S		@nomem							; no, get out
+
+			MOVE.L		#Ctl_Mem_Size,D0				; add up memory needed
+
+			MOVE.L		#Rxpkt.RxRDAsize,D1
+			MULU		D3,D1
+			ADD.L		D1,D0							; D0=memory for all descriptors
+			LSL.L		#1,D0							; times 2
+
+			MOVE.L		#Max_Pkt_Size,D1
+			MULU		D3,D1
+			ADD.L		D1,D0							; D0=memory for receive buffers
+
+			MOVE.L		D0,D4							; save SONIC memory size for later
+
+			MOVE.L		D2,D1							; D1=# xmit buffs
+
+			MULU		#XmitRec.Size,D1				; D1=memory needed for xmit buffs		<Z12>
+			
+			ADD.L		D1,D0							; D0=memory for recv and xmit buffs
+
+			MOVE.L		D0,D5							; remember size of Sonic memory
+			
+			_NewPtr		,SYS,CLEAR						; get the memory
+			BEQ.S		@haveMem						; use it
+
+			SUBQ.L		#1,D2							; adjust # xmit buffers first
+			BHI.S		@GetMemory
+			MOVEQ		#1,D2							; set back to mininum of one
+			SUBQ.L		#1,D3							; adjust # recv buffers last
+			BHI.S		@GetMemory
+@nomem
+			MOVE.W		#mFulErr,D0
+			BRA			OpenError						; get out with error
+@haveMem
+			BTST		#NeedDefer,([OurDCE,A2],dCtlStorage)
+			BNE.S		@haveMemDispatch				; VM is running, ok to call _VM
+
+			TST.B		SONICCfg.SmartMMU(A2)			; no VM, do we have smart MMU code?		<H5>
+			BEQ.S		@nolock							; no, don't lock memory					<H5>
+
+@haveMemDispatch			
+			MOVE.L		A1,-(SP)						; save a1
+			MOVEA.L		D5,A1							; length of buffer
+			MOVEQ		#4,D0							; LockMemoryContiguous
+			_MemoryDispatch								; MemoryDispatch						<T3><T6>
+			MOVEA.L		(SP)+,A1						; restore a1
+			BNE			OpenError						; failed, so bail
+
+@nolock													;										<H5>
+			MOVE.L		D2,XmitBuffs(A2)				; save # of xmit buffers
+
+			MOVE.L		D1,D5							; save xmit buffers size for later
+
+			MOVE.L		A0,D0
+			_StripAddress
+			MOVEA.L		D0,A0
+			MOVE.L		D0,SONICmem(A2)					; save ptr in our vars
+			MOVE.L		A0,WrBuffHdr(A2)				; set header pointer
+
+			MOVE.L		D2,D0
+			SUBQ.W		#1,D0							; adjust loop count
+			BRA.S		@db1
+@setBufLink 													; link together xmit buffers
+			PEA			Max_Pkt_Size+OneWdsSz(A0)
+			MOVE.L		(SP),(A0)						; set link to next buffer
+			MOVEA.L		(SP)+,A0						; point to next buffer
+@db1
+			DBRA		D0,@setBufLink					; do them all
+			CLR.L		(A0)							; clear the last one
+
+			LEA			Max_Pkt_Size+OneWdsSz(A0),A0	; A0->Physical to Logical Table
+
+			MOVE.L		A0,PLTable(A2)					; save address of translation table
+			MOVEA.L		WrBuffHdr(A2),A1				; A1->1st buffer
+
+			MOVE.L		D2,D1							; D1=# xmit buffs
+			BRA.S		@db2
+@setupWDS
+			MOVEM.L		A0/D1,-(SP)
+			MOVE.L		#Max_Pkt_Size+OneWdsSz,-(SP)	; logical size
+			MOVE.L		A1,-(SP)						; logical address
+			BSR			TranslateAddress				; get physical address in D0
+			MOVEA.L		(SP)+,A1						; get back buffer addr
+			ADDQ.W		#4,SP							; trash length
+			MOVEM.L		(SP)+,A0/D1
+			MOVE.L		A1,PtoL.Logical(A0)				; save logical address
+			MOVE.L		D0,PtoL.Physical(A0)			; save physical address
+			MOVE.L		D0,Max_Pkt_Size+2(A1)			; in WDS too
+			LEA			PtoL.Size(A0),A0				; next table entry
+			LEA			Max_Pkt_Size+OneWdsSz(A1),A1	; next buffer
+@db2
+			DBRA		D1,@setupWDS					; translate all xmit buff addresses
+
+			LEA			OurAddr(A2),A1
+			TST.L		(A1)
+			BNE.S		@45								; already have an address
+			TST.W		4(A1)
+			BNE.S		@45								; already have an address
+;	Must be in 32 bit mode to examine Ethernet address PROM on an LC, doesn't matter for others <Z12>
+			MOVEQ		#true32b,D0						;									<Z12>
+			_SwapMMUMode								; put us in 32-bit mode				<Z12>
+			MOVE.B		D0,-(SP)						; save prior MMU status				<Z12>
+
+			BSR			AddrPromAddr					; A0->address prom					<Z12>
+			MOVEQ		#0,D1							; setup to checksum the PROM address<Z12>
+			MOVEQ		#7,D0							; do 8 bytes						<Z12>
+@Xor
+			MOVE.B		(A0)+,D2						; get byte to XOR
+			EOR.B		D2,D1
+			DBRA		D0,@Xor							; do them all						<Z12>
+			SUBI.B		#$FF,D1							; end result should be $FF			<Z12>
+			BEQ.S		@GetAddr						; keep going if it is				<Z12>
+
+			MOVE.B		(SP)+,D0						;									<Z12>
+			_SwapMMUMode								; put back mmu						<Z12>
+			MOVEQ		#-1,D0							;									<Z12>
+			BRA			OpenError						; return with generic error (D0=-1)	<Z12>
+@GetAddr												;									<Z12>
+			ADDQ.W		#EAddrSz,A1 					; go from last to first				<Z12>
+
+			BSR			AddrPromAddr					; A0->address prom					<Z12>
+			MOVEQ		#EAddrSz-1,D2					; get 6 addr bytes
+@35
+			MOVE.B		(A0,D2.W),D0					; D0=inverted address
+			BSR			NormAddr						; normalize it
+			MOVE.B		D0,-(A1)						; store in our vars
+			DBRA		D2,@35
+
+			MOVE.B		(SP)+,D0						;									<Z12>
+			_SwapMMUMode								; put back mmu						<Z12>
+@45
+
+			MOVEQ		#-1,D0
+			_StripAddress
+			MOVE.L		D0,AddrMask(A2)					; save cached 32 bit address mask
+
+			SUBA.W		#SONICinitParms.ParmSize,SP 	; make room for parms
+			PEA 		TranslateAddress				; addr of our log->phys addr translation
+			MOVE.L		(SP)+,SONICinitParms.TransAddr(SP)
+														; translation table proc address
+			BSR			SONICAddr						; A0->SONIC
+
+;	So far, only the Quadra's need this register set...
+			MOVE.L		SONICCfg.DataCfg2(A2), D0		; setup SONIC extended data config 				<H5>
+			SMOVE		D0,Data_Config2(A0)				; set extended data config						<H5>
+
+			MOVE.L		SONICCfg.DataCfgLpBk(A2), D0	; setup SONIC data config for loopback tests	<H5>
+
+			MOVE.L		D0,SONICinitParms.DataConfig(SP)	
+
+			PEA			EtherStats(A2)					; ptr to stats array
+			MOVE.L		(SP)+,SONICinitParms.NetStatArray(SP)
+
+			PEA 		IntEnable						; interrupt enable routine
+			MOVE.L		(SP)+,SONICinitParms.IntEnable(SP)
+
+			PEA 		IntDisable
+			MOVE.L		(SP)+,SONICinitParms.IntDisable(SP)
+														; disable interrupts routine
+
+			MOVE.L		D3,SONICinitParms.NumRxBuffs(SP)
+														; # of receive buffers
+
+			MOVE.L		D4,SONICinitParms.MemSize(SP)	; size of sonic mem
+
+			MOVE.L		SONICmem(A2),SONICinitParms.MemStart(SP)
+			ADD.L		D5,SONICinitParms.MemStart(SP)	; ptr to sonic mem
+
+			MOVE.L		A2,SONICinitParms.TRANPrms(SP)	; trans complete parms
+
+			PEA 		XmitDone
+			MOVE.L		(SP)+,SONICinitParms.TRANRtn(SP)
+														; proc to call for xmit complete
+
+			MOVE.L		OurDCE(A2),SONICinitParms.RECVPrms(SP)	
+														; recv complete parms
+			PEA 		EtherRecv
+			MOVE.L		(SP)+,SONICinitParms.RECVRtn(SP)
+														; proc to call for recvd packets
+
+			PEA 		IntInstallation
+			MOVE.L		(SP)+,SONICinitParms.IntInstall(SP)
+														; interrupt proc installation routine
+
+			BSR			SONICAddr						;									<Z12>
+			MOVE.L		A0,SONICinitParms.SONICbase(SP)	;									<Z12>
+
+			BSR			DataCacheOff					; turn off data cache on LC 030		<Z12>
+
+			BSR 		SONICINIT						; initialize sonic chip
+			ADDA.W		#SONICinitParms.ParmSize,SP 	; strip parms
+
+			BSR			DataCacheOn						; turn data cache back on			<Z12>
+			
+			BLT			OpenError						; init failed				
+			BEQ.S		@loadCAM
+
+			NEG.L		D0
+			MOVE.L		D0,-(SP)						; memory not used
+			MOVEA.L		SONICmem(A2),A0					; addr of SONIC memory
+			_GetPtrSize	,SYS
+			ADD.L		(SP)+,D0						; adjust pointer size
+			_SetPtrSize	,SYS
+@loadCAM
+			SUBA.W		#CAMparms.ParmSize,SP			; make room for CAM parms
+			MOVE.L		#-1,CAMparms.LoadorClear(SP)	; add an entry
+			MOVE.L		OurAddr+2(A2),CAMparms.EAddr+2(SP)
+			MOVE.W		OurAddr(A2),CAMparms.EAddr(SP)
+			BSR			SONICAddr						;									<Z12> thru next <Z12>
+			MOVE.L		A0,CAMparms.SONICPtr(SP)		; pass SONIC base address
+			
+			BSR			DataCacheOff					; turn off data cache on LC 030
+			BSR 		SONICCAMLOAD					; put our address in CAM
+			ADDA.W		#CAMparms.ParmSize,SP
+			BSR			DataCacheOn						; turn data cache back on			<Z12>
+; perform 3 SONIC loopback tests, if any fails, return an open error
+														
+														
+			Move.l		#SonicEnetLongStrEnd-SonicEnetLongStr-1, -(SP) ; pass size of loopback
+														; data, minus 1 since pascal string		
+			Pea			SonicEnetLongStr+1				; pass ptr to loopback data			
+			PEA			OurAddr(A2)						; pass ptr to our address
+			MOVEA.L		OurDCE(A2),A1					; get ptr to DCE
+			MOVE.W		dCtlRefNum(A1),D0
+			MOVE.L		D0,-(SP)						; pass our refnum for ctl calls
+
+			BSR			SONICAddr
+			MOVEA.L		A0,A3 							; SONIC base address
+
+			SMOVE		Recv_Control(A3),D0 			; get recv_control reg
+			EORI.W		#(1<<RecvErrors)+(1<<RecvRunts)+(1<<RecvBroadCast),D0
+														; turn off broadcast reception
+			
+			ORI.W		#MACLoopBack,D0
+			SMOVE		D0,Recv_Control(A3) 			; setup for MAC loopback test
+			BSR			LOOPBACKTEST					; D0 ­ 0 if passed
+			BEQ			LoopError						; failed
+
+			SMOVE		Recv_Control(A3),D0 			; get recv_control reg
+			EORI.W		#MACLoopBack,D0 				; turn off MAC loopback
+			ORI.W		#ENDECLoopBack,D0
+			SMOVE		D0,Recv_Control(A3) 			; setup for ENDEC loopback test
+			BSR			LOOPBACKTEST					; D0 ­ 0 if passed
+			BEQ.S		LoopError						; failed
+
+			SMOVE		Recv_Control(A3),D0 			; get recv_control reg
+			EORI.W		#ENDECLoopBack,D0				; turn off ENDEC loopback
+			ORI.W		#TxRxLoopBack,D0
+			SMOVE		D0,Recv_Control(A3) 			; setup for TxRx loopback test
+			BSR 		LOOPBACKTEST					; D0 ­ 0 if passed
+			BEQ.S		LoopError						; failed
+
+			SMOVE		Recv_Control(A3),D0 			; get recv_control reg
+			EORI.W		#TxRxLoopBack,D0				; turn off TxRx loopback
+			ORI.W		#(1<<RecvErrors)+(1<<RecvRunts)+(1<<RecvBroadCast),D0
+														; turn on broadcast reception
+			SMOVE		D0,Recv_Control(A3) 			; turn off loopback mode
+
+			EXG			A2,A3							; A2->SONIC Registers
+			BSR			ResetSONIC						; get ready to change FIFO threshholds
+			SMOVE		Data_Config(A2),D0				; get current configuration data
+			MOVE.L		SONICCfg.DataCfgLpBk(A3), D1	; get loopback setup data configuration			<H5>
+			ANDI.W		#$000F,D1						; access only FIFO settings
+			EOR.W		D1,D0							; clear initial FIFO threshholds
+			MOVE.L		SONICCfg.DataCfgRun(A3), D1		; get runtime setup data configuration			<H5>
+			OR.W		D1,D0							; set runtime threshholds (requests bus less often)
+			SMOVE		D0,Data_Config(A2)
+			BSR			RestartSONIC					; start SONIC back up for loopback tests
+			EXG			A2,A3							; A3->SONIC Registers
+
+			ADDQ.W		#8,SP							; strip loopback test parms
+
+			MOVEA.L		(SP)+,A1						; get back DCE
+
+			LEA			VBLQEL(A2),A0
+			MOVE.W		#vType,vblType(A0)
+			PEA			ControlDefer
+			MOVE.L		(SP)+,vblAddr(A0)
+			MOVE.W		#32767,vblCount(A0)				; setup control call deferral timer
+			_VInstall
+
+			MOVEQ   	#noErr,D0   					; Indicate no error
+			UNLK		A6
+			RTS 										; And return
+
+LoopError														; failed one of 3 loopback tests
+			ADDQ.W		#8,SP							; strip loopback test parms
+			BSR			Close							; shut down SONIC
+			MOVEA.L		(SP)+,A1						; get back DCE
+			MOVEQ		#-1,D0
+			BRA.S		OpenErrDone						; return with open error			
+;
+; Open error - clear out variable pointer for next try
+;
+OpenError
+			MOVE.W		D0,D3							; save error code
+
+			MOVEA.L		(SP)+,A1						; A1->DCE
+			TST.L		SONICmem(A2)
+			BEQ.S		@55								; mem not allocated
+			MOVEA.L		SONICmem(A2),A0
+			_DisposPtr									; free it up
+@55
+			LEA 		OurVarPtr,A3    				; A3 -> our variable pointer
+			CLR.L   	(A3)    						; Clear it out
+			MOVE.W		D3,D0
+OpenErrDone
+			CMPI.W		#-1,D0							; translate generic error
+			BNE.S		@60
+			MOVEQ		#openErr,D0
+@60
+			TST.W		D0
+			UNLK		A6
+			RTS 										; Return with error
+
+NormAddr												; convert IEEE address to normal format
+			MOVEM.L		D2,-(SP)
+			CLR.B		D1
+			MOVEQ		#7,D2
+@loop
+			LSL.B		#1,D1							; get ready for next bit
+			LSR.B		#1,D0							; get a bit from source
+			BCC.S		@lb								; non there
+			ADDQ.B		#1,D1
+@lb
+			DBRA		D2,@loop
+			MOVE.B		D1,D0							; D0=converted value
+			MOVEM.L		(SP)+,D2
+			RTS
+
+
+;	Ptr TranslateAddress(laddr,lsize)					; translate logical to physical addrs
+MemBlk		RECORD		0
+address 	DS.L		1
+count		DS.L		1
+			ENDR
+
+TraAdd		RECORD		{A6Link}
+LinkSz		EQU 		*
+logical 	DS			MemBlk
+physical	DS			MemBlk
+A6Link		DS.L		2								; link and return addr
+laddr		DS.L		1								; logical address
+lsize		DS.L		1								; logical size
+			ENDR
+TranslateAddress
+			WITH		TraAdd
+			LINK		A6,#LinkSz
+			MOVE.L		laddr(A6),logical.address(A6)
+			MOVE.L		laddr(A6),physical.address(A6)
+
+			MOVEA.L		OurVarPtr,A0
+			BTST		#NeedDefer,([OurDCE,A0],dCtlStorage)
+			BNE.S		@haveMemDispatch				; VM is running, ok to call _VM
+			
+			TST.B		SONICCfg.SmartMMU(A0)			; no VM, do we have smart MMU code?		<H5>
+			BEQ.S		@nophy							; no, no need to get physical address	<H5>
+@haveMemDispatch			
+			MOVE.L		lsize(A6),logical.count(A6)
+			LEA 		logical(A6),A0					; A0->translation table
+			LEA 		1,A1							; A1=count to translate
+			MOVEQ		#5,D0							; selector
+
+			_MemoryDispatch								; MemoryDispatch						<T3><T6>
+@nophy													;										<H5>
+			MOVE.L		physical.Address(A6),D0 		; return lowest physical address
+
+			UNLK		A6
+			RTS
+			ENDWITH
+
+;	SR IntDisable();									; disable interrupts and return SR
+IntDisable
+			MOVE		SR,D0
+			ORI.W		#$600,SR						;										<SM4> rb
+			RTS
+
+;	void IntEnable(SR)									; restore SR from prior disable call
+IntEnable
+			MOVE.W		6(SP),SR						; do it
+			RTS
+
+;	IntInstallation(SONIChandler)
+
+IntInstallation 													; called by SONIC init
+			WITH		SlotIntQElement
+			LEA 		SONIChandler,A0
+			MOVE.L		4(SP),(A0)						; store SONIC interrupt handler
+			LEA 		SONICintQ,A0					; interrupt queue element
+			MOVE.W		#sIQType,SQType(A0) 			; set type
+			PEA 		SONICInterrupt					; addr of handler
+			MOVE.L		(SP)+,SQAddr(A0)
+			MOVE.W		#200,SQPrio(A0) 				; priority for now
+			MOVEA.L 	OurVarPtr,A1
+			SUB.L		D0,D0
+			MOVE.B		SONICCfg.SONICSlot(A1), D0		; setup slot from config values			<H5>
+			_SIntInstall								; install handler
+			RTS
+			ENDWITH
+SONICInterrupt
+			MOVEM.L 	A0/D1-D3,-(SP)					; Mac OS assumes these are scratch		<Z12>
+			BSR			SONICAddr						; get SONIC address in A0				<Z12>
+			MOVE.L		A0,-(SP)						; pass SONIC base address				<Z12>
+			BSR			DataCacheOff					; turn off data cache on LC 030			<Z12>
+			MOVEA.L 	SONIChandler,A1					;										<Z12>
+			JSR 		(A1)							;										<Z12>
+			ADDQ.W		#4,SP							;										<Z12>
+			BSR			DataCacheOn						; turn data cache back on				<Z12>
+			MOVEM.L 	(SP)+,A0/D1-D3					;										<Z12>
+			MOVEQ		#-1,D0							; indicate we processed this interrupt
+			RTS
+
+;________________________________________________________________________
+;
+; Control - control requests to driver - all ENET calls come in here.
+;
+;    Call:     A0 -> I/O queue element
+;              A1 -> device control entry
+;________________________________________________________________________
+
+ControlDefer											; task to complete a deferred control call
+			MOVE.W  	#32767,vblCount(A0)     		; next task is a long time maybe
+			_StackSpace 								; D0 = avail. stack space
+			TST.L   	D0
+			BMI.S   	@defer          				; defer if negative space
+			CMPI.L  	#512,D0         				; is there a little room?
+			BHS.S   	@doControl      				; yes
+@defer
+			MOVE.W  	#1,VBLCount(A0)     			; restart fast timer
+@exit
+			RTS 										; and get out
+@doControl
+			LEA 		-VBLQEL(A0),A2      			; A2->our vars
+			BCLR		#0,deferCtl(A2)
+			BEQ.S   	@exit       					; return to VBL if not really deferring
+
+			MOVEA.L 	OurDCE(A2),A1       			; A1->our DCE
+			MOVEA.L 	dCtlQHead(A1),A0    			; A0->param block in use
+			BRA.S		doControl
+Control
+			MOVE.W  	ioTrap(A0),D0       			; get trap word that called us
+
+			BTST		#asyncTrpBit,D0     			; is this a synchronous call?
+			BEQ.S   	doControl       				; yes, bypass stack check
+
+			_StackSpace 								; D0 = avail. stack space
+			TST.L   	D0
+			BMI.S   	@defer          				; defer if negative space
+			CMPI.L  	#512,D0         				; is there a little room?
+			BHS.S   	doControl       				; yes
+@defer
+			MOVEA.L 	OurVarPtr,A2      				; A2->our vars
+			BSET		#0,deferCtl(A2)      			; indicate we are deferring
+			MOVE.W  	#1,vblCount+VBLQEL(A2)      	; set next vbl to tick fast
+CRTS
+			MOVEQ		#noErr,D0						; good return for now
+			RTS 										; get out and get stack back
+doControl
+			MOVE.W  	CSCode(A0),D2           		; Pickup control code
+			SUBQ		#KillCode,D2            		; Check for OS kill I/O call
+			BEQ.S		CRTS							; return if so
+
+			MOVEQ		#ControlErr,D0					; Assume a control error
+			MOVE.L  	OurVarPtr,A2    				; A2 -> our variables
+			SUB 		#FirstENET-KillCode,D2  		; Subtract off lowest command
+			BLT 		ENETDone                		; Return error if too low
+			CMP 		#LastENET-FirstENET,D2  		; Make sure not too high
+			BGT 		ENETDone                		; Return error if too high
+			MOVE		CSParam(A0),D1          		; D1 = 1st parameter word (protocol)
+			MOVE.L  	CSParam+2(A0),D3        		; D3 = 1st parameter longword (e.g. WDSP)
+;
+; Pick up routine address for this command and jump to routine
+;
+			MOVE.W		(ControlTable,D2.W*2),D2		; get offset of routine
+			JMP 		(ControlTable,D2.W) 			; go do the call
+
+;_________________________________________________________________________
+;
+; Control dispatch table - must be in the same order as the ENET commands.
+;    Specifies offsets to the command-handling routines.
+;_________________________________________________________________________
+
+ControlTable
+			DC.w		ENETDONE-ControlTable			; 238 LapGetDot3Entry
+			DC.w		ENETDONE-ControlTable			; 239 LapSetDot3Entry
+			DC.w		ENETDONE-ControlTable			; 240 LapDot3Stats
+			DC.w		ENETDONE-ControlTable			; 241 LapDot3CollStats
+			DC.w		ENETDONE-ControlTable			; 242 LapGetLinkStatus
+			DC.w		ENETOK-ControlTable				; 243 CloseSAP
+			DC.w		ENETOK-ControlTable				; 244 OpenSAP
+			DC.w	   	DoDelMulti-ControlTable			; 245
+			DC.w		DoAddMulti-ControlTable			; 246
+			DC.w		DoAttachPH-ControlTable			; 247
+			DC.w		DoDetachPH-ControlTable			; 248
+			DC.w		DoWrite-ControlTable			; 249
+			DC.w		DoRead-ControlTable				; 250
+			DC.w		DoRdCancel-ControlTable			; 251
+			DC.w		DoGetInfo-ControlTable			; 252
+			DC.w		ENETOK-ControlTable				; 253 DoSetGeneral
+;___________________________________________________________________________
+;
+; DoAddMulti - add a multicast address to the list
+;
+;    Call:
+;	A2 -> our variables
+;       	D1 = first two bytes of address
+;       	D3 = last four bytes of address
+;
+;    Return:
+;       	D0 = error code
+;___________________________________________________________________________
+
+DoAddMulti
+			MOVEQ   	#eMultiErr,D0           		; Assume invalid address or table full
+			BTST		#8,D1   						; Make sure multicast bit is set
+			BEQ 		ENETDone                		; Return error if invalid multicast address
+			BSR 		FindMEntry						; D2 = entry number for this address
+			BPL.S   	@40     						; Branch if found it
+;
+; Look for the first free one
+;
+			MOVEQ   	#MTblSz-1,D2    				; D2 = no. of entries in multicast table
+@30 		TST.B		(MultiCTbl+MUseCount,A2,D2*MEntrySz)
+														; This one free?
+			DBEQ		D2,@30      					; Loop until checked them all or got one
+@35 		BNE 		ENETDone    					; Error if none free
+
+;
+; Set in table, then compute and set hash bit in appropriate multicast address register (MAR)
+;
+@40 		MOVE.L  	D3,(MultiCTbl+2,A2,D2*MEntrySz) 
+														; Set second part of address	
+			MOVE		D1,(MultiCTbl,A2,D2*MEntrySz)	
+														; Set first part of address
+			ADDQ.B  	#1,(MultiCTbl+MUseCount,A2,D2*MEntrySz) 
+			CMPI.B		#1,(MultiCTbl+MUseCount,A2,D2*MEntrySz)
+			BHI			ENETOK
+
+
+			SUBA.W		#CAMparms.ParmSize,SP			; make room for CAM parms
+			MOVE.L		#-1,CAMparms.LoadorClear(SP)	; we are adding a CAM entry
+			MOVE.L		D3,CAMparms.EAddr+2(SP) 		; lower 32 bits
+			MOVE.W		D1,CAMparms.EAddr(SP)			; upper 16 bits
+			BSR			SONICAddr						;								<Z12>
+			MOVE.L		A0,CAMparms.SONICPtr(SP)		; pass SONIC base address		<Z12>
+			BSR			DataCacheOff					; turn off data cache on LC 030	<Z12>
+			BSR 		SONICCAMLOAD					; add this entry
+			ADDA.W		#CAMparms.ParmSize,SP
+			BSR			DataCacheOn						; turn data cache back on		<Z12>
+
+			BRA			ENETOK      					; That's it
+
+
+
+;___________________________________________________________________________
+;
+; DoDelMulti - delete a multicast address to the list
+;
+;    Call:
+;	A2 -> our variables
+;       	D1 = first two bytes of address
+;       	D3 = last four bytes of address
+;
+;    Return:
+;       	D0 = error code
+;
+; Decrements the use count for the given address
+;___________________________________________________________________________
+
+DoDelMulti  MOVEQ   	#eMultiErr,D0           		; Assume address not found
+			BSR.S   	FindMEntry  					; D2 = entry number in table
+			BMI.S   	ENETDone    					; Return error if not found
+			SUBQ.B  	#1,(MultiCTbl+MUseCount,A2,D2*MEntrySz) 
+														; Decrement use count
+			BNE.S		ENETOK
+
+
+			SUBA.W		#CAMparms.ParmSize,SP			; make room for CAM parms
+			CLR.L		CAMparms.LoadorClear(SP)		; we are deleting a CAM entry
+			MOVE.L		D3,CAMparms.EAddr+2(SP) 		; lower 32 bits
+			MOVE.W		D1,CAMparms.EAddr(SP)			; upper 16 bits
+			BSR			SONICAddr						;								<Z12>
+			MOVE.L		A0,CAMparms.SONICPtr(SP)		; pass SONIC base address		<Z12>
+			BSR			DataCacheOff					; turn off data cache on LC 030	<Z12>
+			BSR 		SONICCAMLOAD					; delete this entry
+			ADDA.W		#CAMparms.ParmSize,SP
+			BSR			DataCacheOn						; turn data cache back on		<Z12>
+
+			BRA.S   	ENETOK      					; Return no error
+;
+; FindMEntry - find this address's entry in the multicast table
+;
+;    Call:
+;	D1 = high two bytes of address
+;	D3 = low four bytes of address
+;	A2 -> our variables
+;
+;    Return:
+;	D2 = entry number within table (minus if not found). CCR set.
+;
+
+FindMEntry  MOVEQ   	#MTblSz-1,D2    				; D2 = no. of entries in multicast table
+@10 		TST.B		(MultiCTbl+MUseCount,A2,D2*MEntrySz)
+														; Is this entry in use?
+			BEQ.S   	@20     						; Branch if not
+			CMP 		(MultiCTbl,A2,D2*MEntrySz),D1	
+														; This it?
+			BNE.S   	@20     						; Branch if not
+			CMP.L   	(MultiCTbl+2,A2,D2*MEntrySz),D3 
+														; Is it?
+			BEQ.S   	@30     						; Branch if got it
+@20 		DBRA		D2,@10      					; Loop until checked them all
+@30 		TST 		D2      						; Set CCR
+			RTS 										; And return
+
+
+
+;___________________________________________________________________________
+;
+; DoAttachPH - attach protocol handler control call
+;
+;    Call:
+;	A2 -> our variables
+;       	D3 = address of protocol handler's packet-receive code or zero
+;       	D1 = protocol type code 
+;
+;    Return:
+;       	D0 = error code
+;___________________________________________________________________________
+
+DoAttachPH
+			AND.L		AddrMask(A2),D3 				; 32 bit clean
+
+			MOVEQ		#LAPProtErr,D0					; Assume an invalid protocol error
+;
+; Read down the active protocol table, searching for a match
+;
+@10 		BSR.S   	GetProt                 		; See if it's there
+			BPL.S   	ENETDone                		; Return error if protocol already active
+;
+; Now scan for the first free one . . .
+;
+			MOVEQ   	#LAPTblSz-1,D2      			; Index into active protocols list
+@20 		TST.B   	InUseFlag(A2,D2)    			; Check this entry
+			DBEQ		D2,@20      					; Loop until get one or end
+			BNE.S   	ENETDone    					; Error if none
+			MOVE.L  	D3,(Handlers,A2,D2*4)   		; Fill Handlers in first (in case of interrupt)
+			CLR.L   	(RdQueueHd,A2,D2*4)     		; Clear out read queue head
+			MOVE		D1,Protocols(A2,D2*2)			
+														; Fill protocol type in
+			ST  		InUseFlag(A2,D2)    			; Indicate in use
+ENETOK  	CLR 		D0                      		; Indicate no error
+ENETDone
+			MOVE.L  	OurDCE(A2),A1               	; Make sure A1 has DCE address
+			MOVE.L  	JIODone,-(SP)           		; This is how we exit (Prime, Control, Status)
+			RTS
+
+;
+; Lookup D1 in the protocol table. Return D2 = index to protocol (negative = error).
+;
+GetProt 	MOVEQ   	#LAPTblSz-1,D2      			; Index into active protocols list
+@10 		TST.B   	InUseFlag(A2,D2)    			; In use?
+			BEQ.S   	@20     						; Branch if not
+			CMP 		Protocols(A2,D2*2),D1   		; Match?
+			BEQ.S   	@30     						; Branch if so
+@20 		DBRA		D2,@10      					; Keep going until got one
+@30 		TST 		D2      						; Set CCR to D2
+			RTS 										; Return (BPL for match)
+;___________________________________________________________________________
+;
+; DoDetachPH - detach protocol handler control call
+;
+;    Call:
+;	A2 -> our variables
+;       	D1 = protocol type code
+;
+;    Return:
+;      	D0 = error code
+;___________________________________________________________________________
+
+;
+; Find the requested protocol
+;
+DoDetachPH
+			MOVEQ		#LAPProtErr,D0					; Assume no such protocol active
+
+			BSR.S   	GetProt     					; D2 = index to protocol
+			BMI.S   	ENETDone                		; Return error if at end of table
+			CLR.B   	InUseFlag(A2,D2)        		; Indicate entry free
+			TST.L   	(Handlers,A2,D2*4)  			; Default handler?
+			BNE.S   	@10     						; All done if not
+			BSR.S   	AbortAll    					; Abort all active reads
+@10 		BRA.S   	ENETOK      					; Complete this call
+
+
+;
+; AbortAll - abort all active read requests.
+;
+;	A2 -> our variables
+;	D2 = flag offset into protocol table
+;	Uses D1,A0
+;
+; Assumes InUseFlag(A2,D2) cleared out already so no interrupts
+;
+
+AbortAll	MOVE.L  	(RdQueueHd,A2,D2*4),D1  		; D1 -> first read, if any
+			BEQ.S   	@10     						; Branch if none
+			MOVE.L  	D1,A0   						; A0 -> queue element
+			MOVE.L  	(A0),(RdQueueHd,A2,D2*4)    	; Remove from queue
+			MOVE		#reqAborted,D0  				; Set error code
+			BSR 		CompleteReq     				; Return error
+			BRA.S   	AbortAll    					; And loop
+
+@10 		RTS
+;___________________________________________________________________________
+;
+; DoWrite - write out a packet on Ethernet
+;
+;    Call:
+;	A2 -> our variables
+;       	D3 = WDS pointer
+;
+;    Return:
+;       	D0 = error code
+;___________________________________________________________________________
+
+DoWrite
+; D3=ptr to caller's wds
+			MOVE		SR,-(SP)
+			ORI.W		#IntLockOut,SR					; no interrupts							<SM4> rb
+
+			MOVE.L		WrBuffHdr(A2),D2				; get a buffer pointer
+			BNE.S		@haveBuff
+
+			ST			XmitWait(A2)					; set waiting flag
+			MOVE		(SP)+,SR
+			MOVEQ		#noErr,D0
+			RTS											; return to caller
+@haveBuff
+			CLR.B		XmitWait(A2)					; no longer waiting
+
+			MOVEA.L		D2,A1							; A1->buffer
+			MOVE.L		QLink(A1),WrBuffHdr(A2)			; unlink from buffer list
+			MOVE		(SP)+,SR
+
+			MOVE.L		A1,-(SP)						; save buffer pointer for later
+
+			MOVE.L  	D3,A0   						; A0 -> WDS
+			CMP 		#EHdrSize,(A0)  				; First entry must have whole header
+			BLO.S   	@30     						; Error if not
+			MOVE.L  	2(A0),A0                		; A0 -> first WDS entry
+			MOVE.L  	OurAddr(A2),ESrcAddr(A0)    	; Set our address in it
+			MOVE		OurAddr+4(A2),ESrcAddr+4(A0)	
+														;	(all six bytes)
+			
+			MOVE.L		A4,-(SP)						; save non-interrupt scratch reg.
+			
+			LEA 		Max_Pkt_Size(A1),A3 			; A3->singe fragment wds (len field)
+			
+			MOVEQ		#-EHdrSize,D2					; setup for len check					<H5>
+			
+			CLR.W		(A3)							; init len								<H5>
+			MOVE.L		D3,A4							; A4-> caller's WDS						<H5>
+@x1
+			MOVEQ		#0,D0
+			MOVE.W		(A4)+,D0						; get this frag length
+			BEQ.S		@x2 							; all done
+			BMI.S		@LenError						; negative values not allowed			<H5 begin>
+			
+			ADD.W		D0,D2							; accum length
+			CMP.W		MaxData(A2),D2					; check length so far
+			BHI.S		@LenError						; bad, get out with error
+			
+			ADD.W		D0,(A3) 						; sum the length in WDS
+			MOVEA.L		(A4)+,A0						; get pointer to the data
+;a0->source, a1->dest, d0=len
+			MOVEM.L		A1/D0/D2,-(SP)					; save buff ptr and len
+			JSR			([BlockMove,A2])				; move the data
+			MOVEM.L		(SP)+,A1/D0/D2					;										<H5 end>
+			ADDA.L		D0,A1							; update buff ptr
+			BRA.S		@x1								; look for more
+@x2
+			MOVEA.L		(SP)+,A4						; restore non-interrupt scratch reg.
+			BRA.S		@sendit							; go and send it now					<H5 begin>
+
+@LenError												; packet length is invalid
+			MOVEA.L		(SP)+,A4						; restore this reg.						<H5 end>
+@30		
+			MOVE.L		(SP)+,A3						; A3->buffer
+			MOVE		SR,-(SP)
+			ORI.W		#IntLockOut,SR					;										<SM4> rb
+
+			MOVE.L		WrBuffHdr(A2),(A3)				; link buffer back to list
+			MOVE.L		A3,WrBuffHdr(A2)
+
+			MOVE		(SP)+,SR
+
+			MOVEQ   	#eLenErr,D0             		; Set length error
+			BRA			ENETDone                    	; Return it
+			
+@sendit
+			MOVE.L		(SP),-(SP)						; dup TOS								<H5>
+			ADDI.L		#Max_Pkt_Size,(SP)				; pass wds pointer						<H5>
+			BSR			SONICAddr
+			MOVE.L		A0,-(SP)						; pass base address of SONIC
+			
+			BSR			DataCacheOff					; turn off data cache on LC 030
+			BSR 		SONICXMIT						; send the packet
+			ADDQ.W		#8,SP
+			BSR			DataCacheOn						; turn data cache back on
+
+			BEQ.S		@TxOK							; SONIC was able to handle xmit
+			
+			MOVE.L		(SP)+,A3						; A3->buffer
+			MOVE		SR,-(SP)
+			ORI.W		#IntLockOut,SR					;										<SM4> rb
+
+			MOVE.L		WrBuffHdr(A2),(A3)				; link buffer back to list
+			MOVE.L		A3,WrBuffHdr(A2)
+
+			MOVE		(SP)+,SR						;										<Z12>
+
+			BSET		#0,deferCtl(A2)      			; indicate we are deferring
+			MOVE.W  	#1,vblCount+VBLQEL(A2)      	; set next vbl to tick fast
+			MOVEQ		#noErr,D0
+			RTS
+@TxOK
+			ADDQ.W		#4,SP							; trash buffer pointer					<Z12>
+
+			MOVEQ		#noErr,D0
+			MOVEA.L		ourDCE(A2),A1					; A1->DCE
+			MOVEA.L		JIODone,A0
+			JMP			(A0)							; all done now
+
+;
+; Tramsmit Complete routine (called from SONICInterrupt):
+
+TxPrm		RECORD		4
+TxDesc		DS.L		1								; ptr to Xmit descriptor
+TxParms		DS.L		1								; ptr to OurVars
+TxPrmSz		EQU			*								; size of record									<T6>
+			ENDR
+			
+XmitDone
+			MOVEA.L 	OurVarPtr,A0					; get ptr to our vars								<T6> thru next <T6>
+			MOVEA.L		OurDCE(A0),A1					; get our DCE ptr
+			BTST		#NeedDefer,dCtlStorage(A1)		; is VM running?
+			BEQ.S		@noVM							; no, just proceed
+			
+			MOVE.L		TxPrm.TxDesc(SP),A1				;													<Z11>
+			BSR.S		GetDescPhAddr					; get physical write buffer address in D0			<Z11>
+			LEA			@deferWrite,A0					; routine to call when safe
+			_DeferUserFn								; defer the routine
+			RTS
+@deferWrite
+			MOVEA.L		A0,A1							; A1->physical address of write buffer				<Z11>
+			MOVEA.L		OurVarPtr,A0					;													<Z11>
+			MOVEM.L 	A2/A3/D3,-(SP)					; save C regs										<Z11>
+			BRA.S		@findXmitBuffer					;													<Z11>
+@noVM													;													<Z11>
+			MOVE.L		TxPrm.TxDesc(SP),A1				; get ptr to descriptor
+
+			MOVEM.L 	A2/A3/D3,-(SP)					; save C regs
+
+			BSR.S		GetDescPhAddr					; get physical write buffer address in D0			<Z11>
+			MOVEA.L 	D0,A1							; A1->xmit buffer (physical address)				<Z11>
+@findXmitBuffer											;													<Z11>
+			MOVEA.L		PLTable(A0),A2					; A2->translation table
+			MOVE.L		XmitBuffs(A0),D0				; D0=#xmit buffers
+			SUBQ.W		#1,D0							; base zero
+@cmp
+			CMPA.L		PtoL.Physical(A2),A1			; found it?
+			ADDQ.W		#PtoL.Size,A2
+			DBEQ		D0,@cmp							; keep looking if not
+
+			BNE.S		@done							; safety, should not happen
+			
+			MOVEA.L		PtoL.Logical-PtoL.Size(A2),A1	; replace physical with logical address
+
+			MOVE		SR,-(SP)
+			ORI.W		#IntLockOut,SR					;											<SM4> rb
+
+			MOVE.L		WrBuffHdr(A0),(A1)				; link buffer back into list
+			MOVE.L		A1,WrBuffHdr(A0)
+
+			MOVE		(SP)+,SR
+
+			TST.B		XmitWait(A0)					; any pending xmits?
+			BEQ.S		@done							; leave if not
+
+			MOVEA.L		A0,A2							; A2->our vars
+			MOVEA.L		OurDCE(A2),A1					; A1->our DCE
+			MOVE.L		dCtlQHead(A1),A0				; A0->waiting write param blk
+
+			MOVE.L		CSParam+2(A0),D3				; D3 = 1st parameter longword (e.g. WDSP)
+
+			BSR			DoWrite							; process the write
+@done
+			MOVEM.L		(SP)+,A2/A3/D3					; restore C regs
+			RTS
+		
+GetDescPhAddr											; get physical address of descriptor in D0	<H5 begin>
+			SMOVE		TxPkt.frag_ptr1(A1),D0			; get upper 16 bits of buffer address
+			SWAP		D0
+			SMOVE		TxPkt.frag_ptr0(A1),D1			; get lower 16 bits of buffer address
+			MOVE.W		D1,D0							; D0=xmit buffer (physical address)			<H5 end>
+			RTS
+;___________________________________________________________________________
+;
+; DoRead - read a packet off the Ethernet
+;
+;    Call:
+;	A0 -> queue element
+;	A1 -> our DCE
+;	A2 -> our variables
+;       	D1 = protocol type code 
+;
+;    Return:
+;       	D0 = error code
+;___________________________________________________________________________
+
+DoRead  	MOVEQ   	#LAPProtErr,D0  				; Assume an error
+			BSR 		GetProt     					; D2 = index into PH table
+			BMI 		ENETDone    					; Error if not there
+			TST.L   	(Handlers,A2,D2*4)  			; Is it the default?
+			BNE 		ENETDone    					; Error if not
+			MOVE		#buf2SmallErr,D0    			; Assume buffer not big enough
+			CMP 		#EHdrSize,EBuffSize(A0) 		; Must hold at least header
+			BLO 		ENETDone    					; Return error if not
+;
+; Dequeue the request from the system queue and queue it on ours (in order)
+;
+			LEA 		(RdQueueHd,A2,D2*4),A3  		; A3 -> queue head
+			MOVE		SR,-(SP)    					; Save interrupt status
+			ORI.W		#IntLockOut,SR     				; Disable interrupts					<SM4> rb
+@10 		TST.L   	(A3)                			; Is there a next element?
+			BEQ.S   	@20                 			; Branch if not
+			MOVE.L  	(A3),A3             			; Point to it if so
+			BRA.S   	@10                 			; And keep going until end
+
+@20
+			EXG			D0,A0
+			AND.L		AddrMask(A2),D0
+			EXG			D0,A0							; 32 bit clean
+
+			MOVE.L		A0,(A3) 						; Put queue element on our queue
+			BCLR		#DrvrActive,DCtlFlags+1(A1) 	
+														; Clear driver active flag
+			MOVE.L  	IOLink(A0),DCtlQHead(A1)    	; Set next element addr in head
+			BNE.S   	@30                 			; Branch if there is none
+			CLR.L   	DCtlQTail(A1)       			; Clear tail if not
+@30 		CLR.L   	IOLink(A0)  					; Indicate it's last one on our queue
+			MOVE.L  	DCtlQHead(A1),D0    			; Any more requests?
+			BEQ.S   	@40             				; Branch if not
+			BSET		#DrvrActive,DCtlFlags+1(A1) 	
+														; We're active again
+			MOVE		(SP)+,SR    					; Restore interrupt state
+			MOVE.L  	D0,A0               			; A0 -> new queue element
+			MOVEQ   	#0,D0               			; D0 should be clear
+			BSR 		Control             			; Call ourselves
+			MOVEQ   	#0,D0   						; Return no error for previous call
+			RTS 										; Return
+
+@40 		MOVE		(SP)+,SR            			; Restore interrupt state
+			RTS 										; Return
+;___________________________________________________________________________
+;
+; DoRdCancel - abort a pending read call
+;
+;    Call:
+;	A2 -> our variables
+;       	D3 = pointer to queue element to abort
+;
+;    Return:
+;       	D0 = error code
+;___________________________________________________________________________
+
+DoRdCancel  MOVE		#CBNotFound,D0  				; Assume an error
+			AND.L		AddrMask(A2),D3					; 32 bit clean
+			MOVE.L  	D3,A1   						; A1 -> queue element
+			MOVE		EProtType(A1),D1    			; D1 = protocol type
+			BSR 		GetProt     					; D2 = index into PH table
+			BMI.S   	@60     						; Error if not there
+			TST.L   	(Handlers,A2,D2*4)  			; Is it the default?
+			BNE.S   	@60     						; Error if not
+			LEA 		(RdQueueHd,A2,D2*4),A3      	; A3 -> queue head
+			MOVE		SR,-(SP)                		; Save interrupt status
+			ORI.W		#IntLockOut,SR         			; Disable interrupts				<SM4> rb
+@30 		MOVE.L  	(A3),D3     					; D3 -> next element in queue
+			AND.L		AddrMask(A2),D3					; 32 bit clean
+			BEQ.S   	@50     						; Error if no more
+			SUB.L   	A1,D3   						; Subtract out desired one
+			BEQ.S   	@40                     		; Branch if it's the one
+			MOVE.L  	(A3),A3                 		; A3 -> next in queue
+			BRA.S   	@30                     		; Keep looking
+
+@40 		MOVE.L  	(A1),(A3)               		; Point previous to next
+			MOVE		(SP)+,SR                		; Restore interrupts
+;
+; Complete the ERead with an error, then the ERdCancel
+;
+			MOVE.L  	A1,A0   						; A0 -> ERead queue element
+			MOVE		#ReqAborted,D0  				; D0 = aborted error
+			BSR.S   	CompleteReq     				; Complete it with error
+			BRA 		ENETOk      					; Return no error for RdCancel
+
+@50 		MOVE		(SP)+,SR    					; Restore interrupt state
+@60 		BRA 		ENETDone    					; Return not found error
+
+
+;________________________________________________________________________
+;
+; CompleteReq - this code basically executes the parts of IODone necessary to
+;          complete the user's request (sets result code and executes the user's
+;          completion routine)
+;
+;    Call:
+;         D0 = result code
+;         A0 -> I/O queue element
+;________________________________________________________________________
+
+CompleteReq MOVE.W  	D0,IOResult(A0)             	; Set the result code
+			MOVEM.L 	D1-D3/A0-A3,-(SP)           	; Save registers
+			MOVE.L  	IOCompletion(A0),D1         	; Check if there's a completion routine
+			BEQ.S   	@10                         	; Branch if not - just return
+			MOVE.L  	D1,A1                       	; Get it if so
+			TST.W   	D0                          	; IODone does this
+			JSR 		(A1)                        	; Call completion routine
+@10 		MOVEM.L 	(SP)+,D1-D3/A0-A3           	; Restore registers
+			RTS 										; Return
+;___________________________________________________________________________
+;
+; DoGetInfo - return our node address
+;
+;    Call:
+;	A0 -> queue element
+;	A2 -> our variables
+;       	D3 -> buffer for response
+;
+;    Return:
+;       	D0 = error code
+;___________________________________________________________________________
+
+DoGetInfo
+			AND.L		AddrMask(A2),D3					; 32 bit clean
+
+			MOVEA.L		A0,A3							; save param blk ptr
+			MOVEQ   	#0,D0   						; Clear out D0
+			MOVE		EBuffSize(A3),D0    			; D0 = buffer size
+			CMP 		#InfoEnd-InfoStart,D0   		; Asking for more than we have?
+			BLS.S   	@10     						; Branch if not
+			MOVEQ   	#InfoEnd-InfoStart,D0   		; If so, just return what we have
+@10 		MOVE.L  	D3,A1   						; A1 -> where to move to
+			LEA 		InfoStart(A2),A0    			; A0 -> where to move from
+			PEA			(A1,D0.L)						; next spot to move to
+			MOVE.L		D0,-(SP)						; current move len
+			_BlockMove  								; Move it
+			MOVE.W		EBuffSize(A3),D0
+			SUB.L		(SP)+,D0						; D0=len left in user buffer
+			MOVEA.L		(SP)+,A1						; A1->user buffer
+			BLS			ENETOK							; no more user buffer
+
+			CMPI.L		#NetStats.Size,D0
+			BLS.S		@15 							; only move what is left
+			MOVE.L		#NetStats.Size,D0
+@15
+			LEA			EtherStats(A2),A0				; A0->stats
+			_BlockMove									; move them in
+			BRA 		ENETOK      					; Return no error
+
+
+;___________________________________________________________________________
+;
+; EtherRecv - receive routine - called by slot manager
+;
+;    Called:
+;	A1 = value passed in SIntInstall call (DCE pointer)
+;
+;    Return:
+;	D0 <> 0 to indicate interrupt has been serviced
+;	A1 may be modified
+;
+; We disable AppleTalk interrupts, since incoming ATalk packet could cause a
+; 20 msec hickup, whereas we'll generally take about 1/2 msec.
+;___________________________________________________________________________
+
+; EtherRecv(status,len,data,parms,buffdesc)
+
+EtherRecv												;												<T6> thru next <T6>
+			MOVEA.L		OurVarPtr,A1
+			MOVEA.L		OurDCE(A1),A1					; A1->DCE
+			BTST		#NeedDefer,dCtlStorage(A1)		; indicate VM is running	
+			BEQ.S		@noVM							; no, just continue
+
+			MOVEA.L		OurVarPtr,A0					; A0->our vars
+			LEA			RxDefBuffs-RxParms.ParmsSz(A0),A1				
+														; point at parameter storage
+			MOVEQ		#NumBuffers-1,D0				; loop to find an empty one
+@findRxDef
+			LEA			RxParms.ParmsSz(A1),A1			; bump pointer to next one
+			TST.L		RxParms.InUse(A1)				; find an available storage area
+			DBEQ		D0,@findRxDef					; keep searching
+			BNE.S		@noVM							; safety, should not happen
+
+			PEA			(A1)							; save ptr to storage
+			LEA			RxParms.Status(SP),A0			; setup source addr (stack already aligned)
+			MOVEQ		#RxParms.ParmsSz,D0				; move size
+			_BlockMove									; save parameters
+			MOVE.L		(SP)+,D0						; param to pass to defer routine
+			LEA			@deferRecv,A0					; routine to defer
+			_DeferUserFn
+			RTS
+@deferRecv
+			MOVE.L		A0,-(SP)						; save frame storage ptr
+			SUBA.W		#RxParms.ParmsSz,SP				; make param storage on stack
+			MOVEA.L		SP,A1							; A1->frame
+			MOVEQ		#RxParms.ParmsSz,D0
+			_BlockMove									; set frame data
+			
+			BSR.S		@noVM							; now do the receive routine
+
+			ADDA.W		#RxParms.ParmsSz,SP				; strip param storage				
+			MOVEA.L		(SP)+,A0						; get back storage ptr
+			CLR.L		RxParms.InUse(A0)				; mark entry as free
+			RTS											; done
+@noVM
+			LINK		A6,#RxParms.Size
+
+			MOVEM.L		A2-A5/D3,-(SP)					; save C regs									<T6>
+			
+			MOVE.L		OurVarPtr,A2					; A2 -> our variables
+			MOVE.L		RxParms.RxDesc(A6),LastRxDesc(A2)
+														; save descriptor pointer
+;
+; Process the receive interrupt
+;
+			MOVEA.L 	RxParms.Data(A6),A0 			; A0->packet data
+
+			MOVE.L		RxParms.Status(A6),D1			; get packet status
+			BTST		#ReceivedOK,D1					; was packet received OK?
+			BEQ.S		@85 							; don't process if not                              
+
+			MOVE.L		RxParms.Length(A6),D1			; d1=size of packet
+			SUBQ		#4,D1   						; Subtract off FCS bytes
+;
+; Copy the Ethernet header from the packet into the RHA
+;
+			LEA 		RHA(A2),A3  					; A3 -> RHA
+			MOVEQ   	#EHdrSize/2-1,D0    			; D0 = header count to move
+@40 		MOVE		(A0)+,(A3)+     				; Move from card to RHA
+			DBRA		D0,@40      					; Move them all
+			SUB 		#EHdrSize,D1    				; Subtract out header bytes from total
+;
+; Search the protocol handler table for this protocol
+;
+
+@50 		MOVE		EType-EHdrSize(A3),D0			; D0 = protocol type or 802.3 length
+			CMP.W		#EMaxDataSz,D0					; is it an 802.3?
+			BHI.S		@110							; if not, try other protocols
+
+			CLR 		D0								; Handler will be for type zero
+			EXG 		D0,D1   						; D1 = protocol type, D0 = old D1
+			BSR 		GetProt     					; D2 = offset in table
+			EXG 		D0,D1   						; Restore D0, D1
+			BMI.S		@85 							; Branch if not found
+			MOVE		EType-EHdrSize(A3),D0			; D0 = protocol type
+
+@70 		LEA 		EReadPacket,A4					; A4 -> our ReadPacket routine
+			LEA 		DefaultPH,A5					; use default maybe
+			MOVE.L		(Handlers,A2,D2*4),D3			; call the protocol handler
+			BEQ.S		@80 							; use default
+			MOVEA.L 	D3,A5							; use table entry address
+@80
+			JSR 		(A5)
+@85
+			MOVEA.L 	OurVarPtr,A2
+			MOVE.L		LastRxDesc(A2),D0
+			BEQ.S		@90 							; descriptor already freed
+			MOVE.L		D0,-(SP)
+			BSR 		SONICFREEBUFF
+			ADDQ.W		#4,SP
+@90
+			MOVEM.L 	(SP)+,A2-A5/D3					; Restore registers
+			UNLK		A6
+			RTS 										; That's it
+;
+; Find Protocol handler for non 802.3 packet
+;
+@110
+			EXG 		D0,D1							; D1 = protocol type, D0 = old D1
+			BSR 		GetProt 						; D2 = offset in table
+			EXG 		D0,D1							; Restore D0, D1
+			BMI.S		@85 							; Branch if not found
+
+			BRA.S		@70 							; Process it
+
+FreeDescriptor														; free current receive descriptor
+			MOVEM.L 	D0-D2/A2,-(SP)					; save regs
+			MOVEA.L 	OurVarPtr,A2					; get our vars
+			MOVE.L		LastRxDesc(A2),-(SP)			; pass descriptor pointer
+			CLR.L		LastRxDesc(A2)					; inidicate it has been freed
+			BSR 		SONICFREEBUFF					; free this descriptor
+			ADDQ.W		#4,SP
+			MOVEM.L 	(SP)+,D0-D2/A2
+			TST.W		D0
+			RTS
+
+;___________________________________________________________________________
+;
+;	EReadPacket - read in the specified number of bytes into the specified
+;		buffer. Asking for more than there is is an error.
+;
+;   EReadRest - read in the rest of the packet, putting the specified number
+;       of bytes into the specified buffer, and ignoring the rest.
+;
+;   Call:
+;       A0 -> current location in card memory
+;       A1 -> card registers
+;       A3 -> buffer to read into
+;       A4 -> start of ReadPacket
+;       D1 = number of bytes left to come in (caller may decrease)
+;       D3 = byte count to read
+;
+;   Return:
+;       D0 = error byte (Z bit set in CCR)
+;       D1 updated (ReadPacket)
+;       D2 saved
+;       D3  = 0 if exact number of bytes requested were read
+;           > 0 indicates number of bytes requested but not read
+;               (packet smaller than requested maximum)
+;           < 0 indicates number of extra bytes read but not returned
+;               (packet larger than requested maximum)
+;       A0,A1 preserved by ReadPacket, modified by ReadRest
+;       A2 saved
+;       A3 -> one past where last character went
+;       A4,A5 saved (until packet's all in or error)
+;___________________________________________________________________________
+
+EReadPacket BRA.S   	EDoRP   						; Need this for two entry points
+
+EReadRest   MOVE		D3,D0   						; D0 = number of bytes to return
+			SUB 		D1,D0   						; D0 = remainder count
+			TST 		D3      						; Check for zero
+			BEQ.S   	@10     						; If so, don't waste our time
+			BSR.S   	MoveBytes   					; Move the bytes in
+@10 		MOVE		D0,D3   						; D3 = remainder count
+			MOVEQ   	#0,D0   						; No error no matter what
+			BRA.S		FreeDescriptor					; let SONIC have descriptor back
+
+EDoRP
+			CMP.W		D3,D1
+			BLO.S		@5								; error in request
+			BSR.S		MoveBytes						; Move in the bytes
+			TST 		D3								; Moved them all?
+			BEQ.S		@10 							; Branch if moved all ok
+@5
+			MOVEQ		#eLenErr,D0 					; Set length error
+			BRA.S		FreeDescriptor					; let SONIC have descriptor back
+@10 		RTS 										; Return
+;___________________________________________________________________________
+;
+; DefaultPH - default protocol handler - complete an ERead call if there
+;
+;    Called:
+;	A0,A1: preserve until ReadRest
+;	A2 -> local variables
+;	A4 -> EReadPacket
+;	A5 usable until ReadRest
+;	D0 = protocol type
+;	D2 = index into protocol table
+;	Interrupts are off
+;
+;___________________________________________________________________________
+
+DefaultPH
+			MOVE.L  	(RdQueueHd,A2,D2*4),D0  		; D0 -> first ERead on queue
+			BEQ.S   	@20     						; Skip packet if none
+			MOVE.L  	D0,A5   						; A5 -> ERead queue element
+			MOVE.L  	(A5),(RdQueueHd,A2,D2*4)    	; Remove from queue
+			MOVE.L  	D0,D2   						; D2 = queue element pointer
+			MOVE.L  	EBuffPtr(A5),A3     			; A3 -> buffer to read into
+			MOVE		EBuffSize(A5),D3    			; D3 = maximum size to read
+			SUB 		#EHdrSize,D3    				; Adjust for header
+			LEA 		RHA(A2),A5  					; A5 -> header info
+			MOVE.L  	(A5)+,(A3)+     				; Move header into buffer
+			MOVE.L  	(A5)+,(A3)+     				; Hard code for speed
+			MOVE.L  	(A5)+,(A3)+     				; (AssumeEq?)
+			MOVE		(A5)+,(A3)+     				; A3 -> buffer after header
+			JSR 		2(A4)   						; Read in the whole thing (D0=0)
+			MOVE.L  	D2,A0   						; A0 -> queue element again
+			MOVE		EBuffSize(A0),D1    			; D1 = original request size
+			SUB 		D3,D1   						; D1 = total packet size
+			MOVE		D1,EDataSize(A0)    			; Set in queue element
+			TST 		D3      						; Check for buffer overflow
+			BPL.S   	@10     						; Branch if no overflow
+			MOVE		#buf2SmallErr,D0    			; Set error
+@10 		BRA 		CompleteReq     				; Complete request and return
+
+@20 		MOVEQ   	#0,D3   						; Indicate no buffer
+			JMP 		2(A4)   						; Ignore packet and return
+
+
+;___________________________________________________________________________
+;
+; MoveBytes - move bytes from card memory to desired place
+;
+;     Call:
+;	A0 -> current location in card memory
+;	A3 -> place to move bytes to
+;	D1 = number of bytes left in packet
+;	D3 = number of bytes to move
+;
+;     Return:
+;	A0 adjusted
+;	A3 adjusted past bytes moved in
+;	D1 adjusted
+;	D3 = zero if all could be moved, remainder otherwise
+;___________________________________________________________________________
+
+MoveBytes
+
+			MOVEM.L 	D0/D2/A1/A2,-(SP)   			; Save registers
+			MOVE.L  	OurVarPtr,A2    				; A2 -> our variables
+			EXG			D0,A3
+			AND.L		AddrMask(A2),D0
+			EXG			D0,A3							; 32 bit clean
+			MOVE.L  	A3,A1   						; A1 -> where to move to
+			MOVEQ   	#0,D0   						; D0 = number of bytes to move
+			MOVE		D3,D0   						; Assume we can move all asked for
+			CMP 		D1,D3   						; Can we move all asked for?
+			BLS.S   	@10     						; Branch if so
+			MOVE		D1,D0   						; Else move all we can
+@10 		SUB 		D0,D1   						; Adjust count left to come in
+			SUB 		D0,D3   						; D3 = bytes not moved
+			ADDA.W		D0,A3
+
+			MOVE.L		D1,-(SP)						; save this one
+			MOVE.L		A0,-(SP)
+			MOVE.L		D0,-(SP)
+			JSR 		([BlockMove,A2])				; call block move routine
+			MOVEA.L 	(SP)+,A0
+			ADDA.L		(SP)+,A0						; adjust pointer
+			MOVE.L		(SP)+,D1
+
+@30 		MOVEM.L 	(SP)+,D0/D2/A1/A2				; Restore registers
+			RTS 										; That's it
+;________________________________________________________________________
+;
+; Close - close the ENET driver.
+;
+;	A1 -> DCE
+;________________________________________________________________________
+
+Close
+;	This code is never really called because no use-count in implemented for the .ENET driver
+;	and multiple clients could be using it, e.g. MacTCP.
+			MOVE.L  	OurVarPtr,A2    				; A2 -> our variables
+
+			BSR			SONICAddr						; get SONIC base in A0					<Z12>
+			MOVE.L		A0,-(SP)						; pass SONIC base address				<Z12>
+			BSR.S		DataCacheOff					; turn off data cache on LC 030			<Z12>
+			BSR 		SONICHALT						; stop SONIC							<Z12>
+			ADDQ.W		#4,SP							;										<Z12>
+			BSR			DataCacheOn						; turn data cache back on				<Z12>
+
+			MOVEA.L		SONICmem(A2),A0
+			_DisPosPtr									; get rid of storage
+
+			MOVEQ   	#LAPTblSz-1,D2      			; D2 = Index into active protocols list
+@10 		TST.B   	InUseFlag(A2,D2)    			; Active?
+			BEQ.S   	@20     						; Branch if not
+			TST.L   	(Handlers,A2,D2*4)  			; Default handler
+			BNE.S   	@20     						; Branch if not
+			BSR 		AbortAll    					; Abort all requests
+@20 		DBRA		D2,@10      					; On to next
+			LEA 		SONICintQ,A0					; interrupt queue element
+			MOVEQ   	#0,D0   						; Clear out D0
+			MOVE.B		SONICCfg.SONICSlot(A2), D0		; setup slot from config values			<H5>
+			_SIntRemove 								; Remove us from interrupt queue
+
+			LEA			VBLQEL(A2),A0
+			TST.L		vblAddr(A0)						; did we launch ctl call VBL?
+			BEQ.S		@50
+			_VRemove									; remove VBL task if so
+@50
+			MOVEA.L		OurVarPtr,A0					;										<Z12>
+			_DisPosPtr									;										<Z12>
+			
+			LEA 		OurVarPtr,A2    				; A2 -> variable pointer
+			CLR.L   	(A2)    						; Clear it out (no variables)
+			MOVEQ   	#0,D0   						; Indicate no error
+AnRTS   	RTS 										; And return
+
+; for LC 030 not running VM, turn data caching off so SONIC can DMA and we see it				<Z12>
+DataCacheOff
+			MOVEA.L		OurVarPtr,A0
+			TST.B		SONICCfg.SmartMMU(A0)			; do we have smart MMU code?			<H5>
+			BNE.S		@done							; yes, memory is locked and non-cacheable<H5>
+			BTST		#NeedDefer,([OurDCE,A0],dCtlStorage)
+			BNE.S		@done							; VM running, don't alter data cache
+			MOVE		SR,-(SP)
+			ORI.W		#IntLockOut,SR					; Disable interrupts					<SM4> rb
+			ADDQ.L		#1,CacheCount(A0)				; bump use count
+			TST.L		DataCache(A0)
+			BNE.S		@done0							; data cache already disabled
+			MOVEC		CACR,D0
+			MOVE.L		D0,DataCache(A0)				; save current CACR
+			BSET		#11,D0							; purge data in data cache
+			BCLR		#8,D0							; disable data caching
+			MOVEC		D0,CACR							; do it
+@done0
+			MOVE		(SP)+,SR						; reenable interrupts
+@done
+			RTS
+
+DataCacheOn												; reenable data caching on LC030
+			MOVEM.L		A0/D0,-(SP)
+			MOVE		CCR,-(SP)						; save current condition flags
+			MOVEA.L		OurVarPtr,A0
+			TST.B		SONICCfg.SmartMMU(A0)			; do we have smart MMU code?				<H5>
+			BNE.S		@done							; yes, memory is locked and non-cacheable	<H5>
+			BTST		#NeedDefer,([OurDCE,A0],dCtlStorage)
+			BNE.S		@done							; VM running, don't alter data cache
+			MOVE		SR,-(SP)
+			ORI.W		#IntLockOut,SR					; Disable interrupts						<SM4> rb
+			SUBQ.L		#1,CacheCount(A0)				; decrement use count
+			BNE.S		@done0							; not ready for reenable, nested disables
+			MOVE.L		DataCache(A0),D0
+			CLR.L		DataCache(A0)
+			MOVEC		D0,CACR							; reenable data caching
+@done0
+			MOVE		(SP)+,SR						; reenable interrupts
+@done
+			MOVE		(SP)+,CCR						; restore condition flags
+			MOVEM.L		(SP)+,A0/D0
+			RTS
+			
+AddrPromAddr											; return address of Ethernet PROM in A0
+			MOVEA.L		SONICCfg.EnetPROM(A2), A0		; obtain address				<H5>
+			RTS
+SONICAddr
+			LEA			([OurVarPtr],SONICCfg), A0		;								<H5 begin>
+			TST.B		MMU32Bit
+			BEQ.S		@setBase24						; no adjustment for 24 bit
+			MOVEA.L		SCFG.SONICbase32(A0), A0		; obtain address for 32 bit		
+			RTS
+@setBase24
+			MOVEA.L		SCFG.SONICbase24(A0), A0		; obtain address for 24 bit		<H5 end>
+			RTS
+;
+; Variable storage
+;
+OurVarPtr   DC.L		0                   			; Pointer to our variables
+SONICintQ	DCB.B		SlotIntQElement.sqHDSize,0		; queue element for interrupts
+SONIChandler DC.L		0
+			END
+
+
+

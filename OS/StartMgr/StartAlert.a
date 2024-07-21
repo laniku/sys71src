@@ -1,0 +1,1055 @@
+;
+;	File:		StartAlert.a
+;
+;	Contains:	This file contains the system alert manager, assembled as part of
+;				the ROM-based boot code.  The system alert manager is called as the
+;				result of either a system error (when no debugger is installed) or
+;				through the SysAlert trap interface (used by Disk-switch).  It assumes
+;				that the system is broken and tries to use as little of it as possible
+;				to get a message up on the screen.  The message includes text, icons
+;				and some buttons, which execute user definable code when pushed.
+;
+;				If the system alert manager was entered as the result of an NMI (system
+;				error 13), MicroBug is called.  This the minimal set of get/set/go cmds
+;				for examining/altering the state of the machine.  It uses the system alert
+;				rectangle as a display window.
+;
+;	Written by:	Andy Hertzfeld  			20-Mar-83
+;	   			modified by Ken Krugler		4-May-85
+;
+;	Copyright:	© 1983-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <4>	 9/27/91	JSM		Don’t use hasCQD conditional, all future ROMs will have color
+;									QuickDraw.
+;		 <3>	 9/16/91	JSM		Cleanup header.
+;		 <2>	 6/12/91	LN		Changed #include 'HardwareEqu.a' to 'HardwarePrivateEqu.a'
+;	   <1.5>	 8/22/89	SES		Removed references to nFiles.
+;	   <1.4>	  7/7/89	SWC		NEEDED FOR AURORA: Zeroed DSErrCode when entering MicroBug since
+;									at that point, a fatal error hasn't occurred.
+;	   <1.3>	  5/4/89	SWC		Code cleanup and conditionals reduction for universal ROM.
+;	   <1.2>	 1/16/89	GGD		Added a scratch register parameter to the BigJMP macro calls
+;									since it will be needed when they change to use PC relative
+;									addressing.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	  <•1.1>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.0>	 2/10/88	BBM		Adding file for the first time into EASE…
+;	  <C966>	11/16/87	MSH		Changed alert box sizing and placement to be like Mac 2.
+;	  <C914>	10/29/87	rwh		Port to Modern Victorian (onMvMac)
+;	  <C882>	  9/3/87	RDC		Change check for NMI exception to D0=13 on all systems
+;	  <C873>	  9/1/87	MSH		Added support for HcMac (Laguna)
+;	  <C822>	 2/15/87	RDC		Fixed bug in DSErrHandler for fetch of error code on NuMac
+;	  <C714>	 1/28/87	WRL		Dispose of the color icon after plotting it.
+;	  <C682>	 1/24/87	WRL		When displaying a dialog box, SysErr now looks for a 'cicn'
+;									resource of the same ID as the icon it is about to display. This
+;									allows color icons to appear in system dialog boxes.
+;	  <C651>	 1/19/87	GWN		Changed branch to test mgr to a branch to CritErr.
+;	  <C584>	  1/2/87	GWN		Centered MicroBug port.
+;	  <C578>	12/31/86	GWN		Modified DrawSysErr so the box is centered on the screen
+;									depending upon the size of the screen. The objects drawn in the
+;									box are also centered.
+;	  <C573>	12/30/86	GWN		Fixed "MacsBug Installed" message. Temp hack for TFB video card.
+;	  <C549>	12/19/86	bbm		Fixed offset in hittest for buttons (global to localed the
+;									mouse)
+;	  <C448>	11/20/86	DAH		Jump to TestManager if no DSAlertTab.
+;	  <A309>	10/31/86	DAH		Once again change the sad mac code display so the major code is
+;									in d7 and the minor code is in d6 to match test fail codes.
+;	  <A292>	10/29/86	DAH		swap the error display in sad mac
+;	  <C206>	 10/9/86	bbm		Modified to mpw aincludes.
+;	  <C152>	 9/18/86	WRL		Made this a separate PROC.
+;	   <C56>	 6/26/86	WRL		Moved SystemBeep function to :OS:Beep.a
+;	   <C28>	  6/3/86	CSL		Added changes for Aladddin (onMacPP).
+;	   <C25>	 5/29/86	WRL		DAH Support for new CritErr.
+;		<C1>	 4/14/86	RDC		Added changes for 68020 Reno project (NuMac) - Changed variable
+;									for NMI debounce
+;				 11/3/85	JTC		Heighten erase rect in MicroBug command line.
+;				10/23/85	EHB		Set CurMap to SysMap in case font swap needed.
+;				10/16/85	EHB		Made DSError set clipping to the box (restore after)
+;				10/16/85	EHB		Commented out systemAlert which isn't used
+;				10/16/85	EHB		Made FakeRgn same size as QuickDraw's wide open clip.
+;				10/16/85	EHB		Made MicroBug set clipping to the box (restore after)
+;				 8/23/85	RDC		Changed code for syserror msg display for MidMac
+;				  8/5/85	RDC		Added code to adjust system error msg display for MidMac
+;				 7/23/85	RDC		Added changes for MidMac - changed test for MicroBug jump -
+;									reset NMI indicator bit when keyboard char received
+;				 5/21/85	KWK		Fixed non-save of D1/D2 in PrintNHex routines.
+;				 5/13/85	KWK		G <address> works again, so does regular syserror stuff, also
+;									uses equate for setting up the DS alert rect.
+;				 5/12/85	KWK		Re-added CritErr call if no DS table
+;				 5/10/85	KWK		Errors in drawing/DSAT punt to MicroBug, fixed restore of error
+;									code after drawing box.
+;				  5/7/85	KWK		Multiple MicroBug cleanup/enhancements
+;				  5/4/85	KWK		Added MicroDB, new DeepShit entry code
+;				 4/29/85	SC		D4 new parameter for boot beep
+;				 4/29/85	SC		Made SystemBeep not beep if sound is active
+;				 8/16/83	SC		Added parameter to SystemBeep
+;				  8/6/83	SC		Added SystemBeep
+;				 6/23/83	AJH		made it init VBL manager before tracking button
+;				 6/21/83	AJH		made it recouple cursor
+;				 6/14/83	AJH		made it stash deep shit ID in low mem
+;				  6/2/83	AJH		made it check for no dsAlerts as the 1st thing
+;				 5/14/83	AJH		made it init and show cursor if we have any buttons
+;				 4/13/83	AJH		Made it increment buttonID if restProc installed
+;				  4/5/83	AJH		Added procID field to alert definition structure
+;
+
+
+			BLANKS	ON
+			STRING	ASIS
+
+			PRINT		OFF					; <C152>
+			LOAD		'StandardEqu.d'
+			INCLUDE		'HardwarePrivateEqu.a'
+			PRINT		ON					; <C152>
+
+			PROC
+
+			EXPORT	AllocFakeRgns			; <C56>
+			EXPORT	DSErrorHandler			; <C152>
+			IMPORT	TMRestart				; TestManager entry point					<C448>
+			IMPORT	CritErr					; Critical Error handler, in case we fail.
+
+
+; ---------------------------------------------------------------------------
+; Routine	AllocFakeRgns
+; Arguments
+; Function	Sets up a dummy vis and clip region for the system alert port
+; ---------------------------------------------------------------------------
+
+AllocFakeRgns
+			LEA 	VisRgn(A6),A1			; get pointer to visRgn handle
+			LEA 	PortRec(A6),A0			; point to fake master pointer
+
+			MOVE.L	A0,(A1)+				; set up visRgn's master pointer on the stack
+			ADDQ	#4,A0
+			MOVE.L	A0,(A1)+				; ditto with the clipRgn's
+
+			LEA 	GetParam,A1 			; point the "master pointers" to a region
+			MOVE.L	A1,(A0) 				;  at GetParam to prevent a ROM write
+			MOVE.L	A1,-(A0) 				;											<1.3>
+OpenClip									; clip wide open (used on exit from syserr)
+			LEA 	FakeRgn+10,A0 			; copy the region data to RAM				<1.3>
+			LEA 	GetParam+10,A1 			;											<1.3>
+			MOVE.L	-(A0),-(A1)				;											<1.3>
+			MOVE.L	-(A0),-(A1)				;											<1.3>
+			MOVE.W	-(A0),-(A1)				;											<1.3>
+			RTS
+
+FakeRgn		DC.W	10
+			DC.W	$8001,$8001,$7FFF,$7FFF	;											<16-Oct-85>
+
+
+;---------------------------------------------------------------------------
+; ClipBox sets the clipRegion (stored in GetParam) to the DS Alert rect.
+; Trashes A0 and A1.
+;---------------------------------------------------------------------------
+
+ClipBox		LEA 	DSAlertRect+8,A0		; point to our rect 						<16-Oct-85><1.3>
+			LEA 	GetParam+2+8,A1			; point to vis/clip region					<16-Oct-85><1.3>
+			MOVE.L	-(A0),-(A1)				; DSAlertRect -> GetParam+2					<1.3>
+			MOVE.L	-(A0),-(A1)				;											<1.3>
+			MOVE.L	A1,-(SP)				; offset the clip's rect					<16-Oct-85>
+			BCLR	#7,(A1) 				; clear flag bit							<16-Oct-85>
+			MOVE.L	(A5),A0 				; get the port								<16-Oct-85>
+			MOVE.L	(A0),A0 				;											<16-Oct-85>
+			MOVE.L	PortBounds(A0),-(SP)	; push dh,dv								<16-Oct-85>
+			_OffsetRect 					;											<16-Oct-85>
+			RTS 							;											<16-Oct-85>
+
+
+;---------------------------------------------------------------------------
+; Routine	DSErrorHandler
+; Arguments DSErrCode	(input) 	System error value
+; Function	Creates temporary QD world on stack & uses the current Deep shit
+;			alert table (DSAT) to decide what to draw/do based on the system
+;			error value.  Allows 2 strings, 1 icon and N button to be drawn
+;			for any error value.  The restart proc creates a default 'resume'
+;			button in addition to the main (typically 'restart') button.  In
+;			addition, a procedure (called before drawing buttons) can be
+;			associated with an alert.
+; Uses		A0-A6/D0-D7
+;			NOTE: Interrupts off on entry, assumes reasonable SP, D7.L must
+;			always be DSAlertTab ptr after setup
+; Called by SystemError & SystemAlert
+;---------------------------------------------------------------------------
+
+DSErrorHandler
+			MOVE.W	#$2500,SR				; turn off interrupts 'cept power off		<C448>
+			MOVEQ	#0,D6					; clear upper word stuff					<C309><C448><1.3>
+			MOVE.W	DSErrCode,D6			; get saved error code						<C822>
+			MOVE.L	DSAlertTab,D7			; get alert table pointer					<C448>
+			BNE.S	@GoAlert				; installed, go nuts						<C448>
+
+; no deepshit alert table, keymap/resource map probably not set up either, so just bailout
+
+			MOVEQ	#15,D7					; test 15 => system alert error				<C309><C448><1.3>
+			BigJmp 	CritErr,A0	 			; Go directly to CritErr		  			<C448><C651><1.2>
+
+; setup the world for QuickDraw
+				
+@GoAlert	MOVE.W	#$2000,SR				; turn on interrupts
+			MOVE.W	CurMap,-(SP)			; save and set for System map,				<24Oct85>
+			MOVE.W	SysMap,CurMap			;  to ensure FONT 0 is available			<24Oct85>
+			LEA 	-4(SP),A5				; start A5 here
+			SUB.W	#GrafSize+140,SP		; allocate global, port space
+			MOVE.L	SP,A6					; remember start of port
+
+			PEA 	-4(A5)					; point to QD global space
+			MOVE.B	QDExist,D3				; preserve state of QDExist flag (don't let us affect it)
+			_InitGraf						; initialize QuickDraw
+			MOVE.B	D3,QDExist
+
+; allocate a grafPort using the space above the screen and initialize it
+
+			BSR.S	AllocFakeRgns			; init dummy vis and clip
+			MOVE.L	A6,-(SP)				; push address of grafPort
+			_InitPort						; initialize the port
+
+; decide whether to draw box or not, also whether to fall into MicroBug
+
+			MOVE.W	D6,D0 					; get error code							<1.3>
+			BMI.S	@SkipDBox				; neg => don't redraw alert box
+
+			CMP.W	#13,D0					; programmer's switch hit with no MacsBug?
+			BEQ 	MicroBug				; -> yes, use the ROM-based version
+			BSR 	DrawBox 				; draw and clear the alert box
+
+; move the port to the center of the screen
+
+@SkipDBox	TST.B	DSAlertRect				; is this a system alert? (vs system error?)<C573>
+			BPL.S	@IsSysAlert				; branch if so.								<C573>		
+			MOVE.L	DSCtrAdj,-(SP)			; Adjust TL of screen						<C573><C578>
+			_MovePortTo 					; and move the port.						<C573>		
+
+@IsSysAlert	BSR.S	ClipBox 				; set the clip to the alert rect			<EHB 16-Oct-85>
+
+			MOVE.W	D6,D0					; get error code							<1.3>
+			BSR		FindObject				; look it up, set A0 to pt to it
+			BNE.S	@GotAlert				; found it, now draw everything associated with it
+
+; tricky stuff...didn't find the specific alert id, so default to the first one.  Note, this
+; is required for the normal user alerts to work, as the 'Sorry, as system error has occured..'
+; has an id of -1, thus will never be found, but it is the first alert in the table, thus it
+; gets called for any system error (1..13), and its proc gets the exact error number from the
+; DSErrCode location and draws the 'ID = <N>' string.
+
+			MOVE.L	D7,A0					; get start of table
+			ADDQ.W	#6,A0					; bump past #of entries, entry id, entry length	<1.3>
+
+; we found the alert definition record so draw any appropriate fields
+
+@GotAlert	MOVE.L	A0,A3					; keep record pointer in A3
+			BSR		DrawText				; draw the message							<C682>
+			BSR		DrawText				; draw it									<C682>
+
+; Draw the icon, if any.  It gets the icon structure (the bits
+; and where to plot them) from the logical ID passed in D0...
+
+			MOVE.W	(A3)+,D0				; get the icon ID
+			BEQ.S	@NoIcon					; skip if there isn't one
+
+			BSR.S	FindObject				; get the icon data structure
+			BEQ.S	@NoIcon					; if none, skip
+
+			CMPI.W	#30,DSErrCode 			; Is the error fatal?
+			BLO.S	@FatalError				; If so, don't bug the resource manager.
+
+			MOVE.L	A0,A2					; Save the pointer to the rectangle in A2
+
+			SUBQ.W	#4,SP					; make room for color icon handle			<1.3>
+			MOVE.W	-4(A2),-(SP)			; Push icon ID
+			_GetCIcon						; Get the color icon of the same ID if present
+			TST.L	(SP)					; Did we get a color icon (leave the handle on the stack)?
+			BEQ.S	@NoColor				; Branch if not
+
+			MOVE.L	A2,-(SP)				; Push a pointer to the rectangle to plot it in	<C714>
+			MOVE.L	4(SP),-(SP)				; Push a handle to the color icon.			<C714>
+			_PlotCIcon						; Plot the color icon
+			_DisposCIcon					; Dispose of it								<C714>
+			BRA.S	@NoIcon					; Skip the black and white icon
+
+@NoColor	ADDQ.W	#4,SP					; Restore stack.							<C714>
+			MOVE.L	A2,A0					; Restore A0 so that we can plot the b/w version
+
+@FatalError
+			PEA 	8(A0)					; push a pointer to the icon bits
+			MOVE.L	A0,-(SP)				; push a pointer to the rectangle
+			PEA 	4(SP)					; push handle to the icon bits
+			_PlotIcon						; plot the icon
+			ADDQ.W	#4,SP					; pop off the icon pointer
+
+; call the alert's procedure, if any...
+
+@NoIcon		MOVE.W	(A3)+,D0				; get the proc ID
+			BEQ.S	@NoProc					; if none, skip
+
+			BSR.S	FindObject 				;look up the proc
+			BEQ.S	@NoProc					;if not found, skip
+			JSR		(A0)					;invoke it
+
+; draw any buttons...
+
+@NoProc		MOVE.W	 (A3)+,D0				;get the buttonList
+			BEQ.S	 @NoSemantics			;if none, we're done
+
+; if there's a restart proc installed, increment buttonID number
+
+			TST.L	RestProc				;is a restart procedure installed?
+			BEQ.S	@NoRestart
+			ADDQ.W 	#1,D0					;yes, increment the buttonID number
+@NoRestart	BSR		DoButtons				;draw the button list and hit test it
+			BEQ.S	@NoSemantics			;if none, we're done						<1.3>
+
+; we got a semantic routine associated with a button so invoke it
+
+		   MOVE.L	A0,-(SP)				; set up routine								<EHB 16-Oct85>
+		   BRA		OpenClip				; set clip to full size and jump to A0 routine	<EHB 16-Oct85><1.3>
+
+; there is no button list, or the button that was pushed denies responsibility,
+; so just return to caller normally.
+
+@NoSemantics
+RTS2SysErr	BSR 	OpenClip				; set clip back to full size				<EHB 16-Oct85>
+			ADD.W	#GrafSize+140,SP		; cut back the stack
+			MOVE.W	(SP)+,CurMap			; restore CurMap from stuffed SysMap		<24Oct85>
+			MOVEQ	#0,D0					; return no error
+			RTS 							; exit back to SystemError code
+
+
+;---------------------------------------------------------------------------
+; FindObject takes the logical alert ID in D0 and scans through the
+; association until it finds an entry with the matching ID.  It returns
+; a pointer to the object body in A0, which is NIL if it couldn't
+; find anything. The z-Flag will be set if we couldn't find it.
+;---------------------------------------------------------------------------
+
+FindObject  MOVE.L	D7,A0					;point to DS data structure
+			MOVE.W	(A0)+,D1				;get the number of entries
+			BRA.S	@GoFindIt
+
+@NextObject	CMP.W	(A0)+,D0				;is this the one we're looking for?
+			BEQ.S	@FoundObj				;-> didn't find the object we want
+			ADDA.W	(A0)+,A0				;bump to the next object
+@GoFindIt	DBRA 	D1,@NextObject			;-> keep looping if not
+
+			SUBA.L	A0,A0					;couldn't find it so return NIL
+			MOVEQ	#0,D0					; and exit with BEQ
+			RTS
+
+@FoundObj	ADDQ.W 	#2,A0					;skip length word to point to the data
+			MOVEQ	#-1,D0 			 		; and exit with BNE
+			RTS
+
+
+;---------------------------------------------------------------------------
+; DrawText draws the deep shit text structure as specified by the ID in D0
+;---------------------------------------------------------------------------
+
+DrawText	MOVE.W	(A3)+,D0				;get the text ID
+			BEQ.S	@NoText					;if zero, nothing to do
+
+			BSR.S	FindObject 				;find the text structure
+			BEQ.S	@NoText					;if not found, we're done
+			MOVE.L	(A0)+,D3				;get the start point
+			MOVEA.L	A0,A2					;remember start of the first line
+
+; scan for a null ($00) indicating the end of the text or the line separation character
+
+@ScanForEOL	MOVE.B	(A2)+,D0				;get the next byte							<1.3>
+			BEQ.S	@DrawTxLine				;if null, go draw the last line
+			CMP.B	#'/',D0					;is it the line separator?
+			BNE.S	@ScanForEOL				;if not, continue scanning
+
+; we got a null or a line separator so draw the text line
+
+@DrawTxLine	MOVE.B	D0,-(SP)				;preserve the delimiting character
+
+			MOVE.L	A2,D0					;calculate how many text characters			<1.3>
+			SUB.L	A0,D0					; are on this line							<1.3>
+			SUBQ.W	#1,D0					; (don't include the delimiter in the length)
+			MOVE.L	A0,-(SP)				;pointer to the text to draw				<1.3>
+			CLR.W	-(SP)					;start at the beginning of the text
+			MOVE.W	D0,-(SP)				;how many characters to draw
+
+			MOVE.L	D3,-(SP)				;move to the starting text position
+			_MoveTo
+
+			_DrawText						; and draw a line of text
+
+			ADDI.L	#$000E0000,D3			;move the position to the start of the next line
+
+			MOVEA.L	A2,A0					;point A0 at the beginning of the next line
+			MOVE.B	(SP)+,D0				;was the delimiter a null?
+			BNE.S	@ScanForEOL				;-> no, go do the next line
+@NoText		RTS
+
+
+;---------------------------------------------------------------------------
+; DrawBox draws a dialog-box-like-box or a deepshit-like-box
+;---------------------------------------------------------------------------
+
+DrawBox 	MOVE.L	DSDrawProc,D0			; is a custom dialog draw procedure specified?
+			BLE.S	@StdProc				; -> nope
+			MOVE.L	D0,-(SP)				; push its address
+			BSET	#7,DSDrawProc			; make it a one-shot
+			RTS 							; go to it
+
+@StdProc	LEA 	DSAlertRect,A0			; pt A0 at rect
+			TST.B	(A0)					; is this a system alert? (vs system error?)
+			BPL.S	DrawSysAlert			; yes, draw normal, do _MovePortTo
+
+; we know it's a system error, so go stuff the rect w/what we need
+
+DrawSysErr
+			MOVEM.L	A1/D1,-(SP)				; save registers.							<C578>
+
+			MOVE.L	(A5),A1					;											<C578>
+			LEA		ScreenBits+Bounds+bottom(A1),A1 ;									<C578><1.3>
+
+			MOVEQ	#100,D0					; DSRect.top <- bounds.bottom/5.34				<1.3>
+			MULU	(A1)+,D0				;												<1.3>
+			DIVU	#534,D0					;												<C578>			
+			MOVE.W	D0,top(A0)				;												<C578>
+
+			MOVEQ	#-(DSRectTL>>16),D1		; DSCtrAdj <- DSRect.top - (Mac DSRect.top)		<1.3>
+			ADD.W	D0,D1					;												<1.3>
+			MOVE.W	D1,DSCtrAdj				;												<1.3>
+
+			ADD.W	#DSRectHei,D0			; DSRect.bottom <- DSRect.top + DSRectHei		<C578>
+			MOVE.W	D0,bottom(A0)			;												<C578>
+
+			MOVE.W	(A1),D0					; DSRect.left <- bounds.right/2 - DSRectLen/2	<C578>
+			LSR.W	#1,D0					;												<C578>
+			SUB.W	#DSRectLen/2,D0			;												<C578>
+			MOVE.W	D0,left(A0)				;												<C578>
+
+			MOVEQ	#-(DSRectTL**$FFFF),D1	; DSCtrAdj <- DSRect.left - (Mac DSRect.left)	<1.3>
+			ADD.W	D0,D1					;												<1.3>
+			MOVE.W	D1,DSCtrAdj+2			;												<1.3>
+
+			ADD.W	#DSRectLen,D0			; DSRect.right <- bounds.right/2 + DSRectLen/2	<C578>
+			MOVE.W	D0,right(A0)			;												<C578>
+
+			BSR.S	DrawBox2				; draw it
+
+			BSET	#7,DSAlertRect			; reset flag for system error
+
+			MOVEM.L	(SP)+,A1/D1				; restore registers.
+			RTS 							; and return
+
+DrawSysAlert
+			BSR.S	DrawBox2				; draw it
+			MOVE.L	DSAlertRect,-(SP)		; push TL of rect
+			_MovePortTo 					; move there
+			RTS 							; and return
+
+; use rect at (A0)
+
+DrawBox2	MOVE.L	A0, -(SP)				; rect for EraseRect
+			MOVE.L	A0, -(SP)				; rect for FrameRect
+			MOVE.L	A0, -(SP)				; rect for InsetRect
+			MOVE.L	A0, -(SP)				; rect for FrameRect
+			MOVE.L	A0, -(SP)				; rect for InsetRect						<19Mar85>
+			_EraseRect
+			_FrameRect
+			MOVE.L	#$00020002, -(SP)
+			_PenSize
+			MOVE.L	#$00030003, -(SP)
+			_InsetRect
+			_FrameRect						; draw the border
+			MOVE.L	#$FFFDFFFD,-(SP)		;											<19Mar85>
+			_InsetRect						; put the rect back to normal				<19Mar85>
+			_PenNormal						; put the pen back to normal
+NoButtons 	RTS
+
+
+;---------------------------------------------------------------------------
+; DoButtons draws some buttons as specified by the buttonList data structure
+; defined by the ID in D0, and then hit-tests the mouse position against
+; them.  It returns a dispatch address in A0, which is NIL if the deep
+; shit manager should just return
+;---------------------------------------------------------------------------
+
+DoButtons	BSR		FindObject 				;find the buttonList data structure
+			BEQ.S	NoButtons				;if none, we're done
+
+			MOVE.L	A0,A2					;remember the button base
+			MOVE.W	(A0)+,D3				;get the number of buttons
+			MOVE.L	A0,A3					;point A3 at the first button
+
+; loop through the button list, drawing each button
+
+@DrawBtnLp	MOVE.L	2(A3),-(SP)				;push topLeft
+			ADD.L	#$000E0004,(SP)			;offset it for pen position
+			_MoveTo							;position the pen
+
+			MOVE.W	(A3)+,D0				;get the string ID
+			BSR		FindObject 				;find the string
+			SUBQ.W 	#1,A0					;point to low byte of length
+			MOVE.L	A0,-(SP)				;push the string pointer
+			_DrawString						;draw the string
+
+			MOVE.L	A3,-(SP)				;push the rectangle pointer
+			MOVE.L	#$00100010,-(SP)		;push the roundness factor
+			_FrameRoundRect					;frame it
+
+			ADD.W	#8+2,A3 				;bump to next button
+			SUBQ.W	#1,D3					;any more buttons to do?
+			BNE.S	@DrawBtnLp				;-> yes
+
+; set the cursor to the arrow and show it
+
+			MOVE.L	(A5),A0					;get global base
+			PEA		Arrow(A0)				;push ptr to arrow image
+			_SetCursor						;make that the cursor
+
+			_ShowCursor						;make sure the cursor is visible
+			MOVE 	#$2000,SR				;make sure interrupts are on
+			ST		CrsrCouple 				;force the cursor to be coupled
+			CLR.B	VBLQueue				;make sure VBL manager is cool
+
+; OK, now the buttons are drawn so poll for a mouse button down
+
+@Wait4Click	TST.B	MBState					;is the mouse button down?
+			BNE.S	@Wait4Click 			;-> nope, wait until it is
+
+; the mouse button went down, so loop through the button data structure to
+; determine which button, if any, it went down in
+
+			MOVE.L	A2,A3					;get start of button list
+			MOVE.W	(A3)+,D3				;get the number of buttons
+			ADDQ 	#2,A3					;skip past the string ID
+
+@FindBtnHit	BSR.S	myPtInRect 				;test if we're in the button
+			BNE.S	@TrackBtn				;if so, go track the button
+
+; we're not in this button, so go test the next button.  If we tested them
+; all, go try again
+
+			ADD.W	#8+2+2,A3 				;bump to the next button
+			SUBQ.W 	#1,D3					;decrement button count
+			BNE.S	@FindBtnHit				;if more to test, loop
+			BRA.S	@Wait4Click				;go poll the mouse button
+
+; at this point, we know the mouse has gone down in the rectangle pointed to
+; by A3.  Track the mouse until the button goes up
+
+@TrackLoop	BSR.S	myPtInRect 				;are we in the rectangle?
+			CMP.B	D0,D3					;did it change?
+			BEQ.S	@NoChange				;skip if it didn't
+
+; we've moved in if we were out or out if we were in so toggle our state
+
+@TrackBtn	MOVE.B	D0,D3					;flag the button on/off						<1.3>
+			BSR.S	InvertBut				; and hilite or unhilite it
+
+; now see if the mouse button went up; continue tracking until it does
+
+@NoChange	TST.B	MBState	 				;is the mouse button still down?
+			BEQ.S	@TrackLoop				;-> nope, keep looping until it's not
+
+; the mouse went up -- if it wasn't in a button, continue polling the mouse
+; button.  If it was, return the address of the appropriate semantic routine
+
+			TST.B	D3 						;were we in the button?
+			BEQ.S	@Wait4Click				;if not, go try again
+
+			MOVE.W	8(A3),D0				;get ID of proc object
+			BRA		FindObject 				; and look it up							<1.3>
+
+; myPtInRect is a little code saving utility that tests if the current
+; mouse position is in the rectangle pointed to by A3
+
+myPtInRect	SUBQ 	#2,SP					;make room for the function result
+			MOVE.L	Mouse,-(SP)				;push the current mouse point
+			PEA		(SP)					;push address of mouse point				<C549>
+			_GlobalToLocal					;convert it to coordinates of alert			<C549>
+			MOVE.L	A3,-(SP)				;push the rectangle ptr
+			_PtInRect						;test if the point is in the button
+			MOVE.B	(SP)+,D0				;get the result in D0
+			RTS
+
+; InvertBut is a utility to invert the button whose rectangle is pointed to by A3
+
+InvertBut	MOVE.L	A3,-(SP)				;push the rectangle pointer
+			MOVE.L	#$00100010,-(SP)		;push the rounding factor
+			_InverRoundRect					;invert it
+			RTS
+
+
+; ---------------------------------------------------------------------------
+; Routine	MicroBug
+; Arguments
+; Function	Minimal debugger in Rom.  Allows display/set of memory/registers,
+;			also Go [address].	Invoked by one of two ways:
+;
+;			1) System alert/error & no alert definition found for error number
+;			2) NMI & no debugger installed.
+;
+; Registers D7		Previous command
+;			D6-D3	DM drawing
+;			D0-D2	Scratch
+;			A7		Stack
+;			A6		Input buffer current position ptr
+;			A5		Globals ptr
+;			A4		Input buffer start ptr
+;			A0-A3	Scratch
+; ---------------------------------------------------------------------------
+
+MicroBug	CLR.W	DSErrCode				; zero the deep shit code (no actual error)	<1.4>
+
+			LEA 	DSAlertRect,A0			; pt A0 at rect
+			BSR 	DrawSysErr				; erase/draw the deepshit error box
+
+			MOVE.L	DSCtrAdj,-(SP)			; adjust TL of DS rect for screen size		<C584>
+			ADD.L	#DSrectTL+$00060006,(SP);  so that text is inside of the rect		<C584>
+			_MovePortTo 					;  and move the port						<C584>		
+
+			BSR 	ClipBox 				; set the clipping to DSAlertRect			<EHB 16-Oct-85>
+			SUB.W	#evtBlkSize,SP			; room for event record						<1.3>
+			CLR.W	D7						; clear previous cmd value
+			CLR.L	MBdotAddr				; clear dot address
+			CLR.L	MBlocAddr				; clear location
+
+CmdReset	MOVE.L	#$001101B0,-(SP)		; BR = 120, 440 so we use 15, 440 (minus some)
+											; upped descender to 17 to catch ',' ';' etc.	<03Nov85  JTC>
+			CLR.L	-(SP)					; set TL = 0
+			BSR 	MBDoErase				; erase it
+
+			LEA 	MBbuffer+MBbufSize,A6	; point to end of buffer
+			MOVEQ	#0,D6					; init counter
+
+@0			MOVE.W	#' ',-(A6)				; clear it
+			ADDQ.W	#2,D6					; bump counter
+			CMP.W	#MBbufSize,D6			; all done?
+			BNE.S	@0						; nope
+			MOVE.L	A6,A4					; set start/end ptr
+
+			MOVE.L	#$000F000A,-(SP)		; push h,v = 10,15
+			_MoveTo 						; move there
+			MOVEQ	#'>',D0 				; get prompt char
+			MOVE.W	D0,-(SP)				; push on stack
+			_DrawChar						; and draw it
+
+; Command loop.  Get events, stuff key-down chars into buffer and display them,
+; wait for return.	On return, process buffer.
+
+CmdLoop		MOVE.L	SP,A0					; Point to event record on stack
+			MOVEQ	#1<<keyDwnEvt,D0		; keydown only								<1.3>
+			_GetOSEvent 					; any keyDown events in the queue?
+			BNE.S	CmdLoop 				; -> no, wait for one
+
+; we got a keydown event, process it
+
+			BCLR	#7,NMIFlag				; clear NMI indicator bit					<C1/14Apr86>
+
+			MOVEQ	#$7F,D0					; get the ASCII character value				<1.3>
+			AND.B	evtMessage+3(SP),D0		;  and force it to be less than 128			<1.3>
+			CMP.B	#'a',D0 				; is it lower case?
+			BLT.S	@0
+			BCLR	#5,D0					; yes, force it to be upper case
+
+; now D0.B is the character code value
+
+@0			CMP.B	#13,D0					; carriage return?
+			BEQ.S	GotCommand				; -> yes, go process the buffer
+
+			CMP.B	#8,D0					; backspace?
+			BNE.S	RegChar 				; -> no, all ok
+
+			CMP.L	A6,A4					; anything in buffer?
+			BEQ.S	CmdLoop 				; no, bail out
+
+			ADDQ.W	#1,D6					; increment remaining buffer space count
+			SUBQ.W	#1,A6					; remove one char from buffer
+
+			SUBQ.W	#4,SP					; room for pt
+			MOVE.L	SP,-(SP)				; @pt
+			_GetPen 						; get current pen pos, leave on stack
+			MOVE.L	(SP),-(SP)				; make copy (building rect on stack)
+
+			SUBQ.W	#2,SP					; room for result
+			MOVE.B	(A6),D0 				; get last char
+			MOVE.W	D0,-(SP)
+			_CharWidth						; and measure it
+			MOVE.W	(SP)+,D3				; get width
+			SUB.W	D3,2(SP)				; adjust left point of rect on stack
+			CLR.W	(SP)					; top pt = 0
+			MOVE.L	SP,-(SP)				; push @rect
+			CLR.W	-(SP)					; delta h = 0
+			MOVE.W	#2,-(SP)				; delta v = 2
+			_OffsetRect 					; offset it
+			BSR 	MBDoErase				; erase it
+
+			MOVE.W	D3,-(SP)				; char width
+			NEG.W	(SP)					; negative movement
+			CLR.W	-(SP)					; delta V = 0
+			_Move							; and reset the pen
+			BRA.S	CmdLoop 				; return
+
+RegChar		TST.W	D6						; any space left?
+			BEQ.S	CmdLoop 				; no, don't add any more chars
+
+			SUBQ.W	#1,D6					; dec buffer free space count
+			MOVE.B	D0,(A6)+				; buffer it up
+			MOVE.W	D0,-(SP)				; push on stack
+			_DrawChar						; draw it
+			BRA.S	CmdLoop 				; and loop
+
+GotCommand	CMP.L	A4,A6					; any chars?
+			BNE.S	@0						; yes, do reg processing
+			MOVE.W	D7,(A6)+				; stuff previous command
+
+@0			MOVE.W	(A4)+,D7				; get command word
+			LEA 	MBcmds,A0				; point at command table
+
+@1			MOVE.W	(A0)+,D0				; get routine name
+			BMI.S	@3						; last command, nothing matched
+			MOVE.W	(A0)+,D2				; get routine offset
+			CMP.B	#'@',D0 				; register display routine (wildcard digit?)
+			BNE.S	@2						; nope
+
+			MOVE.B	D7,D0					; stuff input number
+			CMP.B	#'0',D0 				; zero reg?
+			BMI.S	@1						; no, try next command
+			CMP.B	#'7',D0 				; last reg
+			BGT.S	@1						; no, try next command
+
+@2			CMP.W	D0,D7					; does input command match table
+			BNE.S	@1						; try next command
+
+			LEA 	MBcmds,A0				; pt to start of this code
+			JSR 	0(A0,D2.W)				; execute the routine
+@3			BRA 	CmdReset				; and start cmd loop again
+
+MBcmds		DC.W	'G ', GCmd-MBcmds		; since command line cleared, 'G' only matches to G & null
+			DC.W	'DM', DMCmd-MBcmds
+			DC.W	'SM', SMCmd-MBcmds
+			DC.W	'TD', TDCmd-MBcmds
+			DC.W	'D@', DCmd-MBcmds
+			DC.W	'A@', ACmd-MBcmds
+			DC.W	'PC', PCCmd-MBcmds
+			DC.W	'SR', SRCmd-MBcmds
+			DC.W	-1
+
+; Go command.  Try for address, if not there just return, else rts to it
+
+GCmd		BSR 	ReadToken				; try for address
+			BEQ.S	GotResume
+			MOVE.L	D0,-(SP)				; stuff address 							<EHB 16-Oct-85>
+			BSR 	OpenClip				; restore clipping							<EHB 16-Oct-85>
+			RTS 							; and go to it								<EHB 16-Oct-85>
+
+GotResume	ADD.W	#20,SP					; get rid of event record, RTS
+			CLR.B	DSWndUpdate 			; flag GNE to remove the alert . . .
+			BRA 	RTS2SysErr				; return to SysError handler
+
+; Erase the rect on the stack
+; Uses D0-D2/A0-A2
+
+MBDoErase	MOVE.L	(SP)+,A2				; preserve return address
+			MOVE.L	SP,-(SP)				; push @rect
+			_EraseRect						; erase lower pane
+			ADDQ.W	#8,SP					; flush rect
+			JMP 	(A2)					; and return
+
+; Display memory command.  Get Address, do full window for the guy
+
+DMCmd		MOVE.L	#$007001B0,-(SP)		; push BR
+			CLR.L	-(SP)					; TL = 0
+			BSR.S	MBDoErase				; erase the rect
+
+			BSR 	ReadXToken				; get address
+@0			BCLR	#0,D0					; force even address
+			MOVE.L	D0,A3					; set display address
+			MOVE.L	D0,MBdotAddr			; save as dot addr
+
+			MOVEQ	#6-1,D6					; 6 lines
+			MOVEQ	#15,D5					; starting V coord
+
+@1			ADD.W	#15,D5					; bump V coord
+			MOVE.W	#10,-(SP)				; push h
+			MOVE.W	D5,-(SP)				; push v
+			_MoveTo 						; move there
+			MOVE.L	A3,D0					; get address
+			BSR.S	Print6Hx				; print out
+
+			MOVEQ	#7,D4					; 8 words
+			MOVEQ	#35,D3					; starting h coord
+
+@2			ADD.W	#45,D3					; bump h coord
+			MOVE.W	D3,-(SP)				; push h
+			MOVE.W	D5,-(SP)				; push v
+			_MoveTo 						; move there
+			MOVE.W	(A3)+,D0				; get next word
+			BSR.S	Print4Hx				; print word
+			DBRA	D4,@2					; word column loop
+			DBRA	D6,@1					; line loop
+			MOVE.L	A3,MBlocAddr			; set up new address
+			RTS 							; and return
+
+Print6Hx	SWAP	D0
+			BSR.S	Print2Hx
+			SWAP	D0
+
+Print4Hx	MOVE.W	D0,-(SP)
+			ROXR.W	#8,D0
+			BSR.S	Print2Hx
+			MOVE.W	(SP)+,D0
+
+Print2Hx	MOVE.W	D0,-(SP)
+			ROR.W	#4,D0
+			BSR.S	PUTHEX
+			MOVE.W	(SP)+,D0
+
+PUTHEX		ANDI.B	#$0F,D0
+			ORI.B	#'0',D0
+			CMPI.B	#'9',D0
+			BLE.S	@0
+			ADDQ.W	#7,D0
+
+@0			MOVE.L	D0,-(SP)				; save D0
+			MOVE.W	D0,-(SP)				; push on stack
+			_DrawChar						; draw it
+			MOVE.L	(SP)+,D0				; restore D0
+			RTS 							; and return
+
+; Set Memory command.  Get an address, and then keep stuffing values until we're done
+; Uses D0-D6/A0-A1/A3
+
+SMCmd		BSR 	ReadXToken
+			MOVE.L	D0,A1
+			LEA 	MBdotAddr,A0			; point at storage
+			MOVE.L	D0,(A0)+				; set dot and loc addresses
+			MOVE.L	D0,(A0)+
+			MOVE.W	#'DM',D7				; jam repeat cmd to DM
+
+@1			BSR 	ReadToken
+			BEQ.S	DMCmd					; using locAddr, draw lower pane
+			MOVE.L	A1,A2					; get fixed point for shifting bytes in
+
+@2			MOVE.B	D0,-1(A2,D1)			; stuff byte at last position indicated by size (D1.W)
+			ASR.L	#8,D0					; get next byte
+			ADDQ.L	#1,A1					; bump destination ptr
+			SUBQ.L	#1,D1					; dec offset ptr
+			BNE.S	@2						; not done w/this value, keep looping
+			BRA.S	@1						; any more tokens?
+
+; TD command.  Display memory where all the regs are saved.
+
+TDCmd		MOVE.L	#SEVars,MBlocAddr		; set saved address to be location of regs
+			BRA.S	DMCmd					; using locAddr, draw lower pane
+
+; Dx command.  Set/display data register
+
+DCmd		LEA 	SED0,A3 				; pt at reg 0
+			BRA.S	SetR
+
+ACmd		LEA 	SEA0,A3
+			BRA.S	SetR
+
+PCCmd		LEA 	SEPC,A3
+			BRA.S	SetR0
+
+SRCmd		LEA 	SESR,A3
+			BSR.S	ReadToken
+			BEQ.S	SetR2					; print value
+			MOVE.W	D0,(A3) 				; stuff input
+			RTS 							; and return
+
+SetR		BSR.S	GetHex					; convert ascii in D0.B to hex value
+			LSL.L	#2,D0					; turn into long offset
+			ADD.L	D0,A3					; add offset
+
+SetR0		BSR.S	ReadToken
+			BEQ.S	SetR1					; print value
+			MOVE.L	D0,(A3) 				; stuff value
+			RTS 							; and return
+
+SetR2		MOVEQ	#-1,D6					; normal branch to SetR1 has D6=0
+
+SetR1		MOVE.L	#$007001B0,-(SP)		; push BR
+			CLR.L	-(SP)					; TL = 0
+			BSR.S	MBDoErase				; erase the rect
+			MOVE.L	#$00300010,-(SP)		; push 10,30 as drawing pt
+			_MoveTo 						; go there
+			MOVE.W	(A3)+,D0				; get current value
+			TST.W	D6						; special SR case?
+			BNE.S	@0						; yes, only print word
+			BSR.S	Print4Hx				; print high word
+			MOVE.W	(A3)+,D0				; get low word
+@0			BRA.S	Print4Hx				; print low word							<1.3>
+
+GetHex		AND.L	#$FF,D0 				; mask off anything but low byte
+			CMP.B	#$39,D0 				; Hex digit
+			BLE.S	@0						; assume so
+			SUBQ.B	#7,D0					; assume 0..9
+@0			AND.B	#$F,D0					; mask off low nybble
+			RTS 							; and return
+
+; ReadXToken will return either ReadToken value or (if nothing in input buffer)
+; the saved long value
+; ReadToken will return in D0.L the next value in the command line.  CC=NE if
+; something was there.
+; Uses D0-D6/A0
+
+ReadXToken	BSR.S	ReadToken				; try for something
+			BNE.S	@0						; we got something back, return it
+			MOVE.L	MBlocAddr,D0			; return saved address
+@0			RTS 							; and return
+
+ReadToken	MOVEQ	#0,D4					; clear accumulator
+			MOVEQ	#0,D6					; max # digits
+
+ReadMore	MOVEQ	#0,D5					; count # digits
+			CLR.W	MBSign					; set sign to positive
+			MOVEQ	#0,D3					; assume no indirection
+			MOVEQ	#0,D0
+			MOVEQ	#0,D1					; sub-number built here
+
+blanks		CMP.L	A6,A4					; any more chars?
+			BGE 	ReadExit				; if not escape
+
+leadSP		MOVE.B	(A4)+,D0				; get next char
+			CMPI.B	#' ',D0 				; skip blanks
+			BLE.S	blanks
+
+; See if leading sign or indirection
+
+			CMP.B	#'@',D0 				; leading @ indirection
+			BNE.S	@0
+			ADDQ	#1,D3					; bump indirection counter
+			BRA.S	leadSP
+
+@0			CMP.B	#'+',D0 				; leading plus
+			BEQ.S	leadSP
+			CMP.B	#'-',D0 				; leading minus
+			BNE.S	getBase
+			NOT.B	MBSign					; record sign change
+			BRA.S	leadSP
+
+getBase		CMP.B	#'$',D0 				; leading $?
+			BNE 	getLabel				; no, try for label
+
+			MOVEQ	#0,D0					; clear char value
+			MOVE.B	(A4)+,D0				; next character
+
+getNumber	BSR 	GetHex					; convert hex ascii digit in D0.B to number
+
+			ADDQ	#1,D5					; increment # digits
+			LSL.L	#4,D1					; multiply by 16
+			ADD.L	D0,D1					; add in this digit
+
+; Are we done?
+
+			CMP.L	A6,A4					; any more chars?
+			BGE.S	ReadExit				; if not escape
+
+			MOVE.B	(A4)+,D0				; get next char
+
+			CMP.B	#'0',D0 				; < ASCII zero
+			BGE.S	GetNumber				; go get more
+
+ReadExit	TST 	D3						; any indirection?
+			BEQ.S	@1
+			MOVEQ	#8,D5					; jam eight digits
+
+@0			BCLR	#0,D1					; make sure it's even
+			MOVE.L	D1,A0					; indirect it
+			MOVE.L	(A0),D1
+			SUBQ	#1,D3
+			BNE.S	@0
+
+@1			TST.B	MBSign					; negative?
+			BEQ.S	@2						; no, keep going
+			NEG.L	D1
+
+@2			ADD.L	D1,D4					; add into result
+
+; Clean up the bytes counter
+
+			ADDQ.W	#1,D5					; round up
+			LSR.W	#1,D5					; convert # chars to number of bytes
+			CMP.W	#4,D5					; more than a long?
+			BLE.S	@3						; no
+			MOVEQ	#4,D5					; jam to a long
+
+@3			CMP.W	D6,D5					; bump max # digits if D5 >
+			BLE.S	@4
+			MOVE.W	D5,D6					; max # digits
+
+@4			CMPI.B	#'+',D0 				; if plus or minus add a new one
+			BEQ.S	@5
+			CMPI.B	#'-',D0
+			BNE.S	@6
+
+@5			MOVE.B	D0,-(A4)				; push back on sign
+			BRA 	ReadMore				; and keep looping
+
+@6			MOVE.L	D4,D0					; return the number
+			MOVE.L	D6,D1					; return max digits
+			RTS 							; and return
+
+; See if the text matches a label
+
+getLabel	CMP.B	#'.',D0 				; dot?
+			BNE.S	notDot
+
+			MOVE.L	MBdotAddr,D1			; get saved long
+			MOVEQ	#1,D2					; amount to skip
+goLabel
+			MOVEQ	#8,D5					; all eight bytes
+cleanExit
+			MOVE.B	(A4)+,D0
+			SUBQ	#1,D2
+			BNE 	cleanExit
+
+			BRA 	ReadExit
+
+notDot		MOVE	D0,D2					; build a word
+			LSL 	#8,D2
+			MOVE.B	(A4),D2 				; get second byte
+
+			CMP 	#'PC',D2				; PC?
+			BNE.S	notPC
+
+			MOVE.L	SEPC,D1 				; return the PC
+
+go2Label	MOVEQ	#2,D2					; amount to skip
+			BRA 	goLabel
+
+notPC		CMP.B	#'R',D0 				; reg references start with R
+			BNE.S	getNumber				; try for hex number
+
+			CMP.B	#'A',D2 				; aregs
+			BNE.S	notAs
+
+			LEA 	SEA0,A0 				; point to address regs loc
+
+doReg		MOVEQ	#0,D2					; calculate the index
+			MOVE.B	1(A4),D2
+			SUB 	#'0',D2
+			BMI.S	getNumber				; RAx, x < '0'
+
+			CMP 	#7,D2
+			BGT.S	getNumber				; RAx, x > '7'
+
+			LSL 	#2,D2
+			MOVE.L	0(A0,D2),D1
+
+			MOVEQ	#3,D2					; amount to skip
+			BRA 	goLabel
+
+notAs
+			CMP.B	#'D',D2 				; Dregs
+			BNE.S	getNumber				; Rx, x <> A, x <> D
+
+			LEA 	SED0,A0 				; point to data regs loc
+			BRA 	doReg
+
+			ENDP							; <C152>
+
+			END								; <C152>
+

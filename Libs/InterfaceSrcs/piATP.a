@@ -1,0 +1,1256 @@
+;
+;	File:		piATP.a
+;
+;	Contains:	xxx put contents here xxx
+;
+;	Written by:	xxx put writers here xxx
+;
+;	Copyright:	© 1991-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 1/29/93	RB		Do not move the SCCLockout value to the status register, always
+;									do an ORI.W with it so that NuKernel works and the stack is not
+;									changed.
+;		 <4>	11/21/91	JL		Changed JSR StripAddress to the trap call itself. I've been
+;									informed that System 6 and greater has StripAddress implemented
+;									as a trap so I don't need to worry about it being there or not.
+;		 <3>	11/21/91	JL		Added import of StripAddress or else we can't build.
+;		 <2>	11/20/91	JL		Changed CLR.B (SP) to JSR StripAddress for 32 bit clean code in
+;									ListDequeue.
+;
+;
+
+    BLANKS ON
+    STRING ASIS
+
+			EJECT
+;_______________________________________________________________________
+;
+;		   ATP Routines
+;_______________________________________________________________________
+;
+
+;!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+;
+;	 MISCELLANEOUS calls
+;
+;!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+;___________________________________________________________________________
+;
+;	ATPLoad - open the ATP driver
+;
+;	 FUNCTION ATPLoad : OSErr;  OSErr is an INTEGER;
+;
+;	 Returns:  Result code
+;
+;	Operation:  Opens the .ATP driver.  Always synchronous
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .WORD	 Function result (return code)
+;
+;	Register Usage:
+;	 Uses A0, A1, D0
+;
+;	Modification History:
+;
+;	16 Aug 84 	GSS	New today
+;	 3 Sep 84 	GSS	Moved ATPEnter and ATPCompFin code into this function
+;	14 Dec 84 	GRT	Check is now made at beginning to make sure MPP and
+;		   ATP drivers are not already open; if MPP is not open
+;		   then go try to open it.
+;	 4 Jan 85 	RFA	Added ListEnqueue and ListDequeue for cancel calls
+;	 9 Jan 85 	GRT	Now using low memory variables to check if ATP is open
+;		   Also calling MPPOpen to open MPP
+;	10 Jan 85 	RFA	ListEnqueue and ListDequeue disable interrupts now
+;	15 Mar 85 	GRT	In ATPCompFin, RecoverHandle call added
+;	 1 May 86 	GRT	ATPEnter: queue element handle saved in queue element
+;		   No more _RecoverHandle
+;		   MakeBDS now returns BDS handle in A2
+;	Dec. 86		SJF	Added routine ATPEnter2, Fixed ATPReqCancel and ATPRspCancel
+;					so that they always execute syncronously.
+;_____________________________________________________________________________
+
+ATPLoad		PROC	EXPORT
+			JSR	 	RemoveHdlBlks
+
+; check to make sure the MPP driver is opened; if not, then open it anyways
+
+			CLR	 	-(SP)		  ; space for func result
+			JSR	 	MPPOpen		  ; open the MPP driver if necessary
+			TST	 	(SP)+		  ; check result
+@90		 	MOVE  	D0,4(SP)		; Set return code for caller
+			RTS			   		; Return
+			ENDPROC
+			
+			EJECT
+;_____________________________________________________________________________
+;
+; This is the common entry point code used by ATPSndRequest, ATPGetRequest,
+; and ATPSndRsponse
+;
+
+ATPEnter		PROC
+			JSR		RemoveHdlBlks
+			MOVE.L	(SP)+, D1 	 ; D1 = addr of caller to ATPEnter
+			MOVE.L	(SP)+, D2 	 ; D2 = return address one step back
+
+
+; Get a chunk of memory for the I/O queue element and temp storage and set it up.
+; The abRecord handle and async boolean are saved below the normal I/O queue
+; element so the completion routine can access them.
+
+			MOVEQ	#IOPBEnd,D0		; D0 = size of param blk needed
+			JSR	 	GetHdlAndLock 	 ; A0 = handle to IO param blk
+			BEQ.S	@10			 ; no error -- so continue
+
+; no memory for pblk -- so report error and clean up stack
+
+			TST	 	(SP)+		  ; remove async boolean from stk
+			MOVE.L	(SP)+, A0 	 ; pop the abrecord handle from stk
+			MOVE.L	(A0),A1		 ; dereference it
+			MOVE  	D0, abResult(A1)	 ; write result into abRecord
+			MOVE  	D0, (SP) 	  ; write func result to stk
+			MOVE.L	D2, A1		 ; A1 = return address
+			JMP	 	(A1)		  ; return to caller one step back
+
+@10		 	MOVE.L	A0,D0		  ; save handle in D0
+			MOVE.L	(A0), A0		 ; deref handle to param blk
+			MOVE.L	D0,qElHdl(A0)		; save Q element hdl in queue element
+			MOVE.B	(SP)+,asyncFlg(A0)	; save caller's async flag
+			MOVE.L	(SP)+, A1 	 ; A1 = abRecord handle
+			MOVE.L	A1, abRecHdl(A0)	; save handle to ABRecord in param blk
+			EXG	 	A0,A1		  ; A0 = abRec handle, A1 -> IOParamblk
+			_HLock			  ; lock the abRecord
+			EXG	 	A0,A1		  ; A1 = abRec handle, A0 -> IOParamblk
+			MOVE.L	(A1),A1		 ; A1 -> abRecord (dereference the handle)
+
+			MOVE  	#1,abResult(A1)	 ; mark abRecord as op in progress
+			CLR.B	ATPFlags(A0)		; clear all flags in param blk
+
+			MOVE  	#ATPRefNum, IORefNum(A0)  ; .ATP driver's ref num
+			MOVE.L	D1, -(SP) 	 ; push return address on stack
+			RTS			   ; return from ATPEnter
+
+			ENDPROC
+			
+			EJECT
+;	ATPEnter2 - this is the common entry point code used by ATPReqCancel, ATPRspCancel
+;	There is no Abrecord except the one we're aborting.
+
+ATPEnter2		PROC
+			BSR		RemoveHdlBlks
+			MOVE.L	(SP)+,D1				;D1 = addr of caller to ATPEnter
+			MOVE.L	(SP)+,D2				;D2 = return addr one step back
+			
+;	Get a chunk of memory for the I/O queue element and temp storage and set it up.
+;	The ABrecord handle and async boolean are saved below in the normal I/O queue element
+;	so the completion routine can access them.
+			
+			MOVEQ	#IOPBEnd,D0			;size of parm block
+			BSR		GetHdlAndLock			;A0 is handle to IO Param blk
+			BEQ.S	@10					;no errs
+			
+			TST.W	(SP)+				;trash boolean
+			MOVEA.L	(SP)+,A0				;A0 is ABrecord handle
+			MOVEA.L	(A0),A1				;deref
+			MOVE.W	D0,(SP)				;set func rslt
+			MOVEA.L	D2,A1				;A1 is return addr
+			JMP		(A1)					;exit one step back
+@10
+			MOVE.L	A0,D0				;save handle
+			MOVEA.L	(A0),A0				;deref, (A0)->parm blk
+			MOVE.L	D0,qElHdl(A0)			;save queue element hndl
+			TST.B	(SP)+				;trash async flag, always sync
+			MOVEA.L	(SP)+,A1				;A1 is ABrecord hndl
+			MOVEA.L	(A1),A1				;deref, (A1)->Abrecord
+			MOVE  	#ATPRefNum, IORefNum(A0)  ; .ATP driver's ref num
+			MOVE.L	D1, -(SP) 	 ; push return address on stack
+			RTS			   ; return from ATPEnter
+			ENDPROC
+			
+			EJECT
+			
+			
+; This is the common part of all ATP completion routines (It consists of code for
+; unlocking the abRecord, posting an event, and for linking the IOPblk to the free queue)
+
+ATPCompFin	PROC
+
+; unlock the abRecord
+
+			EXG	  	D1, A0			 ; D1 = pblk ptr, A0 = abRec handle
+			_HUnlock
+			EXG	  	D1, A0			 ; A0 = pblk ptr, D1 = abRec handle
+
+			TST.B	asyncflg(A0)		; was it an async call?
+			BEQ.S	@10			 ; no it wasn't
+
+; async call -- post an event
+
+			MOVE.L	A0,-(SP)		 ; iopblk ptr saved across PostEvent
+			MOVE  	#networkEvt,A0	 ; A0 = event number
+			MOVE.L	D1, D0		 ; D0 = event message = abRec Handle
+			_PostEvent		  ; Post the event
+			MOVE.L	(SP)+,A0		 ; Restore A0
+
+; put the IO param blk on the free queue
+
+@10			MOVE.L	qElHdl(A0),A0 	 ; recover handle to param block
+			JSR	 	UnlockAndLinkHdl	 ; put IOPBlk on the free blks queue
+			RTS
+			ENDPROC
+			
+			EJECT
+;
+;	MakeBDS
+;
+;	 This routine makes a BDS and fills in the various fields
+;
+;	 It is shared by ATPRequest and ATPResponse
+;
+;	On entry:
+;		 A1 -> abRecord
+;		 D1 = length of response message buffer
+;		 atpRspBuf(A1) -> response message buffer
+;		 atpRspUData(A1) = response user bytes (relevant
+;			    only for ATPResponse)
+;
+;	Returns:	A2 = BDS Handle
+;		 D0 = error code (condition codes set upon exit)
+;		 atpNumBufs(A1) = number of BDS entries
+;		 atpRspBDSPtr(A1) -> response BDS
+;
+MakeBDS		PROC
+			MOVEM.L	D3/A0/A3, -(SP)	 ; save regs on stack
+			MOVE  	#maxATPBuf, D3	  ; max size of a resp pkt
+			MOVE.L	atpRspBuf(A1), A3	 ; A3 -> rsp buffer
+			MOVE  	D1, D0		   ; move length into D0
+			BEQ.S	@10			  ; if zero, alloc 1 BDS entry
+
+			DIVU  	D3, D0		   ; D0.W = # of full pkts
+			CMP.L	#$FFFF, D0	  ; last piece length <> 0 ?
+			BLE.S	@40			  ; only full size pieces
+@10		 	ADDQ  	#1, D0		    ; count the last piece in
+
+@40		 	MOVE.B	D0, atpNumBufs(A1)   ; write buffer count into abRecord
+			MULU  	#BDSEntrySz, D0	  ; BDS = # entries * entry size
+			JSR		 GetHdlAndLock 	  ; A0 = BDS handle
+			BNE.S	@100 		  ; error exit
+
+			MOVE.L	A0,A2		  ; save handle in A2
+			MOVE.L	(A0), A0		  ; A0 -> BDS
+
+			MOVE.L	A0, atpRspBDSPtr(A1)	; put BDS pointer into abRecord
+			MOVE  	D1, D0		   ; D0 = byte count
+
+@60		 	MOVE  	D3, (A0)+	    ; size of piece
+			CMP	 	D3, D0		   ; how much buffer left ?
+			BGE.S	@70			  ; at least full size pkt
+			MOVE  	D0, -2(A0)	   ; adjust size to remaining part
+@70		 	MOVE.L	A3, (A0)+	   ; BDS.bufptr
+			CLR	 	(A0)+		   ; skip bdsDataSz
+			MOVE.L	atpRspUData(A1), (A0)+	; user bytes into BDS
+
+			ADD	 	D3, A3		   ; advance buffer ptr
+			SUB	 	D3, D0		   ; decrement count of bytes left
+			BGT.S	@60			  ; still not done
+
+			MOVEQ	#0, D0		  ; clear D0 to indicate no error
+
+@100 		MOVEM.L	(SP)+, D3/A0/A3	 ; restore regs
+			TST	 	D0		    ; set CCs for caller
+			RTS
+			ENDPROC
+			
+			EJECT
+;
+; ListEnqueue
+;
+; This utility is used to queue the IOQElements of all asynchronous ATPGetRequest,
+; ATPSndResponse, and ATPResponse calls so that if the user tries to close an ATP
+; socket, the interface can clean up any data structures it had allocated for calls
+; involving that socket.  The element to be queued is pointed to by A0. A1 is used.
+
+ListEnqueue	PROC
+			MOVE  	SR, -(SP)	  ; save old SR
+			ORI.W  	#SCCLockOut, SR	 ; and disable interrupts for now		<SM2> rb
+			LEA	 	SktQElList, A1	 ; get head of list
+			MOVE.L	(A1), ListLink(A0)	; new element points to first element
+			MOVE.L	A0, (A1)		 ; head points to new element
+			MOVE  	(SP)+,SR
+			RTS			   ; re-enable interrupts and return
+			ENDPROC
+;
+; ListDequeue
+;
+; This utility is used to dequeue an IOQElement of one of the above mentioned calls.
+; It is given a pointer to the element to be dequeued in A0, but it must look
+; through the list from the start because the list is not doubly-linked so it must
+; find the element's predecessor.  Note that the code is special-cased if the element
+; we are looking for is the first in the list.  This is unavoidable because the link
+; field is not at the start of the data structure, so I cannot make the head "look"
+; like a predecessor.
+; No error is returned if the element is not found - if this happens, I assume it
+; is because of the race condition between an ATPRspCancel and the completion of
+; the Response call (both of which will try to dequeue the IOQElement).
+
+ListDequeue	PROC
+			MOVE  	SR, -(SP)	  		; save old status
+			ORI.W  	#SCCLockOut, SR	; disable interrupts now				<SM2> rb
+			MOVEM.L	A1-A2, -(SP)		; save some registers
+			LEA	 	SktQElList, A1	 	; get head of list
+			MOVE.L	(A1), D0			; get pointer to next element
+			_StripAddress				;mask out high bits of addr
+			MOVEA.L	D0,A2
+
+			MOVE.L	A0,D0				; get pointer to next element
+			_StripAddress				;mask out high bits of addr
+			MOVEA.L	D0,A0
+			
+			CMP.L	A0, A2		 ; is this our IOQEl?
+			BNE.S	@20			 ; no, check next one
+			MOVE.L	ListLink(A2), (A1)	; yes, head now points to next element
+			BRA.S	@30			 ; and we're done
+
+@20		 	CMP.L	#0, A2		  ; are we at the end of the list?
+			BEQ.S	@30			 ; quit if so
+			MOVEA.L	A2, A1		 ; skip down list
+			MOVE.L	ListLink(A1),D0	; get pointer to next element
+			_StripAddress		;mask out high bits of addr
+			MOVEA.L	D0,A2
+			
+			CMP.L	A0, A2		 ; is this our IOQEl?
+			BNE.S	@20			 ; no, check next one
+			MOVE.L	ListLink(A2), ListLink(A1) ; yes, remove element from list
+
+@30		 	MOVEM.L	(SP)+, A1-A2		 ; restore registers
+			MOVE  	(SP)+,SR
+			RTS			   ; re-enable interrupts and return
+			ENDPROC
+			
+			EJECT
+;___________________________________________________________________________
+;
+;	ATPUnload - close the ATP driver only if we are working on a 128K system
+;	else ignore the call.
+;
+;	FUNCTION ATPUnload : INTEGER;
+;
+;	 Returns:  Result code
+;
+;	Operation:  Closes the .ATP driver. Always synchronous
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .WORD	 Function result (return code)
+;
+;	Register Usage:
+;	 Uses A0, A1, D0
+;
+;	Modification History:
+;
+;	16 Aug 84 	GSS	New today
+;	14 Dec 84 	GRT	Checks to see if system is 128k; if not, just ignore
+;		   the call (NOP).
+;
+;_____________________________________________________________________________
+
+ATPUnload 	PROC	EXPORT
+			JSR	 	RemoveHdlBlks
+			CLR.W	4(SP)				;good result for caller
+			RTS
+			ENDPROC
+			
+;!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+;
+;	 ATP REQUESTING END calls
+;
+;!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+;___________________________________________________________________________
+;
+;	ATPSndRqst - send an ATP request and wait for the response
+;
+;	FUNCTION ATPSndRequest(abRecord: ABRecHandle; async: BOOLEAN): INTEGER;
+;
+;
+;	where:	 async = TRUE if calls is to be made asynchronously
+;		  abRecord is the handle to the user provided atp abus Record
+;
+;	Returns:	 in the abus record
+;		  atpNumRsp = number of responses
+;		  atpEOM	  = true if EOM was set in response
+;		  abResult  = Result code
+;		  function result = abResult in synchronous case
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .BYTE	 async
+;	 .BYTE	 <junk>	   (Pascal filler)
+;	 .LONG	 abRecord 	  (handle)
+;	 .WORD	 Function result (return code)
+;
+;	Register Usage:
+;	 Uses A0, A1, D0, D1, D2
+;
+;	Modification History:
+;
+;	16 Aug 84 	GSS	New today
+;	24 Aug 84 	GRT	atpRefNum is MOVE.W not MOVE.L.
+;	 3 Sep 84 	GSS	code crunch -- use ATPEnter and ATPCompFin
+;	17 Oct 84 	RFA	code crunch
+;	20 Oct 84 	GSS	added label ATPSReq1 and a test branch in ATPRqComp
+;			to allow code sharing with ATPRequest.	Also added
+;			the appropriate .DEF for ATPSReq1
+;	13 Nov 84 	GRT	changed SUBQ.W to SUBQ.B in ATPRqComp's BDS testing loop
+;	14 Nov 84 	GRT	BTST should test bit 0 and not 1 @ ATPSReq1
+;	28 Nov 84 	GRT	Clearing high byte of atpNumRsp field before returning to user
+;	 4 Jan 85 	RFA	Added use of TIDValid bit to permit ATPReqCancel to work
+;	10 Jan 85 	RFA	wrong field name: atpTID instead of atpTransID
+;	15 Mar 85 	GRT	RecoverHandle call added
+;	20 Feb 86 	GRT	ATPRequest part of completion munged the BDS ptr if more than
+;		   one packet was received.
+;	 1 May 86 	GRT	No more _RecoverHandle
+;_____________________________________________________________________________
+
+ATPSndRequest	PROC	EXPORT
+			ENTRY	ATPSReq1
+			
+			JSR	 	ATPEnter 	  ; do preprocessing
+
+; A0 -> IO param blk,   A1 -> abRecord,   D2 = return address
+
+			MOVE.B	#tATPSndRequest,abOpCode(A1) ; write op code to abRecord
+			CLR.B	atpEOM(A1)	 ; clear EOM indication in abRecord
+
+; now prepare the IO param blk for the call to ATP.  Set the XO flag in the IOparamblk
+
+ATPSReq1		BTST  	#0, atpXO(A1) 	 ; (V1.1E)test XO boolean in abRecord
+			BEQ.S	@20			 ; branch if not XO
+			BSET  	#ATPXOBit,ATPFlags(A0) ; set XO flag in paramblk
+
+; now put the rest of the params into the param blk
+
+@20		 	MOVE.L	atpAddress(A1), AddrBlock(A0) ; destination address
+			CLR.B	NumofResps(A0) 		 ; clear number of responses field
+			MOVE.B	atpTimeOut(A1), TimeOutVal(A0)
+			MOVE.B	atpRetries(A1), RetryCount(A0)
+			MOVE.B	atpNumBufs(A1), NumofBuffs(A0)
+			MOVE.L	atpUserBytes(A1),UserData(A0)
+			MOVE  	atpRCount(A1), ReqLength(A0)
+			MOVE.L	atpDataPtr(A1), ReqPointer(A0)
+			MOVE.L	atpRspBDSPtr(A1), BDSPointer(A0)
+
+; set up control calls code
+
+			MOVE  	#SendRequest, CSCode(A0) ; control calls op code
+
+; test to see if the request is for an async call
+
+			TST.B	asyncFlg(A0)		; async call?
+			BEQ.S	@30			 ; No -- make synch call
+			MOVE.L	A1, D1		 ; Yes -- asynch call, save A1 for now
+			LEA	 	ATPRqComp, A1
+			MOVE.L	A1,IOCompletion(A0) ; set completion routine address
+			MOVE.L	D1, A1		 ; restore A1
+			BCLR  	#TIDValid,ATPFlags(A0) ; clear TID Valid flag in paramblk
+			_Control	,ASYNC		 ;
+			MOVE  	D0,(SP)		  ; save result of function call
+			BNE.S	@50			; if immediate error returned then exit
+@25		 	BTST  	#TIDValid,ATPFlags(A0) ; has driver set the TID yet?
+			BEQ.S	@25			 ; loop here until that happens
+			MOVE  	ReqTID(A0),atpTID(A1) ; save TID in abRec for cancels
+			BRA.S	@50			 ; now return to the caller
+@30		 	_Control 		   ; synch call
+
+; we return here after the synch transaction is over.	Call completion routine
+; to free up param blk and unlock abRecord; then return to the caller
+
+			MOVE  	D0,(SP)		  ; save result of function call
+			BSR	 	ATPRqComp
+@50		 	MOVE.L	D2, A1		  ; A1 = return address
+			JMP	 	(A1)		  ; return to caller
+
+; I/O completion routine
+;
+;	A0 -> I/O queue element
+;	abRecHdl(A0) = handle to abRecord for this request
+;	asyncflg(A0) = async boolean provided by the caller
+
+ATPRqComp 	MOVE.L	abRecHdl(A0), A1	; A1 = abRecord handle
+			MOVE.L	A1, D1		 ; save handle in D1
+			MOVE.L	(A1),A1		 ; deref the handle
+			MOVE  	IOResult(A0),abResult(A1) ; Save the result
+			CLR	 	atpNumRsp-1(A1)	 ; clear high byte of word (V1.1E)
+			MOVE.B	NumOfResps(A0),atpNumRsp(A1) ; Set number of responses
+			BTST  	#ATPEOMBit,ATPFlags(A0) ; See if got EOM
+			SNE	 	atpEOM(A1)	  ; Set EOM flag if got it
+			CMP.B	#tATPSndRequest,abOpCode(A1) ; was it a SndRequest call?
+			BEQ.S	@10			 ; Yes -- skip ATPRequest part
+
+
+; ATPRequest part of completion
+;
+;	-- set up A3 to point to the BDS
+;	-- fix abRecord values of atpRspSize and atpRspUData
+;	-- free the BDS
+
+			MOVE.L	A3, -(SP) 	 ; save A3 on stack
+			MOVE.L	atpRspBDSPtr(A1),A3 ; A3 -> BDS
+			MOVE.L	bdsUserData(A3),atpRspUData(A1) ; move user bytes to abRecord
+			CLR	 	D0		   ; clear accumulated message size
+			TST		abResult(A1)		 ; Error?
+			BNE.S	@08			 ; Yes -- skip BDS check
+			;
+			;  if there is no error (ie if we get here) then there is at least one
+			;  BDS entry
+			;
+			MOVE.L	A3,-(SP)		 ; preserve BDS ptr
+@05		 	ADD   	bdsDataSz(A3), D0   ; accumulate size of rsp msg
+			SUBQ.B	#1,NumofResps(A0)	; (V1.1D) decrement resp pkts count
+			BGT.S	@06			 ; if not done then branch
+			MOVE.L	(SP)+,A3		 ; restore BDS ptr
+			BRA.S	@08			 ; exit this routine
+@06		 	CMP   	#maxATPBuf,bdsDataSz(A3) ; check size = maxATPBuf ?
+			BEQ.S	@07			 ; size OK
+			;
+			;  intermediate piece of bad size -- report error
+			;
+			MOVE  #atpBadRsp,abResult(A1)  ; indicate resp bad structure
+			;
+			;  if a synch call then must fix function result on stack
+			;
+			TST.B	asyncFlg(A0)		; Synch call ?
+			BNE.S	@07			 ; No -- skip next instruction
+			MOVE  	#atpBadRsp, 8(SP)	 ; Synch call: fix func result
+			;
+			;  move on to next BDS entry
+@07		 	ADD  	#bdsEntrySz,A3	  ; point to next BDS entry
+			BRA.S	@05			 ; go check it
+			;
+			;  now free the BDS
+			;
+@08			MOVE  D0, atpActCount(A1) 	; stuff message length
+
+			EXG	 	A0, A3		  	; save A0 in A3 and A0 -> BDS
+			MOVE.L	bdsHdl(A3),A0		; get handle to BDS
+			JSR	 	UnlockAndLinkHdl	; put BDS on the free blks queue
+			EXG	 	A0, A3		  	; restore A0
+			MOVEA.L	(SP)+,A3			;restore A3
+@10			LEA  	 ATPCompFin,A1
+			JMP	 	(A1)		  		; jump to the common part of the
+									; completion routine
+			ENDPROC
+			EJECT
+;___________________________________________________________________________
+;
+;	  - send an ATP request and wait for the response
+;
+;	FUNCTION ATPRequest(abRecord: ABRecHandle; async: BOOLEAN): INTEGER;
+;
+;
+;	where:	 async = TRUE if calls is to be made asynchronously
+;		  abRecord is the handle to the user provided atp abus Record
+;
+;	Returns:	 in the abus record
+;		  atpActCount = size in bytes of the response message
+;		  atpRspUData = user bytes from response ATP header
+;		  atpEOM	  = true if EOM was set in response
+;		  abResult  = Result code
+;		  abOpCode  = tATPRequest
+;		  function result = abResult in synchronous case
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .BYTE	 async
+;	 .BYTE	 <junk>	   (Pascal filler)
+;	 .LONG	 abRecord 	  (handle)
+;	 .WORD	 Function result (return code)
+;
+;	Register Usage:
+;	 Uses A0, A1, D0, D1, D2
+;
+;	Modification History:
+;
+;	19 Oct 84 	GSS	New today
+;	20 Oct 84 	GSS	Put in the BDS part and the completion path fixes
+;	22 Oct 84 	GSS	modified to share MakeBDS code with ATPResponse
+;	15 Mar 85 	GRT	RecoverHandle call added
+;	 1 May 86 	GRT	Saving bds handle in queue element
+;_____________________________________________________________________________
+
+ATPRequest	PROC	EXPORT
+			JSR	 	ATPEnter 	  ; do preprocessing
+
+; A0 -> IO param blk ,	A1 -> abRecord ,   D2 = return address
+
+			MOVE.B	#tATPRequest,abOpCode(A1) ; write op code to abRecord
+			CLR.B	atpEOM(A1)	 ; clear EOM indication in abRecord
+
+; set up the BDS
+; first adjust the buffer length to be at most maxATPBuf
+
+			MOVEQ	#0, D1		 ; clear D1
+			MOVE 	atpRspSize(A1), D1  ; read response buffer size
+			CMP	 	#maxATPBuf*8, D1	 ; Is it too big ?
+			BLE.S	@05			 ; No -- go on
+			MOVE  	#maxATPBuf*8, D1	 ; Yes --too big. Set to 8*maxATPBuf
+
+@05			MOVE.L	 A2,-(SP) 	  ; save A2
+			JSR	 	MakeBDS		  ; go build the BDS
+			MOVE.L	A2,bdsHdl(A0)		; save BDS handle in queue element
+			MOVE.L	(SP)+,A2		 ; restore A2
+			TST		D0		   ; any errors from MakeBDS?
+			BNE.S	@09			 ; no error -- so continue
+
+; call the common code in ATPSndRquest
+
+			JMP	 	ATPSReq1
+
+; no memory for BDS -- so report error, unlock abRecord and free param blk
+
+@09		 	MOVE 	 D0, abResult(A1)	  ; write result into abRecord
+			MOVE  	D0, 4(SP)	  ; write function result onto stk
+			MOVE.L	(SP), A0		 ; get the param blk pointer from stk
+			MOVE.L	abRecHdl(A0), A0	; handle to abRecord
+			_HUnlock			  ; unlock abRecord
+			MOVE.L	(SP)+, A0 	 ; pop paramblk ptr from stk
+			_RecoverHandle 		 ; recover hdl to paramblk
+			_HUnlock
+			_DisposHandle			 ; free up the paramblk
+			MOVE.L	D2, A0		 ; return addr into A0
+			JMP	 	(A0)		  ; return to the caller
+
+			ENDPROC
+			EJECT
+;___________________________________________________________________________
+;
+;	ATPReqCancel - cancel a pending asynchronous ATPSndRqst or ATPRequest call
+;
+;	FUNCTION ATPReqCancel(abRecord: ABRecHandle; async: BOOLEAN): INTEGER;
+;
+;	This call is used to cancel any pending asynchronous ATPSndRqst or
+;	ATPRequest call from the Requesting End
+;
+;	where:	 abRecord is the handle to the user provided ATP abus Record
+;
+;	Returns:	 in the abRecord:
+;		  abResult = error code
+;		  function result = abResult in synchronous case
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .BYTE	 async
+;	 .BYTE	 <junk>	   (Pascal filler)
+;	 .LONG	 abRecord 	  (handle)
+;	 .WORD	 Function result (return code)
+;
+;	Register Usage:
+;	 Uses A0, A1, D0, D1, D2
+;
+;	Note: The .ATP driver will call the completion routine for the Request call,
+;	  and a ReqAborted error will be returned to the original call.
+;
+;	Modification History:
+;
+;	23 Oct 84 	RFA	New today
+;	10 Jan 85 	RFA	wrong field name: atpTID instead of atpTransID
+;
+;_____________________________________________________________________________
+
+ATPReqCancel	PROC	EXPORT
+			ENTRY	CnclCommon
+			
+			JSR	 	ATPEnter2 	  		; standard entry
+
+; A0 -> IO param blk,   A1 -> abRecord,   D2 = return address
+;	To abort, we must search for the queue element whose abrechndl matches
+			MOVE.W	#RelTCB,CSCode(A0)		;cancel req code
+CnclCommon
+			MOVE.W	#atpRefNum,IORefNum(A0)	;set drvr refnum
+			MOVE.L	atpAddress(A1),AddrBlock(A0)	;set dest addr
+			MOVE.W	atpTID(A1),TransID(A0)	;set transaction ID
+			
+			_Control						;always a sync call
+
+			MOVE.W	D0,(SP)				;set return code
+			MOVE.L	QElHdl(A0),A0			;A0 is qel handle
+			JSR		UnlockAndLinkHdl		;unlock it
+			MOVEA.L	D2,A1				;A1=return addr
+			JMP		(A1)
+			ENDPROC
+			EJECT
+;!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+;
+;	 RESPONDING END calls
+;
+;!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+;___________________________________________________________________________
+;
+;	ATPOpenSkt
+;
+;	FUNCTION ATPOpenSocket : (addrRcvd : AddrBlock;
+;			  VAR atpSocket : Byte) : INTEGER;
+;
+;	 where:	 atpSocket   - number of the socket to open (zero <=> dynamic)
+;		  addrRcvd - four byte block with internet socket address
+;			    from which requests are to be accepted
+;				 (0 field == anyone)
+;	 Returns:  atpSocket - number of the socket opened
+;		  Result code (function value)
+;
+;	Operation:  Opens an ATP responding socket for the purpose of receiving
+;	    transaction requests. [Always synchronous call]
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .LONG	 memory address of atpSkt var
+;	 .LONG	 internet socket address of fromWhom
+;	 .WORD	 Function result (result code, i.e., function value)
+;
+;	Register Usage:
+;	 Uses A0, A1, D0, D1, D2
+;
+;	Modification History:
+;
+;	16 Aug 84 	GSS	New today
+;	17 Oct 84 	RFA	Cleanup
+;_____________________________________________________________________________
+
+ATPOpenSocket	PROC	EXPORT
+			JSR	 	RemoveHdlBlks
+			MOVE.L	(SP)+,D2		 ; Save return address in D2
+
+		;
+		;   get parameters off stack
+		;
+			MOVE.L	(SP)+, A1 	 ; A1 = address of atpSkt
+			MOVE.L	(SP)+, D1 	 ; D1 = address filter
+		;
+		;   make IOParamBlk for Control call on the stack and fill in
+		;
+			SUB	 	#IOQElSize,SP 	 ; Allocate queue element
+			MOVE.L	SP,A0		 ; A0 -> I/O queue element
+
+			MOVE  	#OpenATPSkt,CSCode(A0) ; Code for "Open ATP Responding Socket"
+			MOVE  	#atpRefNum,IORefNum(A0) ; Set refnum of ATP driver
+			MOVE.B	1(A1), ATPSocket(A0) ; stuff socket number
+			MOVE.L	D1, AddrBlock(A0)	; stuff address filter
+			_Control			  ; Issue the call
+			MOVE.B	ATPSocket(A0),1(A1)  ; Return socket number to caller
+			ADD	 	#IOQElSize,SP 	 ; Deallocate queue element
+			MOVE  	D0,(SP)		  ; Set return code for caller
+			MOVE.L	D2,A1		 ; put return address in A1
+			JMP	 	(A1)		  ; Return to caller
+			ENDPROC
+			EJECT
+;___________________________________________________________________________
+;
+;	ATPCloseSkt
+;
+;	FUNCTION ATPCloseSocket (atpSkt : Byte) : INTEGER;
+;
+;	 where	 atpSkt - number of socket to close
+;	 Returns:  Result code
+;
+;	Operation:  Close the specified ATP responding socket, and abort all
+;	    outstanding async ATPGetRqst, ATPSndRsp, and ATPResponse calls
+;	    involving that socket.   [Always synchronous call]
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .BYTE	 <junk>
+;	 .BYTE	 atpSkt
+;	 .WORD	 Function result (return code)
+;
+;	Register Usage:
+;	 Uses A0, A1, D0, D1 (in completion routines), D2
+;
+;	Modification History:
+;
+;	16 Aug 84 	GSS	New today
+;	17 Oct 84 	RFA	Cleanup
+;	 4 Jan 85 	RFA	Find all IOQEls for this socket and call their
+;			completion routines to clean up data structures
+;	10 Jan 85 	RFA	Lock out interrupts while stepping through IOQEl list,
+;			and return an error to all aborted async calls.
+;	11 Feb 85 	GRT	Removing RTE instructions
+;_____________________________________________________________________________
+
+ATPCloseSocket PROC	EXPORT
+			JSR	 	RemoveHdlBlks 	 ; Go release old/free IOParamBlks
+			MOVE.L	(SP)+,A1		 ; save return address in A1
+			MOVE  	(SP)+,D2 	  ; get the socket number
+			MOVE.L	A1, -(SP) 	 ; put return address back on stack
+
+; get space on stack for IOParamBlk for Control call
+
+			SUB	 	#IOQElSize, SP	 ; Allocate queue element
+			MOVE.L	SP, A0		 ; A0 -> I/O queue element
+			MOVE  	#CloseATPSkt,CSCode(A0) ; Set code for Close Receive Socket
+			MOVE  	#atpRefNum, IORefNum(A0) ; Set refnum of ATP driver
+			MOVE.B	D2, ATPSocket(A0)	; stuff socket number
+			_Control			  ; Issue the call
+			ADD	 	#IOQElSize, SP	 ; remove param blk from stack
+			MOVE  	D0, 4(SP)	  ; Set return code for caller
+
+; go through list of IOQEls and complete all that were associated with this socket
+
+			LEA	 	SktQElList, A0	 ; get head of list
+			MOVE  	SR, -(SP)	  ; save old status
+			MOVE  	#SCCLockOut, SR	 ; disable interrupts
+			MOVE.L	(A0), A0		 ; get first element
+@10		 	CMP.L	#0, A0		  ; is the list empty?
+			BEQ.S	@30			 ; skip if empty
+			MOVE.L	ListLink(A0), -(SP) ; get pointer to next element
+			CMP.B	ATPSocket(A0), D2	; is IOQEl for our socket?
+			BNE.S	@20			 ; no, check next one
+			MOVE  	#sktClosedErr, IOResult(A0) ; yes, flag it as an error
+			MOVE.L	IOCompletion(A0),A1 ; get address of completion routine
+			JSR	 	(A1)		  ; call its completion routine
+@20		 	MOVE.L	(SP)+, A0	  ; restore pointer to next element
+			BRA.S	@10			 ; and keep searching list
+
+@30		 	MOVE  	(SP)+,SR
+			RTS			   ; re-enable interrupts and return
+			ENDPROC
+			EJECT
+;___________________________________________________________________________
+;
+;	ATPGetRqst - specify an ATP request is to be asynchronously received
+;
+;	FUNCTION ATPGetRequest (abRecord: ABRecHandle; async: Boolean) : INTEGER;
+;
+;
+;	where:	 async = TRUE if call is to be made asynchronously
+;		  abRecord is the handle to the user-provided atp abus Record
+;
+;	Returns:	 in the abus record
+;		  atpAddress = request sender's internet skt address
+;		  atpActCount = actual size of request's data
+;		  atpUserBytes = the user bytes received in the request packet
+;		  atpXO = was the request an XO request
+;		  atpBitMap = the bit map received in the request
+;		  atpTID	= transaction ID of the request received
+;		  abResult  = Result code
+;		  function result = abResult in synchronous case
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .BYTE	 async
+;	 .BYTE	 <junk>	   (Pascal filler)
+;	 .LONG	 abRecord 	  (handle)
+;	 .WORD	 Function result (return code)
+;
+;	Register Usage:
+;	 Uses A0, A1, D0, D1, D2
+;
+;	Modification History:
+;
+;	16 Aug 84 	GSS	New today
+;	 3 Sep 84 	GSS	code crunch -- use ATPEnter and ATPCompFin
+;	17 Oct 84 	RFA	Cleanup
+;	 4 Jan 85 	RFA	If async, put IOQEl on list so ATPCloseSkt can clean up
+;	10 Jan 85 	RFA	ListDequeue no longer returns error code
+;_____________________________________________________________________________
+
+ATPGetRequest	PROC	EXPORT
+			JSR	 	ATPEnter
+
+; A0 -> IO param blk,   A1 -> abRecord,   D2 = return address
+
+			MOVE.B	#tATPGetRequest,abOpCode(A1) ; write op code to abRecord
+			CLR.B	atpEOM(A1)	 ; clear EOM indication in abRecord
+
+; now prepare the IO param blk for the call to ATP
+
+			CLR.B	Bitmap(A0)	 ; clear bitmap field
+			CLR	 	TransID(A0)		 ; clear transaction ID field
+			MOVE.B	atpSktNum(A1), ATPSocket(A0)
+			MOVE  	atpRCount(A1), ReqLength(A0)
+			MOVE.L	atpDataPtr(A1), ReqPointer(A0)
+
+; set up control calls code
+
+			MOVE  	#GetRequest,CSCode(A0) ; Set code for Get Request
+
+; test to see if the request is for an async call
+
+			TST.B	asyncFlg(A0)		; async call?
+			BEQ.S	@30			 ; No -- make synch call
+			LEA	 	ATPGRqComp, A1	 ; Yes -- asynch call
+			MOVE.L	A1,IOCompletion(A0) ; set completion routine address
+			JSR	 	ListEnqueue		 ; queue it up in case of cancels
+			_Control	,ASYNC
+			MOVE  	D0,(SP)		  ; return result code
+			BRA.S	@50			 ; now return to the caller
+
+@30		 	_Control 		   ; synch call
+
+;  we return here after the synch transaction is over.  Call completion routine
+; to free up param blk and unlock abRecord; then return to the caller
+
+			MOVE  	D0,(SP)		  ; return result code
+			BSR	 	ATPGRqComp
+@50		 	MOVE.L	 D2, A1		  ; return address to A1
+			JMP	 	(A1)		  ; return to caller
+
+; I/O completion routine
+;
+;	A0 -> I/O queue element
+;	abRecHdl(A0) = handle to abRecord for this request
+;	asyncflg(A0) = async boolean provided by the caller
+
+ATPGRqComp	MOVE.L	abRecHdl(A0), A1	 ; A1 = abRecord handle
+			MOVE.L	A1, D1		 ; save handle in D1
+			MOVE.L	(A1),A1		 ; deref the handle
+			MOVE  	IOResult(A0),abResult(A1) ; Save the result
+			BTST  	#ATPXOBit,ATPFlags(A0) ; See if got XO
+			SNE	 	atpXO(A1)	  ; Set XO flag if got it
+			MOVE.L	AddrBlock(A0),atpAddress(A1)	; requester's address
+			MOVE  	ReqLength(A0),atpActCount(A1) ; length of received request's data
+			MOVE.L	UserData(A0),atpUserBytes(A1) ; user bytes from request
+			MOVE.B	Bitmap(A0),  atpBmap(A1)    ; Set bitmap in abRecord
+			MOVE  	TransID(A0), atpTID(A1)   ; trans ID received
+
+			TST.B	asyncFlg(A0)		; was this an async call?
+			BEQ.S	@10			 ; no, just jump to common
+			JSR	 	ListDequeue		 ; yes, go take IOQEl off list
+@10		 	LEA   	ATPCompFin,A1	  ; jump to the common part of the
+			JMP	 	(A1)		  ; completion routine
+			ENDPROC
+			EJECT
+;___________________________________________________________________________
+;
+;	ATPSndRsp - send (part of) a response to an ATP request
+;
+;	FUNCTION ATPSndRsp (abRecord: ABRecHandle; async: Boolean) : INTEGER;
+;
+;
+;	where:	 async = TRUE if call is to be made asynchronously
+;		  abRecord is the handle to the user-provided atp abus Record
+;
+;	Returns:	 in the abus record
+;		  abResult  = Result code
+;		  function result = abResult in synchronous case
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .BYTE	 async
+;	 .BYTE	 <junk>	   (Pascal filler)
+;	 .LONG	 abRecord 	  (handle)
+;	 .WORD	 Function result (return code)
+;
+;	Register Usage:
+;	 Uses A0, A1, D0, D1, D2
+;
+;	Modification History:
+;
+;	16 Aug 84 	GSS	New today
+;	 3 Sep 84 	GSS	Code crunch -- use ATPEnter and ATPCompFin
+;	17 Oct 84 	RFA	Code crunch
+;	22 Oct 84 	RFA	Added alternate entry point for ATPResponse, and
+;			test in completion routine so that code can be shared.
+;	14 Nov 84 	GRT	BTST should test bit 0 and not bit 1 @ SndRspAltEntry
+;	 4 Jan 85 	RFA	If async, put IOQEl on list so ATPCloseSkt can clean up
+;	10 Jan 85 	RFA	ListDequeue no longer returns error code
+;	15 Mar 85 	GRT	RecoverHandle call added
+;	 1 May 86 	GRT	No more _RecoverHandle
+;_____________________________________________________________________________
+
+ATPSndRsp 	PROC	EXPORT
+			ENTRY	SndRspAltEntry
+			
+			JSR	 	ATPEnter
+
+; A0 -> IO param blk,   A1 -> abRecord,   D2 = return address
+
+			MOVE.B	#tATPSdRsp,abOpCode(A1) ; write op code to abRecord
+
+; now prepare the IO param blk for the call to ATP.  Set the EOM flag in the IOPBlk
+
+SndRspAltEntry BTST  	#0, atpEOM(A1)	  ; (V1.1E)test EOM boolean in abRecord
+			BEQ.S	@20			  ; branch if not EOM
+			BSET  	#ATPEOMBit,ATPFlags(A0) ; set EOM flag in paramblk
+
+; and put the rest of the params into the param blk
+
+@20		 	MOVE.B	atpSktNum(A1), ATPSocket(A0)
+			MOVE.L	atpAddress(A1),AddrBlock(A0)	; requester's address
+			MOVE.L	atpRspBDSPtr(A1), BDSPointer(A0)
+			MOVE.B	atpNumBufs(A1),NumofBuffs(A0)
+			MOVE.B	atpBDSSize(A1),BDSSize(A0)
+			MOVE  	atpTID(A1), TransID(A0)
+
+; set up control call code
+
+			MOVE  	#SendResponse,CSCode(A0) ; Set code for Send Response
+
+; test to see if the request is for an async call
+
+			TST.B	asyncFlg(A0)		; async call?
+			BEQ.S	@30			 ; No -- make synch call
+			LEA	 	ATPSdComp, A1 	 ; Yes -- asynch call
+			MOVE.L	A1,IOCompletion(A0) ; set completion routine address
+			JSR	 	ListEnqueue		 ; queue it up in case of cancels
+			_Control	,ASYNC
+			MOVE  	D0,(SP)		  ; return function code to user
+			BRA.S	@50			 ; now return to the caller
+
+@30		 	_Control 		   ; synch call
+
+; we return here after the synch transaction is over.	Call completion routine
+; to free up param blk and unlock abRecord; then return to the caller
+
+			MOVE  	D0,(SP)		  ; return function code to user
+			BSR	 	ATPSdComp
+@50		 	MOVE.L	 D2, A1		  ; A1 = return address
+			JMP	 	(A1)		  ; return to caller
+
+
+; I/O completion routine
+;
+;	A0 -> I/O queue element
+;	abRecHdl(A0) = handle to abRecord for this request
+;	asyncflg(A0) = async boolean provided by the caller
+
+ATPSdComp 	MOVE.L	abRecHdl(A0), A1	; A1 = abRecord handle
+			MOVE.L	A1, D1		 ; save handle in D1
+			MOVE.L	(A1),A1		 ; deref the handle
+			MOVE  	IOResult(A0),abResult(A1) ; Save the result
+			CMP.B	#tATPResponse,abOpCode(A1)	 ; was this a ATPResponse call?
+			BNE.S	@10			 ; no, go on
+
+; here if the call was an ATPResponse.	special handling required
+
+			MOVE.L	A0, -(SP) 	 ; save IOPBlk pointer on stack
+			MOVE.L	bdsHdl(A0),A0		; A0 = bds handle
+			JSR	 	UnlockAndLinkHdl	 ; queue it for disposal
+			MOVE.L	(SP)+, A0 	 ; restore A0
+
+@10		 	TST.B	asyncFlg(A0)		 ; was this an async call?
+			BEQ.S	@20			 ; no, just jump to common
+			JSR	 	ListDequeue		 ; yes, go take IOQEl off list
+
+@20		 	LEA   	ATPCompFin, A1
+			JMP	 	(A1)		  ; jump to the common part of the
+									; completion routine
+			ENDPROC
+			EJECT
+;___________________________________________________________________________
+;
+;	ATPAddRsp - add a response to a ongoing transaction [always synchronous]
+;
+;	FUNCTION ATPAddRsp (abRecord: ABRecHandle) : INTEGER;
+;
+;	where:	 abRecord = handle to Abus Record
+;
+;	 Returns:  Result code in abResult field of abRecord
+;		  function result = abResult in synchronous case
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .LONG	 abRecord handle
+;	 .WORD	 Function result (return code)
+;
+;	Register Usage:
+;
+;	 Uses registers A0, A1, D0, D1
+;
+;	Modification History:
+;
+;	16 Aug 84 	GSS	New today
+;	17 Oct 84 	RFA	Cleanup
+;	14 Nov 84 	GRT	BTST should test bit 0 and not 1 of EOM pascal boolean
+;_____________________________________________________________________________
+
+ATPAddRsp 	PROC	EXPORT
+			JSR		RemoveHdlBlks
+			MOVE.L	4(SP), A0 	 ; get the abrecord handle from stk
+			_HLock			  ; lock the abRecord
+			MOVE.L	A0,A1		 ; A0 = abRec handle
+			MOVE.L	(A1),  A1 	 ; dereference handle
+
+; Get a chunk of memory on stack for the I/O queue element
+
+			SUB	 	#IOQElSize,SP
+			MOVE.L	SP,A0		; A0 -> IO param blk
+
+; A0 -> IO param blk,   A1 -> abRecord
+
+			MOVE.B	#tATPAddRsp,abOpCode(A1) ; write op code to abRecord
+			MOVE  	#1,abResult(A1)	 ; mark abRecord as op in progress
+
+; now prepare the IO param blk for the call to ATP.  Set the EOM flag in the IOPBlk
+
+			CLR.B	ATPFlags(A0)		; clear all flags in param blk
+			BTST 	#0, atpEOM(A1)	 ; (V1.1E)test EOM boolean in abRecord
+			BEQ.S	@10			 ; branch if not EOM
+			BSET  	#ATPEOMBit,ATPFlags(A0) ; set EOM flag in paramblk
+@10
+
+; now put the rest of the params into the param blk
+
+			MOVE.B	atpSktNum(A1), ATPSocket(A0)
+			MOVE.L	atpAddress(A1),AddrBlock(A0)	; requester's address
+			MOVE.B	atpNumRsp(A1), RspNum(A0)	; response's seq number
+			MOVE  	atpTID(A1), TransID(A0)   ; response's Transaction ID
+			MOVE.L	atpUserBytes(A1), UserData(A0) ; user bytes for response
+			MOVE  	atpRCount(A1),ReqLength(A0) ; length of response data
+			MOVE.L	atpDataPtr(A1),ReqPointer(A0)  ; response's data buffer
+
+; set up control calls code and the driver ref num
+
+			MOVE  	#AddResponse,CSCode(A0) ; Set code for Send Response
+			MOVE  	#atpRefNum, IORefNum(A0)  ; .ATP driver's ref num
+			_Control			   ; always a synch call
+			MOVE 	 D0, abResult(A1)	 ; write result into abRecord
+			ADD	 	#IOQElSize,SP 	 ; remove IO param blk from stk
+			MOVE.L	(SP)+,A1		 ; return address off stack
+			MOVE.L	(SP)+,A0		 ; abRecord handle off stack
+			MOVE 	D0, (SP) 	  ; write func result to stk
+			_HUnlock			  ; unlock the abRecord
+			JMP	 	(A1)		  ; return to caller
+			ENDPROC
+			EJECT
+;___________________________________________________________________________
+;
+;	ATPResponse - send a response to an ATP request - special higher-level call
+;		 allowing the caller to specify the response as a single,
+;		 large buffer.  This code breaks that into packet-sized
+;		 chunks for transmission.  It is the inverse of ATPRequest,
+;		 which assembles a transaction's response packets into
+;		 one large buffer.
+;
+;	FUNCTION ATPResponse (abRecord: ABRecHandle; async: Boolean) : INTEGER;
+;
+;
+;	where:	 async = TRUE if call is to be made asynchronously
+;		  abRecord is the handle to the user-provided atp abus Record
+;
+;	Returns:	 in the abus record
+;		  abResult  = Result code
+;		  function result = abResult in synchronous case
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .BYTE	 async
+;	 .BYTE	 <junk>	   (Pascal filler)
+;	 .LONG	 abRecord 	  (handle)
+;	 .WORD	 Function result (return code)
+;
+;	Register Usage:
+;	 Uses A0, A1, D1
+;
+;	Notes:
+;	 I assume that if the caller specifies a zero-length buffer,
+;	 this means that s/he wants to send only the UserData and no
+;	 ATP data, so I must send one packet to transmit this.
+;
+;	Modification History:
+;
+;	18 Oct 84 	RFA	New today
+;	22 Oct 84 	RFA	Created MakeBDS common to this call & ATPRequest
+;	15 Mar 85 	GRT	RecoverHandle call added
+;	 1 May 86 	GRT	Saving BDS handle in queue element
+;_____________________________________________________________________________
+
+ATPResponse	PROC	EXPORT
+			JSR	 	ATPEnter
+
+; A0 -> IO param blk,   A1 -> abRecord,   D2 = return address
+
+			MOVE.B	#tATPResponse, abOpCode(A1) ; write opcode to abRecord
+			MOVEQ	#0, D1		  ; clear entire register
+			MOVE  	atpRspSize(A1), D1   ; D1 = size of response buffer
+			CMP	 	#maxATPBuf*8, D1	  ; trying to send too much data?
+			BLE.S	@20			  ; no, continue
+			MOVE  	#atpLenErr, D0	  ; yes, flag an error
+
+; Error detected - cleanup IO parameter block and unlock abRecord
+
+@10		 	MOVE  	D0, (SP)	    ; report an error in func result
+			MOVE  	D0, abResult(A1)	  ; report same error in abRecord
+			_RecoverHandle 		  ; recover iopblk handle
+			_HUnlock			   ; unlock it
+			_DisposHandle			  ; and dispose of it
+			MOVE.L	A1,A0
+			_RecoverHandle 		  ; recover ABRec handle
+			_HUnlock			   ; just unlock it
+			MOVE.L	D2, A0		  ; recover return address
+			JMP	 	(A0)		   ; and return to caller
+
+; create BDS and fill it in
+
+@20		 	MOVE.L	A2,-(SP) 	   ; save A2
+			JSR	 	MakeBDS
+			MOVE.L	A2,bdsHdl(A0)		 ; put bds handle into queue element
+			MOVE.L	(SP)+,A2		  ; restore A2
+			TST	 	D0		    ; any errors from MakeBDS?
+			BNE.S	@10			  ; quit if any error
+
+			MOVE.B	atpNumBufs(A1), D1	 ; get number of resps from abRec
+			MOVE.B	D1, atpBDSSize(A1)	 ; BDS Size = number of responses
+
+; and from here on it looks like an ordinary ATPSndRsp call, so share code
+
+			JMP	 	SndRspAltEntry
+			ENDPROC
+			EJECT
+;___________________________________________________________________________
+;
+;	ATPRspCancel - cancels a transaction from the Responding End
+;
+;	FUNCTION ATPRspCancel(abRecord: ABRecHandle; async: Boolean): INTEGER;
+;
+;	This call can be used by the transaction responder to clean up ATP's
+;	internal data structures associated with a not-yet-completed transaction.
+;	One way in which this call may be used:  Requester and Responder agree
+;	that there will be only one outstanding request between them at any time.
+;	They want to use XO but don't want the extra overhead of the Release
+;	packets.	Whenever the Responder receives a new request, he assumes that
+;	the Requester received the previous transaction's response, so he (Responder)
+;	issues this call to cancel the previous transaction.
+;
+;	where:	 abRecord is the handle to the user provided ATP abus Record
+;
+;	Returns:	 in the abRecord:
+;		  abResult = error code
+;		  function result = abResult in synchronous case
+;
+;	Stack setup upon entry:
+;	 .LONG	 Return address
+;	 .BYTE	 async
+;	 .BYTE	 <junk>	   (Pascal filler)
+;	 .LONG	 abRecord 	  (handle)
+;	 .WORD	 Function result (return code)
+;
+;	Register Usage:
+;	 Uses A0, A1, D0, D1, D2
+;
+;	Note: The .ATP driver will call the completion routine for the Response call,
+;	  but noErr (0) will be returned to the original call, since previous
+;	  response packets for this transaction have probably been returned to
+;	  the requester already.
+;
+;	Modification History:
+;
+;	23 Oct 84 	RFA	New today
+;
+;_____________________________________________________________________________
+
+ATPRspCancel	PROC	EXPORT
+			JSR	 	ATPEnter2 	  		; standard entry
+
+; A0 -> IO param blk,   A1 -> abRecord,   D2 = return address
+
+			MOVE  	#RelRspCB, CSCode(A0) 	; code for "cancel response"
+			MOVE.B	atpSktNum(A1), ATPSocket(A0) 	; put skt num in IOQElement
+			
+			JMP	 	CnclCommon	  		; share code with ATPReqCncl
+		
+			ENDPROC

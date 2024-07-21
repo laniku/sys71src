@@ -1,0 +1,438 @@
+;
+;	File:		DeCompressDefProc1.a
+;				By Donn Denman
+;
+;	Contains:	parts of the decompress defprocs that are common to all.
+;
+;	Copyright:	© 1990 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <4>	 8/14/90	DD		Changed variable lookup at FetchData and assignment at
+;									RememberData to use unsigned word offsets.
+;		 <3>	 7/24/90	gbm		Fix branches to next instruction, but don't break debug mode...
+;									:)
+;		 <2>	 4/18/90	DD		Added RunLength Encoding and Delta Encoding variations.
+;		 <1>	 4/12/90	DD		first checked in today
+; BBS versions above:
+;___________________________________________________________________________________________________
+
+
+********************************************************************************************
+*
+* Procedure UnPackData(SourcePtr, DestPtr, VarTable: ptr; VarTableSize: Longint);  
+*
+* Description:	Unpack the data from the source pointer to the dest pointer.
+*			The unpacking is automatically terminated when the end token is reached.
+*
+*
+********************************************************************************************
+UnPackFrame	Record	{A6Link},Decr
+SourcePtr	DS.L	1
+DestPtr		DS.L	1
+VarTablePtr	DS.L	1
+VarTableSize	DS.L	1
+ReturnAddress	DS.L	1
+A6Link		DS.L	1
+LocalSize	DS.L	0
+		EndR
+		With	UnpackFrame
+		
+UnPackData
+	Link	A6,#LocalSize			;do the unpack from ptr A0 into pointer in A1.
+	MoveM.L	D0-D3/A0-A4,-(SP)
+	
+; Set up the registers, for fast handling.
+
+	Move.L	SourcePtr(A6),A4		;input stream.
+	Move.L	DestPtr(A6),A1			;output stream.
+	Lea	CodeDispatchTable,A2		;dispatch table.
+	
+	Move.L	VarTablePtr(A6),A3		;variable table.
+	Move.L	VarTableSize(A6),D0		; table size.
+	Bsr	InitRemember			;init the var table.
+	Bra	UnpackLoop			; now go to the unpack loop.
+	
+ExitUnpack
+	MoveM.L	(SP)+,D0-D3/A0-A4
+	UnLk	A6
+	Move.L	(SP)+,A0
+	Add	#SourcePtr-ReturnAddress,SP
+	Jmp	(A0)
+		
+	EndWith
+	
+********************************************************************************************
+*
+* GetEncodedValue
+*
+* Description:	gets the value pointed to by A4 into D0.L.  The values are encoded:
+*
+*		Tag		Range		computation method
+*		---		-----		------------------
+*		0..127		0,127		Tag[0]
+*		128..254 	-16384,16127	(Tag[0]-$C0)*$100+Tag[1]
+*		255		same as Long	Tag[1]<<24 + Tag[2]<<16 + Tag[3]<<8 + Tag[4]
+*
+*       Input:	A4:	pointer to tags.
+*
+*	Output:	A0:	points past tags.
+*		D0:	value long.
+*
+*
+********************************************************************************************
+GetEncodedValue	Head
+
+	
+; try byte encoding, cuz it is so easy.
+
+		MoveQ	#0,D0
+		Move.B	(A4)+,D0
+	
+		Bpl.S	@HaveValue		;got the result already.
+
+; is it long encoded?
+
+		Cmp.B	#FourByteValue,D0	;long?
+		Beq.S	@FetchLong		;yep, that's fairly easy too.
+	
+; word encoded value.
+
+		Sub.W	#TwoByteValue*3/2,D0	;cut back the range, toggle the psuedo sign bit.
+		Asl.W	#8,D0			;shift by a byte (*256).
+		Asl.W	#1,D0			;shift away the top bit.
+		ASR.W	#1,D0			;sign extend the top bit.
+		Move.B	(A4)+,D0		;get the next byte.
+		Ext.L	D0			;sign extend to a long value.
+		Bra.S	@HaveValue
+	
+; long encoding
+
+@FetchLong
+		Move.B	(A4)+,D0		;add in the next byte.
+		Asl.W	#8,D0			;shift by a byte (*256).
+		Move.B	(A4)+,D0		;add in the next byte.
+		Asl.L	#8,D0			;shift by a byte (*256).
+		Move.B	(A4)+,D0		;add in the next byte.
+		Asl.L	#8,D0			;shift by a byte (*256).
+		Move.B	(A4)+,D0		;add in the next byte.
+	
+@HaveValue
+		Tail
+
+;
+; CopyWithLength - copy the data following an encoded length.
+;
+CopyWithLength
+		Bsr	GetEncodedValue		;get the value into D0.
+	IF	delta=2		THEN
+		Add.W	D0,D0			;double the value if we are processing word chucks.
+	EndIF
+		;BRA.S	CopyData		;fall through
+;
+; CopyData - copy the data already knowing the word length.
+;
+CopyData
+	Bra.S	@Sub1FirstTime
+@CopyData
+	Move.B	(A4)+,(A1)+			;copy a byte.
+@Sub1FirstTime
+	DBRA	D0,@CopyData
+	Rts
+
+;
+; RememberLiteral - copy the data already knowing the word length.
+;	Also add this literal to the Var Table.
+;
+RememberLiteral
+	Bsr.S	RememberData			;stuff the data pointed to by A4, for length D0 into the var table.
+	; fall through to CopyLiteralAndLoop
+;
+; CopyLiteralAndLoop - copy the data pointed to by the input into the output and loop.
+;
+CopyLiteralAndLoop
+	Bsr.S	CopyData
+	Bra	UnpackLoop
+	
+;
+; RememberWithLength - copy the data preceeded by a byte length.
+;	Also add this literal to the Var Table.
+;
+RememberWithLength
+		Bsr	GetEncodedValue		;get the value into D0.
+	IF	delta=2		THEN
+		Add.W	D0,D0			;double the value if we are processing word chucks.
+	EndIF
+		Bsr.S	RememberData		;stuff the data pointed to by A4, for length D0 into the var table.
+		Bra.S	CopyData
+
+;
+; InitRemember - Init the var table.
+;	Entry:	A3 - Var Table.
+;		D0 - Table size.
+;
+InitRemember
+	Move.W	D0,VarsList(A3)			;first entry points to the end of the table.
+	Move.W	#2+VarsList,NextVarIndex(A3)	;point to the next var entry.
+	Rts
+	
+;
+; RememberData - stuff the data pointed to by A4, for length D0 into the var table.
+;
+;	Entry:	A4 - Pointer to the data.
+;		D0 - length of the data.
+;		A3 - Var Table.
+;
+;	Exit:	A1,D0 - preserved.
+;		A0,D1 Trashed.
+;
+RememberData
+	MoveM.L	D0/A1,-(SP)
+	
+	MoveQ	#0,D1
+	Move.W	NextVarIndex(A3),D1		;get the index into the next var.
+	AddQ.W	#2,NextVarIndex(A3)		;bump the index.
+	Lea	-2(A3,D1.L),A0			;point to the previous data offset.
+	Move.W	(A0)+,D1			;it defines where my new string must end.
+	Sub.W	D0,D1				;compute my new offset.
+	Move.W	D1,(A0)				;put my offset in place.
+; Debugging
+	IF DoDebug > 0 THEN
+	Lea	0(A3,D1.L),A1			;point to my data loc.
+	Cmp.L	A0,A1
+	BGT.S	@NoOverFlow
+	BreakError	'Variable Table Over Flow!'
+@NoOverFlow
+	ENDIF
+; Debugging
+
+	Lea	0(A3,D1.L),A0			;point to my data loc.
+	Move.L	A4,A1
+	Bsr.S	BlockMoveBytes
+	
+	MoveM.L	(SP)+,D0/A1
+	Rts
+
+;
+; BlockMoveBytes - block moves bytes from (A1)+ to (A0)+ for D0.W.
+;
+BlockMoveBytes
+	Bra.S	@Sub1FirstTime
+@CopyData
+	Move.B	(A1)+,(A0)+			;copy a byte.
+@Sub1FirstTime
+	DBRA	D0,@CopyData
+	Rts
+
+;
+; ReuseByte2Length - Reuse the data indexed by the following byte, to add 256 to.
+;
+ReuseByte2Length
+	MoveQ	#0,D0
+	Move.B	(A4)+,D0			;get the length from the input stream
+	Add.W	#Max1ByteReuse+256,D0		;bump by the number of vars we can ref in one byte.
+	Bra.S	FetchData			;call FetchData.
+;
+; ReuseWordLength - copy the data following a word length.
+;
+ReuseWordLength
+	MoveQ	#0,D0
+	Move.B	(A4)+,D0			;get the length from the input stream
+	Asl.W	#8,D0				;shift into high byte.
+	Bra.S	ReuseLowByte
+;
+; ReuseByteLength - Reuse the data indexed by the following byte.
+;
+ReuseByteLength
+	MoveQ	#0,D0
+ReuseLowByte
+	Move.B	(A4)+,D0			;get the length from the input stream
+	Add.W	#Max1ByteReuse,D0		;bump by the number of vars we can ref in one byte.
+	;Bra.S	FetchData			;call FetchData.
+
+;
+; FetchData - retrieve the data from index D0 of the var table.
+;
+;	Entry:	A1 - Pointer to the output stream.
+;		D0 - index the data.
+;		A3 - Var Table.
+;
+;	Exit:	A0,D0,D1 Trashed.
+;
+FetchData
+	Add.W	D0,D0				;make the index into an offset.
+; Debugging
+	IF DoDebug > 0 THEN
+	Cmp.W	NextVarIndex(A3),D0		;are we indexing too far into the table?
+	BLo.S	@NoProblem
+	BreakError	'Error - Index beyond end of vars list'
+@NoProblem
+	ENDIF
+; Debugging
+	Lea	VarsList(A3,D0),A0		;point to the previous entry (end of this string).
+	Move.W	(A0)+,D0			;get the data offset of the previous entry.
+	MoveQ	#0,D1				;clear high word, so unsigned offsets will work.
+	Move.W	(A0),D1				;get the offset of this entry.
+	Sub.W	D1,D0				;compute the length of this entry.
+	Lea	0(A3,D1.L),A0			;point to the string.
+
+	Exg	A0,A1				;point A1 to the string, A0 to the output Stream.
+	Bsr.S	BlockMoveBytes
+	Move.L	A0,A1				;get output ptr back.
+	Rts
+
+;
+; ReuseData - Reuse the data indexed by the encoded byte.
+;
+ReuseData
+	Bsr.S	FetchData			;fetch the data from the var table.
+	Bra	UnpackLoop			; go back to the main loop.
+
+HandleExtensions
+	Move.B	(A4)+,D0			;get the extension opCode.
+	Beq.S	@JumpTableTrans
+	SubQ.B	#RunLengthByteTransCode,D0	; runlength encoding by bytes?
+	Blo.S	@EntryVectorTrans		; is it an entry vector trans?
+	Beq	RunLengthByteTrans
+	SubQ.B	#DiffWordTransCode-RunLengthByteTransCode,D0	;peel off the next two cases.
+	Blo	RunLengthWordTrans
+	Beq	DiffWordTrans
+	SubQ.B	#DiffEncLongTransCode-DiffWordTransCode,D0	;peel off the next two cases.
+	Blo	DiffEncWordTrans
+	Beq	DiffEncLongTrans
+	BreakError	'got an undefined Extension op-code'
+	Bra	@Return
+	
+; EntryVector transformation
+; Format is as follows:
+;	  BranchOffset  Delta  NumEntries  Offset0  < Offset1  Offset2 ... OffsetN >
+; where each item is an encoded value.
+; Offset1...OffsetN is an optional words list that is
+;    present only if Delta==0.  If Delta != 0 then 
+;    the Delta is added to Offset0 to create Offset1 etc.
+;
+@EntryVectorTrans
+	MoveM.L	D2-D7,-(SP)
+
+	Move.W	#$6100,D3
+	Move.W	#$4EED,D5
+	Bsr.S	GoGetEncodedValue		;get the initial branch offset.
+	Move.W	D0,D4
+	Bsr.S	GoGetEncodedValue		;get the Delta amount.
+	Move.W	D0,D2
+	Bsr.S	GoGetEncodedValue		;get the number of entries.
+	Move.W	D0,D7
+	Bsr.S	GoGetEncodedValue		;get the inital offset.
+	Move.W	D0,D6
+	Bra.S	@HaveOffset
+@ExpandEntryVector
+	SubQ	#8,D4				;compute the next branch offset.
+	Tst	D2				;is there an offset list?
+	Beq.S	@GetNextOffset			;if the delta is constant (non-zero) then 
+	Add.W	D2,D6				; compute next offset.
+	Bra.S	@HaveOffset
+@GetNextOffset
+	Bsr.S	GoGetEncodedValue		;get the next offset.
+	Move.W	D0,D6
+@HaveOffset
+	MoveM.W	D3-D6,(A1)			;output the next entry vector.
+	AddQ	#8,A1				;move the output pointer past the entry.
+	DBRA	D7,@ExpandEntryVector		;until all entries are done.
+	
+	MoveM.L	(SP)+,D2-D7
+	Bra.S	@Return
+
+; JumpTable transformation
+; Format is as follows:
+;	Seg#  NumEntries  Delta0  Delta1  Delta2
+; where each value is encoded.
+;
+@JumpTableTrans
+	MoveM.L	D3-D7,-(SP)
+
+	Move.W	#$3F3C,D3
+	Move.W	#$A9F0,D5
+	Move.W	#6,D6				;init the offset to our bias.
+	Bsr.S	GoGetEncodedValue		;get the segment number
+	Move.W	D0,D4				;remember seg
+	Bsr.S	GoGetEncodedValue		;get the number of entries.
+	Move.W	D0,D7
+	Bra.S	@skipLastOffset
+@StuffLoop
+	Bsr.S	GoGetEncodedValue		;get the delta plus bias of 6.
+	SubQ	#6,D0				;adjust the delta by my bias (allows some small negs to be a byte).
+	Add.W	D0,D6				;add the delta to the last offset.
+	MoveM.W	D3-D6,(A1)			;output the next jump table entry.
+	AddQ	#8,A1
+@skipLastOffset
+	DBRA	D7,@StuffLoop			;until all entries are done.
+	MoveM.W	D3-D5,(A1)			;output the next jump table entry.
+	AddQ	#6,A1
+	
+	MoveM.L	(SP)+,D3-D7
+@Return
+	Rts
+
+GoGetEncodedValue
+	Bra	GetEncodedValue			;get the value
+
+RunLengthByteTrans	Head
+	Bsr.S	GoGetEncodedValue		;get the value
+	Move.W	D0,D1				;remember value.
+	Bsr.S	GoGetEncodedValue		;get the rep count.
+@RunLengthByte
+	Move.B	D1,(A1)+			;output the value.
+	DBRA	D0,@RunLengthByte		;loop till all done.
+	Tail
+	
+RunLengthWordTrans	Head
+	Bsr.S	GoGetEncodedValue		;get the value
+	Move.W	D0,D1				;remember value.
+	Bsr.S	GoGetEncodedValue		;get the rep count.
+@RunLengthWord
+	Move.W	D1,(A1)+			;output the value.
+	DBRA	D0,@RunLengthWord		;loop till all done.
+	Tail
+	
+DiffWordTrans	Head
+	Bsr.S	GoGetEncodedValue		;get the initial value
+	Move.L	D0,D2				;remember value.
+	Bsr.S	GoGetEncodedValue		;get the rep count.
+	Move.L	D0,D1
+	Bra.S	@FirstTime
+@DiffWord
+	Move.B	(A4)+,D0			;get the delta
+	Ext.W	D0
+	Add.W	D0,D2				;add in the signed delta
+@FirstTime
+	Move.W	D2,(A1)+			;output the value.
+	DBRA	D1,@DiffWord			;loop till all done.
+	Tail
+
+DiffEncWordTrans	Head
+	Bsr.S	GoGetEncodedValue		;get the initial value
+	Move.L	D0,D2				;remember value.
+	Bsr.S	GoGetEncodedValue		;get the rep count.
+	Move.L	D0,D1
+	Bra.S	@FirstTime
+@DiffWord
+	Bsr.S	GoGetEncodedValue		;get the delta.
+	Add.L	D0,D2				;add in the signed delta
+@FirstTime
+	Move.W	D2,(A1)+			;output the value.
+	DBRA	D1,@DiffWord			;loop till all done.
+	Tail
+
+DiffEncLongTrans	Head
+	Bsr.S	GoGetEncodedValue		;get the initial value
+	Move.L	D0,D2				;remember value.
+	Bsr.S	GoGetEncodedValue		;get the rep count.
+	Move.L	D0,D1
+	Bra.S	@FirstTime
+@DiffLong
+	Bsr.S	GoGetEncodedValue		;get the delta.
+	Add.L	D0,D2				;add in the signed delta
+@FirstTime
+	Move.L	D2,(A1)+			;output the value.
+	DBRA	D1,@DiffLong			;loop till all done.
+	Tail

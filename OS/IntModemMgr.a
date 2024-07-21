@@ -1,0 +1,945 @@
+;__________________________________________________________________________________________________
+;
+;	File:		IntModemMgr.a
+;
+;	Contains:	Internal modem manager initialization code
+;
+;	Written by:	Steven Swenson
+;
+;	Copyright й 1994-1994 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 1/27/94	rab		Removed padForOverpatch stuff from the end of this file
+;									(SuperMario does not use it╔).
+;		<H4>	 5/23/93	SES		Made changes from code review, 5/19/93.
+;		<H3>	  5/4/93	SES		Removed machine primitives and replaced them with the dispatch
+;									functions in the IntModemMgr.a file.
+;		<H2>	 4/27/93	SES		Altered modem manager to enhance it somewhat per code review on
+;									4/22/93.  Added dispatcher in this file (from ImmgPrimitives.a).
+;									Split primitives into machine primitives and modem primitives.
+;		 <1>	  4/8/93	SES		first checked in
+;__________________________________________________________________________________________________
+
+		LOAD	'StandardEqu.d'
+		INCLUDE	'HardwarePrivateEqu.a'
+		INCLUDE	'UniversalEqu.a'
+		INCLUDE	'ROMEqu.a'
+		INCLUDE	'IntModemMgrEqu.a'
+		INCLUDE	'IntModemMgrPrivEqu.a'
+
+		MACHINE	MC68020
+
+;----------------------------------------------------------------------------------------
+; ImmgInit
+; 
+; Entry:	none
+;
+; Exit:		none
+;
+; Trashes:	none
+;
+; Uses:
+;
+;	A1: pointer to head of modem primitive table list
+;	A2:	pointer to modem manager globals
+;	A3:	pointer to machine primitives table
+;	A4: pointer to individual modem primitives tables
+;
+; Sets up the internal modem manager if it should be set up.  The manager will not be 
+; installed if the pointer in the product info record is NULL.  The manager will attempt to 
+; install any primitives that the root table points to (see IntModemMgrPrivEqu.a).
+;----------------------------------------------------------------------------------------
+
+ImmgInit		PROC		EXPORT
+@savedRegs	REG	d0-d2/a0-a4
+
+				movem.l	@SavedRegs,-(sp)		; save away registers
+				
+		; First check to see if the modem manager should be installed.
+
+			WITH ProductInfo
+				movea.l	UnivInfoPtr,a0			; get the product info table
+				move.l	ImmgPrimPtr(a0),d0		; get the internal modem manager primitives offset
+				beq.w	@exit					; exit if null pointer
+				lea		(a0,d0.l),a1			; A1 -> immgMdmList: head of modem prim list
+			ENDWITH
+
+		; set up modem manager globals
+		
+				move.l	#immgGlobals.size,d0	; size of globals
+				_NewPtr	,SYS,CLEAR				; pointer to globals -> A0
+				tst.w	d0						; check pointer for validity
+				bne.w	@exit					; bad, bad, bad...
+				movea.l	a0,a2					; A2 -> globals pointer
+				
+		; set up the machine dispatch table
+		
+			WITH immgGlobals
+				move.l	#immgDispTable.size,d0	; size of dispatch table
+				_NewPtr	,SYS,CLEAR				; pointer to dispatch table -> A0
+				tst.w	d0						; check pointer for validity
+				bne.w	@error1					; bad, bad, bad...
+				move.l	a0,dispTable(a2)		; store pointer to dispatch table in globals
+				movea.l	a0,a3					; A3 -> machine prim table ptr
+			ENDWITH
+			WITH immgDispTable
+				lea		immgDispatchTable,a0	; A0 -> pointer to ROM based dispatch table
+				move.l	a0,d2					; D2 -> ROM based dispatch table base for offset to absolute conversion
+				move.l	(a0)+,(a3)+				; copy flags and number of primitives
+				move.l	#size,d0				; D0 -> size of dispatch table, in bytes, including storage
+				sub.l	#dispOffset,d0			; D0 -> size of dispatch table in bytes					; <H4>
+				lsr.l	#2,d0					; D0 -> number of dispatch routines
+				move.w	d0,-2(a3)				; put number of dispatch routines into RAM based table
+				bra.s	@startLoop				; for DBRA loop											; <H4>
+@machPrimLoop	move.l	(a0)+,d1				; D1 -> offset to dispatch routine
+				add.l	d2,d1					; D1 -> absolute address of dispatch routine
+				move.l	d1,(a3)+				; copy absolute address into RAM based dispatch table
+@startLoop		dbra	d0,@machPrimLoop		; copy all dispatch functions
+			ENDWITH
+				
+		; set up the modem manager modem queue
+		
+			WITH immgGlobals
+				moveq	#qHeadSize,d0			; size of a OS queue header
+				_NewPtr	,SYS,CLEAR				; A0 -> pointer to modem queue header
+				tst.w	d0						; check for valid pointer
+				bne.w	@error2					; bad, bad, bad...
+				move.l	a0,mdmQ(a2)				; store pointer to modem queue in globals
+			ENDWITH
+			
+		; save modem globals in expand mem
+		
+			WITH ExpandMemRec
+				move.l	a2,([ExpandMem],emIMdmMgrGlobs)
+			ENDWITH
+				
+		; install the dispatcher
+				
+				lea		ImmgDispatch,a0			; address of dispatcher for the trap
+				move.w	#IntMdmMgrTrap,d0		; internal modem manager trap number
+				_SetTrapAddress	,NEWTOOL
+				
+		; call modem manager init to initialize any future modem manager specific things
+		
+				_IModemInit
+				tst.w	d0						; check for modem manager init errors
+				bne.s	@error3					; bad, bad, bad...
+
+		; for each root table entry, attempt to install the modem primitives
+		
+			WITH immgMdmList
+				moveq	#0,d0					; first time around, A1 is already a pointer
+@modemInstall	adda.l	d0,a1					; A1 -> pointer to next modem list element
+				move.l	primTable(a1),d0		; D0 -> offset to modem primitives table
+				beq.s	@skipModemPrims			; no install if NULL
+				lea		(a1,d0.l),a4			; A4 -> pointer to modem primitives table
+				bsr		CopyModemPrims			; copy modem primitives table into RAM
+				bne.s	@error4					; bad, bad, bad...									; <H4>
+				_IModemInstall					; install the primitives
+@skipModemPrims	move.l	mdmListPtr(a1),d0		; D0 -> offset to next modem list
+				bne.s	@modemInstall			; continue installing modems until NULL pointer
+			ENDWITH
+				
+		; install the gestalt trap
+		
+				lea		ImmgGestalt,a0			; get address of gestalt code
+				move.l	#gestaltIntModemType,d0	; internal modem manager selector code
+				_NewGestalt						; install the selector
+				
+@exit			movem.l	(sp)+,@SavedRegs		; restore registers
+				rts
+
+
+;----------------------------------------------------------------------------------------
+;	Error conditions from the modem init code above
+;----------------------------------------------------------------------------------------
+
+		; have allocated an unknown number of modem primitive queue blocks and modem primitive tables
+		; and also have done modem manager init
+
+@error4			move.l	immgGlobals.mdmQ(a2),a1	; A1 -> pointer to modem queue header
+				movea.l	qHead(a1),a1			; A1 -> pointer to first modem queue element
+				tst.l	a1						; check if pointer is real
+				beq.s	@error3					; no more modem queue elements to deallocate
+			WITH immgQEl
+@cleanUpMdms	move.l	qMdmPrimPtr(a1),d0		; D0 -> pointer to modem primitives table
+				beq.s	@nextMdmQEl				; no pointer to deallocate
+				movea.l	d0,a0					; A0 -> pointer to modem primitives table
+				_DisposPtr						; get rid of it
+@nextMdmQEl		movea.l	a1,a0					; A0 -> pointer to this modem queue element
+				move.l	qLink(a1),a1			; A1 -> pointer to next modem queue element
+				_DisposPtr						; get rid of previous modem queue element
+				tst.l	a1						; check if the end of the list
+				bne.s	@cleanUpMdms			; no more modem queue elements to deallocate
+
+		; call modem manager close to clean up anything done in modem manager init
+		
+				_IModemClose
+
+		; have already set trap address of modem manager
+
+@error3			move.l	#UnimplTrap,d0			; D0 -> trap word of unimplemented trap
+				_GetTrapAddress	,NEWTOOL		; A0 -> address of unimplemented trap
+				move.l	#IntMdmMgrTrap,d0		; D0 -> trap word of internal modem manager
+				_SetTrapAddress ,NEWTOOL		; make modem manager unimplemented
+
+		; have already allocated machine primitive table pointer
+
+@error2			movea.l	a3,a0					; A0 -> pointer to machine primitves table
+				_DisposPtr						; get rid of it
+				
+		; have already allocated globals pointer
+
+@error1			movea.l	a2,a0					; A0 -> pointer to globals
+				_DisposPtr						; get rid of it
+				bra.s	@exit
+
+;----------------------------------------------------------------------------------------
+; CopyModemPrims
+; 
+; Entry:	A4: pointer to ROM based modem primitives table
+;
+; Exit:		A0: pointer to RAM based copy of modem primitives table, with absolute addresses
+;			D0: zero if no error, -1 if error
+;
+; Trashes:	none
+;
+; Copies ROM based modem primitives table into RAM, converting addresses to primitives
+; into absolute addresses.  Leaves the condition codes register set to ZERO on memory
+; allocation error.
+;----------------------------------------------------------------------------------------
+
+CopyModemPrims
+				movem.l	d1-d3,-(sp)				; save registers
+				
+			WITH immgPrimTable
+				move.l	#size,d0				; size of modem primitives table
+				beq.s	@errorExit				; if the size of the thing is ever zero				; <H4>
+				_NewPtr	,SYS,CLEAR				; pointer to machine primitives table -> A0
+				tst.w	d0						; check pointer for validity
+				bne.s	@errorExit				; bad, bad, bad...
+				move.l	a0,d2					; D2 -> pointer to RAM based modem prim table
+				move.l	a4,d3					; D3 -> ROM based modem table base for offset to absolute conversion
+				move.l	(a4)+,(a0)+				; copy flags and number of primitives
+				move.l	#size,d0				; D0 -> size of modem primitives table, in bytes, including storage
+				sub.l	#primOffset,d0			; D0 -> size of modem primitives table in bytes		; <H4>
+				lsr.l	#2,d0					; D0 -> number of modem primtives
+				move.w	d0,-2(a0)				; put number of primitives into RAM based table
+				bra.s	@startLoop				; for DBRA loop										; <H4>
+@mdmPrimLoop	move.l	(a4)+,d1				; D1 -> offset to primitive
+				add.l	d3,d1					; D1 -> absolute address of primitive
+				move.l	d1,(a0)+				; copy absolute address into RAM based primtive table
+@startLoop		dbra	d0,@mdmPrimLoop		; copy all primitives
+			ENDWITH
+			
+				movea.l	d2,a0					; A0 -> pointer to RAM based modem prims
+				moveq	#0,d0					; indicate no error
+				
+@exit			movem.l	(sp)+,d1-d3				; restore registers
+				rts
+				
+@errorExit		move.b	#$FF,d0					; indicate an error occurred
+				bra.s	@exit
+				
+
+;----------------------------------------------------------------------------------------
+; ImmgDispatch
+; 
+; Entry:	D0: high word: modem ID; low word: trap selector
+;			A0: may hold a pointer or data
+;
+; Exit:		D0: result code
+;
+; Trashes:	none
+;
+; Uses:
+;	
+;	A1: pointer to modem manager globals
+;	A2: pointer to machine primitives table
+;
+; Handles a modem manager call.  Jumps through the machine primitives table and returns
+; the result code.
+;----------------------------------------------------------------------------------------
+
+ImmgDispatch
+@saveRegs		REG		d1/a1-a2					; registers to save in this routine
+
+				movem.l	@saveRegs,-(sp)				; save registers
+				
+		; Get machine primitives table
+		
+			WITH ExpandMemRec
+				move.l	([ExpandMem],emIMdmMgrGlobs),a1
+				tst.l	a1							; check for valid pointer, this should never happen
+				beq.s	@errorNoBoard				; bad, bad, bad...
+			ENDWITH
+			
+		; range check trap selector
+				
+			WITH immgGlobals
+				move.l	dispTable(a1),a2			; A2 -> pointer to machine primitives
+				tst.l	a2							; check for valid primitives pointer
+				beq.s	@errorInvalid				; bad, bad, bad...
+			ENDWITH
+			WITH immgDispTable
+				cmp.w	numDisp(a2),d0				; is the selector < number of dispatch functions
+				bcc.s	@errorInvalid				; invalid selector
+				adda.l	#dispOffset,a2				; A2 -> pointer to beginning of dispatch functions
+			ENDWITH
+
+		; call the dispatch function to do the work
+		
+				move.w	d0,d1						; D1 -> trap selector
+				lsl.w	#2,d1						; D1 -> offset to dispatch function address
+				jsr		([a2,d1.w])					; do dispatch function
+				
+				
+@exit			movem.l	(sp)+,@saveRegs				; restore registers
+				rts
+
+@errorNoBoard	move.w	#immgNoBoardErr,d0			; D0 -> no board error result
+				bra.s	@exit
+
+@errorInvalid	move.w	#immgInvalidSelector,d0		; D0 -> invalid selector error result
+				bra.s	@exit
+
+;----------------------------------------------------------------------------------------
+; ImmgGestalt
+; 
+; Entry:	D0: gestaltIntModemType
+;			A0:	pointer for return data
+;
+; Exit:		D0: gestalt result code
+;
+; Trashes:	A0
+;
+; Finds out about the internal modem manager by calling IModemInfo.
+;----------------------------------------------------------------------------------------
+
+ImmgGestalt
+				_IModemInfo							; get the modem mgr information (in d0)
+				move.l	a0,d0						; D0 -> num modems and version
+				movea.l	4(sp),a0					; get a pointer to the response longword
+				move.l	d0,(a0)						; return type of modem
+				move.l	(sp)+,a0					; get the return address
+				add.l	#8,sp						; remove paramters
+				move.w	#noErr,(sp)					; set return error code
+				jmp		(a0)						; return
+				
+
+;----------------------------------------------------------------------------------------
+; Dispatch table for internal modem manager.
+;----------------------------------------------------------------------------------------
+
+immgDispatchTable
+					DC.W		0									; flags
+					DC.W		0									; number of primitives (filled in at init time)
+ 					DC.L		mdmInit-immgDispatchTable			; offset to modem manager init routine
+					DC.L		mdmPower-immgDispatchTable			; offset to modem manager power routine
+					DC.L		mdmWakeUp-immgDispatchTable			; offset to modem manager wake up routine
+					DC.L		mdmStatus-immgDispatchTable			; offset to modem manager status routine
+					DC.L		mdmPrime-immgDispatchTable			; offset to modem manager prime routine
+					DC.L		mdmSndCtl-immgDispatchTable			; offset to modem manager sound control routine
+					DC.L		mdmGetInd-immgDispatchTable			; offset to modem manager get indexed routine
+					DC.L		mdmFind-immgDispatchTable			; offset to modem manager find routine
+					DC.L		mdmInstall-immgDispatchTable		; offset to modem manager install routine
+					DC.L		mdmRemove-immgDispatchTable			; offset to modem manager remove routine
+					DC.L		mdmGetName-immgDispatchTable		; offset to modem manager get name routine
+					DC.L		mdmInfo-immgDispatchTable			; offset to modem manager info routine
+					DC.L		mdmClose-immgDispatchTable			; offset to modem manager close routine
+					DC.L		mdmSndVol-immgDispatchTable			; offset to modem sound volume routine
+					DC.L		mdmSndHW-immgDispatchTable			; offset to system sound HW arbitration routine
+
+
+
+
+;----------------------------------------------------------------------------------------
+; mdmInit
+; 
+; Entry:	a1 = modem manager global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Sets up private storage for the machine primitives.
+;----------------------------------------------------------------------------------------
+
+mdmInit
+			move.w	#immgVersion,immgGlobals.version(a1)	; store modem manager version number
+			
+			move.w	#noErr,d0
+@exit		rts
+			
+		
+		
+;----------------------------------------------------------------------------------------
+; mdmPower
+; 
+; Entry:	d0 = high word: modem ID
+;			a0 = pointer to modem parameter block
+;			a1 = modem manager global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Calls modem primitive for modem power.
+;----------------------------------------------------------------------------------------
+
+mdmPower
+			move.w	#selMPPower,d0			; select modem power
+			bra.w	CallMdmPrim				; make the call
+
+
+;----------------------------------------------------------------------------------------
+; mdmWakeUp
+; 
+; Entry:	d0 = high word: modem ID
+;			a0 = pointer to modem parameter block
+;			a1 = modem manager global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Calls modem primitive for wake up on ring.
+;----------------------------------------------------------------------------------------
+
+mdmWakeUp
+			move.w	#selMPWakeUp,d0			; select modem power
+			bra.w	CallMdmPrim				; make the call
+
+
+;----------------------------------------------------------------------------------------
+; mdmStatus
+; 
+; Entry:	d0 = high word: modem ID
+;			a0 = pointer to modem parameter block
+;			a1 = modem manager global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Calls modem primitive for status.
+;----------------------------------------------------------------------------------------
+
+mdmStatus
+			move.w	#selMPStatus,d0			; select modem power
+			bra.w	CallMdmPrim				; make the call
+
+
+;----------------------------------------------------------------------------------------
+; mdmPrime
+; 
+; Entry:	d0 = high word: modem ID
+;			a0 = pointer to modem parameter block
+;			a1 = modem manager global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Calls modem primitive for prime.
+;----------------------------------------------------------------------------------------
+
+mdmPrime
+			move.w	#selMPPrime,d0			; select modem power
+			bra.w	CallMdmPrim				; make the call
+
+
+;----------------------------------------------------------------------------------------
+; mdmSndCtl
+; 
+; Entry:	d0 = high word: modem ID
+;			a0 = pointer to modem parameter block
+;			a1 = modem manager global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	A0, A1
+;
+; Set machine up to be enable/disable sound, then Calls modem primitive for sound control.
+;----------------------------------------------------------------------------------------
+
+mdmSndCtl
+			move.w	#selMPSndCtl,d0				; select modem power
+			bra.w	CallMdmPrim					; make the call
+
+;----------------------------------------------------------------------------------------
+; mdmGetInd
+; 
+; Entry:	d0 = high word: modem ID
+;			a1 = modem manager global pointer
+;
+; Exit:		d0 = high word: modem ID; low word: result code
+;			a0 = modem type (longword)
+;
+; Trashes:	none
+;
+; Checks to see if the modem with index given in the high word of D0 is installed.  If it
+; is, the mdmType primitive for the modem is called to get the modem type, and the modem
+; ID, modem type, and result code are returned.
+;----------------------------------------------------------------------------------------
+
+mdmGetInd
+			move.w	d1,-(sp)					; save registers
+			
+			swap	d0							; put modem index in low word
+			bsr		GetIndMdm					; A0 -> pointer to the modem queue element
+			beq.s	@noModem					; if no modem, report it
+			
+			move.w	immgQEl.qMdmId(a0),d0		; D0 -> modem ID
+			move.w	d0,d1						; D1 -> modem ID
+			swap	d0							; D0: high word -> modem ID
+			move.w	#selMPType,d0				; select modem type primitive
+			bsr		CallMdmPrim					; make the call, A0 -> modem type, D0 -> result code
+			swap	d0
+			move.w	d1,d0						; D0 -> modem ID
+			swap	d0							; DO: high word -> modem ID, low word -> result code
+
+@exit		move.w	(sp)+,d1					; restore registers
+			rts
+
+@noModem	move.w	#immgNoBoardErr,d0			; report error
+			bra.s	@exit
+
+
+
+;----------------------------------------------------------------------------------------
+; mdmFind
+; 
+; Entry:	A0: pointer to modem primitives table
+;
+; Exit:		D0: result code of modem primitive MdmExists	
+;			
+; Trashes:	none
+;
+; Calls the modem primitive MdmExists to determine if the modem that the primitives 
+; apply to physically exists in the machine.
+;----------------------------------------------------------------------------------------
+
+mdmFind
+			jsr		([immgPrimTable.mdmExists,a0])	; call primitive
+			rts
+
+
+;----------------------------------------------------------------------------------------
+; mdmInstall
+; 
+; Entry:	A0: pointer to modem primitives table
+;			A1: pointer to modem manager globals
+;
+; Exit:		D0: high word: modem ID; low word: result code
+;			
+; Trashes:	none
+;
+; Calls mdmFind to ensure that the modem to be installed is in the machine.  If the
+; modem is physically present, a new queue element is allocated and enqueued in the 
+; modem queue.  Finally, the modem setup primitive is called, the returned A1 is stored 
+; in the modem queue element, and the pointer to the queue element is returned in A1.
+;----------------------------------------------------------------------------------------
+
+mdmInstall
+@saveRegs		REG		d2/a1-a4					; registers to save
+
+				movem.l	@saveRegs,-(sp)				; save registers
+				
+				movea.l	a0,a2						; A2 -> pointer to modem primitives
+				
+				bsr		mdmFind						; let primitives check if modem is in box
+				tst.w	d0							; check result
+				bne.s	@noModem					; no modem found, report error
+				
+		; create the new modem queue element
+		
+				move.l	#immgQEl.size,d0			; D0 -> size of modem queue element
+				_NewPtr	,SYS,CLEAR					; A0 -> pointer to new modem queue element
+				tst.w	d0							; check pointer validity
+				bne.s	@noModem					; no more memory, UNLUCKY!
+				movea.l	a0,a4						; A4 -> pointer to modem queue element
+
+		; fill in the fields of the modem queue element
+		
+			WITH immgQEl							; type is already set up (from CLEAR)
+				bsr		GetNewMdmID					; D0 -> new modem ID
+				move.w	d0,qMdmID(a0)				; store modem ID
+				move.w	d0,d2						; save modem ID for mdmSetUp later
+				move.l	a2,qMdmPrimPtr(a0)			; store modem primitives table pointer
+			ENDWITH									; optionalA1 will wait 'til after SetUp call
+
+		; install the modem queue element into the modem queue
+
+				movea.l	a1,a3						; A3 -> pointer to modem globals
+				move.l	immgGlobals.mdmQ(a3),a1		; A1 -> pointer to modem queue header
+				_Enqueue							; place new modem queue element into queue
+				
+		; call the modem primitive MdmSetUp
+		
+				move.w	d2,d0						; D0 -> modem ID
+				swap	d0							; put modem ID into high word
+				movea.l	a3,a1						; A1 -> pointer to modem manager globals
+				move.w	#selMPSetUp,d0				; call the MdmSetUp primitive
+				bsr		CallMdmPrim					; this calls the modem primitive
+				tst.w	d0							; check returned error result
+				bne.s	@primError					; there was an error in the primitive
+				
+		; store the optional A1 pointer in the queue element
+				
+				move.l	a0,immgQEl.optionalA1(a4)	; save the value returned by the primitive
+			
+		; return the modem ID in the high word of D0, and no error in low word
+		
+				swap	d0
+				move.w	d2,d0						; D0 -> modem ID
+				swap	d0
+				
+@exit			movem.l	(sp)+,@saveRegs				; restore registers
+				rts
+
+@noModem		move.w	#immgNoBoardErr,d0			; report no board
+				bra.s	@exit
+				
+@primError		move.w	d2,d0						; D0 -> modem ID
+				swap	d0							; put modem ID into high word
+				bsr		mdmRemove					; remove the modem from the queue
+				bra.s	@exit
+
+
+
+
+
+;----------------------------------------------------------------------------------------
+; mdmRemove
+; 
+; Entry:	D0: high word: modem ID
+;			A1: pointer to modem manager globals
+;
+; Exit:		D0: noErr
+;			
+; Trashes:	none
+;
+; Calls FindInstalledMdm to get the modem queue element for the modem with the ID passed
+; in the high word of D0.  Calls the CallMdmPrim routine to call the mdmTearDown primitive.
+; Dequeues the modem queue element and deallocates it.
+;----------------------------------------------------------------------------------------
+
+mdmRemove
+@saveRegs		REG		a1-a2						; registers to save
+
+				movem.l	@saveRegs,-(sp)				; save registers
+				
+		; get the modem queue element to remove
+		
+				movea.l	a1,a2						; A2 -> pointer to modem globals
+				bsr		FindInstalledMdm			; A1 -> pointer to modem queue element
+				beq.s	@noModem					; no modem found, report error
+				exg		a1,a2						; A1 -> modem globals, A2 -> modem Q El
+				
+		; call the modem tear down primitive
+		
+				move.w	#selMPTearDown,d0			; select modem tear down
+				bsr		CallMdmPrim					; make the call, don't care about errors
+				
+		; dequeue the modem
+		
+				movea.l	a2,a0						; A0 -> modem queue element
+				movea.l	immgGlobals.mdmQ(a1),a1		; A1 -> pointer to modem queue header
+				_Dequeue							; don't care about errors
+				
+		; deallocate the modem queue element
+		
+				movea.l	a2,a0						; A0 -> modem queue element
+				_DisposPtr							; get rid of it
+				
+@noModem		move.w	#noErr,d0					; D0 -> no error
+				
+@exit			movem.l	(sp)+,@saveRegs				; restore registers
+				rts
+				
+
+
+;----------------------------------------------------------------------------------------
+; mdmGetName
+; 
+; Entry:	a0 = pointer to string buffer
+;			a1 = modem manager global pointer
+;
+; Exit:		d0 = result code
+;			a0 = pointer to null terminated c string
+;
+; Trashes:	none
+;
+; Gets the name of an installed modem by calling the get modem name primitive.
+;----------------------------------------------------------------------------------------
+
+mdmGetName
+			move.w	#selMPName,d0			; select mdmGetName primitive
+			bra.w	CallMdmPrim				; make the call
+
+
+;----------------------------------------------------------------------------------------
+; mdmInfo
+; 
+; Entry:	a1 = modem manager global pointer
+;
+; Exit:		d0 = valid gestalt result code
+;			a0 = high word: modem manager version; low word: number of modems
+;
+; Trashes:	none
+;
+; Counts the number of installed modems, and returns the count and the modem manager 
+; version number.
+;----------------------------------------------------------------------------------------
+
+mdmInfo
+			bsr		CountMdms				; D0.L -> number of installed modems
+			
+			swap	d0
+			move.w	immgGlobals.version(a1),d0	; D0 -> modem manager version number
+			swap	d0
+			move.l	d0,a0					; A0 -> return result
+			
+			move.w	#noErr,d0
+@exit		rts
+			
+
+			
+;----------------------------------------------------------------------------------------
+; mdmClose
+; 
+; Entry:	a1 = modem manager global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Cleans up any initialization done by mdmInit.
+;----------------------------------------------------------------------------------------
+
+mdmClose
+			move.w	#noErr,d0
+@exit		rts
+			
+		
+;----------------------------------------------------------------------------------------
+; mdmSndVol
+; 
+; Entry:	d0 = high word: modem ID
+;			a0 = pointer to modem parameter block
+;			a1 = modem manager global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	A0, A1
+;
+; Set machine up to set modem sound volume, then Calls modem primitive for sound control.
+;----------------------------------------------------------------------------------------
+
+mdmSndVol
+			move.w	#selMPSndVol,d0				; select modem power
+			bra.w	CallMdmPrim					; make the call
+
+
+;----------------------------------------------------------------------------------------
+; mdmSndHW
+; 
+; Entry:	d0 = high word: modem ID
+;			a0 = pointer to modem parameter block
+;			a1 = modem manager global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	A0, A1
+;
+; Arbitrate for the system sound hardware via the appropriate primitive.
+;----------------------------------------------------------------------------------------
+
+mdmSndHW
+			move.w	#selMPSndHW,d0				; select modem power
+			bra.w	CallMdmPrim					; make the call
+
+		
+; еееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееее
+;	Useful utility routines
+; еееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееее
+
+;----------------------------------------------------------------------------------------
+; FindInstalledMdm
+; 
+; Entry:	D0: high word: modem ID
+;			A1: pointer to modem manager globals
+;
+; Exit:		A1: pointer to modem queue element for modem with ID passed in D0
+;			Condition codes set to zero if modem not found, otherwise not zero
+;
+; Trashes:	none
+;
+; Looks up the modem with ID given in high word of D0 and returns the modem queue 
+; element.
+;----------------------------------------------------------------------------------------
+
+FindInstalledMdm
+				move.l	immgGlobals.mdmQ(a1),a1		; A1 -> pointer to modem Q header
+				swap	d0							; D0: low word -> modem ID
+				
+				move.l	qHead(a1),a1				; A1 -> first modem queue element
+			WITH immgQEl
+@nextModem		tst.l	a1							; check pointer for validity
+				beq.s	@exit						; Oops!  out of modems and not found!
+				cmp.w	qMdmID(a1),d0				; check modem ID against the one we want
+				beq.s	@exit						; found it!
+				move.l	qLink(a1),a1				; A1 -> pointer to next modem queue element
+				bra.s	@nextModem					; keep checking...
+			ENDWITH
+				
+@exit			swap	d0							; put things back the way they were
+				tst.l	a1							; set condition codes
+				rts
+
+
+;----------------------------------------------------------------------------------------
+; CallMdmPrim
+; 
+; Entry:	D0: high word: modem ID; low word: primitive selector
+;			A1: pointer to modem manager globals
+;
+; Exit:		A0: whatever is returned by the modem primitive
+;			D0: result code returned by modem primitive, or no board found err
+;				if the modem ID was not valid.
+;
+; Trashes:	none
+;
+; Calls FindInstalledMdm to get the modem queue element desired, then calls the modem
+; primitive selected by the low word of D0.
+;----------------------------------------------------------------------------------------
+
+CallMdmPrim
+@saveRegs		REG		d1/a1-a2					; registers to save over routine
+
+				movem.l	@saveRegs,-(sp)				; save registers
+				
+				bsr		FindInstalledMdm			; A1 -> pointer to modem queue element
+				beq.s	@noModem					; no modem found, report error
+				
+		; get data from the queue element that will be used
+		
+			WITH immgQEl
+				move.l	qMdmPrimPtr(a1),a2			; A2 -> pointer to modem primitives
+				move.l	optionalA1(a1),a1			; A1 -> pointer to optional A1 parameter
+			ENDWITH
+
+		; range check the primitive selector against the number of prims in the prim table
+
+			WITH immgPrimTable
+				cmp.w	numPrims(a2),d0				; is the prim selector < num prims?
+				bcc.s	@invalidSel					; nope, report error...
+				adda.l	#primOffset,a2				; A2 -> pointer to primitives
+				move.w	d0,d1						; D1 -> primitive selector
+				lsl.w	#2,d1						; D1 -> offset to primitive
+				jsr		([a2,d1.w])					; do the primitive
+			ENDWITH
+			
+@exit			movem.l	(sp)+,@saveRegs				; restore registers
+				rts
+
+@noModem		move.w	#immgNoBoardErr,d0			; report no board
+				bra.s	@exit
+				
+@invalidSel		move.w	#immgInvalidSelector,d0		; report invalid primitive selector
+				bra.s	@exit
+				
+
+
+;----------------------------------------------------------------------------------------
+; GetIndMdm
+; 
+; Entry:	D0: index of modem to retrieve (zero based)
+;			A1: pointer to modem manager globals
+;
+; Exit:		A0: pointer to modem queue element for modem at index in D0
+;			Condition codes set to zero if modem not found, otherwise not zero
+;
+; Trashes:	D0, A0
+;
+; Looks up the modem with index given in D0 and returns a pointer to the modem queue 
+; element.
+;----------------------------------------------------------------------------------------
+
+GetIndMdm
+				move.l	immgGlobals.mdmQ(a1),a0		; A0 -> pointer to modem Q header
+				
+				move.l	qHead(a0),a0				; A0 -> first modem queue element
+				tst.l	a0							; check pointer for validity
+				beq.s	@exit						; Oops!  out of modems and not found!
+				tst.w	d0							; check if we want first (0) modem
+				beq.s	@exit						; yep! leave...
+
+			WITH immgQEl
+				subq	#1,d0						; for dbeq loop
+@nextModem		move.l	qLink(a0),a0				; A1 -> pointer to next modem queue element
+				tst.l	a0							; set condition codes
+				dbeq	d0,@nextModem				; keep checking...
+			ENDWITH
+				
+@exit			tst.l	a0							; set condition codes
+				rts
+
+
+
+;----------------------------------------------------------------------------------------
+; CountMdms
+; 
+; Entry:	A1: pointer to modem manager globals
+;
+; Exit:		D0: number of modems
+;
+; Trashes:	A0
+;
+; Counts the number of installed modems in the modem queue.
+;----------------------------------------------------------------------------------------
+
+CountMdms
+				moveq	#0,d0						; clear counter
+				move.l	immgGlobals.mdmQ(a1),a0		; A0 -> pointer to modem Q header
+				
+				move.l	qHead(a0),a0				; A0 -> first modem queue element
+				tst.l	a0							; check pointer for validity
+				beq.s	@exit						; Zero modems
+
+			WITH immgQEl
+@nextModem		addq	#1,d0						; counting...
+				move.l	qLink(a0),a0				; A1 -> pointer to next modem queue element
+				tst.l	a0							; set condition codes
+				bne.s	@nextModem					; keep counting...
+			ENDWITH
+				
+@exit			rts
+
+
+
+;----------------------------------------------------------------------------------------
+; GetNewMdmID
+; 
+; Entry:	A1: pointer to modem globals
+;
+; Exit:		D0: modem ID	
+;			
+; Trashes:	none
+;
+; Comes up with a new modem ID.  Right now, all it does is increment the number in the
+; modem manager globals and returns it.
+;----------------------------------------------------------------------------------------
+
+GetNewMdmID
+		WITH immgGlobals
+			add.w	#1,lastMdmID(a1)				; increment last modem ID
+			move.w	lastMdmID(a1),d0				; get the modem ID
+		ENDWITH
+
+			rts
+
+
+			End

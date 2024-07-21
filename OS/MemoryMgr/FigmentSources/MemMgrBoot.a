@@ -1,0 +1,726 @@
+;__________________________________________________________________________________________________
+;
+;	File:		MemMgrBoot.a
+;
+;	Contains:	Assembly language routines for boot the new memory manager.
+;
+;
+;	Written by:	Jeff Crawford, stolen from old code in the existing MM
+;
+;	Copyright © 1982, 1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;		<23>	10/25/93	SAM		Roll in <MC5> from mc900ftjesus.
+;	   <MC5>	10/25/93	SAM		Changed mmCacheUnk1 to mmFigEnable (MMFlags bit number equate).
+;		<22>	10/15/93	SAM		Roll in <MC4> from mc900ftjesus.
+;	   <MC4>	10/15/93	SAM		Removed figgyonvector stuff completely.  Removed the nasty hack
+;									in InitMemMgr for native figment (native fig is smart now).
+;		<21>	10/14/93	BT		Sync up with Sam's SM changes.
+;	  <SM14>	10/12/93	SAM		Roll in <MC3> from mc900ftjesus.
+;	   <MC3>	10/12/93	SAM		Inverted the sense of figgyonvect and added two lines of code to
+;									the start of InitMemVect that the native code looks for before
+;									plugging itself in (this'll be gone in the next build).
+;	  <SM13>	10/12/93	SAM		Roll in <MC2> from mc900ftjesus.
+;	   <MC2>	10/12/93	SAM		Rewrote InitMemMgr.  Now fully universal.  Upated all routines
+;									that used figgyonvector and read PRAM location AA.  Cleaned up
+;									lotsa stuff (will finish cleaning later).
+;		<20>	  9/2/93	BT		<BT, ewa> #1108042, sync up with SuperMario.
+;		<19>	 8/19/93	JC		<mlw>, #1106373, Fixed Timbuktu bug where SetApplBase was
+;									removing heap zones above BufPtr out of the heap tree.
+;		<18>	 8/18/93	JC		<BK>, #1105907, Fix boot process to leave the first 8 bytes of
+;									low memory the same as the old MM.
+;		<17>	  8/5/93	BT		<BT, JC> We came, we saw, we initialed...
+;		<16>	  8/2/93	JC		#1095953, now is FakeHandleRange instead of RealMemTop to permit
+;									clients to create heaps above RealMemTop.
+;		<15>	  8/2/93	JC		Fixed the previous fix so it boots on PDM. The Syszone was
+;									expanding into the ApplZone at boot up time.
+;		<14>	 7/20/93	JC		#1095954, Fixed bug where After Dark's zone above BufPtr
+;									(possibly others) was removed from the heap tree during
+;									InitApplZone.
+;		<13>	 7/16/93	JC		Made changes to support Figment as a System File. These changes
+;									we done using the IF ForROM define.
+;		<12>	  6/9/93	JC		Fix ExtSysZone HeapDispatch selector.
+;		<11>	 5/26/93	BT		Switch the polarity on the Figment PRAM bit.
+;		<10>	 5/21/93	JC		oooops.
+;		 <9>	 5/21/93	JC		Support for QuickTime 1.6 now works. Added vector and
+;									initialization code to support QT.
+;		 <8>	 5/19/93	BT		Change PRAM bit used for Figment to end of Spectre's startup
+;									server name. Slot 6 didn't work because it got cleared after
+;									every second boot (after noticing no card was present).
+;		 <7>	 5/18/93	BT		Changed entry point names so that the control for InitMemMgr,
+;									InitMemVect and SetApplBaseAfterBoot pass through a multiplexer
+;									that can pass control to the correct routines.  These are the
+;									only routines that are called directly.
+;		 <6>	  5/6/93	JC		Set GZRootHnd, GZRootPtr, and GZMoveHnd to be initialized to
+;									nil.
+;__________________________________________________________________________________________________
+;
+;	Code used during the boot process by the Memory Manager.
+;
+;	InitApplZone is really a toolbox function and should not be part of the new
+;	Memory Manager. To prevent rewriting toolbox code in C, I have included the 
+;	modified assembly language implementation for it here.
+;
+;	SetApplBase is in a similar predicament. It does require some knowlege of
+;	the System heap though and has been rerwitten but not yet tested.
+;
+
+
+				BLANKS			ON
+				STRING			ASIS
+				MACHINE			MC68020
+
+			LOAD	'StandardEqu.d'
+			INCLUDE 'ColorEqu.a'		;
+			INCLUDE 'palettePriv.a'		; <10Jun87 EHB>
+			INCLUDE	'MemoryMgrPriv.a'
+			INCLUDE	'FontPrivate.a'
+			INCLUDE	'HardwarePrivateEqu.a'
+			INCLUDE	'UniversalEqu.a'
+			INCLUDE	'TrapsPrivate.a'
+			
+NextUpLink  	EQU 		$20  					; offset of nextUp field in stdHeap
+													; Warning! this is tied to MemMgr.h
+
+
+MMAsmCode	PROC
+
+				IMPORT	FlushApplVBLs				; code borrowed from SegLoader				<C681>
+				IMPORT	AppZoneAddr					; code borrowed from SegLoader				<C699>
+				IMPORT	FlushApplNM					; from NotificationMgr.c
+				IMPORT	BaseofRom
+				
+				IMPORT	MoveBytes
+				IMPORT	MoveBytes020
+				IMPORT	MoveBytes040
+				IMPORT	ClearBytes
+				IMPORT	InitQTMemory
+				IMPORT	Old_AfterBootSetApplBase	; <7 BT>
+
+			IF forROM THEN
+				IMPORT	PramIO						;										<MSH>
+				IMPORT	Old_InitMemMgr				; <7 BT>
+				IMPORT	Old_InitMemVect				; <7 BT>
+				EXPORT	AfterBootSetApplBase		;										<SM20>
+				EXPORT	Fig___STRIPADDRESS			; <C169>, <7 BT>
+			ENDIF
+
+				EXPORT	InitMemMgr					; initialization at system boot time			<v1.1>
+				EXPORT	InitMemVect					; old routine to init 32/24 vectors
+				EXPORT	Fig_SETAPPLBASE				; <7 BT>
+				EXPORT	Fig_INITAPPLZONE			; <7 BT>
+				EXPORT	Fig_VIAZINIT				; init at top of InitApplZone for vector	<C681>, <7 BT>
+				EXPORT	Fig_VIAZPOSTINIT			; init after zone is created for vector		<C681>, <7 BT>
+
+ExtSysZoneSelector 		EQU 		$14				; selector for extending the system zone
+
+vMoveBytes		EQU			$1E00					; jump vector for MoveBytes (old 24bit MM start)
+vClearBytes		EQU			$1E04					; jump vector for ClearBytes
+vTrashQTMemList	EQU			$1E0C					; used for QuickTime 1.6 compatibility
+FakeHandleRange EQU			$1E10					; used to range check fake handles
+
+
+;----------------------------------------------------------------
+; InitMemMgr: Set up some low memory constants related to the memory manager.
+; Destroys	tons
+; Called by	System initialization sequence.
+;----------------------------------------------------------------
+
+				With	ProductInfo
+
+InitMemMgr		MOVE.L	#BCMask,Lo3Bytes
+				MOVE.L	#mnStackSize,MinStack
+				MOVE.L	#NDfltStackSize,DefltStack		; new name for flexibility
+				MOVE.W	#(dfltFlags<<8),MMDefFlags
+				
+InitMemVect		MOVEM.L	D0-D3/A0-A3,-(SP)					; Save registers
+
+				MOVEA.L	UnivInfoPtr,a1						; Get product info pointer
+				MOVEA.L	A1,A0								; Make a copy into A1
+				ADDA.L	ProductInfo.DecoderInfoPtr(A1),A0	; Get ptr to hardware bases
+				MOVE.L	ProductInfo.ExtValid(A1),D1			; Get external features (0-31)
+				MOVE.L	#MMPRAMloc,D3						; Read MMFlags from PRAM
+				LEA		MMFlags,A3							; A3 points to MMFlags lomem
+				BSR.L	PramIO								; Get the current MMFlags
+
+				BTST	#hasNewMemMgr,UnivROMFlags			; Does this ROM support Figment?
+				BEQ.S	@noFigment							; -> No. Don't bother w/PRAM
+				
+				BTST	#mmFigEnable,MMFlags				; Is Figment enabled for this boot?
+				BEQ.S	@noFigment							; -> Nope.  Use old MemMgr
+
+				BRA.S	Fig_InitMemMgr						; -> Call Figment Init
+@noFigment		BRA		Old_InitMemMgr						; -> Call Old Mem Mgr Init
+				EndWith
+
+;----------------------------------------------------------------
+; InitMemMgr: Set up some low memory constants related to the memory manager.
+; Destroys	none
+; Called by	System initialization sequence.
+;----------------------------------------------------------------
+
+Fig_InitMemMgr	
+			IF		ForROM THEN
+				BSET	#MMStartMode,MMFlags	; Force 32-bit mode
+				BSET	#MMMixed,MMFlags		; Force 32-bit mode
+				BSET	#MMSysheap,MMFlags		; Force 32-bit mode
+				BSET	#MMROZheap,MMFlags		; Force 32-bit mode
+				BCLR	#mmHighSysHeap,MMFlags	; Force 32-bit mode
+			ELSE
+				Move.B	#5,MMFlags				; MMStartMode & MMSysheap bits set
+												; note: we dont read PRAM here
+			ENDIF
+
+				BCLR.B	#Systemis24bit,SystemInfo 	; set system to be 32 bit
+				BCLR.B	#Sysheapis24bit,SystemInfo	; set system heap to be 32 bit
+
+				MOVE.L	ROMBase,D0				; get ROMbase								<18>
+				ADD.L	#$00010000,D0			; makeup a safe address						<v1.9>
+				MOVE.L	D0,$0					; write address for nil handle				<v1.9>
+				MOVE.L	D0,$4					; write address for nil window pointer		<v1.9>
+
+				CMPI.B	#cpu68040,CPUFlag		; Are we less than an 040?					<T7><SM9>
+				BLO.S	@not040					; Yes? Then use original MoveBytes.			<T7><SM9>
+
+				; Need to set up MoveBytes and ClearBytes vectors
+				LEA 	MoveBytes040,A0			; get address for MoveBytes on 040
+				BRA.S	@3
+
+@not040			LEA 	MoveBytes020,A0			; get address for MoveBytes on 020
+@3				MOVE.L	A0,vMoveBytes			; store MoveBytes address in vector
+				
+				LEA 	ClearBytes,A0			; get address for ClearBytes
+				MOVE.L	A0,vClearBytes			; store ClearBytes address in vector
+				
+; For the new HeapManager we need to clear out the grow zone handle/ptr root stuff
+; in case someone checks it.
+
+				CLR.L	GZRootHnd				; clear 'em out
+				CLR.L	GZRootPtr
+				CLR.L	GZMoveHnd
+
+				CLR.L	vTrashQTMemList			; lomem used for Heap utilties support
+				
+; initialize the fake handle range with RealMemTop
+
+				MOVE.L	RealMemTop, FakeHandleRange	
+
+				MOVEM.L	(SP)+,D0-D3/A0-A3		; restore registers
+				RTS	
+
+
+
+;----------------------------------------------------------------------
+; PROCEDURE SetApplBase(a: Address);
+;
+; Sets the Application Zone Base, and Inits the Application Zone
+; No error setting required here,since IAZ does all the hard work.		   <25Apr85>
+; These days use the full splendor of InitApplZone.
+;
+; Argument:
+;		A0: 			New Base Address for Applic Zone.
+;
+; Result:
+;		D0: 	ec: 	error code.
+;
+; Registers:
+;		D0: 	amount to adjust counter by, new counter value.
+;		A0: 	points to counter, max pair.
+;
+
+Fig_SETAPPLBASE	; <7 BT>
+
+			IF		ForROM THEN
+; Roll in SetAppBaseCacheCleaner from BassPatches.a <SM8> <PN>
+;	Remove any application memory allocated by Bass whenever the application heap is		
+;	reformatted. SetAppBase and InitApplZone must be patched since they both trash the		
+;	application heap.
+				TST.B		CurApName			;checking for app name <SM8> <PN>
+				BMI			@SkipIt				;still in booting, skip the patch <SM8> <PN>
+				MOVEM.L	A0-A2/D0-D3,-(sp)		; save registers <SM8> <PN>
+				CLR.L		-(SP)				; room for result <SM8> <PN>
+				MOVE.L		applZone,A0			; point to zone hdr <SM8> <PN>
+				MOVE.L		A0,-(SP)			; push start ptr <SM8> <PN>
+				MOVE.L		(A0),-(SP)			; push zone trailer <SM8> <PN>
+				_sbKillSomeCaches				; <SM8> <PN>
+				ADDQ		#4,SP				; ignore result <SM8> <PN>
+				MOVEM.L		(sp)+,A0-A2/D0-D3		; restore registers <SM8> <PN>
+@SkipIt	
+			ENDIF
+
+; 32 bit version
+v32SetApplBase
+				MoveM.L D3/A2-A6,-(SP)			; Save Registers.
+				MOVE.L	A0,-(SP)				; Move param so IAZ can hose A0		<sm9>stb
+				BSR		IAZ						; roll in patch to get extra cleanup<sm9>stb
+				Move.L	SysZone,A6				; Get sysZone pointer.
+				Move.L	(SP)+,D0				;  round base up to 4x		<C251><sm9>stb
+
+				Add.L	#15,D0					; Quad-word align
+				AndI.W	#$FFF0,D0				;  D0 = 16x; D0 >= A0
+				bra.s	@continue
+
+@0				AddQ.L	#3,D0					;
+				AndI.W	#$FFFC,D0				;  D0 = 4x; D0 >= A0
+@continue										;							<2> kc.end
+				MoveA.L	D0,A0					;							<C251>
+				Sub.W	#MinFree32,A0 			; Point to new end block.	<v1.2>
+				Cmp.L	BkLim(A6),A0			; New sysZone end <= current?
+				BLS.S	@SABInitAppl 			; Yes, just init applZone.
+
+				; note, we must keep the heap tree intact, so we save and restore
+				; the nextLink of the application zone across calls to IAZ (which
+				; could destroy it). This is to permit heaps above bugPtr (Timbuktu, 
+				; After Dark, Virex) to stay in the heap tree.
+				Move.L	NextUpLink(A6),A1			; Get app zone
+				Move.L	NextUpLink(A1),-(SP)		; Save app zone's next link on stack
+
+				
+				;  Need to call Figment instead of a32ZoneAdjustEnd
+				; *** BSR 	a32ZoneAdjustEnd		; Adjust the sysZone end.	JC <v1.1>
+				suba.l	BkLim(A6),A0				; get size to increase in A0
+				move.w	#ExtSysZoneSelector, D0		; ExtendSystemZone selector in D0
+				_HeapDispatch
+				
+				BSR.S	IAZ						; use historical IAZ call	<C681>
+				BSR.S	IAZ						; roll in patch to get extra cleanup<sm9>stb
+
+				; Since the system zone could have expanded into the app zone, 
+				; we restore the link to put heaps back in heap tree
+				Move.L	NextUpLink(A6),A1			; Get app zone
+				Move.L	(SP)+,NextUpLink(A1)		; restore app zone's nextlink
+
+				BRA.s	@doneWithSAB			
+
+@SABInitAppl
+				BSR.S	IAZ						; use historical IAZ call	<C681>
+				BSR.S	IAZ						; roll in patch to get extra cleanup<sm9>stb
+
+@doneWithSAB
+				MoveM.L (SP)+,D3/A2-A6
+				RTS
+
+
+;----------------------------------------------------------------------
+; PROCEDURE AfterBootSetApplBase(a: Address);
+;
+; This is the patch BracketSetAppBaseWithInitApplZones
+; It will patch out the SetApplBase at Gibbly time when InstallMgr
+; get called.  The time when this patch applied is crucial (during boot
+; time up to gibbly time this patch is NOT to be used, it is used 
+; after gibbly time)  <SM20> PN
+; 
+
+			IF		ForROM THEN
+AfterBootSetApplBase 
+				BTST	#mmFigEnable,MMFlags				; Is Figment enabled for this boot?
+				BNE.S	@hasFigment							; -> Yes.  Use the wrapper.
+				BRA		Old_AfterBootSetApplBase
+
+@hasFigment		
+				_InitApplZone
+				JSR		Fig_SetApplBase
+				_InitApplZone
+				RTS
+
+			ENDIF
+
+;----------------------------------------------------------------------
+;
+; Procedure InitApplZone;
+;
+; Common code for initializing the Application Zone.  Requires SPBot,
+;	sysZone to be set up.  Sets up ApplLimit, applZone.  Invokes
+;	RsrcZoneInit, if needed.  Sets up HiHeapMark := ApplLimit, as always,		<C765><C778>
+;	but uses the more conservative result (D1) from ToMaxLimit rather than		<C765><C778>
+;	the BufPtr-based result (D2) which was historical.							<C778>
+;
+; New wrinkle -- start ApplZone up high, then let it grow downwards.				<14Apr85>
+; Stuff error codes in IAZ (for SetApplBase) and InitApplZone.						<25Apr85>
+; Init ApplZone and OrgApplZone before InitZone, to simplify MakeMoreMasters		<27Apr85>
+; Roll all of InitApplZone into one blob, leaving IAZ for history.					<C681>
+;
+; Arguments:
+;		None.
+;
+; Result:
+;		D0: 	ec: 	error code.
+;								<0: 			InitZone failed.
+;								0:				Success.
+;
+; Registers:
+;		D1: 	appLim: Computed ApplLimit value.
+;		D2: 	lTemp:	Proposed appl Limit value.
+;		A0: 	start:	Points to proposed applZone start.
+;		A0: 	args:	Points to InitZone argument list.
+;		A1: 	end:	Points to proposed applZone end.
+;		A6: 	z:		Points to sysZone, eventually applZone.
+;
+
+
+Fig_INITAPPLZONE								;<7 BT> 
+
+			IF		ForROM THEN
+			ELSE
+		; massive change to support script manager. <v1.4>
+		; The following is for the in-ROM script manager.
+		; clear the pack6 resource cache when launching
+		
+			with	ExpandMemRec
+			move.l	expandMem,a0				; expand pointer
+			add.w	#emItlCache,a0				; point to cache
+			move.l	#emItlCacheSize/4-1,d0		; dbra ptr
+@ClearCache
+			clr.l	(a0)+						; clear part of cache
+			dbra	d0,@ClearCache				; until done
+			endWith
+@CacheDone
+			ENDIF
+
+
+; JC note: Prologue removed
+
+; see if QuickTime 1.6 needs to be initialized
+			tst.l	vTrashQTMemList				; Is the Lomem zero
+			bnz.s	@dontInitQT					; no, already initialized, skip it
+			jsr		InitQTMemory				; init QT memory routines now.
+@dontInitQT
+
+			MoveA.L	jIAZInit,A0				; get pre-processing routine vector		<C681>
+			JSR		(A0)					; do it									<C681>
+			BSR.S	IAZ						; get the real zone						<C681>
+			MoveA.L	jIAZPostInit,A0			; get post-processing routine vector	<C681>
+			JSR		(A0)					; do it									<C681>
+
+			MoveQ	#0,D0					; re-stuff the no-error code			<16Apr85>
+			Move.W	D0,MemErr				; Record it globally, too				<25Apr85>
+			RTS
+
+
+
+
+;----------------------------------------------------------------------
+; IAZ																	<C681>
+; - Do the real work of initing the appl zone.
+; Major change to use stack&BufPtr-based ApplLimit and HiHeapMark, not
+; just to hammer BufPtr-MinStack, as has been done since the early days.
+; This fixes problems at start time, when SetApplBase is called with the
+; stack in mid-ram and StackSpace is forced to say there is no
+; Registers: D0-D2/A0-A1
+; Called by InitApplZone and SetApplBase.
+;----------------------------------------------------------------------
+IAZ 		Move.L	A6,-(SP)				;Save A6.
+
+			_RsrcZoneInit					;initialize resources in appl heap
+			
+			Move.L	SysZone,A6				; get SysZone
+			
+			Move.L	ApplZone,A1				; <14 JC> get the new ApplZone
+			Cmp.L	A1,A6					; <14 JC>  is ApplZone == SysZone
+			Bz		@ClearAppLink			; <14 JC>  yes, don't need to take out since it does not exist
+
+			Move.L	NextUpLink(A6),A1		; <14 JC>  get link to old application zone
+			Bz		@continue				; <14 JC>  skip if no link exists
+			
+			; note: the System Zone could have expanded into the Application Zone; as in the
+			; case with NSA loading on PDM at Gibbly time. This does not occur when loading
+			; inits.
+			Cmp.L	BkLim(A6),A1			; <15 JC> is backlimit of System zone is past old ApplZone?
+			BMi		@ClearAppLink			; <15 JC> Yes, old ApplZone has been trashed, clear link.
+			
+			Move.L	NextUpLink(A1),NextUpLink(A6)	; <14 JC>  take old ApplZone out of the heap tree 
+			Bra		@continue				; <14 JC> 
+			
+@ClearAppLink								; <14 JC> 
+			Clr.L	NextUpLink(A6)			; <14 JC>  clear link in SysZone
+@continue	
+			
+			Clr.L	applZone				;No applZone exists during init.
+
+			; Do the Launch-type computation of ApplLimit, to give ample stack				<C817>
+			; at boot time.  Remove use of antiquated ToMaxLimit.							<C817>
+			Move.l	SP,D1					;current stack									<C817>
+			Sub.L	DefltStack,D1			;enough space for even QD						<C817>
+			Move.L	D1,ApplLimit			;Use stack limit, NOT BufPtr’s					<C778>
+			Move.L	D1,HiHeapMark			;Start HiHeapMark in sync with					<C778>
+											;ApplLimit in case of glue MaxApplZone<C778>
+
+			Move.L	BkLim(A6),A0			;Current Last Block in sysZone.
+
+			TST.B	Zone32Flag(A6)			;is it 32 bit zone								<v1.2>
+			BNE.S	@1						;branch if yes									<v1.2>
+
+			; Ordinarily start ApplZone just after SysZone, but if GrowDown is true,		<14Apr85>
+			; and there's room, start up offset by CacheSize.                               <27Apr85>
+			LEA 	MinFree24(A0),A0		;Points to first of cur. applZone.				<v1.2>
+			BRA.S	@5						;												<v1.2>
+@1
+			LEA 	MinFree32(A0),A0		;Points to first of cur. applZone.				<v1.2>
+
+@5
+			; Now proceed building the zone...												<14Apr85>
+			Move.L	A0,A1					;New Application zone base.
+			Add.W	#AppZoneSize,A1 		;Compute new end address.
+			Cmp.L	D1,A1					;New End Address < ApplLimit?
+			BCS.S	@10						;Yes, use new end address.
+
+			Move.L	D1,A1					;use ApplLimit as end address.
+
+@10
+;			Move.L	A0,StartPtr(SP) 		;New Applic Zone Base.
+;			Move.L	A1,LimitPtr(SP) 		;New Applic Zone End.
+;			Move.W	#<2*dfltMasters>,CMoreMasters(SP)
+;			Move.L	#0,PGrowZone(SP)		;No Grow Zone procedure.
+
+			Move.L	#0,-(SP)				;No Grow Zone procedure.
+			Move.W	#(2*dfltMasters),-(SP)	;Number of masters to alloc.
+			Move.L	A1,-(SP)				;New Applic Zone End.
+			Move.L	A0,-(SP)				;New Applic Zone Base.
+
+			Move.L	A0,applZone 			;Save as the application heap zone.
+
+			Move.L	SP,A0					;Point to argument block.
+			_InitZone						;Ask OS to do request.
+
+			Add.W	#14,SP					;Restore stack pointer.
+
+			Move.L	theZone,A6				;Application heap zone.
+			Move.L	BkLim(A6),HeapEnd		;Set up HeapEnd.
+
+			MoveQ	#0,D0					;Success result code.
+			Move.W	D0,MemErr				;Record it globally, too				<25Apr85>
+
+			Move.L	(SP)+,A6				;Restore A6.
+			RTS								;										<C681>
+			;-------------------------------------------------------------------	<C681>
+			; End of historical IAZ.
+			;-------------------------------------------------------------------	<C681>
+
+
+
+;----------------------------------------------------------------------
+; vIAZInit																	new		<C681>
+; - Inits before ApplZone is created.
+; Registers: D0-D2/A0-A1
+; Called by InitApplZone via jIAZInit vector.
+;----------------------------------------------------------------------
+Fig_VIAZINIT							;<7 BT> 
+			MOVE.L	IAZNotify,D0		; anyone to notify?
+			BLE.S	@0					; br if not
+			MOVE.L	D0,A0				; give them a call if so
+			JSR 	(A0)
+
+@0			MOVE.W	#-1,WWExist 		; $FF for non-existence (also sets QDExist)
+			ST		FMExist				; $FF for InitFonts hasn’t been called
+;			 BSET	 #7,DSWndUpdate 	 ; cancel pending PaintBehind
+			CLR.L	MenuList
+;			Clr.L	LastFOND			;											<06May85>
+;			Move.W	#-1,FONDID			;											<06May85>
+			Move.L	MinusOne,LastSPExtra ; flag to inval cache		<13Jan86  JTC>
+			ST		SEvtEnb 			; re-enable system event
+
+			MoveQ	#(IOVQElSize/2)-1,D0	;										<10May85>
+@99
+			Clr.W	-(SP)
+			DBrA	D0,@99
+			MoveA.L SP,A0
+
+			MOVE.L	VCBQHdr+QHead,D0
+@2			BEQ.S	@4
+			MOVE.L	D0,A1
+			MOVE.W	VCBDrvNum(A1),IOVDrvNum(A0)
+			BEQ.S	@3
+			_FlushVol					; flush all on-line volumes
+@3			MOVE.L	QLink(A1),D0
+			BRA.S	@2
+@4
+			ADD 	#IOVQElSize,SP		; clean up stack
+
+; Init code moved from Launch
+			CLR.L 	DragHook				 ;No drag hook yet
+			CLR.L 	DeskHook				 ;No desk hook for hit-testing desk.
+			LEA		CloseOrnHook, A0		 ; Point to closeOrnHook
+			CLR.L 	(A0)+					 ;clear closeOrnHook
+			CLR.L 	(A0)+					 ;clear RestProc
+			CLR.L 	(A0)+					 ;clear saveProc
+			CLR.W 	TaskLock				 ;clear taskLock, fScaleDisable.
+			CLR.L 	ResErrProc				 ;and resource error proc.
+			CLR.L 	EjectNotify 			 ;moved here from InitApplZone (from patches) <24Apr85>
+
+		IF hasASC THEN						;										<C897><C914><1.7>
+			MOVE.L	jSoundDead,A0			 ;get vector to kill all current sounds in ...	<C681>
+			JSR		(A0)					 ;...the application heap						<C681>
+		ENDIF
+
+			JSR 	FlushApplVbls			 ;kill off doomed vbl tasks 			 <27Mar85>
+			BigJSR	FlushApplNM,A0			; And bogus NM requests					<V1.1><1.2>
+
+			IF		ForROM THEN
+			BSR.S	FlushFontCaches			; flush TrueType caches					<sm10>stb
+			ENDIF
+			BSR.S	FlushApplPorts			 ;kill off doomed grafPorts				<C699>
+			BSR.S	FlushPalettes			 ;as well as doomed palettes			<10Jun87 EHB>
+
+; this cleanup is needed, for instance, if an ES is done from MacsBug.				<10Jun87 EHB>
+
+			MOVE.L	MainDevice,A0			; get the main device					<10Jun87 EHB>
+			MOVE.L	A0,SrcDevice			; set the src device					<10Jun87 EHB>
+			MOVE.L	A0,theGDevice			; and the current device				<10Jun87 EHB>
+			MOVE	#$2000,SR				; make sure interrupts enabled			<10Jun87 EHB>
+			RTS
+
+
+			IF		ForROM THEN
+FlushFontCaches
+;----------------------------------------------------------------------
+; Remove any application memory allocated by TrueType whenever the application heap is		
+; reformatted. SetAppBase and InitApplZone are both patched since they both trash the		
+; application heap.
+; Rolled in InitApplZoneCacheCleaner from BassPatches.a								<SM8> <PN><sm10>stb
+; Registers:	saves all registers, trashes condition codes
+;----------------------------------------------------------------------
+
+				MOVEM.L		A0-A2/D0-D3,-(sp)	; save registers					<SM8> <PN>
+				CLR.L		-(SP)				; room for result					<SM8> <PN>
+				MOVE.L		applZone,A0			; point to zone hdr					<SM8> <PN>
+				MOVE.L		A0,-(SP)			; push start ptr					<SM8> <PN>
+				MOVE.L		(A0),-(SP)			; push zone trailer					<SM8> <PN>
+				_sbKillSomeCaches				;									<SM8> <PN>
+				ADDQ		#4,SP				; ignore result						<SM8> <PN>
+				MOVEM.L		(sp)+,A0-A2/D0-D3	; restore registers					<SM8> <PN>
+@SkipIt
+				RTS
+			ENDIF
+
+FlushApplPorts
+;----------------------------------------------------------------------
+; FlushApplPorts																new		<C681>
+;  -- clean up portList just before ApplZone is eliminated
+; Registers: D0-D2/A0-A1
+; Called by vIAZInit.
+;----------------------------------------------------------------------
+; Remove from the PortList any ports in the application heap zone
+
+@REPEAT		MOVE.L	portList,A1			;get the portList							<C699>
+			CMP.L	MinusOne,A1			;are they equal?							<C699>
+			BEQ.S	@DONE				;=>if so,invalid portlist, just return		<C699>
+			MOVE.L	(A1),A1				;point to it								<C699>
+			MOVE.L	A1,A0				;save pointer in A0							<C699>
+			MOVE	(A1)+,D1			;get count of elements?						<C699>
+			BRA.S	@NEXT				;=> and dive into loop						<C699>
+
+@SEARCH		MOVE.L	(A1)+,D0			;get next element from list					<C699>
+			JSR		AppZoneAddr			;in application area (or zero)?				<C699>
+			BEQ.S	@DELETE				;=>yes, delete it							<C699>
+@NEXT		DBRA	D1,@SEARCH			;=>else try next in list					<C699>
+			BRA.S	@DONE				;=>none left, continue						<C699>
+
+@DELETE		SUB		#1,(A0)				;decrement port count						<C699>
+			MOVE.L	-(A1),-(SP)			;stk: port < etc.							<C699>
+			CLR.L	-(SP)				;stk: result < port < etc.					<C699>
+			MOVE.L	portList,-(SP)		;stk: plist < res < port < etc.				<C699>
+			MOVEQ	#2,D0				;search after length						<C699>
+			MOVE.L	D0,-(SP)			;stk: #2 < plist < res < port < etc.		<C699>
+			PEA		12(SP)				;PTR1 = GrafPtr								<C699>
+			MOVEQ	#4,D0				;LEN1 = 4 bytes								<C699>
+			MOVE.L	D0,-(SP)			;stk: #4 < ptr1 < #2 < plist < res < port <	<C699>
+			PEA		@DONE				;PTR2 = XXX									<C699>
+			CLR.L	-(SP)				;LEN2 = 0									<C699>
+			_Munger						;rhymes with plunger						<C699>
+			ADDQ	#8,SP				;strip result, grafPort						<C699>
+			BRA.S	@REPEAT				;=>repeat until no more						<C699>
+@DONE		RTS
+
+
+FlushPalettes								; patch rolled in <10Jun87 EHB>
+;-----------------------------------------------------------------------
+; Call DisposePalette for all palettes in the app heap.
+;
+; Registers: D0-D2/A0-A1
+; Called by vIAZInit.
+;----------------------------------------------------------------------
+			MOVEM.L	A2-A3/D3,-(SP)			; save work registers
+			MOVE.L	PMgrHandle,A2			; get paletteMgr handle
+			CMP.L	MinusOne,A2				; is it there?
+			BEQ.S	@DONE					; => no, just return
+			MOVE.L	(A2),A1					; point to data structure
+			MOVE.L	PListHandle(A1),A0		; get handle to palette list
+			_HLock							; and lock it down
+			MOVE.L	(A0),A3					; point to palette list
+
+			Move	APalettes(A1),D3		; get number of active handles
+			Beq.s	@NoPals					; no friends => go home
+			Add		FreeSpaces(A1),D3		; calculate total number of entries
+			BRA.S	@FindEnd				; => check for no entries
+
+@FindLoop	Move.L	PaletteRef(A3),D1		; get first entry
+			BEQ.S	@FindNext				; => no palette in entry
+			MOVE.L	D1,D0					; and get for routine
+			JSR		AppZoneAddr				; in application area (or zero)?
+			BNE.S	@FindNext				; => not in app heap
+			MOVE.L	D1,-(SP)				; push palette handle
+			_DisposePalette					; and dispose it in place
+@FindNext	AddQ	#PLstEntrySz,A3			; bump to the next entry
+@FindEnd	DBra	D3,@FindLoop			; repeat for all spaces
+
+@NoPals		MOVE.L	(A2),A1					; point to palette stuff
+			MOVE.L	PListHandle(A1),A0		; get handle to palette list
+			_HUnlock						; and unlock it
+
+@DONE		MOVEM.L	(SP)+,A2-A3/D3			; restore work registers
+			RTS
+
+;----------------------------------------------------------------------
+; vIAZPostInit																new		<C681>
+; - last-minute inits after ApplZone has been created.
+; Registers: D0-D2/A0-A1
+; Called by InitApplZone via jIAZPostInit vector.
+;----------------------------------------------------------------------
+Fig_VIAZPOSTINIT							;<7 BT> 
+			_InitAllPacks					; reinstall the packages -- may trash MemErr <25Apr85>
+
+			CLR.W 	CurApRefNum 			; since all app heap res files closed	<C681>
+			_RDrvrInstall 					; fix up ram based drivers				<C681>
+
+			IF		ForROM THEN
+; clear the pack6 resource cache when launching (for Int'l Utilities / Script Mgr)
+; moved here from InitApplZone because it seems to make more sense.				<sm10>stb
+			with	ExpandMemRec
+			move.l	expandMem,a0			; expand pointer
+			add.w	#emItlCache,a0			; point to cache
+			move.l	#emItlCacheSize/4-1,d0	; dbra ptr
+@ClearCache
+			clr.l	(a0)+					; clear part of cache
+			dbra	d0,@ClearCache			; until done
+			endWith
+			ENDIF
+			
+			RtS
+
+
+			IF		ForROM THEN
+;----------------------------------------------------------------------
+;
+; FUNCTION StripAddress(p: Ptr): Ptr;
+;
+; Make an address in D0 suitable for use in the current environment.  Ultimately,
+; this should test some flag and mask suitable bits.
+;
+; D0 <->	Address to be stripped.
+;
+Fig___StripAddress									;<7 BT> 
+				;Roll in FixStripAddress to not check the MMStartMode <SM12>
+				
+	IF Supports24Bit THEN							; <SM17> CSS 
+				BTST.B	#Systemis24bit,SystemInfo	; is it 32 bit or 24 bit <SM12>					
+				BEQ.S	@1							; no strip address for 32 bit mode <SM12>	
+				AND.L	Lo3Bytes,D0					
+@1
+	ENDIF
+				RTS
+			ENDIF
+
+				END
+
+

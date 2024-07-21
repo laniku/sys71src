@@ -1,0 +1,335 @@
+;
+;	File:		EnvironsGlue.a
+;
+;	Contains:	glue version of SysEnvirons
+;
+;	Written by:	Jim Friedlander
+;
+;	Copyright:	© 1987-1992 by Apple Computer, Inc.  All rights reserved.
+;
+;   This file is used in these builds: ROM System
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	10/28/92	SWC		Changed INCLUDEs to a LOAD of StandardEqu.d.
+;		 <5>	 7/24/91	MH		Added conditional wrapper(s) to prevent duplication of public
+;									interface declarations: TRUE
+;		 <4>	 6/12/91	LN		Removed #includes for private interfaces from public interfaces.
+;									changed #include 'HardwareEqu.a' to #include
+;									'HardwarePrivateEqu.a'
+;		 <3>	 2/25/91	dba		change from SystemSixOrBetter to SystemSixOrLater
+;		 <2>	 11/4/90	dba		get rid of lots of stuff if we have SystemSixOrBetter
+;		04 Dec 89 JAL	Removed PrNonPortable and HWNonPortable equates because they are
+;						defined in the Makefile.  Keeping Old Rom (64K) Rom code just to
+;						be paranoid.
+;		28 Apr 87 KLH	now in interface.o, so I trust it works now.
+;		4/6/87 -- JAF	this is untested and untried
+;
+
+	if &type('SystemSixOrLater') = 'UNDEFINED' then
+		SystemSixOrLater: equ 0
+	endif
+
+; glue to implement:
+; FUNCTION SysEnvirons(VersionRequested: Integer; VAR theWorld: WorldRec):OSErr;
+;
+;
+; Arguments:
+;		VersionRequested -which version of SysEnvirons the caller knows about
+;		TheWorld		 -Record to contain environs data
+;
+; Entry:
+;		A0.L -			Pointer to theWorld
+;		D0.W -			VersionRequested
+;
+; Exit:
+;		D0.W -			Error Code
+;								noErr			(0)
+;								envNotPresent	(-5500) glue determines that call does not exit
+;								envBadSel		(-5501) non-positive VersionRequested passed in
+;																handled by trap
+;								envSelTooBig	(-5502) selector too big, largest known by call is returned
+;																handled by trap
+;
+
+		LOAD	'StandardEqu.d'
+		INCLUDE 'AppleTalk.a'
+		INCLUDE 'HardwarePrivateEqu.a'
+		;DUMP	'EnvironsDump.dump'
+		;INCLUDE		'EnvironsEqu.a' 				; include templates and equates
+		PRINT	NOMDIR							; don't list HFS macros
+
+;-----------------------------------------------------------------------------------------
+;				Equates
+;-----------------------------------------------------------------------------------------
+				IF &TYPE('TRUE') = 'UNDEFINED' THEN
+TRUE			EQU 	1		; IMV1p86: "Boolean value in bit 0" -- FALSE EQU 0
+				ENDIF
+
+SysWDProcID 	EQU 	'ERIK'	; for use with OpenWD
+TwoBitsClear	EQU 	$3FFF	; for compare below (two high bits clear)
+
+SysEnvTrap		EQU 	$90 			; trap number of SysEnvirons
+UnImplTrap		EQU 	$9F
+
+
+;*****************************************************************************
+;
+;		REMEMBER TO CHANGE curSysEnvVers in SysEqu.a if there is a new version
+; of SysEnvirons.
+
+TheVersion		EQU 	1		; Current version of this call
+
+;*****************************************************************************
+
+
+SysEnvirons 	PROC	EXPORT
+
+	if not SystemSixOrLater then
+
+				TST.W	ROM85					; check for old ROMs
+				BMI.S	RunRAM					; if so, run the RAM version
+
+; we don't have to worry about saving A0 here, since the parameter is still on the stack
+				MOVE.W	#SysEnvTrap,D0			; still here, let's check for existence of the trap
+				_GetTrapAddress ,NEWOS
+				MOVE.L	A0,A1					; put in A1 so we can call again
+				MOVE.W	#UnImplTrap,D0
+				_GetTrapAddress ,NEWTOOL		; unimplemented trap is in A0
+				CMPA.L	A0,A1					; compare them
+				BEQ.S	RunRAM					; they are the same, so the call doesn't exist, run RAM version
+
+TheGlue
+
+	endif
+
+				MOVE.L	(SP)+,A1 				; return address
+				MOVE.L	(SP)+,A0 				; @theWorld
+				MOVE.W	(SP)+,D0				; VersionRequested
+				MOVE.L	A1,-(SP)				; move return address back on the stack
+				_SysEnvirons					; do the call
+				MOVE.W	D0,4(SP) 				; error code
+				RTS 							; RTS to caller
+
+	if not SystemSixOrLater then
+
+		; the call is unimplemented, run the glue version
+RunRAM
+				MOVE.L	4(SP),A0				; @theWorld into A0
+				MOVE.W	#TheVersion,D0			; since we're glue, only return what we know how to
+
+
+		WITH SysEnvRec
+
+				MOVE.L	A0,A1					; Pointer to theWorld, ZeroWorld needs world pointer in A0
+
+				BRA.S	ZeroWorld				; start filling in the record
+
+;-----------------------------------------------------------------------------------------
+;	Now for the keyboard table, hiding behind the above BRA -- has to be up here
+;	because we have a one-pass assembler
+;-----------------------------------------------------------------------------------------
+KbdTable		DC.B	3,$13,$B,2,1			; table of kbdType values for envMacKbd, etc.
+												; extend the table by adding more values to the right
+												; most frequent to the right
+KbdTableEnd 	EQU 	*
+KbdTableSize	EQU 	KbdTableEnd-KbdTable
+				ALIGN	2						; need this because of odd sized table
+
+;-----------------------------------------------------------------------------------------
+; ZeroWorld
+;		routine to zero out bytes of record
+;
+;		On Input: D0 == bytes to zero
+;				  A0 == (copy of) pointer to the world
+;				  A1 == pointer to the world
+;
+;		Register usage:
+;-----------------------------------------------------------------------------------------
+ZeroWorld
+				MOVE.W	#SysEnv1Size,D0 ; put the size to zero in D0 -- all we know about in glue
+				;change this in future versions!!!
+
+				ASR.W	#1,D0			;count by words
+				SUBQ	#1,D0			;adjust for Debra
+ZeroLoop
+				CLR.W	(A0)+			;clear next word
+				DBRA	D0,ZeroLoop 	;loop till done.
+				; now we've zeroed out the record
+
+FillInWorld1
+				MOVE.W	#curSysEnvVers,EnvironsVersion(A1)		; put in latest version number
+
+;-----------------------------------------------------------------------------------------
+;	Get MachineType -- here's the glue that needs to check for XLs and 64K ROMs in addition to all the rest
+;		this also assumes that future Macs will have 8(ROMBase) > 0
+;-----------------------------------------------------------------------------------------
+GetMachineType
+				MOVE.L	ROMBase,A0				; get ROMBase
+				MOVE.W	#EnvXL,MachineType(A1)	; default to XL
+				CMPI.B	#$FF,9(A0)				; check for XL
+				BEQ.S	DoneType				; yep, it's an XL, let's leave
+				; still here, we've got a mac
+				TST.B	8(A0)					; check for Mac versus SE/II 0 = Mac, 2,1 = SE/II
+				BGT.S	SEorII					; got a fancy Mac
+				MOVE.W	#EnvMac,MachineType(A1) ; assume Mac as default
+				TST.W	ROM85					; check for old ROMs
+				BMI.S	DoneType				; if ROM85 = FFFF then we're done
+				; still here, must be a Plus or a 512KE
+				MOVE.W	#Env512KE,MachineType(A1); assume 512KE
+				TST.W	HwCfgFlags				; test HwCfgFlags for presence of SCSI
+				BPL.S	DoneType				; yes, it is a 512E (no SCSI), we're done
+				MOVE.W	#EnvMacPlus,MachineType(A1) ; must be a Mac+ (has SCSI, 8(ROMBase) = 0)
+				BRA.S	DoneType				; we're done, we have a MacPlus
+
+SEorII
+				MOVE.W	#EnvMachUnknown,MachineType(A1); assume unknown
+				CMPI.B	#02,8(A0)				; check ROM type  1 == MacII, 2 == SE
+				BGT.S	UnKnown 				; if greater than 2, then it's unknown
+				BEQ.S	SE						; it's an SE
+				MOVE.W	#EnvMacII,MachineType(A1); it's >0, <= 2, != 2 so, it's 1
+				BRA.S	DoneType
+
+SE
+				MOVE.W	#EnvSE,MachineType(A1)	; it's an SE
+UnKnown 										; waste a label for clarity!
+DoneType										; all done
+
+;-----------------------------------------------------------------------------------------
+;  SYSTEM VERSION code -- just put a zero in here
+;-----------------------------------------------------------------------------------------
+				CLR.W	SystemVersion(A1)
+
+;-----------------------------------------------------------------------------------------
+;	Get Processor Stuff
+;-----------------------------------------------------------------------------------------
+				CMPI.B	#2,CPUFlag				; compare CPUFlag with 2
+				BGT.S	UnKnownCPU				; if greater than 2, we don't know what it is
+				MOVE.B	CPUFlag,D0				; get the CPUFlag
+				ADDQ	#1,D0					; increment by one (zero = unknown_
+				MOVE.B	D0,Processor+1(A1)		; otherwise, we know what it is
+UnKnownCPU
+
+;-----------------------------------------------------------------------------------------
+;	HasFPU -- only for newer roms
+;-----------------------------------------------------------------------------------------
+				TST.W	ROM85
+				BMI.S	DoneFPU 				; 64K ROMs can't have FPU (HwCfgFlags at $B22 = sys heap on 64K ROMS)
+				BTST	#hwCbFPU-8,HwCfgFlags	; check for FPU
+						; -8 because equates for HwCfgFlags are based on 16-bit word
+				BEQ.S	DoneFPU 				; not set, leave
+				MOVE.B	#TRUE,HasFPU(A1)		;
+DoneFPU 										; all done with this sucker!
+
+;-----------------------------------------------------------------------------------------
+;	Has ColorQD
+;-----------------------------------------------------------------------------------------
+ColorQD
+				CMPI.W	#TwoBitsClear,ROM85 	; we're actually testing the two hi bits of ROM85 here
+				BHI.S	NoColorQD				; false case
+				MOVE.B	#TRUE,HasColorQD(A1)
+NoColorQD		; just fall through here, HasColorQD is already set to 0
+
+;-----------------------------------------------------------------------------------------
+;	Get Keyboard type
+;-----------------------------------------------------------------------------------------
+				MOVE.B	KbdType,D0				; get the low-memory global
+				LEA 	KbdTableEnd,A0			; address just beyond table of keyboard type values
+				MOVE.W	#kbdTableSize-1,D1		; and sizeÉ
+
+@0
+				CMP.B	-(A0),D0				; have we found the matching keyboard type?
+				DBEQ	D1,@0					; if not found and not done, loop
+
+				ADDQ.W	#1,D1					; adjust D1 for range 0..n
+				MOVE.W	D1,KeyBoardType(A1) 	; move in the value and we're done
+
+;-----------------------------------------------------------------------------------------
+;	Get AppleTalk Driver Version Number
+;-----------------------------------------------------------------------------------------
+
+				;Is the B serial port in use?
+				TST.B	PortBUse				; if so, this will be positive.
+				BMI.S	DoneAT					; oops - not in use, return 0
+
+				;Port B is in use. Is it in use by AppleTalk?
+				MOVE.B	SPConfig,D1 			; get port configuration info
+				AND.B	#$0F,D1 				; mask off to Port B info only
+				CMP.B	#useATalk,D1			; is it AppleTalk?
+				BNE.S	DoneAT					; nope, return 0
+
+				;Port B is in use by AppleTalk. Get the DCE pointer
+				MOVE.L	ABusDCE,A0				; get .MPP's DCE pointer
+				MOVE.B	DCtlQueue+1(A0),ATDrvrVersNum+1(A1) 	; put version number in record
+DoneAT
+
+;-----------------------------------------------------------------------------------------
+;	Get SysVRef --	returns WDRefNum of directory that contains
+;						open system file in D0 -- if this call fails, returns 0
+;		We use GetFCBInfo here -- slower but smaller
+;
+;
+;		Doesn't Assume system 4.1 or 128K or greater ROMs (HFS)
+;		In the MFS case, just slam BootDrive into SysVRefNum(A1)
+;-----------------------------------------------------------------------------------------
+
+				MOVE.W	BootDrive,SysVRefNum(A1); default for MFS
+				TST.W	FSFCBLen
+				BLT.S	DoneBoot				; if <0, then MFS installed, we're done
+
+
+GetSysVRef
+				CLR.W	SysVRefNum(A1)			; in case we get an error below
+
+				MOVE.W	#(ioHVQElSize/2)-1,D1	; this many CLR.Ws, minus one for the DBRA
+@1
+				CLR.W	-(SP)					; push zeros onto the stack, worse case 2 too many.
+				DBRA	D1,@1					; branch if not done
+
+				MOVE.L	SP,A0					; set up A0 to point to our cleared param block for the HFS calls
+				MOVE.W	SysMap,ioRefNum(A0) 	; get the fileRefNum of System File
+				_GetFCBInfo 					; get info
+				BNE.S	FixStack				; oops, clean up stack and leave
+
+; now we need to do a PBHGetVInfo call -- we've already established that we're running HFS
+
+				MOVE.W	ioFCBVRefNum(A0),ioVRefNum(A0); Thanks Bill B. -- no thanks Inside Mac
+				_HGetVInfo						; getVolInfo, to get VFndrInfo (blessed folder's dirID)
+				BNE.S	FixStack				; If HGetVInfo fails, branch to ErrorBoot
+
+; we're OK so far, now we just do a OpenWD, the VRef is set up we just need to
+; get the id of the blessed folder from ioVFndrInfo[1] and put it into the dirID
+; field of the parameter block, and away we go!
+
+VInfoOK
+				MOVE.L	ioVFndrInfo(A0),ioWDDirID(A0) ; set up the "blessed folder"
+				MOVE.L	#SysWDProcID,ioWDProcID(A0); put 'ERIK' into WDProcID
+				_OpenWD 						; open a working directory (it's probably already open)
+				BNE.S	FixStack				; if OpenWD fails, branch to error
+				MOVE.W	ioVRefNum(A0),SysVRefNum(A1) ; put result in parameter block
+FixStack
+				ADDA	#ioHVQelSize,SP 		; clean up the stack, same count as above.
+DoneBoot										; reach here if error (CurBootDrive=0), or MFS
+
+;-----------------------------------------------------------------------------------------
+;	End of FillInWorld1  - for future versions (>=2) put checking in here to see how
+;								much more to fill in, based on selector passed in in D0
+;-----------------------------------------------------------------------------------------
+
+		ENDWITH
+
+;-----------------------------------------------------------------------------------------
+;		All done, cleanup and leave
+;-----------------------------------------------------------------------------------------
+
+CleanUp 										; done running glue, set the world right and wave goodbye
+				MOVE.L	A1,A0					; restore A0, 'cause we said we would
+				MOVE.L	(SP)+,A1				; get return address
+				ADDQ	#6,SP					; get rid of parameters, one long, one word
+				MOVE.W	#EnvNotPresent,(SP) 	; put error return on stack, since the glue is running
+				JMP 	(A1)					; bye-bye
+
+	endif
+
+				ENDP
+				END

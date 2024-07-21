@@ -1,0 +1,2364 @@
+;
+;	File:		BTreeFuncs.a
+;
+;	Contains:	This file contains all the B*Tree interface calls and the dispatcher
+;				A BTOpen patch is added at the end.
+;
+;	Written by:	Kenny SC. Tung
+;
+;	Copyright:	© 1988-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	  9/3/93	rab		Roll in changes from Reality. Fixes AOCE B-Tree trashing
+;									problem. Comments follow…
+;		<41>	  7/8/92	KST		#1030304 <csd>: For fix #39, I have to call SetEOF() to change
+;									the LEOF, otherwise it does not work on a FileShare server.
+;		<40>	  6/2/92	KST		#1030304 <hsK>: For change #39, need to mark the block dirty if
+;									we change the header node. And make sure that the file has write
+;									permission. Previous fix did not work with a BTfile opened with
+;									read only permission.
+;	   <SM2>	10/22/92	CSS		Change some branch short instructions to word branches.
+;	   <SM1>	 4/1/92		kc		Changed the name prefex used to distinguish
+;									 routines used by the external B-Tree manager
+;									from the versions used by the File System.	
+;									Move romGtNxtFCB and romGt1stFCB inline.
+;									• Pre-SuperMario comments follow •
+;		<39>	 1/13/92	KST		Fixed 2 bugs reported by 20/20 project. And verified by them
+;									with the fixes.
+;		<38>	 1/12/92	KST		Documentation changes only.
+;		<37>	 9/13/91	JSM		Cleanup header.
+;		<36>	 2/19/91	KST		dfn, #82340: Fixing a bug in BtreeRfncall introduced by #35, it
+;									didn't set up A2 to VCB.
+;		<35>	  2/6/91	KST		dnf, 82340: Do not use ROM rfnCheck code because it changes
+;									ReqstVol.
+;		<34>	 1/28/91	KST		dnf, #DNF-001: Allow openning old btree file which doesn't have
+;									key descriptor if user pass me his own key comparison routine.
+;		<33>	  1/4/91	KST		With dnf: Takes out the 'kdDTString' support and returns error
+;									if anyone uses 'kdReserved' type.
+;		<32>	12/18/90	KST		With Bill B. Adding DoAlloc back. We do _Allocate and then
+;									_SetEOF for external file systems.
+;		<31>	12/11/90	KST		BBS messed up the comments.
+;		<30>	12/11/90	KST		With Bill B. BTOpen doesn't call fileClose to close the file.
+;									Change _Allocate to _SetEOF.In "ExtIsBtree", make sure RefNum in
+;									the BTCB is the one we are currently accessing.
+;									And BTUpdateKD should verify this is a B*Tree file before
+;									changing its KD.
+;		<29>	 9/21/90	BG		Removed <22>. 040s are behaving more reliably now.
+;		<28>	 8/22/90	KST		If we modified a B*Tree file and its LEOF <> PEOF, then we need
+;									to set LEOF = PEOF and mark FCB dirty.
+;		<27>	 8/10/90	KST		Renaming NuLenBTH and NuLenBTCB.
+;		<26>	  8/3/90	KST		Fixing the bug that depends on PEOF = LEOF.
+;		<25>	 7/30/90	dnf		Convert to linked patch format.
+;		<24>	 7/23/90	KST		Fixing a bug in BTGetUID that wraps around incorrectly.
+;		<23>	 7/18/90	KST		BTGetRec will now return eofErr when reading pass EOF and return
+;									posErr when reading before BOF.
+;		<22>	 6/20/90	CCH		Added a NOP for flaky 68040's.
+;		<21>	 6/20/90	KST		If the header node is bad, we should release the buffer before
+;									returning error (ExtBTOpen).								<SM1>
+;		<20>	 5/10/90	KST		Fixing a minor bug in "BTGetInfo" that uses user's KDbuffer
+;									length when it is a BIG num.
+;		<19>	 4/26/90	KST		btGetUid should clear ioResult from within the routine because
+;									the call is not queued.
+;		<18>	 4/17/90	KST		Adding btDebugSYS conditional in "ExtIsBtree".
+;		<17>	 4/13/90	KST		btRelAccess will return "noErr" if the file is not previously
+;									reserved.
+;		<16>	 4/11/90	KST		Use ExtBTMaxDepth and related equates.						<SM1>
+;		<15>	  4/9/90	KST		User can specify his/her own key comparison procedure in the
+;									field of ioBTKCProc of BTioParam.
+;		<14>	  4/4/90	KST		Bug fix: BTHDepth is a word, not a byte.
+;		<13>	 3/30/90	KST		If ioBuffer is NULL in BTSearch and BTGetRec, I will return
+;									paramErr error.
+;		<12>	 3/28/90	KST		BTClose doesn't handle multiple open path correctly.
+;		<11>	 3/13/90	KST		Return btVersionErr error if accessing a newer version Btree
+;									file.
+;		<10>	 2/23/90	KST		Return btNoKDErr error if there is no key descriptor in the
+;									header node.
+;		 <9>	 2/22/90	KST		Documentation change and cleanup.
+;		 <8>	 2/12/90	KST		Special case kdDTString type in checkKD. kdDTString cannot be
+;									used with other types.
+;		 <7>	  2/6/90	KST		Adding a new call, BTUpdateKD.
+;		 <6>	  2/4/90	DNF		Add include of FileMgrPrivate.a
+;		 <5>	 1/22/90	KST		Added 3 access control calls and removed using Hfs70Equ.a
+;		 <3>	12/21/89	BBM		bug in script put ‘#’ instead of ‘;’ in comments
+;		 <2>	12/19/89	KST		Change DTKeyCmp routine to use the correct key length.
+;	   <3.1>	 12/8/89	KST		Take out debugger code.
+;	   <3.0>	 12/8/89	KST		Added special key comparison routine for handling DTDBMgr B*Tree
+;									key with KD type = 9.
+;	   <2.9>	11/17/89	dnf		btRfnCall should ignore volOffLinErr.
+;	   <2.8>	 11/6/89	KST		Save A0 in BTCleanUp.
+;	   <2.7>	10/16/89	KST		Added new call -- BTCleanUp.
+;				 10/5/89	KST		Added BTCleanUp support
+;	   <2.6>	 10/3/89	KST		AppleShare compatibility problem. No clump size in there header
+;									node.
+;	   <2.5>	 9/25/89	KST		Fixed a bug in BTInit, MOVE.L should be MOVE.W
+;	   <2.4>	 9/18/89	KST		Allowing open a B*Tree file without a KD. AppleShare B*tree file
+;									don't use KD. A file without KD will be using "kdDTString" key
+;									comparison routine which was and will be our default.
+;	   <2.3>	 9/18/89	KST		Added a new type kdDTString to replace default for DTDB.
+;				 9/18/89	KST		Added a "kdDTString" type for DTDB.
+;	   <2.2>	 9/17/89	KST		New buffer scheme. Revoked default key descriptor.
+;	   <2.1>	 8/16/89	KST		Fixed a bug in comparing default key, RelString is not the right
+;									thing to call.
+;	   <2.0>	 8/11/89	KST		Fixed a bug a BTKcmp, high byte of D3 needs to be cleared in a
+;									word operation.
+;				 8/11/89	KST		Fixed a bug in "BTKCmp", L.S. Byte of D3 is not cleared if
+;									returned from a DBRA loop then it is used again as loop index.
+;	   <1.9>	  8/7/89	KST		Code cleanup.
+;				 7/27/89	KST		BTInit now can initialize huge file (limited by disk space)
+;				 7/27/89	KST		Added btRfnCall and btTstMod, can't use ROM's jRfnCall and
+;									tstMod because it doesn't work for external FS.
+;				 7/27/89	KST		Use jump table for dispatching calls; Get rid of macro calls
+;	   <1.8>	  7/6/89	KST		Added BTFlush call.
+;	   <1.7>	  7/5/89	KST		ioMisc field in the param block has to be NIL for HFS OPEN call.
+;									Fixed the problem in "ExtCopyParam". Also cleaned up the code.
+;				 6/30/89	KST		Don't copy ioMisc field in "ExtCopyParam".
+;	   <1.6>	 6/15/89	KST		Created BTreePrivate.a equate file.
+;	   <1.5>	 6/14/89	KST		Changes made for the new implementation of BTreemgr.
+;	   <1.4>	  4/7/89	KST		Made necessary tweak to make Btree Manager to work on the PLUS.
+;									ie, tstMod is not vectored on the PLUS.
+;	   <1.3>	 3/21/89	KST		Added support for Mac Plus, new KD types, new patch for ExtRelNode
+;									on three systems.
+;				 3/16/89	KST		Added a patch in ExtRelNode for BTDelete => MOVE.L D2,D3
+;				 3/15/89	KST		Added "checkey" routine to validate user's key before we do
+;									anything else
+;	   <1.1>	 3/13/89	KST		made traps as callable routines from file system.
+;	   <1.0>	  3/8/89	KST		Adding to EASE for the first time.
+;				 12/4/88	KST		New today.
+;
+
+;;Bugs fixed: 
+;; ADD 2,keylen in BTreesvcs.a (BTInsert), BTreemaint2.a (ExtLocRec)
+;; 3/16/89	  Added a patch in ExtRelNode for BTDelete => MOVE.L	 D2,D3
+;; BTParam is used by xBTInit, xBTGetInfo, and xBTUpdateKD. All other calls
+;; use BTioParam.		BTClose can use either. xBTCleanUp uses dummy param.
+
+	LOAD		'StandardEqu.d'
+	INCLUDE		'BTreeEqu.a'		; BTManager
+	Include		'BTreePrivate.a'
+	Include		'Processes.a'
+	Include		'FileMgrPrivate.a'
+	include		'LinkedPatchMacros.a'
+	include		'DTDBMgrPriv.a'		; Desktop key type format
+
+
+		IF	&type('btDebug') = 'UNDEFINED' THEN
+btDebug		EQU		0
+		ENDIF
+
+  		IF  (&TYPE('btDebugSYS') = 'UNDEFINED') THEN 
+btDebugSYS 	EQU 		0
+  		ENDIF
+
+
+;————————————————————————————————————————————————————————————————————————————————————————————————————
+; 15FEB89	KST		Boot-time initialization code.
+; 04Jan90	KST		Added a field "btVNextUID" in btvars to store the next UID.
+;————————————————————————————————————————————————————————————————————————————————————————————————————
+ExtBTreeInstall	InstallProc		(Plus,SE,II,IIci,Portable)
+			MOVEQ	#btVtotal,D0			; 28 bytes
+	    	_NewPtr	,SYS ,Clear				; allocate BTVars
+			BNE		errLoad					; exit if no room
+			MOVEA.L	A0,A1					; save btVars in A1
+			MOVE.L	FSVarsPtr,D0			; has this been initialized?
+			CMP.L	#-1,D0					; $FFFF FFFF if not
+			BNE.S	@3						; initialized
+			
+			MOVE.L	#FSVars.size,D0
+	    	_NewPtr	,SYS ,Clear
+			BNE		errLoad					; exit if no room
+			move.l	a0, FSVarsPtr			; stash the address in lomem
+			move.w	#FSVars.size, FSVars.length(a0)	; store length of block in 1st word
+			BRA.S	@4
+
+@3			MOVEA.L	D0,A0					; FSVar already initialized
+@4			MOVE.L	A1,fsVars.BTMgr(A0)		; save BTVar in fsVars
+		;; allocate Btree stack, ioParam and read/write Buffer ....
+		;; A1 = ptr(Btree Vars)
+			MOVE.L	#WCSigLong,btVNextUID(A1)	; UID save area (next UID)
+			MOVE.L	#-1,btVStop(A1)			; no stack yet
+			MOVE.L	#btTmpSize,D0 			; N bytes for stack, private param, and r/w buffers
+	    	_NewPtr	,SYS ,Clear
+			BNE		errLoad					; exit if no room
+
+;	+--	BT param (Low mem)
+;	|
+;	+-- buffer index (word)				; current free buffer index (starts with 0)
+;	+-- buffer size  (word)
+;	+-- BT buffers						; N buffers follow
+;	|
+;	+-- stack top
+;	|
+;	+-- stack base (btVSTop)
+			MOVE.L	A0,btVParam(A1)			; ioParam pointer
+			ADDA.L	#btParamLen,A0
+			MOVE.L	A0,btBufQHdr(A1)		; BT buffer QHeader
+			MOVE	#btNodesize,btQBSize(A0); save INIT buffer size
+			ADDA.L	#(btBufLen+btStkLen),A0	; points to bottom of stack
+			MOVE.L	A0,btVSTop(A1)			; stack base
+
+			Rts
+
+errLoad:	MOVEQ	#dsMemFullErr,D0		; no mem error
+			_SysError
+
+			EndProc							; for linkpatch
+
+
+BTFuncs		PatchProc	$A08E,(Plus,SE,II,IIci,Portable)
+
+			EXPORT	ExtBtreeDispatch
+			IMPORT	ExtBTQueue, ExtBTCmdDone, ExtDoAOCRWF, ExtCopyParam, ExtIsBtree
+			IMPORT	ExtBTOpen, ExtGetBlock										; <SM1>
+			IMPORT	ExtBTDelete, ExtBTSearch, ExtBTGetRecord					; <SM1>
+			IMPORT	ExtBTFlush,  ExtBTClose,  ExtBTInsert						; <SM1>
+			IMPORT	ExtBTAdjEOF, ExtckClumpSize			; <20AUG90>
+
+ExtBtreeDispatch	;; Input: D0 = trap index, A0 = ioParam, D1 = trap
+			TST.W	D0					; Check the trap dispatch
+			BLT.S	@1					; Negative traps are trouble
+			CMP.W	#MaxBtTrap,D0		; Compare against our known limits
+			BLS.S	@2					; Continue if all seems well
+
+@1			BSR		ExtBTQueue			; We're doomed, but will wait for our turn
+			MOVEQ	#ParamErr,D0		; Indicate parameter error
+			BRA		ExtBTCmdDone		; Terminate this call
+
+@2			MOVE.W	D0,D2				; trap index
+			LEA 	BtreeTrpTbl,A1		; Point to the trap table
+			ADD.W	D2,D2				; double for word index
+			ADD.W	D2,D2				; double for long index
+			JMP		(A1, D2.W)			; pass control to routine
+
+BtreeTrpTbl			
+			macro
+			DispatchEntry &where
+			entry &where
+			jmp &where
+			endm
+
+			DispatchEntry	xBTInit				; 0 initialize Btree file
+			DispatchEntry	xBTOpen				; 1 Open a Btree file
+			
+												; from 2 to 8 are access controlled <1/5/90>
+			DispatchEntry	xBTClose			; 2 Close a Btree
+			DispatchEntry	xBTInsRec			; 3 insert a record
+			DispatchEntry	xBTSetRec			; 4 set a record
+			DispatchEntry	xBTReplRec			; 5 replace a record
+			DispatchEntry	xBTSearch			; 6 search for a record
+			DispatchEntry	xBTGetRec			; 7 Get record
+			DispatchEntry	xBTDelRec 			; 8 delete a record
+
+			DispatchEntry	xBTGetInfo 			; 9 Get Btree file information
+			DispatchEntry	xBTFlush 			;10 Flush our buffers
+			DispatchEntry	xBTCleanUp 			;11 BT cleanup upon process exit
+			DispatchEntry	xBTRsrvAccess 		;12 reserve access priviledge
+			DispatchEntry	xBTRelAccess 		;13 release access
+			DispatchEntry	xBTGetUid 			;14 assign UID
+			DispatchEntry	xBTUpdateKD 		;15 update KD info
+
+;_______________________________________________________________________
+;
+; Routine:		xBTInit
+; Arguments:	  A0.L (input)	-- pointer to BT parameter block.
+;				  D1.W (input)  -- trap word
+;				  D0 (output)   -- error code
+;				D3-D7/A2-A6 are saved by ExtBTQueue
+; Calls:		FSQueue,FndFilName,CVFlgs,CmdDone
+; Function: 	Initializes a new B*Tree file, the file should be already created.
+;				If not enough disk space allocated, we will do it using SetEOF.
+;				At the end of this routine, we also force LEOF = PEOF.
+; Modification History:
+;	03Nov88		KSCT	New today
+;	17Mar89		KSCT	Provided default key descriptor
+;	11May89		KSCT	Fixed the even maxkeylen restriction in RAM implementation
+;	27Jul89		KSCT	Use bitmapInit routine to set up the bitmap, the file size
+;						can be initialized has no limit now
+;	22Aug89		KSCT	BGT should be BHI
+;	31Aug89		KSCT	no default case for this release.
+;	18Dec90		KSCT	Changed _Allocate to _SetEOF to allocate disk space.
+;	18Dec90		KSCT	After _SetEOF, LEOF may not equal to PEOF because clump size
+;						is not multiple of allocation block size.
+;------------------------------------------------------------------------
+xBTInit		BSR		ExtBTQueue				; wait for our turn
+	;; first validate user's parameters:
+			MOVE.W	#btKDLenErr,D0		; preset error code
+			MOVE.L	ioBTKDPtr(A0),D2	; will allow default in the future
+			BEQ		BTCExit2			; no KD error
+	;; There is no default case for this release <8/31/89>
+	;;		BEQ.S	@4					; no KD, default case
+			MOVEA.L	D2,A1				; A1=key descriptor
+			BSR		checkKD				; validate kd
+			BNE		BTCExit2			; KD error
+
+@4			MOVE.W	#BTKeyLenErr,D0		; validate max key length
+			MOVE.W	ioBTMaxKLen(A0),D2
+			BEQ		BTCExit2			; it cannot be zero
+			CMPI.W	#maxKeyLen,D2		; key too long?
+			BHI		BTCExit2			; yes, punt <Aug-22-89>
+			MOVEA.L	A0,A4				; save user ioparam in A4
+			MOVEQ	#0,D7				; D7 = not open flag
+			BSR		ExtCopyParam		; get and clear BT param in A3 and A0
+			BSET	#fsWrPerm,ioPermssn(A0)	; req for write permssn
+
+			MOVEQ	#DoOpen,D1			; indicate this is OPEN
+			BSR		ExtDoAOCRWF			; do the open/close sync/async
+			BNE		BTCExit1			; error, exit
+			ST		D7					; set file opened flag
+			MOVEA.L	FCBSptr, A2			; A2 = ptr to FCBs
+			MOVE.W	ioRefNum(A0),D5		; D5 = file refnum
+
+			MOVE.L	ioBTClumpsize(A4),D6; use user's clump size?
+			MOVEA.L	FCBVPtr(A2,D5.W),A1	; A1 = VCB
+			CMP.L	VCBClpSiz(A1),D6	; user >= volume clump size
+			BCC.S	@7					; yes, D6 = clump size
+			MOVE.L	VCBClpSiz(A1),D6	; no, use volume clump size
+			MOVE.L	D6,ioBTClumpsize(A4); set user's clump size to VC's
+@7
+			MOVE.L	FCBPLEN(A2,D5.W),D4	; test for physical EOF
+			BEQ.S	BTInit3				; no space allocated
+			CMP.L	D6,D4				; size >= clump
+			BCC.S	BTInit5				; user size OK
+
+BTInit3	;; file empty or too small, need to allocate some disk space up to clump size.
+		;; A0 = BTParam, A1 = VCB, D4.L = physical EOF, D6.L = clump size and D4 is free.
+		;; Do _Allocate and then _SetEOF. 'cause many foreign file system such as UNIX and
+		;; AppleShare doesn't understand _Allocate.
+		
+	
+			SUB.L	D4,D6				; D6 = bytes to allocate
+			MOVE.L	D6,ioReqCount(A0)	; request so many
+		;; This (HFS) will try contig first and then non-contig
+			MOVEQ	#DoAlloc,D1			; indicate this is Allocate
+			BSR		ExtDoAOCRWF			; A1 is free
+			BNE		BTCExit1			; punt on error
+			ADD.L	ioActCount(A0),D4	; D4 = new file size
+			
+		;; In case the file system doesn't handle _Allocate, we do a _SetEOF here:
+			MOVEA.L	FCBVPtr(A2,D5.W),A2	; A2 = VCB							<18Dec90 #32>
+			MOVE.L	D4,D6				; pass parameter in D6				<18Dec90 #32>
+			BSR		ExtckClumpSize		; make sure there is no conflict	<18Dec90 #32>
+			MOVEA.L	FCBSptr,A2			; A2 = ptr to FCBs					<18Dec90 #32>
+			MOVE.L	D6,IOLEOF(A0)		; set new LEOF to D6				<27Nov90 #30>
+			MOVEQ	#DoSetEof,D1		; indicate this is setEof		<27Nov90 #30>
+			BSR		ExtDoAOCRWF			; A1 is free					<27Nov90 #30>
+			BNE		BTCExit1			; punt on error					<27Nov90 #30>
+			MOVE.L	D6,D4				; D4 = PEOF = LEOF				<27Nov90 #30>
+
+BTInit5	;; D4.L = PEOF !
+		;; BTree opened, space allocated, build and write header block.
+			BSR		GetaCBlock			; get a clear BTbuffer in A0
+	;; init the ND, A0 = ptr(buffer)
+			MOVE.B	#NdHdrNode,NdType(A0)	; node type
+			MOVE.W	#NRHdrNode,NdNRecs(A0)	; always 3 records in header
+	;; init the BTHeader
+			MOVE.L	A0,-(SP)			; save buffer(header node) address
+			ADDA.L	#lenND,A0			; points to BT header
+			MOVE.W	#BTNodeSize,bthNodeSize(A0)
+			MOVE.W	ioBTMaxKLen(A4),D0	; max key length
+			MOVE.W	D0,bthKeyLen(A0)
+			DIVU	#BTNodeSize,D4		; divide by node size
+			SWAP	D4					; to calculate the number of nodes
+			CLR.W	D4					; PEOF always on block boundary
+			SWAP	D4					; D4.L = total number of nodes
+			MOVE.L	D4,bthNNodes(A0)	; save in BTHeader
+			MOVE.L	D4,D6				; also save in D6
+			MOVEQ	#1,D3				; D3 = # of map nodes
+			SUBI.L	#NHmapnode,D6		; is header bitmap enough?
+			BLE.S	@2					; yes
+@1	;; calculate bitmap node, now can handle huge file !
+	;; only a word in D3 is used for number of map nodes, top word is 0
+			ADDQ.L	#1,D3				; D3.L = # of map nodes
+			SUBI.L	#NMmapnode,D6		; is map node bitmap enough?
+			BHI.S	@1					; still to come
+
+@2			SUB.L	D3,D4				; free node = total - used (map) blocks
+			MOVE.L	D4,bthFree(A0)		; number of free nodes
+	;; save user's arguments: (B*Tree Manager specific info)
+			MOVE.L	ioBTClumpsize(A4),bthClumpSize(A0)
+	;; B*Tree Type --  we need a way to identify our B*Tree file.
+			MOVE.B	#userBT1Type,bthBTType(A0)	; set our Btree type (use fixed index keylen)
+	;; copy key descriptor into the header
+			ADDA.L	#LenBTH,A0			; A0 = ptr(user area)
+			MOVE.L	ioBTKDPtr(A4),D0
+			BEQ.S	@6					; no KD
+			MOVEa.L	D0,A1				; A1 = KD ptr
+			MOVEQ	#0,D0
+			MOVE.B	(A1),D0				; length of KD
+@3			MOVE.B	(A1)+,(A0)+			; copy into BTH
+			DBF		D0,@3
+
+@6			MOVEA.L	(SP),A0				; get hdr buffer
+			ADDA.L	#(lenND+LenBTH+LenUser),A0	; A0 = ptr(bitmap)
+	;; init the bitmap of header node, 1 = used, 0 = free
+	;; D6.L = total number of map nodes needs to be marked in the bitmap record
+			MOVE.L	D3,D6				; D6 = # of map nodes
+			MOVE	#NHmapnode,D2		; size of the header bitmap
+			BSR		bitmapInit
+
+initHdrOffset	
+		;; init header node offset to records, there are 3 records in header node:
+		;;  header record, user record, map record.
+			SUBQ.L	#1,D3				; indicate 1 map node less
+			MOVEA.L	(SP),A0				; A0 = header node
+			MOVE.W	#(lenND+lenBTH+lenUser+LenBMapHdr),btNodeSize-8(A0)	; offset to free space
+			MOVE.W	#(lenND+lenBTH+lenUser),btNodeSize-6(A0)			; offset to bitmap
+			MOVE.W	#(lenND+lenBTH),btNodeSize-4(A0)	; to user space
+			MOVE.W	#lenND,btNodeSize-2(A0)				; to BTHeader (1st record)
+			MOVEA.L	A3,A0				; A0=A3=BTParam, A3 should not be changed before here
+
+			MOVEA.L	(SP)+,A3			; A3 = restore header node.
+			MOVE.L	A3,IOBuffer(A0)		; buffer to write
+			MOVE.W	#fsFromStart,IOPosMode(A0)	; position mode(from BOF)
+			MOVE.L	#BtnodeSize,IOByteCount(A0) ; always r/w 512 bytes
+			MOVEQ	#1,D5				; D5.L= next node, D3-D6 been used in this loop !!
+			MOVEQ	#0,D4				; D4.L= current node #
+										; D6.L= # of map nodes remain to be marked in bitmap
+BTCLoop		;; If more than 1 map node needed, set them up in this loop
+			TST		D3					; next link?
+			BEQ.S	BTCwrite			; no more
+			MOVE.L	D5,NDFlink(A3)		; points to next MapNode
+BTCwrite	;; A0 = our ioParam, A3 = header node
+			MOVE.L	D4,D0				; current node number
+			MOVEQ	#btNSftCnt,D1		; shift bit (BTnodesize is a constant)
+			LSL.L	D1,D0				; ...x 512
+			MOVE.L	D0,IOPosOffset(A0)	; ... gives position offset
+			MOVEQ	#DoWrite,D1			; indicate this is WRITE
+			BSR		ExtDoAOCRWF
+			BNE.S	BTCExit1			; error
+			DBF		D3,BLoopEnd			; continue if there are more map nodes
+
+	;; all done, make LEOF = PEOF, A2 = FCB array
+			MOVE.W	ioRefNum(A0),D5		; D5 = file refnum
+			MOVE.L	FCBPLEN(A2,D5.W),FCBEOF(A2,D5.W)	; LEOF = PEOF
+			BRA.S	BTCExit1			; cool
+
+BLoopEnd	;; clear the buffer and initialize next map node
+			MOVEA.L	A3,A1				; A1 = header ptr
+			MOVEQ	#0,D0
+			MOVE	#(btnodesize/4 - 1),D1	; node size in long
+@5			MOVE.L	D0,(A1)+				; clear header node
+			DBRA	D1,@5
+	;; init ND and index, can't use "InitNode" because it calls "GetBlock" !
+			MOVE.B	#NdMapNode,NdType(A3)	; node type
+			MOVE.W	#NRMapnode,NdNRecs(A3)	; always 1 record in map node
+			MOVE.L	D4,NDBlink(A3)			; D4 = previous node
+	;; init offset
+			MOVE.W	#(btNodeSize-4),btNodeSize-4(A3) ; offset to free	<9/21/89>
+			MOVE.W	#lenND,btNodeSize-2(A3)			 ; offset to 1st record
+
+			ADDQ.L	#1,D4				; bump current node #
+			ADDQ.L	#1,D5				; bump next node #
+			TST.L	D6					; are all map nodes marked in the bitmap?
+			BEQ.S	BTCLoop				; yes
+	;; need to indicate how many bits are used for map nodes in this bitmap
+			MOVE.L	A0,-(SP)			; save BT param
+			MOVEA.L	A3,A0
+			ADDA.L	#lenND,A0			; A0 = ptr(bitmap)
+			MOVE	#NMmapnode,D2		; size of the map node bitmap
+			BSR		bitmapInit			; init the bitmap
+			MOVEA.L	(SP)+,A0			; A0, A1 unchanged
+			BRA.S	BTCLoop				; write next map node
+
+BTCExit1	;; ready to leave, D0 = error code
+			TST.B	D7					; file still open?
+			BEQ.S	BTCExit2			; no
+			MOVE.W	D0,-(A6)			; save error code
+	;; close the file before we leave
+			MOVEQ	#DoClose,D1			; indicate this is CLOSE
+			BSR		ExtDoAOCRWF
+			MOVE.W	(A6)+,D0			; restore error code
+BTCExit2	BRA		ExtBTCmdDone		; exit BTInit
+
+;_______________________________________________________________________
+;
+; Routine:		xBTOpen
+; Arguments:	  A0.L (input)	-- pointer to BT ioParameter block.
+;				  D1.W (input)  -- trap word
+;				  D0 (output)   -- error code
+;				  This call can only be executed synchronously.
+; Function: 	Opens a B*Tree file. If first time open, allocate and init BTCB,
+;				otherwise, FCBs share the BTCB and bump the reference count.
+; Modification History:
+;	07Aug89	KSCT	Added node size shift count in BTCB
+;	12Jan92 KSCT	If a B*Tree file has been opened first by a file system open,
+;					we need to allocate a BTCB for this BTOpened file.
+;------------------------------------------------------------------------
+xBTOpen		;; BTOpen can only be executed synchronously
+			BCLR	#btAsyncBit,D1	 	; sync only
+			BSR		ExtBTQueue			; wait for our turn
+			MOVEA.L	A0,A4				; save user ioparam
+			BSR		ExtCopyParam		; A0=A3=BTParam
+			MOVE.B	ioPermssn(A4),ioPermssn(A0)
+			MOVEQ	#DoOpen,D1			; indicate this is OPEN
+			BSR		ExtDoAOCRWF
+			BNE		BOExit				; open error, punt
+
+			MOVE.W	ioRefNum(A0),ioRefNum(A4)
+			MOVEA.L	FCBsptr,A1
+			MOVE.W	ioRefNum(A0),D3		; D3 = RefNum, A0=btParam
+			EXG		A0,A4				; A0 = userParam, A4=btParam		<21Nov90 #30>
+			TST.L	FCBPLen(A1,D3)		; has disk space?
+			BNE.S	@openOK				; yes,
+		;; file has opened but it is empty; close it and return error
+			MOVE.W	#btbadHdr,D0		; file empty (notBtreeErr)
+			BRA.S	BOExit1				; return to user
+
+@openOK
+			MOVE.L	FCBFlNm(A1,D3.W),D2	; D2 = file num
+			MOVEA.L	FCBVPtr(A1,D3.W),A3	; A3 = vcb
+			MOVEQ	#2,D1				; index to first FCB
+		;; check if the BTree file has been opened already. D3.W = our (newly open) FCB.
+GNMLoop		CMP.W	D1,D3				; same FCB?
+			BEQ.S	GtNxtMatch			; skip ourself
+		 	CMP.L	FCBFlNm(A1,D1),D2	; file numbers match?
+			BNE.S	GtNxtMatch			; no, try next FCB					<12Jan92 #39>
+			CMP.L	FCBVPtr(A1,D1),A3	; on the same volume?				<12Jan92 #39>
+			BNE.S	GtNxtMatch			; no, try next FCB					<12Jan92 #39>
+
+		;; This is the same file with 2 open paths, but make sure the		<12Jan92 #39>
+		;; first open is thru B*tree Manager, ie., it has a BTCB.			<12Jan92 #39>
+			MOVE.L	FCBBTCBptr(A1,D1),D0; D0 = ptr(BTCB)?					<12Jan92 #39>
+			BNE.S	BOpened				; found it							<12Jan92 #39>
+
+GtNxtMatch	ADD.W	FSFCBLen,D1			; go to next FCB				<03Feb87><SM1>
+			CMP.W	(A1),D1 			; reached the end yet?					 <SM1>
+			BCS.S	GNMLoop 			; loop thru them all
+
+		;; This is the first time open
+			MOVEM.L	A0-A1/A5,-(A6)		; save user ioParam and FCBs		<28Mar90>
+			MOVEA.L	A0,A5				; A5 = ioParam						<28Mar90>
+			MOVEa.L	FSVarsPtr,A1
+			MOVEA.L	fsVars.btMgr(A1),A1
+			MOVEA.L	btBufQHdr(A1),A1	; A1 = ptr(buffer Qheader)
+			LEA		BTKCmp,A0			; key compare routine
+			MOVE.L	ioBTKCProc(A5),D0	; does user specify his/her own KC procedure?
+			BEQ.S	@0					; no, use mine						<28Mar90>
+			MOVEA.L	D0,A0				; otherwise, override				<28Mar90>
+@0		;;	Need to patch ROM BTOpen for B*Tree Manager 					<05May89>
+			JSR		ExtBTOpen			; use our BTOpen 					<05May89><SM1>
+			MOVEM.L	(A6)+,A0-A1/A5		; restore user ioParam and FCBs
+			BEQ.S	btOpenOK			; no error, continue
+
+BOExit1	;; file is open, but we got an error => close the file.
+		;; D0.W = error code, D3.W = Refnum, A0 = userParam, A4=btParam
+			CLR.W	ioRefNum(A0)		; return no RefNum in user param	<21Nov90 #30>
+			MOVE.W	D0,-(A6)			; save error code					<21Nov90 #30>
+			MOVEA.L	A4,A0				; get BTparam						<21Nov90 #30>
+			MOVE.W	D3,ioRefNum(A0)		; D3=refnum							<21Nov90 #30>
+			MOVEQ	#DoClose,D1			; indicate this is CLOSE			<21Nov90 #30>
+			BSR		ExtDoAOCRWF			; close the file					<21Nov90 #30>
+			MOVE.W	(A6)+,D0			; restore error code				<21Nov90 #30>
+
+			CMPI	#eofErr,D0			; B*tree has at least a header; EOF?
+			BNE.S	@3					; No, other error
+			MOVEQ	#BTBadHdr,D0		; Yes, then this is not a B*Tree
+@3			TST.W	D0					; any error?
+			BMI.S	BOExit				; branch if already negative
+			SUBI.W	#BTErrConst,D0		; else, make it negative
+BOExit		BRA		ExtBTCmdDone		; exit BTOpen
+
+BOpened	;; this file is already open, share the BTCB and bump the reference count.
+			MOVEA.L	FCBBTCBptr(A1,D1),A4; A4 = ptr(BTCB)
+			MOVE.L	A4,FCBBTCBptr(A1,D3); share the same BTCB
+			ADDQ.B	#1,BTCRcount(A4)	; bump reference count
+			BRA.S	BOReturn			; skip the conversion, has been done already
+btOpenOK	
+		;; B*Tree file 1st time open, convert node size to shift bits
+			MOVEA.L	FCBBTCBptr(A1,D3),A4; A4 = ptr(BTCB)
+			MOVE.W	btcNodeSize(A4),D0	; D0=nodesize
+			LSR		#8,D0				; some optimization /256
+			MOVEQ	#7,D1				; D1 starts from 7
+@2			ADDQ.B	#1,D1
+			LSR		#1,D0				; is it a 1?
+			TST		D0
+			BNE.S	@2					; no, continue
+			MOVE.B	D1,btcL2NSize(A4)	; save it in BTCB
+BOReturn	MOVEQ	#0,D0				; all done
+			BRA.S	BOExit				; OK
+
+
+;_______________________________________________________________________
+;
+; Routine:		xBTClose
+; Arguments:	  A0.L (input)	-- pointer to BT ioParameter block.
+;				  D1.W (input)  -- trap word
+;				  D0 (output)   -- error code
+;				  This call can only be executed synchronously.
+; Calls:		BTClose (btsvcs)
+; Function: 	Closes a BTree file. If this is the last open access path, then
+;				the BTree Header (BTH) is updated and the cache is flushed and
+;				trashed for the specified file.  The BTCB memory is also released.
+;
+; Modification History:
+;
+;	Jan/18/89	KSCT	New today
+;	Mar/28/90	KSCT	For multiple access file, when closing one file, need to
+;						replace the RefNum in the BTCB to the open one.
+;------------------------------------------------------------------------
+xBTClose	BCLR	#btAsyncBit,D1 		; sync only
+			BSR		ExtBTQueue
+			MOVEQ	#noWrite,D0			; no write permssn
+			BSR		ExtIsBtree
+			BNE.S	BClExit
+			MOVEQ	#0,D4				; D4 flag = 0						<28Mar90>
+			SUBI.B	#1,BTCRcount(A4)	; is this the only access path?		<28Mar90>
+			BEQ.S	@5					; yes, release BTCB					<28Mar90>
+		;; no, there are more than 1 access path, before we close this FCB,
+		;; stick another FCB in the BTCB.
+			MOVEM.L	A0/D1,-(SP)			; save param and refnum				<28Mar90>
+			MOVE.W	D1,D3				; D3 = refnum						<28Mar90>
+			MOVEA.L	FCBSptr, A1			; A1 = ptr to FCBs					<28Mar90>
+			MOVE.L	FCBFlNm(A1,D3.W),D2	; D2 = file num						<28Mar90>
+			MOVEA.L	FCBVPtr(A1,D3.W),A3	; A3 = vcb							<28Mar90>
+			MOVEQ	#2,D1				; index to first FCB				<28Mar90>
+	;; check if the BTree file has been opened already						<28Mar90>
+@BCLoop		CMP.W	D1,D3				; same FCB?							<28Mar90>
+			BEQ.S	@NxtMatch			; skip ourself						<28Mar90>
+		 	CMP.L	FCBFlNm(A1,D1),D2	; file numbers match?				<28Mar90>
+			BNE.S	@NxtMatch			;									<28Mar90>
+			CMP.L	FCBVPtr(A1,D1),A3	; on the same volume?				<28Mar90>
+			BEQ.S	@BCOpened			; found it							<28Mar90>
+@NxtMatch	ADD.W	FSFCBLen,D1			; go to next FCB				    <SM1>
+			CMP.W	(A1),D1 			; reached the end yet?				<SM1>
+			BCS.S	@BCLoop 			; loop thru them all				<28Mar90>
+
+		IF btDebug THEN					; no match ??!!						<28Mar90>
+			_Debugger					; can't be happening				<28Mar90>
+		ENDIF
+
+@BCOpened	MOVE.W	D1,D4				; another access path				<28Mar90>
+			MOVEM.L	(SP)+,A0/D1			; restore param and refnum			<28Mar90>
+			MOVE.W	D1,D0				; D0 = RefNum	
+			MOVEQ	#0,D5				; clear flag so that it will not flush fs cache
+			BSR		ExtBTFlush			; just flush (will not write to disk)<30Jul90><SM1>
+			BRA.S	BClCommon
+
+@5		;; close the file, BTflush and release BTCB and KD buffer
+			MOVE.L	btcKDPtr(A4),D0		; default case?
+			BEQ.S	@7					; yes, don't dispose
+			MOVEa.L	D0,A0				; A0 = KD ptr
+			_DisposPtr					; else, free the memory
+@7			MOVE.W	D1,D0				; D0 = RefNum
+			JSR		ExtBTClose			; use only D0, BTCB will be cleared !<SM1>
+										; will not flush the cache			<30Jul90>
+BClCommon	;; join here to close a file
+			MOVE	D1,-(A6)			; save refnum
+			BSR		ExtCopyParam		; get and clear BT param in A3=A0
+			MOVE	(A6)+,ioRefNum(A0)	; this file to close
+			MOVEQ	#DoClose,D1			; indicate this is CLOSE
+			BSR		ExtDoAOCRWF			; close will flush DiskCache		<30Jul90>
+			TST.W	D4					; is there another access path?		<28Mar90>
+			BEQ.S	BClExit				; NO								<28Mar90>
+			MOVE.W	D4,BTCRefNum(A4)	; set new refnum					<28Mar90>
+BClExit		BRA		ExtBTCmdDone
+
+;_______________________________________________________________________
+;
+; Routine:		xBTInsRec
+; Arguments:	  A0.L (input)	-- pointer to BT ioParameter block.
+;				  D1.W (input)  -- trap word
+;				  D0 (output)   -- error code
+; Function: 	Insert a record in the BTree file.
+; Modification History:
+;	Jan-18-89	KSCT	New today
+;
+;------------------------------------------------------------------------
+
+xBTInsRec	BSR		ExtBTQueue
+
+			MOVEA.L	A0,A3				; A3=ioParam
+			MOVEQ	#write,D0			; request for write permssn
+			BSR		ExtIsBtree			; is this a BTree?
+			BNE.S	@8					; no, fatal error
+			BSR		checkey				; is key correct?
+			BNE.S	@8					; no, syntax error
+
+			MOVEA.L	ioBTKeyPtr(A3),A0	; A0=addr of key
+			MOVE.L	ioReqCount(A3),D1	; D1=size of data
+			BSR		ChkSize
+			BGT.S	@8					; key length or size error
+
+			MOVEA.L	ioBuffer(A3),A1		; A1=addr of data
+			MOVE.W	ioRefNum(A3),D0		; D0=RefNum
+			MOVE.L	D1,ioActCount(A3)	; assume it works
+			JSR		ExtBTInsert			;									<SM1>
+@8			BRA.S	BTSExit1
+
+
+;_______________________________________________________________________
+;
+; Routine:		xBTSetRec
+; Arguments:	  A0.L (input)	-- pointer to BT ioParameter block.
+;				  D1.W (input)  -- trap word
+;				  D0 (output)   -- error code
+; Calls:		BTInsert (BTreesvcs.a)
+; Function: 	Insert/overwrite a record in the BTree file.
+;
+; Modification History:
+;
+;	Jan-30-89	KSCT	New today
+;
+;------------------------------------------------------------------------
+
+xBTSetRec	BSR		ExtBTQueue
+
+			MOVEA.L	A0,A3				; A3=ioParam
+			MOVEQ	#write,D0			; request for write permssn
+			BSR		ExtIsBtree			; is this a BTree?
+			BNE.S	BTSExit1			; no, fatal error
+			BSR		checkey				; is key correct?
+			BNE.S	BTSexit1			; no, syntax error
+
+			MOVEA.L	ioBTKeyPtr(A3),A0	; A0=addr of key
+			MOVE.L	ioReqCount(A3),D1	; D1=size of data
+			BSR		ChkSize
+			BGT.S	BTSExit1			; record too big
+			MOVE.L	D1,ioActCount(A3)	; assume it works
+BTSet1
+			MOVEA.L	ioBuffer(A3),A1		; A1=addr of data
+			MOVE.W	ioRefNum(A3),D0		; D0=RefNum
+
+			JSR		ExtBTInsert			;								<SM1>
+			BEQ.S	BTSExit1			; br if no error
+			CMPI.W	#BTexists,D0		; record already exist?
+			BNE.S	BTSExit1			; no, other error
+			;; here, record already exist, overwrite if possible
+			MOVEA.L	ioBTKeyPtr(A3),A0	; A0=addr of key
+			MOVE.W	ioRefNum(A3),D0		; D0=RefNum
+			JSR		ExtBTDelete			;								<SM1>
+			BNE.S	BTSExit1			; punt on error
+			MOVEA.L	ioBTKeyPtr(A3),A0	; A0=addr of key
+			BRA.S	BTSet1				; try insert again
+BTSExit1
+			TST.W	D0
+			SEQ		D1					; set if no error
+			BRA		BTReturn
+
+;_______________________________________________________________________
+;
+; Routine:		xBTReplRec
+; Arguments:	  A0.L (input)	-- pointer to BT ioParameter block.
+;				  D1.W (input)  -- trap word
+;				  D0 (output)   -- error code
+; Calls:		BTInsert (BTreesvcs.a)
+; Function: 	replace a record in the BTree file.
+;
+; Modification History:
+;
+;	Jan-30-89	KSCT	New today
+;
+;------------------------------------------------------------------------
+
+xBTReplRec	BSR		ExtBTQueue
+
+			MOVEA.L	A0,A3				; A3=ioParam
+			MOVEQ	#write,D0			; request for write permssn
+			BSR		ExtIsBtree			; is this a BTree?
+			BNE.S	BTRExit				; no, fatal error
+			BSR		checkey				; is key correct?
+			BNE.S	BTRexit				; no, syntax error
+
+			MOVEA.L	ioBTKeyPtr(A3),A0	; A0=addr of key
+			MOVE.L	ioReqCount(A3),D1	; D1=size of data
+			BSR		ChkSize
+			BGT.S	BTRExit				; record or key size error
+BTRepl1
+			MOVE.W	ioRefNum(A3),D0		; D0=RefNum
+			JSR		ExtBTDelete			;								<SM1>
+
+			BNE.S	BTRExit				; punt on error
+			MOVEA.L	ioBTKeyPtr(A3),A0	; A0=addr of key
+			MOVEA.L	ioBuffer(A3),A1		; A1=addr of data
+			MOVE.W	ioRefNum(A3),D0		; D0=RefNum
+			MOVE.L	ioReqCount(A3),ioActCount(A3)	; assume it works
+			JSR		ExtBTInsert		;								<SM1>
+BTRExit		BRA.S	BTSExit1
+
+
+;_______________________________________________________________________
+;
+; Routine:		xBTSearch
+; Arguments:	  A0.L (input)	-- pointer to BT ioParameter block.
+;				  D1.W (input)  -- trap word
+;				  D0 (output)   -- error code
+; Calls:		BTInsert (BTreesvcs.a)
+; Function: 	search for a record in the BTree file.
+;
+; Modification History:
+;
+;	Jan-30-89	KSCT	New today
+;
+;------------------------------------------------------------------------
+xBTSearch	BSR		ExtBTQueue
+
+			MOVEA.L	A0,A3				; A3=ioParam
+			MOVEQ	#noWrite,D0			; no write permssn flag
+			BSR		ExtIsBtree			; is this a BTree?
+			BNE.S	SearchExit			; no, fatal error
+			BSR		checkey				; is key correct?
+			BNE.S	SearchExit			; no, syntax error
+
+			MOVEA.L	ioBTKeyPtr(A3),A0	; A0=addr of key
+			MOVEQ	#0,D2				; no hint
+			MOVE.L	ioBTHint1(A3),D1	; write count
+			CMP.L	btcWcount(A4),D1	; validate it
+			BNE.S	@1					; bad hint
+			MOVE.L	ioBTHint2(A3),D2	; good node hint
+
+@1			MOVE.W	ioRefNum(A3),D0		; D0=RefNum
+			JSR		ExtBTSearch			;									<SM1>
+@3			BNE.S	RecNotFound			; punt on error
+; Record found =>	A1.L  -  pointer to data record,
+; 					D1.W  -  size of data record,
+;					D2.L  -  new BTree hint, must preserve
+			EXT.L	D1					; make D1 long
+			CLR.L	ioActCount(A3)		; assume 0							<30Mar90>
+			MOVE.L	ioReqCount(A3),D0	; D0=size of user data buffer
+			BEQ.S	SearchExit			; no data requested					<30Mar90>
+			CMP.L	D0,D1				; D1=size of data on disk
+			BGE.S	BTSrch2				; use user buffer size
+			MOVE.L	D1,D0				; data < user, use exact datasize
+BTSrch2		MOVE.L	ioBuffer(A3),D3		; D3=user buffer (dest)				<30Mar90>
+										; is there a buffer?				<30Mar90>
+			BNE.S	@6					; yes								<30Mar90>
+			MOVE.W	#paramErr,D0		; NULL pointer						<30Mar90>
+			BRA.S	SearchExit			; punt =>							<30Mar90>
+@6			MOVEA.L	D3,A0				; A0=user buffer (dest)				<30Mar90>
+			MOVE.L	D0,ioActCount(A3)	; actual count
+			EXG		A0,A1				; exchange dest and source buffer
+			_BlockMove					; copy data byte by byte
+			MOVEQ	#0,D0				; perfect ending
+SearchExit	MOVEQ	#0,D1				; clear flag, search never changes Btree
+			BRA		BTReturn
+RecNotFound	CMP.W	#BTnotfound,D0		; key not found error ?
+			BNE.S	SearchExit			; no, must be IO error ->
+		;; D0=BTnotFound(32), make it negative
+			SUBI.W	#BTErrConst,D0		; make it negative
+		;; If search failed, return correct HINT to caller. <5/31/89 Tung>
+			MOVE.L	btcWcount(A4),ioBTHint1(A3)		; writecount
+			MOVE.L	BTCNodeM(A4),ioBTHint2(A3)		; node #
+			MOVE.W	BTCIndexM(A4),ioBTHint3(A3)		; index #
+			BRA		ExtBTCmdDone
+
+
+;_______________________________________________________________________
+;
+; Routine:		xBTGetRec
+; Arguments:	  A0.L (input)	-- pointer to BT ioParameter block.
+;				  D1.W (input)  -- trap word
+;				  D0 (output)   -- error code
+; Calls:		BTInsert (BTreesvcs.a)
+; Function: 	search for a record using cookies.
+; Output:		If hint is invalid, the correct write count is returned
+;				node number and node index is cleared.
+; Modification History:
+;
+;	Jan-31-89	KSCT	New today
+;	Jul-17-90	KSCT	Return eofErr when reading pass EOF and return posErr when 
+;						reading before BOF. Return btnotfound if get current record.
+;------------------------------------------------------------------------
+xBTGetRec	BSR		ExtBTQueue
+
+			MOVEA.L	A0,A3				; A3=ioParam
+			MOVEQ	#noWrite,D0			; not write permssn
+			BSR		ExtIsBtree			; is this a BTree?
+			BNE		GetExit				; no, fatal error
+			MOVE.W	#BTPMInvalid,D0		; set error code
+			BSR		Zerohints			; all hints are 0?
+			BEQ.S	@2					; yes (D1.L=write count; D2.L=Node #; D3.W=Index#)
+
+			CMP.L	BTCWcount(A4),D1	; validate it
+			BEQ.S	@GetRec2			; OK
+			MOVE.L	BTCWcount(A4),ioBTHint1(A3)	; return current Wcount
+			BRA 	GetExit				; invalid marker <SM2> CSS 
+@2
+			MOVE.L	btcFNode(A4),D2		; user wants to read the 1st record
+@GetRec2	MOVE.L	D2,btcNodeM(A4)		; get record in this node, (change the node marker)
+			MOVE.W	D3,btcIndexM(A4)	; and this index (and change the node index to read from)
+
+			MOVE.W	ioRefNum(A3),D0		; D0=RefNum
+			MOVE.W	ioBTPosMode(A3),D1	; D1=position mode
+			MOVE.W	D1,D3				; save in D3
+			JSR		ExtBTGetRecord		;								<SM1>
+			BNE.S	GetExitChk			; check special error
+; A0.L  -  pointer to key,      A1.L  -  pointer to data record
+; D1.W  -  size of data record, D2.L  -  new BTree hint, must preserve
+			EXT.L	D1
+			CLR.L	ioActCount(A3)		; assume 0					<30Mar90>
+			MOVE.L	ioReqCount(A3),D0	; D0=size of user data buffer
+			BEQ.S	@GetRec5			; data buffer = 0
+		;; copy data back to user ...
+			MOVE.L	A0,-(A6)			; save key buffer
+			CMP.L	D0,D1
+			BCC.S	@GetRec3			; use user buffer size
+			MOVE.L	D1,D0				; data < user
+@GetRec3	MOVE.L	ioBuffer(A3),D3		; D3=user buffer
+										; is there a buffer?		<30Mar90>
+			BNE.S	@4					; yes						<30Mar90>
+			MOVE.W	#paramErr,D0		; NULL pointer				<30Mar90>
+			BRA.S	GetExit				; punt =>					<30Mar90>
+@4			MOVEA.L	D3,A0				; A0=user buffer (dest)		<30Mar90>
+			MOVE.L	D0,ioActCount(A3)	; actual count
+			EXG		A0,A1				; exchange dest and source buffer
+			_BlockMove					; copy data byte by byte
+			MOVEA.L	(A6)+,A0			; restore A0
+@GetRec5	;; ;; copy key back to user ...
+			MOVEQ	#0,D0
+			MOVE	D0,D1
+			MOVE.W	ioKReqCount(A3),D0	; D0=size of user KEY buffer
+			BEQ.S	@GetRec7			; don't copy key if user key buffer len = 0
+			MOVE.B	(A0),D1				; record key size
+			CMP.W	D0,D1
+			BCC.S	@GetRec7			; key>=user, use user buffer size
+
+		;;  Note: return key length includes length byte !!
+			ADDQ.W	#1,D1				; include length byte
+			MOVE.W	D1,D0				; key < user, use key
+@GetRec7	MOVE.W	D0,ioKActCount(A3)	; actual count
+			BEQ.S	GetExit				; don't copy key
+			MOVEA.L	ioBTKeyPtr(A3),A1	; A1=user key buffer
+
+			_BlockMove					; copy key byte by byte
+			MOVEQ	#0,D0				; perfect ending
+GetExit		MOVEQ	#0,D1				; clear flag
+			BRA		BTReturn
+GetExitChk	; D0.W=error code, D3.W=position mode
+			CMPI.W	#btnotfound,D0		; is this the special case that we're looking for?
+			BNE.S	GetExit				; branch if not
+			; if it is btnotfound error, then we don't change the HINTs,
+			; and we'll also change the error code to a more meaning code.
+			TST.W	D3					; are we reading forward?
+			BEQ.S	GetExit				; can't find the current node, this HINT must be bad
+										; so we'll invalidate the HINT.
+			BMI.S	@2					; no, =>
+			MOVE.W	#btEofErr,D0		; move forward pass EOF
+			BRA.S	@4					; all done
+@2			MOVE.W	#btBofErr,D0		; attempt to position to before start of file
+@4			CLR.L	ioActCount(A3)		; no data is written
+			BRA		ExtBTCmdDone		; error code is negative now
+
+;_______________________________________________________________________
+;
+; Routine:		xBTDelRec
+; Arguments:	  A0.L (input)	-- pointer to BT ioParameter block.
+;				  D1.W (input)  -- trap word
+;				  D0 (output)   -- error code
+; Calls:		BTDelete (BTreesvcs.a)
+; Function: 	search for a record using cookies.
+;
+; Modification History:
+;
+;	Feb-1-89	KSCT	New today
+;
+;------------------------------------------------------------------------
+xBTDelRec	BSR		ExtBTQueue
+
+			MOVEA.L	A0,A3				; A3=ioParam
+			MOVEQ	#write,D0			; request for write permssn
+			BSR		ExtIsBtree			; is this a BTree?
+			BNE.S	DelExit				; no, fatal error
+			BSR		checkey				; is key correct?
+			BNE.S	DelExit				; no, syntax error
+
+			MOVEA.L	ioBTKeyPtr(A3),A0	; A0=addr of key
+			MOVE.W	ioRefNum(A3),D0		; D0=RefNum
+			JSR		ExtBTDelete			;								<SM1>
+
+DelExit		TST.W	D0
+			SEQ		D1					; set if no error
+			MOVEQ	#0,D2				; zero out node hint
+			BRA		BTReturn
+
+
+;_______________________________________________________________________
+;
+; Routine:		xBTGetInfo
+; Arguments:	  A0.L (input)	-- pointer to BT parameter block.
+;				  D1.W (input)  -- trap word
+;				  D0 (output)   -- error code
+; Calls:		BTDelete (BTreesvcs.a)
+; Function: 	search for a record using cookies.
+;
+; Modification History:
+;
+;	Feb-01-89	KSCT	New today
+;	May-10-90	KSCT	KDlen is a word in paramblock, a byte in KDptr.
+;						To compare them we have to use word comparison.
+;------------------------------------------------------------------------
+xBTGetInfo	BSR		ExtBTQueue
+
+			MOVEA.L	A0,A3					; A3=ioParam
+			MOVEQ	#noWrite,D0				; not write permssn
+			BSR		ExtIsBtree				; is this a BTree?
+			BNE.S	GInfoExit				; no, fatal error
+			MOVE.W	ioRefNum(A3),D0			; D0=RefNum
+			MOVE.L	FCBClmpSize(A1,D0),ioBTClumpSize(A3); clumpsize
+
+			MOVE.W	btcNodeSize(A4),ioBTNodesize(A3)	; node size
+			MOVE.W	btcKeyLen(A4),ioBTMaxKLen(A3)		; key len
+			MOVE.W	btcDepth(A4),ioBTDepth(A3)			; tree depth
+			MOVE.L	btcNRecs(A4),ioBTRecNum(A3)			; total records
+			MOVE.L	btcNNodes(A4),ioBTNNodes(A3)		; total number of nodes
+			MOVE.L	btcFree(A4),ioBTFreeNode(A3)		; number of free nodes
+
+			CLR.W	ioBTKDActCount(A3)		; clear ActCount
+			MOVE.L	ioBTKDPtr(A3),D0		; is there a buffer?
+			BEQ.S	GInfoExit				; no buffer
+			MOVEA.L	D0,A1					; A1 = user KD ptr
+			MOVE.L	btcKDPtr(A4),D0			; D0 = btree kd
+			BEQ.S	GInfoExit				; no KD, default case
+			MOVEA.L	D0,A0					; A0 = Btree KD ptr
+			MOVEQ	#0,D0
+			MOVE.W	ioBTKDReqCount(A3),D0	; D0 = user kd buffer len
+			BEQ.S	GInfoExit				; buffer len = 0 ?
+			
+			MOVEQ	#0,D1					; clear D1				<10May90>
+			MOVE.B	(A0),D1					; D1.W = KD length		<10May90>
+			CMP.W	D1,D0					; D0.W = buffer len		<10May90>
+			BLE.S	@2						; user <= btree, use user buffer size
+			MOVE.W	D1,D0					; use btree's
+			ADDQ.W	#1,D0					; include length byte
+@2			MOVE.W	D0,ioBTKDActCount(A3)
+			_BlockMove
+			MOVEQ	#0,D0					; perfect
+GInfoExit
+			BRA		ExtBTCmdDone
+			
+;_______________________________________________________________________
+;
+; Routine:		xBTFlush
+; Arguments:	  A0.L (input)	-- pointer to BT parameter block.
+;				  D1.W (input)  -- trap word
+;				  D0 (output)   -- error code
+; Function: 	Flush cache buffers associated with the Btree file.
+;				If ioWriteFlag is clear, then this is a delayed write to fs's cache.
+; Modification History:
+;
+;	06Jul89		KST		New today
+;	01Aug90		KST		Adding a new field ioBTWriteFlag in BTioParam.
+;------------------------------------------------------------------------
+xBTFlush
+			BSR		ExtBTQueue
+			MOVEQ	#noWrite,D0			; not write permssn
+			BSR		ExtIsBtree			; is this a BTree?
+			BNE.S	@2
+			MOVE.W	ioRefNum(A0),D0		; D0.W = RefNum
+			MOVE.B	ioBTWriteFlag(A0),D5; D5.B = write flag
+			BSR		ExtBTFlush			; just flush				<SM1>
+@2			BRA		ExtBTCmdDone
+
+;_______________________________________________________________________
+; Routine:		xBTCleanUp				<2.7>
+; Arguments:	A0.L (input) -- pointer to (dummy) BT parameter block.
+;				D1.W (input) -- trap word
+; Output:		Always return no error (D0 = 0) code
+; Function: Close all Btree files associated with a process at process termination.
+; 				This routine is not queued and cannot be called from interrupt !!
+;				Because, it calls xBTClose which is executed sychronously.
+; Modification History:
+;	Oct-06-89	KSCT	New today
+;------------------------------------------------------------------------
+xBTCleanUp
+			MOVEM.L	A2-A3/D2-D6,-(SP)
+			MOVE.L	A0,-(SP)			; save A0, trashed by _GetCurrentProcess
+			LEA		-10(SP),SP			; get current procID and verify it's for us
+			PEA		2(SP)
+			_GetCurrentProcess
+			LEA		2(SP),SP			; don't need to check for error
+			MOVE.L	(SP)+,D6			; D6 = process ID1 (network address)
+			MOVE.L	(SP)+,D2			; D2 = process ID2
+			MOVEA.L	(SP)+,A0			; restore A0
+
+			MOVEA.L	FSVarsPtr,A1
+			MOVEa.L	FSVars.fcbPBuf(A1),A2	; A2=parallel array
+			MOVE	cbPBufCount(A2),D3		; D3=number of FCBs
+			SUBQ	#1,D3					; for DBcc
+			MOVE	cbPBufULen(A2),D4		; D4=ext. FCB unit size
+			LEA		fcbPBufData(A2),A2		; A2=ext. fcb array
+			MOVE	FSFCBLen,D5				; D5=FCB len
+			MOVE.L	FCBSPtr,A1				; A1=FCB ptr			<SM1>
+			MOVEQ	#2,D1					; D1=FCB index			<SM1>
+			
+; First close all the open files belong to this process:
+; A1=FCBptr, A2=Ext. FCBptr, D1.W=RefNum, D2=id2, D3.W=loop index, D4.W=ext FCBlen,
+;					D5.W=original FCBlen, D6=id1
+@cleanLoop	MOVE.L	FCBBTCBptr(A1,D1),D0; is this B*Tree file?
+			BEQ.S	@3					; no->
+			MOVE.L	xFCBPid2(A2),D0		; do the 2nd one first
+			CMP.L	D0,D2				; FCB belongs to this process?
+			BNE.S	@3					; no->
+			MOVE.L	xFCBPid1(A2),D0
+			CMP.L	D0,D6				; FCB belongs to this process?
+			BNE.S	@3					; no->
+
+		;; this open path belongs to this proc, let's close it
+			BSR.S	clearPB				; clear iopb in A0
+			MOVE	D1,ioRefNum(A0)		; close this access path
+			MOVEM.L	A1/D1/D2,-(SP)		; these registers are trashed
+			BSR		xBTClose			; close the file
+			MOVEM.L	(SP)+,A1/D1/D2
+
+@2			CLR.L	xFCBPid1(A2)		; clear procID 1
+			CLR.L	xFCBPid2(A2)		; clear procID 2
+@3			ADDA	D4,A2				; go to next ext.FCB
+			ADD.W	D5,D1				; go to next FCB RefNum
+			DBF		D3,@cleanLoop		; process them all …
+
+			MOVEM.L	(SP)+,A2-A3/D2-D6
+			MOVEQ	#0,D0				; happy ending
+			RTS
+
+clearPB		MOVEA.L	A0,A3				; A3=A0=iopb
+			MOVE	#(fscPBLen/2)-1,D0	; iopb len in word -1
+@2			CLR		(A3)+
+			DBRA	D0,@2				; clear 26 bytes
+			RTS
+
+;_______________________________________________________________________
+; Routine:		xBTRsrvAccess		<2.9>
+; Arguments:	A0.L (input) -- pointer to BT ioParameter block.
+;				D1.W (input) -- trap word
+; Output:		D0 = 0 if no error.
+; Function: 	Reserve access for one process.
+;
+; Modification History:
+;	01Dec89		KSCT	New today
+;------------------------------------------------------------------------
+xBTRsrvAccess
+			BSR		ExtBTQueue
+			MOVEQ	#noWrite,D0			; not write permssn
+			BSR		ExtIsBtree			; is this a BTree?
+			BNE.S	@notBT				; no,
+
+			MOVE.L	ioBTRsrvUID(A0),D0	; D0=UID
+		;; make sure this is a valid UID !! (>=startUid and < currentUid)
+			CMPI.L	#WCSigLong,D0		; D0 >= start UID?
+			BLO.S	@badUid				; no, error
+			MOVEA.L	FSVarsPtr,A1
+			MOVEA.L	fsVars.BTMgr(A1),A1	; get BTVar
+			MOVE.L	btVNextUID(A1),D1	; D1 = next UID
+			CMP.L	D1,D0				; D0 must < D1
+			BLO.S	@uidok				; OK
+@badUid		MOVE	#btBadUIDErr,D0		; UID error
+			BRA.S	@notBT
+@uidok	;	TST.L	BTCRsrvUID(A4)		; already reserved?
+		;	BNE.S	@rsrved				; yes => (this should not happen now <17Jul90>)
+			MOVE.L	D0,BTCRsrvUID(A4)	; Mark the B*-Tree as in exclusive use
+			MOVEQ	#0,D0				; successful
+@notBT		BRA		ExtBTCmdDone
+
+
+;_______________________________________________________________________
+; Routine:		xBTRelAccess		<2.9>
+; Arguments:	A0.L (input) -- pointer to BT ioParameter block.
+;				D1.W (input) -- trap word
+; Output:		D0 = 0 if no error.
+; Function: 	Relinquish exclusive access to the B*-Tree.
+;
+; Modification History:
+;	04Dec89		KSCT	New today
+;------------------------------------------------------------------------
+xBTRelAccess
+			BSR		ExtBTQueue
+			MOVEQ	#noWrite,D0			; not write permssn
+			BSR		ExtIsBtree			; is this a BTree?
+			BNE.S	@notBT				; no,
+
+			MOVE.L	BTCRsrvUID(A4),D0	; D0 = current UID				<13Apr90>
+			BEQ.S	@notBT				; not reserved, return OK		<13Apr90>
+			MOVE.L	ioBTRsrvUID(A0),D1	; D1 = user's UID
+			CMP.L	D1,D0				; D0 must = D1
+			BEQ.S	@uidok				; OK
+			MOVE	#btBadUIDErr,D0		; UID error
+			BRA.S	@notBT
+@uidok		CLR.L	BTCRsrvUID(A4)		; free access
+			MOVEQ	#0,D0				; successful
+@notBT		BRA		ExtBTCmdDone
+
+;_______________________________________________________________________
+; Routine:		xBTGetUid			<2.9>
+; Arguments:	A0.L (input) -- pointer to BT ioParameter block.
+;				D1.W (input) -- trap word
+; Output:		D0 = 0 if no error.
+; Function: 	Assign a B*-Tree UID. This routine is not queued!!
+;
+; Modification History:
+;	04Dec89		KSCT	New today
+;	23Jul90		KSCT	ADDQ.W should be ADDQ.L
+;------------------------------------------------------------------------
+xBTGetUid	MOVEA.L	FSVarsPtr,A1		; locate next UID from BTVars
+			MOVEA.L	fsVars.BTMgr(A1),A1	; get BTVars
+			MOVE.L	btVNextUID(A1),D0	; D0 = next UID
+			MOVE.L	D0,ioBTRsrvUID(A0)	; return to user
+
+			ADDQ.L	#1,D0				; bump UID					<23Jul90>
+			BNE.S	@2					; UID wraps around to 0?
+			MOVE.L	#WCSigLong,D0		; yes, the system is so robust
+@2			MOVE.L	D0,btVNextUID(A1)	; and stash in the save area
+			MOVEQ	#0,D0				; no error
+			MOVE.W	D0,ioResult(A0)		; this call is not queued, so we have to clear it here.
+			RTS
+
+;_______________________________________________________________________
+; Routine:		xBTUpdateKD
+; Arguments:	A0.L (input) -- pointer to BT parameter block.
+;				D1.W (input) -- trap word
+; Output:		D0 = 0 if no error.
+; Function: 	Replace Key descriptor into the header!!
+;
+; Modification History:
+;	30Jan90		KSCT	New today
+;------------------------------------------------------------------------
+xBTUpdateKD	BSR		ExtBTQueue
+
+			MOVE.W	#btKDLenErr,D0		; preset error code
+			MOVE.L	ioBTKDPtr(A0),D2
+			BEQ		@ret				; no KD error
+			MOVEA.L	D2,A1				; A1=key descriptor
+			BSR		checkKD				; validate kd
+			BNE		@ret				; KD error
+
+			MOVEA.L	A0,A4				; save user ioparam in A4
+			MOVEQ	#0,D7				; D7 = not open flag
+			BSR		ExtCopyParam		; get and clear BT param in A3=A0
+			BSET	#fsWrPerm,ioPermssn(A0)	; req for write permssn
+
+			MOVEQ	#DoOpen,D1			; indicate this is OPEN
+			BSR		ExtDoAOCRWF			; do the open/close sync/async
+			BNE		@ret				; error, exit
+			ST		D7					; set file opened flag
+			MOVEA.L	FCBSptr, A2			; A2 = ptr to FCBs
+			MOVE.W	ioRefNum(A0),D5		; D5 = file refnum
+			MOVE.L	fcbEof(A2,D5.W),D0	; logical length					<07Dec90 #30>
+			BEQ.S	@badHdr				; LEOF = 0? No way !				<07Dec90 #30>
+
+		;; BTree opened, read the header block
+			BSR		GetaCBlock			; get a clear BTbuffer in A0
+			MOVE.L	A0,IOBuffer(A3)		; buffer to read
+			EXG		A3,A0				; A0= private param block, A3 = buffer
+			MOVE.L	#0,D0				; header node number = 0
+			MOVE.L	D0,IOPosOffset(A0)	; ... gives position offset
+			MOVE.W	#fsFromStart,IOPosMode(A0)	; position mode(from BOF)
+			MOVE.L	#BtnodeSize,IOByteCount(A0) ; always r/w 512 bytes for header
+			MOVEQ	#DoRead,D1			; indicate this is READ
+			BSR		ExtDoAOCRWF			; read header node into A3
+			BNE.S	@Exit1				; error
+
+		;; do a simple check of the header in A3 to make sure that this is B*Tree file!
+
+			LEA 	lenND(A3),A2		; A2 = ptr to BTH
+			MOVE.W	BTHNodeSize(A2),D0	; node size
+			BEQ.S	@badHdr				; node size = 0, error ->
+			MOVE.W	D0,D1				; copy into D1
+			ANDI.W	#$1FF,D1			; clear bits
+			BNE.S	@badHdr				; node size not 512 multiple, error ->
+
+			MOVEA.L	FCBSptr, A1			; A1 = ptr to FCBs					<26Nov90>
+			MOVE.L	fcbEof(A1,D5.W),D2	; logical length (will not be 0)	<26Nov90>
+			DIVU	D0,D2				; length / node size				<26Nov90>
+			SWAP	D2					;	= # of nodes					<26Nov90>
+			CLR.W	D2					;									<26Nov90>
+			SWAP	D2					; D2.L = total nodes				<26Nov90>
+			CMP.L	BTHNNodes(A2),D2	; same # as in BTH?					<26Nov90>
+			BNE.S	@badHdr				; no, error ->						<26Nov90>
+			CMP.L	BTHFree(A2),D2		; # of nodes > free count?			<26Nov90>
+			BHI.S	@1					; yes, looks OK ->					<26Nov90>
+
+@badHdr		MOVE.W	#notBTree,D0		; result = 'bad header node'		<26Nov90>
+			BRA.S	@Exit1				; and exit							<26Nov90>
+
+		
+@1		;; copy KD into the header then write it back
+			MOVEA.L	ioBTKDPtr(A4),A1	; A1 = KD buffer
+			LEA		kdPtr(A3),A2		; A2 is free
+			MOVEQ	#0,D0				; clear D0
+			MOVE.B	(A1),D0				; KD length
+@2			MOVE.B	(A1)+,(A2)+			; copy over
+			DBRA	D0,@2
+			MOVE.L	#0,D0				; header node number = 0
+			MOVE.L	D0,IOPosOffset(A0)	; ... gives position offset
+			MOVEQ	#DoWrite,D1			; indicate this is WRITE
+			BSR		ExtDoAOCRWF			; write the block back
+@Exit1	;; ready to leave, D0 = error code
+			TST.B	D7					; file still open?
+			BEQ.S	@ret				; no
+		;; close the file before we leave
+			MOVE.W	D0,-(A6)			; save error code
+			MOVEQ	#DoClose,D1			; indicate this is CLOSE
+			BSR		ExtDoAOCRWF
+			MOVE.W	(A6)+,D0			; restore error code
+
+@ret		BRA		ExtBTCmdDone
+
+;________________________________________________________________________________
+;
+; Routine:      DTKeyCmp
+;
+; Function:     Compare two Desktop B*-Tree keys.
+;
+; Input:        A0.L  -  search key pointer
+;               A1.L  -  trial key pointer
+;
+; Output:       D0.W  -  result code
+;                            +n  search key > trial key
+;                             0  search key = trial key
+;                            -n  search key < trial key
+;
+; NOTE: The keys in the Desktop B*-Tree are all either numeric or case-sensitive
+;       strings, differentiated in the first position by the key type.  The key
+;       type will ensure that keys are sorted by type first; beyond that, a
+;       straight byte comparison may be used to properly differentiate the keys.
+;________________________________________________________________________________
+		IF 0 THEN
+DTKeyCmp:
+
+; Figure the trial key length from the search key type; since all index
+; keys are padded out to their full length, the trial key length is
+; unreliable.  The search key length cannot be used because Getxxx routines
+; pass shorter keys (Type & Creator only) meant to compare less than any
+; key by that creator, but greater than preceding Creators.
+
+            MOVE.B  (A0)+,D0            ; Pick up length of search key
+			MOVEQ	#IconKey.IKLen-1,D1	; Figure length of icon key
+			CMP.B	#IconKeyType,(A0)	; Looking for an icon key?
+			BEQ.S	@5					; Yes - we're in business
+			MOVEQ	#APPLKey.AKLen-1,D1	; No - try an APPL key
+			CMP.B	#APPLKeyType,(A0)	; Looking for an APPL key?
+			BEQ.S	@5					; Yes - go with it
+			MOVEQ	#CommentKey.CKLen-1,D1	; Finally, try a comment key
+			CMP.B	#CommentKeyType,(A0); Looking at a comment?
+			BEQ.S	@5					; Yes - finally right.
+			MOVE.B	D0,D1				; No - just use the search key length
+;
+@5          TST.B   (A1)+	            ; Ignore length of trial key
+@10         CMPM.B  (A1)+,(A0)+         ; Compare byte in key
+            BHI.S   DTKCIsGT            ; search key > trial key
+            BLO.S   DTKCIsLT            ; search key < trial key
+            SUBQ.B  #1,D1               ; Count off one trial key character
+            SUBQ.B  #1,D0               ; Count off one search key character
+            BEQ.S   @20                 ; If zero, stop comparison
+            TST.B   D1                  ; Reached end of trial key?
+            BNE.S   @10                 ; No - keep checking
+            BRA.S   DTKCIsGT            ; Yes - search key > trial key
+@20			TST.B   D1                  ; Also reached end of trial key?
+            BNE.S   DTKCIsLT            ; No - search key < trial key
+DTKCIsEQ    MOVEQ   #0,D0               ; The two keys are equal
+            BRA.S   DTKCExit            ; So we're done
+DTKCIsLT    MOVEQ   #-1,D0              ; Search key < trial key
+            BRA.S   DTKCExit            ;
+DTKCIsGT    MOVEQ   #1,D0               ; Search key > trial key
+DTKCExit    BRA		DefExit				; use common return code
+		ENDIF
+
+;_______________________________________________________________________________
+; Routine:	DefKCmp (default key comparison routine)
+; Function: Compare 2 keys as unsigned binary
+; Input:	A0.L  - search key pointer	(user key)
+;			A1.L  - trial key pointer	(BTree)
+;			A4.L  - ptr(BTCB)
+; Output:	D0.W  -  result code
+;			+n  search key (A0) > trial key (A1)
+;		 	 0  search key (A0) = trial key (A1)
+;			-n  search key (A0)	< trial key (A1)
+;_______________________________________________________________________________
+DefKCmp		;; D0-D5/A2-A3 are free
+			MOVEQ	#0,D0				; clear D0
+			MOVE	D0,D1				; clear D1
+			MOVE.B	(A0)+,D0			; D0.W=user  key length
+			MOVE.B	(A1)+,D1			; D1.W=Btree key length
+			MOVE	D0,D2				; use the smaller len as loop index
+			CMP		D2,D1				; D1 < D2?
+			BGE.S	@2					; No
+			MOVE	D1,D2				; D1 is smaller
+@2			SUBQ	#1,D2
+@4			CMP.B	(A1)+,(A0)+
+			DBNE	D2,@4
+			BEQ.S	DefKEqual			; 2 keys are the same (so far)
+			BSR		UnsCmpRet			; not equal, set up D0
+			BRA		DefExit				; use common return code
+DefKEqual	CMP		D1,D0				; if length is the same then they are really equal
+			BEQ		DefExitOK			; cool
+			BLO.S	A1longer			; A1 is longer
+			MOVEQ	#1,D0				; A0 is longer => A0>A1
+			BRA		DefExit				; use common return code
+A1longer	MOVEQ	#-1,D0				; A1 is longer => A1>A0
+			BRA		DefExit				; use common return code
+
+;_______________________________________________________________________________
+; Routine:	BTKCmp (BTree Key Compare)
+;
+; Function: Compares two keys (a search key and a trial key).
+;			This is a small interpreter that will handle different key types.
+;			Each type is then processed by the corresponding comparison routine.
+;			User's key has been validated before it comes to here.
+; Input:	A0.L  - search key pointer	(user)
+;			A1.L  - trial key pointer	(BTree)
+;		* 4(SP).L =	BTCB, BTreemaint2.a (ExtSearchNode)
+;		* This key comparison routine depends on that BTCB is passed on stack
+;		* when get called (because I need the KD from it), therefore the calling
+;		* convention cannot be changed !!! Leave it there on return.
+; Output:	D0.W  -  result code, uses D1
+;			+n  search key (A0) > trial key (A1)
+;		 	 0  search key (A0) = trial key (A1)
+;			-n  search key (A0)	< trial key (A1)
+;
+; <03Jan91>	KST		Type kdDTString is no longer used by DTmgr.
+;_______________________________________________________________________________
+
+BTKCmp	;; A4 was BTCB and is saved on SP by "ExtSearchNode"
+		;; each compare routine is responsible for updating A0,A1,A2 and D2!
+			MOVEA.L		4(SP),A4		; A4 = BTCB
+			MOVEM.L		D2-D5/A2-A3/A5,-(SP)
+		;; set up for the default case (unsigned binary)
+		;; no default case for this release, but we leave the code here for future,
+		;; since BTInit will not honor a NULL KD, so it's safe to keep the code around.
+		;; Besides, we cannot return error from this call ! <8/31/89>
+			MOVE.L		btcKDPtr(A4),D0	; default case?
+			BEQ.S		DefKCmp			; yes, go do it
+
+			MOVEA.L		D0,A2			; A2 = ptr(KD)
+			CMPI.B		#kdReserved,1(A2)	; type = kdDTString? (2,9,1)		<9/18/89>
+			BEQ.S		DefExit				; can't return error, so just exit	<03Jan91 #33>
+
+			ADDQ		#1,A0			; skip total key length byte
+			ADDQ		#1,A1
+			MOVEQ		#0,D2
+			MOVE.B		(A2)+,D2		; D2.W = KD length
+
+DefLoop		TST.W		D2				; more to come?
+			BEQ.S		DefExitOK		; no, all done
+			MOVE.B		(A2)+,D3		; D3.B = selector
+			BNE.S		@2				; 0 if skip bytes
+			SUBQ.W		#2,D2			; type = kdSkip
+			MOVEQ		#0,D0
+			MOVE.B		(A2)+,D0		; D0.W = # of bytes
+			ADDA.W		D0,A0			; skip N bytes
+			ADDA.W		D0,A1
+			BRA.S		DefLoop
+
+@2		;; not kdSkip:	A2.l=ptr(KD), A0 = search key, A1 = trial key, D1.b=string attr
+		;;				D2.w=KD length, D3.b=D5=KD type, D4.w=buffer size (if FLString)
+			MOVEQ		#0,D5
+			MOVE.B		D3,D5
+			LEA			kCmpTable,A3	; use jump table
+			LEA			updStrPtr,A5	; string update routine
+			CMPI.B		#kdString,D3	; is it string?
+			BEQ.S		doCompare		; yes
+			CMPI.B		#kdFLString,D3	; is it FL string?
+			BNE.S		common			; no, forget it
+		;; FL string: need different string update routine and need to get
+		;;			  buffer length from the key descriptor
+			LEA			updFLStrPtr,A5	; string update routine
+			MOVEQ		#0,D4
+			MOVE.B		(A2)+,D4		; D4.W = string buffer len
+			SUBQ		#1,D2			; D2-1 for buffer length byte
+			BRA.S		doCompare		; string
+		;; not string => byte, word or long are common here, string is special case
+common		MOVEQ		#0,D3			; clear high byte, it could be -1 from DBRA loop <11Aug89>
+			MOVE.B		(A2)+,D3		; # of occurrence
+			SUBQ		#1,D3			; for loop index
+			SUBQ.W		#2,D2			; KD length - 2
+
+doCompare	SUBQ		#1,D5			; make selector offset from 0
+			ADD			D5,D5
+			ADDA.W		(A3,D5),A3
+			JSR			(A3)			; do the comparison
+			BNE.S		DefExit			; not equal, stop
+			BRA.S		DefLoop
+
+DefExit		TST			D0
+			MOVEM.L		(SP)+,D2-D5/A2-A3/A5
+			RTS
+DefExitOK	MOVEQ		#0,D0			; no error
+			BRA.S		DefExit
+
+
+;___________________________________________________________________
+; Input:	A0,A1= first char of Keys; D0 is free, D4.W=buffer length
+; Function: Update key pointer to pass the fixed-length string (points to next field)
+;___________________________________________________________________
+updFLStrPtr	SUBQ.W		#1,D4			; exclude length byte
+			ADDA.W		D4,A0			; points to next FL string
+			ADDA.W		D4,A1
+		;; in case there is more than 1 occurrence (fixed length string)
+		;; so D4 should be restored for next reference !
+			ADDQ.W		#1,D4
+			RTS
+
+;___________________________________________________________
+; Input:	A0,A1= first char of Keys; D0 is free
+; Function: Update key pointer to pass the string (points to next field)
+;___________________________________________________________
+updStrPtr	MOVEQ		#0,D0
+			MOVE.B		-1(A0),D0		; points to length byte !!
+			ADDA.W		D0,A0
+			MOVE.B		-1(A1),D0		; points to length byte !!
+			ADDA.W		D0,A1
+			RTS
+
+kCmpTable	DC.W		unByteCmp-kCmpTable		; 1
+			DC.W		sByteCmp -kCmpTable		; 2
+			DC.W		StrCmp   -kCmpTable		; 3
+			DC.W		unWordCmp-kCmpTable		; 4
+			DC.W		sWordCmp -kCmpTable		; 5
+			DC.W		unLongCmp-kCmpTable		; 6
+			DC.W		sLongCmp -kCmpTable		; 7
+			DC.W		StrCmp   -kCmpTable		; 8 FLString share the same code as 3
+
+;_________________________________________________________________________________
+;; Input: A0,A1=Keys, A2=KD (occurrence, keyattr), A4=BTCB, A5=key update routine
+;;		  D2.W =KD len, D4 = fixed string buffer length if type = kdFLstring
+;; D0,D1,D3,A3 are free
+;; each compare routine is responsible for updating A0,A1,A2 and D2!
+;_________________________________________________________________________________
+StrCmp
+			MOVE.B		(A2)+,D3	; # of occurrence
+			MOVE.B		(A2)+,D1	; string attr
+			SUBQ.W		#3,D2		; string uses 3 bytes
+
+strcmpLoop	MOVEQ		#0,D0
+			MOVE.B		(A0)+,D0	; search key length
+			SWAP		D0			; in high-order word
+			MOVE.B		(A1)+,D0	; low-order word
+			;; A0, A1 points to the first char of the string
+			CMPI.B		#casesen+diacNsen,D1
+			BEQ.S		@4
+			CMPI.B		#diacNsen,D1
+			BEQ.S		@6
+			CMPI.B		#casesen,D1
+			BEQ.S		@8
+
+@2			_RelString				; anything else
+			BRA.S		strcmpExit
+@4			_RelString	,MARKS ,CASE
+			BRA.S		strcmpExit
+@6			_RelString ,MARKS		; diacSens=False, caseSens=False
+			BRA.S		strcmpExit
+@8			_RelString	,CASE		; diacSens=True, caseSens=True
+
+strcmpExit	;; D0 already set, make sure CR unchanged when return
+			BNE.S		@6			; stop
+			SUBQ.B		#1,D3		; another string?
+			BEQ.S		@2			; no, all done
+			;; do we need to update A0 and A1 ? => yes
+			JSR			(A5)		; update string pointers
+			BRA.S		strcmpLoop
+
+@2			MOVE.W		D0,-(SP)	; save result
+			TST.W		D2			; more key to compare?
+			BEQ.S		@4			; br if no
+			JSR			(A5)		; update key pointers (points to next key)
+@4			MOVE.W		(SP)+,D0
+			TST.W		D0			; result of sting comp
+@6			RTS
+
+
+;____________________________________________________________________
+; unsigned byte, word, long compare routine
+; Input: A0,A1=Keys, A2=KD (occur and keyattr), A4=BTCB, D2.W=KD len
+;		 A2=updated KDptr, D2.W=updated KD len, D3=occurrence-1.
+;		 D0,D1,A3 are free
+;		 each compare routine is responsible for updating A0,A1!
+;____________________________________________________________________
+unByteCmp
+@2			CMP.B		(A1)+,(A0)+
+			DBNE		D3,@2
+
+;____________________________________________________________________
+; Function:	unsigned byte, word, long compare routine common return handler
+; Input:	condition code set
+; Output:	set D0 and return (unsigned)
+;____________________________________________________________________
+UnsCmpRet	BHI.S	 	SKIsHI 			; search ParID > trial parID ->
+			BLO.S	 	SKIsLO 			; search ParID < trial parID ->
+			MOVEQ		#0,D0			; search ParID = trial parID
+			BRA.S		CmpExit
+SKIsHI		MOVEQ		#1,D0
+			BRA.S		CmpExit
+SKIsLO		MOVEQ		#-1,D0
+CmpExit		TST.W		D0
+			RTS
+
+;____________________________________________________
+; unsigned word
+;____________________________________________________
+unWordCmp
+@2			CMP			(A1)+,(A0)+
+			DBNE		D3,@2
+			;; set D0 and return
+			BRA.S		UnsCmpRet
+
+;_____________________________________________________
+; unsigned long
+;_____________________________________________________
+unLongCmp
+@2			CMP.L		(A1)+,(A0)+
+			DBNE		D3,@2
+
+			;; set D0 and return
+			BRA.S		UnsCmpRet
+
+;____________________________________________________________________
+; Signed byte compare routine
+; Input: A0,A1=Keys, A2=KD (occur and keyattr), A4=BTCB, D2.W=KD len
+;		 A2=updated KDptr, D2.W=updated KD len, D3=occurrence-1.
+;		 D0,D1,A3 are free
+;		 each compare routine is responsible for updating A0,A1!
+;____________________________________________________________________
+sByteCmp
+@2			CMP.B		(A1)+,(A0)+
+			DBNE		D3,@2
+;; common return code, set D0 and return
+sCmpRet		BGT.S	 	SKIsGT 			; search ParID > trial parID ->
+			BLT.S	 	SKIsLT 			; search ParID < trial parID ->
+			MOVEQ		#0,D0			; search ParID = trial parID
+			BRA.S		sCmpExit
+SKIsGT		MOVEQ		#1,D0
+			BRA.S		sCmpExit
+SKIsLT		MOVEQ		#-1,D0
+sCmpExit	TST.W		D0
+			RTS
+
+;____________________________________________________
+; signed word
+;____________________________________________________
+sWordCmp
+@2			CMP			(A1)+,(A0)+		; compare word
+			DBNE		D3,@2
+			;; set D0 and return
+			BRA.S		sCmpRet
+
+;____________________________________________________
+; signed long
+;____________________________________________________
+sLongCmp
+@2			CMP.L		(A1)+,(A0)+		; compare long
+			DBNE		D3,@2
+			;; set D0 and return
+			BRA.S		sCmpRet
+
+
+; internal routines:
+;_______________________________________________________________________
+; Routine:	checkKD
+; Function:	key descriptor syntax check
+; Input:	(A0.L = pointer to ioparam, D1.W = trap word)
+;			 A1 = ptr(kd), D0.W = btKDLenErr (length error)
+; Modification History:
+;	04Jan90	KSCT	added check for kdDTString type. This is used by DTDBMgr only,
+;					and the kd should = 2,9,1 (total length = 2)
+;	04Jan91	KSCT	Took out the kdDTString type support.
+;_______________________________________________________________________
+checkKD		MOVEQ	#0,D2
+			MOVE.B	(A1)+,D2			; KD length
+			BEQ.S	typeExit			; if KD = 0, punt
+			CMPI.W	#kdMaxLen,D2		; is it too big?
+			BLS.S	ckType				; br if OK
+typeExit	TST.W	D0
+			RTS
+
+;; validate each KD type
+ckType		MOVE.W	#btKDTypeErr,D0		; KD type err
+			MOVEM.L	D1/D3-D4,-(SP)		;						<1/4/90>
+			MOVE	D2,D4				; save total KD length	<1/4/90>
+typeLoop	TST.W	D2					; all done?
+			BNE.S	typeLoop1			; no
+tLoopDone	MOVEQ	#0,D0				; yes, no error
+			BRA.S	tloopEnd			; ready to leave
+typeLoop1	MOVE.B	(A1)+,D1			; D1.B = type
+			CMPI.B	#kdReserved,D1		; this is only allowed to be used by DTDB
+			BEQ.S	tloopEnd			; this type is not used			<03Jan91 #33>
+			
+			CMPI.B	#kdUseKCProc,D1		; is this special type?			<29Mar90>
+			BNE.S	@1					; good, it's not				<29Mar90>
+		;; DT's KD should be "2,9,1", useKC should be "2,10,1"			<29Mar90>
+@0			CMPI	#2,D4				; total KD length = 2 ?			<29Mar90>
+			BNE.S	tloopEnd			; if not then punt=>			<29Mar90>
+@1			SUBQ.W	#2,D2				; consume at least 2 bytes
+			BMI.S	tloopEnd			; total length error, punt
+			MOVEQ	#0,D3
+			MOVE.B	(A1)+,D3			; D3.B = occurrence (or buffer len if FL string)
+			BEQ.S	tloopEnd			; can't = 0
+			CMPI.W	#maxOccur,D3		; happen too many times?
+			BHI.S	tloopEnd			; br if error
+		;; # of occurrence is OK, (or FL string buffer is OK)
+			CMPI.B	#kdString,D1		; is this a string?
+			BEQ.S	@2					; yes
+			CMPI.B	#kdFLString,D1		; is this a FLstring?
+			BNE.S	@6					; no
+		;; here, type is a Fixed Length string, check occurrence and string attr
+		;; buffer length has been checked, it is not zero.
+			SUBQ.W	#1,D2				; consume 1 more byte for buffer len
+			MOVE.B	(A1)+,D3			; D3.B = occurrence
+			BEQ.S	tloopEnd			; can't = 0
+			CMPI.W	#maxOccur,D3		; happen too many times?
+			BHI.S	tloopEnd			; br if error
+		;; here, type is string, check string attr
+@2		;; code shared with Fixed Length string type
+			MOVE.B	(A1)+,D3			; D3.B = attr
+			SUBQ.W	#1,D2				; consume 1 more byte for attr
+			BMI.S	tloopEnd			; total length error, punt
+			ANDI.B	#keyAttrmsk,D3		; attr OK? (not a valid KD type)
+			BEQ.S	typeLoop			; valid key attr
+			MOVE.W	#BTKeyAttrErr,D0	; return with error
+			BRA.S	tloopEnd
+@6		;; not string and FLstring, then it must be one of general types
+			CMPI.B	#kdMaxnum,D1		; supported type?
+			BLO.S	typeLoop			; D1<max, type OK, continue
+tloopEnd	MOVEM.L	(SP)+,D1/D3-D4		; <1/4/90>
+			BRA.S	typeExit
+
+
+;______________________________________________________________________
+; Routine:	bitmapInit
+; Function:	Init the bitmap from A0 in the header/map node. 1 = used, 0 = free
+;			some optimization here, if more than 8 nodes, set the whole byte,
+;									if more than 16 nodes,set the whole word.
+; Inout:	A0 = bitmap, D2=size of the bitmap, D6=number of map nodes
+; output:	D6 = number of map node remains to be initialized
+;______________________________________________________________________
+bitmapInit
+			CMP.L	D2,D6				; occupy the whole bitmap?
+			BLO.S	initPart			; no
+	;; it takes the whole map, convert the size to words
+			SUB.L	D2,D6				; D6=nodes remaining
+			LSR.L	#4,D2				; divide by 16
+			SUBQ.L	#1,D2
+@1			MOVE	#$FFFF,(A0)+		; set the word
+			DBF		D2,@1
+			BRA.S	MNinitEnd
+
+initPart	;; init part of the map, this node does it all
+			CMPI	#8,D6				; more than 8 nodes?
+			BLO.S	initByte			; no
+			MOVE.B	#$FF,(A0)+
+			SUBQ	#8,D6				; take care of 8 nodes
+			BHI.S	initPart			; more to come
+
+initByte	;; init part of a byte
+			MOVEQ	#7,D2				; from bit 7
+initBitLoop	DBF		D6,initBit			; if not 0, go set a bit
+			MOVEQ	#0,D6				; all done
+MNinitEnd	RTS
+
+initBit		BSET	D2,(A0)				; mark as used
+			SUBQ.L	#1,D2				; next bit
+			BRA.S	initBitLoop			; continue
+
+;______________________________________________________________________
+; Routine:		checkey
+; Function:		make sure the user's key matches with the fields in the key descriptor.
+; Input:		A0=A3=user ioParam, A4=BTCB, A1=ptr(FCBs)
+; Return:		condition and error code set. D0=0 means OK
+; Trash:		A2,D1,D2
+;______________________________________________________________________
+checkey		MOVE.L	btcKeyCR(A4),D0		; kc routine					<28Mar90>
+			LEA		BTKCmp,A2			; my key compare routine		<28Mar90>
+			CMP.L	D0,A2				; are they using mine?			<28Mar90>
+			BEQ.S	@2					; yes, parse the key			<28Mar90>
+			MOVEQ	#0,D0				; if not using mine,			<28Mar90>
+			BEQ		ckeyexit2			; don't parse, exit				<28Mar90>
+@2										;								<28Mar90>
+			MOVE.L	btcKDPtr(A4),D0
+			BEQ		ckeyexit2			; default key, exit
+			MOVEA.L	D0,A2				; A2 = KD ptr
+			MOVE.W	#btKeyFdErr,D0		; D0 = error code
+			MOVEM.L	A1/D3-D4,-(SP)		; save FCBsptr
+			MOVEA.L	ioBTKeyPtr(A0),A1	; A1 = ptr(user key)
+			MOVEQ	#0,D1
+			MOVE.B	(A1)+,D1			; D1.W = user key len
+			BLE.S	ckeyexit			; keyLen<=0, punt on error
+			MOVEQ	#0,D2				; zero out D2-D4
+			MOVE	D2,D3
+			MOVE	D2,D4
+			MOVE.B	(A2)+,D2			; D2.W = (system) KD len
+
+ckeyloop	TST		D1					; key exhausted?
+			BLE.S	ckeyexit			; <=0, punt on error
+			MOVE.B	(A2)+,D3			; D3 = key type
+			MOVE.B	(A2)+,D4			; D4 = occurrence (if not FL string)
+			SUBQ.W	#kdBytesPerKey,D2	; each field consumes 2 bytes
+
+			CMPI.B	#kdReserved,D3		; is it the special type?		<9/18/89>
+			BEQ.S	ckeyexit			; no longer used				<03Jan91 #33>
+			
+			CMPI.B	#kdSignedByte,D3	; is it byte operation?
+			BHI.S	notskip				; no
+	;; skip N bytes, unsigned and signed byte are all treated the same as byte
+	;; this takes care of type = 0, 1 and 2
+ckeycommon	SUB.W	D4,D1				; skip N bytes
+			ADDA.W	D4,A1				; points to next field
+			BRA.S	ckeyend
+notskip		CMPI.B	#kdString,D3		; is it string?
+			BEQ.S	@stringType			; yes
+			CMPI.B	#kdFLString,D3		; is it FL string?
+			BNE.S	@notstring			; no
+	;; here, it is a fixed length string
+			MOVE.B	D4,D3				; D3 = key buffer total length
+			MOVE.B	(A2)+,D4			; D4 = occurrence
+			SUBQ.W	#1,D4				; index -= 1
+			SUBQ.W	#kdBytesFLStr,D2	; FL string uses 2 byte more than others
+			ADDA	#1,A2				; skip attr byte!
+@2			SUB.W	D3,D1				; skip N bytes (buffer size)
+			ADDA.W	D3,A1				; points to next field
+			DBF		D4,@2				; continue if more FLstring
+			BRA.S	@stringEnd
+
+@stringType	;; yes, this is a string
+			SUBQ.W	#1,D4				; index -= 1
+			SUBQ.W	#kdBytesStr,D2		; string uses one byte more than others
+			ADDA	#1,A2				; bump KD ptr too!
+@3			MOVE.B	(A1)+,D3			; D3 = string length
+			SUB.W	D3,D1				; skip N bytes
+			SUBQ.W	#1,D1				; skip the length byte too!
+			ADDA.W	D3,A1				; points to next field
+			DBF		D4,@3				; continue if more string
+@stringEnd	MOVEQ	#0,D4				; clear high order byte
+			BRA.S	ckeyend
+
+@notstring	;; here, it must be either a word or long. D4=number of occurrence
+			ADD.W	D4,D4				; *2 (a word type, skip 2*N bytes)
+			CMPI.B	#kdSignedWord,D3	; is it Word?
+			BLS.S	ckeycommon			; yes, signed or unsigned word
+		;; here, it must be long, skip 4*N bytes
+			ADD.W	D4,D4				; *2 (skip 2*N more bytes)
+			BRA.S	ckeycommon			; use common code
+
+ckeyend		TST.W	D2					; more to come?
+			BNE.S	ckeyloop			; yes
+			TST.W	D1					; key len should = 0 too
+			BNE.S	ckeyexit			; error =>
+ckNewType	MOVEQ	#0,D0				; perfect
+ckeyexit	MOVEM.L	(SP)+,A1/D3-D4
+ckeyexit2	TST.W	D0					; set SR
+			RTS
+
+;______________________________________________________________________
+; Routine:		ChkSize
+; Function:		make sure the record size fits in the node, check both key and data
+; Input:		A0=key, D1.L=size of data, A4=BTCB
+; Return:		condition code set; <= 0 means OK.
+;				If not OK(>0), then D0 = error code, D2 = total record size
+;______________________________________________________________________
+ChkSize
+			MOVEQ	#0,D2
+			MOVE.W	#btnoFit,D0			; set error code = record too big
+			MOVE.B	(A0),D2				; get key length
+			BEQ.S	@2					; key length = 0?
+			CMP.W	btcKeyLen(A4),D2	; key too long?
+			BGT.S	@2					; yes
+
+			EXT.L	D2
+			BTST	#0,D2				; is it odd
+			BNE.S	@1					; yes,
+			ADDQ.L	#1,D2				; no, even (even key needs 2 more bytes)
+@1			ADDQ.L	#1,D2				; include length byte
+			BCLR	#0,D2
+			ADD.L	D1,D2				; total size  = key size + data size
+			CMPI.L	#MaxRecSize,D2		; is the record fit
+			BRA.S	@4					; CR and D0 set
+@2			;; key length too big or zero
+			MOVE	#btKeyLenErr,D0		; set error code
+			MOVE	#0,CCR				; set condition code (>0)
+@4			RTS
+
+; _________________________________________________________
+;; check if all hints are 0
+;; Input:	A3 = ioParam
+;; Ouput:	D1.L = write count; D2.L = Node #; D3.W = Index#
+; _________________________________________________________
+ZeroHints
+			MOVE.L	ioBTHint1(A3),D1	; write count
+			MOVE.L	ioBTHint2(A3),D2	; node #
+			MOVE	ioBTHint3(A3),D3	; index #
+			BNE.S	notzero
+			TST.L	D2
+			BNE.S	notzero
+			TST.L	D1
+notzero		RTS
+
+;_________________________________________________________________________________
+; Input:	(A2,D5)=refnum, A1=VCB, D1 is free
+; output:	D0=error code, A0 = ptr(buffer). Should always succeed.
+; Function: Get a free buffer, also clear it! The buffer is only used to initialize
+;			and update (xBTUpdateKD) the B*Tree file. 
+;			This function is sync since there is no I/O !
+;_________________________________________________________________________________
+GetaCBlock
+			MOVE	D5,D0
+			MOVE.L	A1,-(sp)			; free a1
+			MOVEa.L	FSVarsPtr,A1
+			MOVEA.L	fsVars.btMgr(A1),A1	; get BTvars
+			MOVEA.L	btBufQHdr(A1),A1	; A1 = buffer Qheader
+			MOVEQ	#kGBNoRead,D1		; indicate noRead
+			MOVEQ	#0,D2				; node=0
+			JSR		ExtGetBlock			;								<SM1>
+			BNE.S	@2					; no buffer?
+	;; buffer in A0 has marked inuse, clear it (just temp use by INIT)	<9/8/89>
+			LEA 	-lenbtBH(A0),A1		; A1 = ptr to CBH				<9/8/89>
+			BCLR	#CBHinuse,btBHFlags(A1) ; set not in-use			<9/8/89>
+			MOVEA.L	A0,A1				; A1=A0=ptr(buffer)
+	;; Clear the buffer. At INIT time, nodesize is a constant
+			MOVEQ	#(btnodesize/4 - 1),D1	; buffer length in long - 1
+@1			CLR.L	(A1)+				; clear the buffer
+			DBF		D1,@1				; continue
+@2			MOVEa.L	(sp)+,A1
+			TST		D0
+	IF btDebug THEN
+			BNE.S	@goof				; should never happen
+			RTS
+@goof		_Debugger
+
+	ELSE
+			RTS
+	ENDIF
+
+
+; _________________________________________________________________________
+; Input:	A3=ioParam, A4=BTCB, D0=error code, D1=0 if file has not changed
+; 			If D0=0, then D2=node hint, D3 is free
+; Output:	none, will not return
+; Function: Common return code for B*Tree calls. For a successful operation, the hint
+;			is updated, otherwise Hint2 and Hint3 are cleared, Hint1 unchanged. (except
+;			for BTSearch, if search failed, the insertion point is returned)
+;			Also, if the file has changed, we bump the write count.
+; _________________________________________________________________________
+BTReturn
+			TST.W	D0					; any error?
+			BEQ.S	BTRET1				; no, all right
+			BMI.S	@2					; branch if already negative
+			SUBI.W	#BTErrConst,D0		; make it negative
+
+@2			CLR.L	ioActCount(A3)		; no data is written
+			;; if error, write count unchanged, other hints are cleared (except BTSearch)
+			CLR.L	ioBTHint2(A3)		; no node
+			CLR.W	ioBTHint3(A3)		; no index
+			BRA.S	BTRET				; and return
+BTRET1		;; record inserted, get hints to application
+			;; A4 = BTCB
+			TST.B	D1					; BTree changed?
+			BEQ.S	BTRET2				; No, skip next
+			;; here, btree file has been changed, update LEOF !!
+			ADDQ.L	#1,BTCWcount(A4)	; bump write count
+			MOVE.L	FCBsptr,A1			; get FCBs						<20Aug90>
+			MOVE.W	ioRefNum(A3),D1		; and refnum					<20Aug90>
+			MOVE.L	FCBPLEN(A1,D1.W),D3	; D3.L = PEOF					<20Aug90>
+			CMP.L	FCBEOF(A1,D1.W),D3	; LEOF = PEOF?					<20Aug90>
+			BEQ.S	BTRET2				; already equal					<20Aug90>
+			MOVE.L	D3,FCBEOF(A1,D1.W)	; make LEOF = PEOF				<20Aug90>
+			BSET	#FCBModBit,FCBMdRByt(A1,D1.W)	; mark FCB dirty	<20Aug90>
+			BSR		ExtBTAdjEOF			; adjust other EOFs				<20Aug90>
+
+BTRET2		MOVE.L	BTCWcount(A4),ioBTHint1(A3)	; write count
+			MOVE.L	D2,ioBTHint2(A3)			; node #, don't use btcNodeM
+			MOVE.W	BTCIndexM(A4),ioBTHint3(A3)	; index #
+BTRET		BRA		ExtBTCmdDone
+
+			ENDPROC						; BTFuncs
+
+;__________________________________________________________________________________
+; Routine:	ExtIsBtree
+; Function:	Make sure the RefNum is good, the file is open and is a BTree file.
+; Input:	A0=user ioParam, D0.W=0 if request for write permission.
+; Output:	condition and error code set. D0=0 means OK, if D0=0 then A4=BTCB
+;			A1=FCB array,A2=VCB,D1=RefNum,D2 trashed by RfnCall.
+;			A0 preserved.
+; Modification History:
+;	27Nov90		KSCT	Because we share BTCB for multiple access, we need to make sure
+;						the btcbRefNum in the BTCB is the current requested file.
+;__________________________________________________________________________________
+ExtIsBtree	PROC	EXPORT
+			TST.W	D0					; write permssn request?
+			BEQ.S	@2					; yes
+			BSR		btRfNCall			; no, verify the file is open only
+			BRA.S	@4
+
+@2			BSR		btTstMod			; check RfnCall and write Perm
+					; D1.W=RefNum, D2.L=file number,
+					; A1.L=ptr(FCB buffer start), A2.L=VCB pointer
+@4			BNE.S	@IsBtRet			; br if not open or write protected
+
+		IF NOT btDebugSYS THEN			; if debug, don't check	ID			<16Apr90>
+			MOVE.L  fcbFlNm(A1,D1),D0   ; Pick up the file number			<11/30/89>
+            CMP.L   #fsUsrCNID,D0       ; Check: is it a system B*-Tree?	<11/30/89>
+            BLO.S   @notBt	        	; If so, we're in trouble			<11/30/89>
+		ENDIF							; if debug, don't check				<16Apr90>
+
+			MOVE.L	FCBBTCBptr(A1,D1),D0; D0 = BTCB
+			BEQ.S	@notBt				; not btree
+			MOVEa.L	D0,A4				; A4=BTCB
+			CMP.B	#1,BTCRcount(A4)	; only 1 reference ?			<27Nov90 #30>
+			BEQ.S	@6					; yes							<27Nov90 #30>
+		;; If more than reference, then we need to make sure that the	<27Nov90 #30>
+		;; RefNum points to the same file that we are accessing.		<27Nov90 #30>
+			MOVE.W	ioRefNum(A0),D0		; accessing this file			<27Nov90 #30>
+			CMP.W	BTCRefNum(A4),D0	; they better be the same		<27Nov90 #30>
+			BEQ.S	@6					; cool =>						<27Nov90 #30>
+			MOVE.W	D0,BTCRefNum(A4)	; correct RefNum				<27Nov90 #30>
+
+@6			MOVEQ	#0,D0				; no error
+			BRA.S	@isBTRet
+@notBt		MOVE.W	#NotBTree,D0
+@IsBtRet	RTS
+
+
+	
+;______________________________________________________________________
+; Btree Manager's very own RfnCall
+; Version that doesn't set ReqstVol, destroying potential value
+; for the FS call in progress
+;______________________________________________________________________
+BtreeMgrRfNCall:	
+
+			MOVE.L	FCBSPtr,A1			; get ptr to FCBs
+			MOVEQ	#0,D1				; clear D1 high word
+			MOVE.W	IORefNum(A0),D1 	; get refnum
+
+			MOVEQ	#RfNumErr,D0		; Be pessimistic here...
+			MOVEQ	#0,D2				; Clear upper half of D2
+			MOVE.W	D1,D2				; Copy for check
+			DIVU	FSFCBLen,D2			; Divide by FCB size				<03Feb87>
+			SWAP	D2					; Get remainder in low word
+			SUBQ.W	#2,D2				; Remainder had better be 2 (length word)
+			BNE.S	@2					; If not, that's a bad refnum
+
+			CMP.W	(A1),D1 			; Refnum within range?
+			BCC.S	@2					; If too high, that's too bad.
+			MOVEQ	#FNOpnErr,D0		; Is this file actually open?
+			
+
+			MOVEA.L	FCBVPTR(A1,D1),A2	; get VCB pointer, too					<18Feb91 #36>
+			MOVE.L	FCBFlNm(A1,D1),D2	; get the file's filenum				<18Feb91 #36>
+			
+			BEQ.S	@2					; Sigh - and we were so close...
+			MOVEQ	#0,D0				; It's open - complete success!
+
+@2			TST.W	D0					; Set condition codes
+			RTS
+
+
+;______________________________________________________________________
+; Routine:		btRfNCall
+; Function:		make sure the file is open, if it returns ExtFSErr, then it's OK
+; Input:		A0=ioParam block (uses refnum), A1 is free
+; Output:		D0=0 means OK.  D1.W=RefNum, D2.L=file number,
+;								A1.L=ptr(FCB buffer start), A2.L=VCB pointer
+;______________________________________________________________________
+btRfNCall:
+				BSR		BtreeMgrRfnCall	; don't use ROM routine				<06Feb91 #35>
+				BEQ.S	@2				; no error
+				CMP		#ExtFSErr,D0	; external FS error?
+				BEQ.S	@NotAProblem	; that's not our problem
+				cmp.w	#volOffLinErr, d0	; volume off line?				<2.9>
+				bne.s	@2				; if not, then there's a real error <2.9>
+@NotAProblem:
+				MOVEQ	#0,D0			; external FS is OK for us
+@2				RTS
+
+;______________________________________________________________________
+; Routine:		btTstMod
+; Function:		make sure the file is open, if it returns ExtFSErr, then it's OK
+;				can't use ROM tstMod because it doesn't work for external FS
+; Input:		A0=ioParam block (uses refnum), A1 is free
+; Output:		D0=0 means OK.
+; Trash:		A1,A2,D1,D2 by jRfnCall
+;______________________________________________________________________
+btTstMod		BSR.S	btRfnCall		; file open?
+				BNE.S	tmExit2			; no
+				MOVEQ	#WrPermErr,D0	; check if file opened for write
+				BTST	#FCBWrtBit,FCBMdRByt(A1,D1.W)
+				BEQ.S	tmExit			; exit if no write permission
+				BSR.S	CVFlgs			; check if vol locked or wr protected
+tmExit			TST.W	D0				; return status flags set on error
+tmExit2			RTS
+
+;_______________________________________________________________________
+; Routine:		CVFlgs
+; Arguments:	  A2.L (input)	--	VCB pointer
+;				  D0.W (output) -- error code (volume locked, wr prot error)
+; Function: 	Check the volume's flags to see if modify requests are allowed.
+;_______________________________________________________________________
+CVFlgs		MOVEQ	#VLckdErr,D0		; assume volume locked
+			TST.W	VCBAtrb(A2) 		; volume locked?
+			BMI.S	CVExit				; br if so
+			MOVEQ	#WPrErr,D0			; assume diskette is write protected
+			TST.B	VCBAtrb+1(A2)		; bit 7=1 means write protected
+			BMI.S	CVExit				; br if so
+			MOVEQ	#0,D0				; otherwise, no error
+CVExit		RTS 						; that's all folks (BEQ FOR OK)
+
+			ENDPROC
+
+;______________________________________________________________________
+; Routine:	ExtCopyParam
+; Function:	Get BT private param in A3 then copy parameters from A0 to A3
+;			and set A0 = A3.
+; Inout:	A0 = user Param, A1/A3 are free
+; output:	A0=A3 = BT private Param, A0 trashed!
+;______________________________________________________________________
+ExtCopyParam	PROC	EXPORT
+			MOVEa.L	FSVarsPtr,A1
+			MOVEA.L	fsVars.btMgr(A1),A1
+			MOVEA.L	btVParam(A1),A3		; A3 = get BTParam
+
+			MOVEQ	#(btParamLen/4 - 1), D1		; param length in long - 1
+			MOVE.L	A3,-(SP)			; save A3
+;; before copy, we should zero the whole thing !!
+@5			CLR.L	(A3)+				; clear the param
+			DBF		D1,@5				; continue
+			MOVEA.L	(SP)+,A3			; restore BT param
+
+			MOVE	ioTrap(A0),ioTrap(A3)			; use async bit
+			MOVE.L	ioFileName(A0),ioFileName(A3)	; copy name
+			MOVE	ioVRefNum(A0),ioVRefNum(A3)		; copy vRefNum
+			MOVE.L	ioDirID(A0),ioDirID(A3)			; copy DirID
+			MOVEA.L	A3,A0				; A0=A3 is our param now
+			RTS
+			ENDPROC
+
+
+;______________________________________________________________________________
+; Routine:	ExtckClumpSize
+; Function:	Force D6 to be multiple of allocation block size so that _SetEOF
+;			will extend the file and make LEOF = PEOF.
+; Inout:	D6.L = clump size, A2.L = VCB
+; output:	D6.L = multiple of allocation block size and >= clump size
+;______________________________________________________________________________
+ExtckClumpSize	PROC	EXPORT				; used also by BtreeAlloc.a			<18Dec90 #32>
+		
+			MOVEM.L	D3/D4,-(SP)			; save D3, D4						<18Dec90 #32>
+			MOVE.L	VCBAlBlkSiz(A2),D4	; D4.L = allocation block size		<18Dec90 #32>
+			MOVE.L	D4,D3				; D3.L = D4.L						<18Dec90 #32>
+
+@3			CMP.L	D4,D6				; D6 = D4?							<18Dec90 #32>
+			BEQ.S	@ret				; yes, nothing to worry				<18Dec90 #32>
+			BMI.S	@less				; D6 < D4							<18Dec90 #32>
+			ADD.L	D3,D4				; D4 = D4+D3						<18Dec90 #32>
+			BRA.S	@3					; and continue						<18Dec90 #32>
+			
+@less		MOVE.L	D4,D6				; use this size						<18Dec90 #32>
+@ret		MOVEM.L	(SP)+,D3/D4			; restore D3, D4					<18Dec90 #32>
+			RTS							; and return						<18Dec90 #32>
+			ENDP
+
+;__________________________________________________________________________________
+; Routine:		ExtBTOpen									<SM1>
+; Function: 	patch to BTOpen --> BTCB has been extended, and we need to allocate
+;				storage for Key descriptor.
+; Input:		D3.W  - file refnum							<28Mar90>
+;				A0.L  -  pointer to key compare routine
+;				A1.L  -  pointer to cache queue
+;				A4.L  - BTParam								<SM3>
+;				A5.L  - ioParam								<28Mar90>
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							-n = FS Open error
+;							BTnoBTCB = no available BTCB
+;				Other registers preserved.
+;
+; Modification history:
+;	26Jul90		KSCT	Check header node should use the file's logical EOF,
+;						don't use physical EOF.
+;	12Jan92		KSCT	ROM (and AppleShare's) B*Tree file relies on that PEOF = LEOF.
+;						to make our file compatible with the old INIT, we set the LEOF=PEOF
+;						if they are not the same and update the # of nodes in the BTHeader.
+;						(This happens when you copy a B*Tree file from one disk to another.)
+;	02Jun92		KSCT	If the file is open read only, then don't try to modify the FCB.
+;						If we can write to the file, mark the cache buffer dirty too.	<#40><SM3>
+;	06Jul92		KSCT	It's not a good idea to modify the FCB directly because it does
+;						not work on a FileShare volume. Has to call SetEOF().			<#41><SM3>
+;__________________________________________________________________________________
+ExtBTOpen	PROC	EXPORT						;							<SM1>
+			IMPORT	ExtGetBlock, ExtRelBlock, MarkDirty, ExtDoAOCRWF	;	<SM1><SM3>
+
+			MOVE.L	 (SP)+,-(A6)		; save return address on A6 stack
+			MOVEM.L  D1-D6/A0-A4,-(A6)	; save regs							<SM3>
+	;		MOVE.W	 D0,D3				; D3 = file refnum					<28Mar90>
+			MOVE.L	 A0,D4				; D4 = ptr(key compare routine)
+			MOVE.L	 A1,D5				; D5 = cache queue ptr
+			MOVE.L	 A4,D6				; D6 = BTParam						<SM3>
+;
+; allocate and initialize a BTCB
+			MOVE.L	#lenBTCB70,D0		; allocate space for BTCB
+			_NewPtr	,SYS,CLEAR			;
+			BNE		ptBOExit1			; couldn't get it ->
+			MOVEA.L	A0,A4				; A4 = BTCB ptr
+			MOVEA.L	FCBSPtr,A3			; A3 = start of FCB array
+			MOVE.L	A4,FCBBTCBptr(A3,D3.W) ; set BTCB ptr in FCB
+			MOVE.W	 D3,BTCRefNum(A4)	; set refnum
+			MOVE.L	 D4,BTCKeyCR(A4)	; set ptr(key compare routine)
+			MOVE.L	 D5,BTCCQptr(A4)	; set ptr to cache queue
+;
+; get BTH from disk
+			MOVE.W	 D3,D0				; file refnum
+			MOVEA.L  D5,A1				; cache queue ptr
+			MOVEQ	 #0,D1				; no GetBlock options (read if not read)
+			MOVEQ	 #0,D2				; BTH is block 0
+			JSR		 ExtGetBlock		; get the block			<SM1>
+			BNE		 ptBOExit1			; couldn't get it ->
+			MOVEA.L  A0,A2				; A2 = cache buffer ptr (header)
+;
+; make sure the BTree header node is ok
+BOChkHdr
+			LEA 	lenND(A2),A0		; A0 = ptr to BTH
+			MOVE.W	BTHNodeSize(A0),D0	; node size
+			BEQ.S	BOBadHdr			; node size = 0, error ->
+			MOVE.W	D0,D1				;
+			ANDI.W	#$1FF,D1			;
+			BNE.S	BOBadHdr			; node size not 512 multiple, error ->
+
+			MOVE.L	fcbEof(A3,D3.W),D2	; logical length					<26Jul90>
+			DIVU	D0,D2				; logical length / node size		<12Jan92 #38>
+			SWAP	D2					;	= # of nodes
+			CLR.W	D2					;
+			SWAP	D2					;
+			CMP.L	BTHNNodes(A0),D2	; same # as in BTH?
+			BNE.S	BOBadHdr			; no, error ->
+			CMP.L	BTHFree(A0),D2		; free count < # of nodes?
+			BLO.S	BOBadHdr			; no, error ->
+			SUBQ.L	#1,D2				; D2 = max node #
+
+			CMPI.W	#ExtBTMaxDepth,BTHDepth(A0) ; tree depth <= max?		<11Apr90><SM1>
+			BHI.S	BOBadHdr			; no, error ->
+
+			CMP.L	BTHRoot(A0),D2		; root node # <= max?
+			BLO.S	BOBadHdr			; no error ->
+
+			CMP.L	BTHFNode(A0),D2 	; 1st leaf node # <= max?
+			BLO.S	BOBadHdr			; no error ->
+
+			CMP.L	BTHLNode(A0),D2 	; last node # <= max?
+			BHS.S	BOCpyBTH			; yes -> all OK
+BOBadHdr
+		;; A bad header, return this is not a B*Tree ...
+		;; buffer in A0 has marked inuse, clear it.							<20Jun90>
+			LEA 	-lenND(A0),A0		; A0 = ptr to buffer				<20Jun90>
+			LEA 	-lenbtBH(A0),A0		; A0 = ptr to CBHdr					<20Jun90>
+			BCLR	#CBHinuse,btBHFlags(A0) ; set not in-use				<20Jun90>
+			MOVEQ	#BTBadHdr,D0		; result = 'bad header node'
+BOBadHdr2	MOVE.W	 D0,-(A6)			; save result code
+			MOVEA.L	A4,A0
+			_DisposPtr					; release BTCB
+			MOVE.W	 (A6)+,D0			; restore result code
+			BRA		ptBOExit			; ->
+
+BOCpyBTH
+		;; The header (A2) looks good, so continue BTOpen (A0 = ptr to BTH) ...
+		;; We set the LEOF = PEOF if they are not the same...				<12Jan92 #39>
+
+			MOVE.L	FCBPLEN(A3,D3.W),D1	; D1.L  = PEOF						<12Jan92 #39>
+			SUB.L	FCBEOF(A3,D3.W),D1	; LEOF <= PEOF?						<12Jan92 #39>
+			BLS.S	@eq					; br if not							<12Jan92 #39>
+
+		;; If the file is open read only, then skip all the nonsense !		<02Jun92 #40><SM3>
+			BTST	#fcbFlgWBit,fcbFlags(A3,D3.W)	; can we write to it?	<02Jun92 #40><SM3>
+			BEQ.S	@eq					; no, so don't update				<02Jun92 #40><SM3>
+			
+		;; PEOF > LEOF, we force them to be equal here ...					<12Jan92 #39>
+			
+			MOVEM.L	A0/D1,-(A6)			; free A0/D1						<06Jul92 #41><SM3>
+			MOVEA.L	D6,A0				; get BTParam						<06Jul92 #41><SM3>
+			MOVE.L	FCBEOF(A3,D3.W),D0	; get current LEOF					<06Jul92 #41><SM3>
+			ADD.L	D1,D0				; update LEOF						<06Jul92 #41><SM3>
+			MOVE.L	D0,IOLEOF(A0) 		; set new eof						<06Jul92 #41><SM3>
+	
+			MOVEQ	#DoSetEOF,D1		; indicate this is SetEOF			<06Jul92 #41><SM3>
+			BSR		ExtDoAOCRWF			; A1 is free						<06Jul92 #41><SM3>
+			MOVEM.L	(A6)+,A0/D1			; restore A0/D1						<06Jul92 #41><SM3>
+			BNE.S	@eq	 				; no disk space ->					<06Jul92 #41><SM3>
+			
+		;; Update the # of nodes in the BTHeader too.						<12Jan92 #39>
+			MOVE.W	BTHNodeSize(A0),D0	; node size							<12Jan92 #39>
+			DIVU	D0,D1				; (physical length - logical)		<12Jan92 #39>
+			SWAP	D1					;	/ node size						<12Jan92 #39>
+			CLR.W	D1					;	= # of nodes to add				<12Jan92 #39>
+			SWAP	D1					;									<12Jan92 #39>
+			ADD.L	D1,BTHNNodes(A0)	; update total nodes				<12Jan92 #39>
+			ADD.L	D1,BTHFree(A0)		; update free  nodes				<12Jan92 #39>
+		;; So far, we fixed everything except writing to disk. Mark the buffer dirty ...
+		;; FCB has been marked dirty by SetEOF() call ...
+			JSR		MarkDirty			; mark A2 node dirty too			<19May92 #40><SM3>
+
+@eq
+		;; now copy BTH into BTCB ...
+			MOVE.W	 #lenMemBTH70-1,D0	; loop index
+			LEA 	 lenND(A2),A0		; ptr(source)
+			LEA 	 BTCDepth(A4),A1	; ptr(dest)
+@1			MOVE.B	 (A0)+,(A1)+		; move it
+			DBRA	 D0,@1				; ...in
+
+	;; The followings are for B*Tree Manager only (extention to BTCB):
+	;; Type 0 .. 127 and $FF uses fixed length index key,
+	;; Type $FE uses variable length index key and supports large data record. 
+	;; This version of B*Tree Manager can not access $FE Btree files !!		<13Mar90>
+			MOVE.B	bthBTType+lenND(A2),D0	; D0.B = Btree type				<13Mar90>
+			CMPI.B	#validBTType,D0			; user B*tree?					<13Mar90>
+			BLO.S	@archaic				; no, system or AppleShare,or ..<13Mar90>
+			CMPI.B	#userBT1Type,D0			; user TYPE1?					<13Mar90>
+			BEQ.S	@archaic				; yes							<13Mar90>
+			MOVE.W	#btVersionErr,D0		; can't access new type files	<13Mar90>
+			BRA		BOBadHdr2				; exit							<13Mar90>
+@archaic
+			MOVE.B	D0,btcType(A4)			; set Btree type
+
+	;; set clump size, write count and reference count for this BTree file !!
+			MOVE.L	btcClump(A4),D0			; do we have clump?				<10/3/89>
+			BNE.S	@2						; yes							<10/3/89>
+	;; AppleShare B*Tree file's clumpsize = 0, too bad!						<10/3/89>
+			MOVEA.L	FCBVPtr(A3,D3.W),A1		; A1 = VCB						<10/3/89>
+			MOVE.L	VCBClpSiz(A1),D0		; use volume clump size			<10/3/89>
+
+@2			MOVE.L	D0,fcbClmpSize(A3,D3)	; (56)							<10/3/89>
+			MOVE.L	#WCSigLong,BTCWcount(A4); set write count (60)
+			MOVE.B	#1, BTCRcount(A4)		; set reference count (68)
+			MOVEQ	#0,D0
+			MOVE.B	kdPtr(A2),D0		; key descriptor length
+			BNE.S	@3					; has KD							<23Feb90>
+	;; It is an error if there is no KD.									<23Feb90>
+	;; Since we now support user's KCmp routine, we open and fake a key descriptor...
+			MOVE.W	#btNoKDErr,D0		; preset error code					<28Jan91 #34>
+			TST.L	ioBTKCProc(A5)		; does user specify KC proc?		<28Jan91 #34>
+			BEQ.S	ptBOExit			; no KD and no KC routine			<28Jan91 #34>
+			BRA.S	@9					; continue ...						<28Jan91 #34>
+@3	;; D0.L = key descriptor length
+			MOVEQ	#1,D1				; next byte is type					<28Mar90>
+			MOVE.B	kdPtr(A2,D1),D1		; key descriptor type				<28Mar90>
+			CMPI.B	#kdUseKCProc,D1		; use private proc?					<28Mar90>
+			BNE.S	@4					; no, use KD						<28Mar90>
+			MOVE.L	ioBTKCProc(A5),D1	; does user specify KC proc?		<28Mar90>
+			BNE.S	@4					; Yes, use theirs					<28Mar90>
+			MOVE	#btNoKCProcErr,D0	; return error						<28Mar90>
+			BRA.S	ptBOExit			; no key descriptor					<28Mar90>
+
+@4			ADDQ.W	#1,D0				; include length byte
+			_NewPtr	,SYS,CLEAR
+			BNE.S	BOBadHdr2			; couldn't get it ->
+			MOVE.L	A0,btcKDPtr(A4)		; store it in BTCB (64)
+			LEA		kdPtr(A2),A1		; source
+			MOVEQ	#0,D0
+			MOVE.B	kdPtr(A2),D0		; key descriptor length
+@5			MOVE.B	(A1)+,(A0)+			; copy it
+			DBRA	D0,@5				;  ....in 
+@9
+			CLR.W	 D0 				; result = 'ok'
+
+ptBOExit	; release header block and exit
+			MOVE.W	 D0,-(A6)			; save result code
+			MOVEA.L  D5,A1				; cache queue ptr
+			MOVEQ	 #0,D1				; release 'clean'
+			MOVEA.L  A2,A0				; cache buffer ptr
+			JSR		 ExtRelBlock		;									<SM1>
+			BEQ.S	 @1 				; ok ->
+			MOVE.W	 D0,(A6)			; replace previous result code
+@1			MOVE.W	 (A6)+,D0			; restore result code
+
+ptBOExit1
+			MOVEM.L  (A6)+,D1-D6/A0-A4	; restore regs						<SM3>
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit BTOpen
+
+			ENDPROC
+
+			END

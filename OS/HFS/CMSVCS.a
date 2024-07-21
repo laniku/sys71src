@@ -1,0 +1,1082 @@
+;
+;	File:		CMSVCS.a
+;
+;	Contains:	These routines provide service functions used to access
+;				and maintain the file catalog.
+;
+;	Written by:	Bill Bruffey
+;
+;	Copyright:	© 1984-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM1>	 4/1/92		kc		Roll in CMCreateUpdateCNPatch, CMRenameCNAfterSetup,
+;									CMMoveCNAfterSetup, CMDeleteCNAfterSetup, 
+;									and CMCreateUpdateCNPatch from FileMgrPatches.a.
+;									¥ Pre-SuperMario comments follow ¥
+;		 <2>	 9/10/91	JSM		Add a header.
+;	   <1.2>	  3/2/89	DNF		removed references to forROM; HFS now builds identically for ram
+;									or rom
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	  <¥1.1>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				 9/25/86	BB		Updated to use new MPW equate files.
+;				12/15/85	BB		1st version.
+;				10/31/85	BB		CMRenameCN no longer updates the file or directory mod date.
+;				10/25/85	BB		Added a common CMSetUp subroutine. Added vector for ROM
+;									versions.
+;				10/16/85	BB		Modified all routines to use new new MOVEQ error code equates.
+;				  9/9/85	BB		Fixed CMCreateCN and CMRenameCN to handled partial catalog
+;									updates.
+;				  9/8/85	LAK		Call MarkVCBTime instead of MarkVCB since consistency check will
+;									be used to determine file and directory counts if VCB info is
+;									not flushed . . .
+;				  8/9/85	BB		Fixed bug in CMRenameCN which was trashing Finder info.
+;				  8/5/85	BB		Fixed bug in CMGetOff, was not converting error codes upon
+;									return from BTGetRecord.
+;				 7/26/85	BB		Added calls to MarkVCB to set the VCB dirty. Also added code to
+;									set the modification date for updated directories.
+;				 7/25/85	BB		Modified CMCreateCN and CMRenameCN to truncate CName's in thread
+;									records to max length.
+;				 7/10/85	BB		Added calls to CMFlush.
+;				  7/2/85	BB		Modified CMRenameCN to rename an existing CNode. Modified
+;									CMMoveCN to handle a null move, i.e., a move to the same parent
+;									directory.
+;				 6/27/85	BB		Changed internal error code 'CMbadmove' to TFS global error code
+;									'BadMovErr'.
+;				 6/20/85	PWD		Changed to use system CNode equates Changed to use VCBNxtCNID
+;									for file numbers and DirIDs.
+;				 6/12/85	BB		Added check for invalid move operation to CMMoveCN.
+;				 5/30/85	BB		Fixed CMGetOff to invalidate directory and offspring markers
+;									when an error condition is detected.
+;				 5/16/85	BB		Cleaned the code up some.
+;				 4/21/85	BB		Added use of directory and offspring markers for catalog
+;									enumeration.
+;				 3/30/85	BB		Replaced use of memory manager for CM vars allocation with A6
+;									stack based allocation.
+;				 3/15/85	BB		Modified to use A6 stack.
+;				 3/14/85	BB		Change names of CM service routines.
+;				  3/7/85	BB		Modified to support the existence of a root directory record.
+;				 2/12/85	BB		Added save/restore for scratch registers
+;				12/11/84	BB		Birth.
+;
+;
+
+;_________________________________________________________________________________
+;
+; External
+;  Routines:	 CMCreateCN   -  Creates a new directory or file CNode.
+;				 CMDeleteCN   -  Deletes an existing directory or file CNode.
+;				 CMGetCN	  -  Locates an existing directory or file CNode.
+;				 CMGetOff	  -  Gets an offspring record from a directory.
+;				 CMMoveCN	  -  Moves an existing directory or file CNode to
+;								 another directory CNode.
+;				 CMRenameCN   -  Renames an existing directory or file CNode.
+;				 CMUpdateCN   -  Marks a Catalog BTree node as 'dirty'.
+;
+;_________________________________________________________________________________
+
+
+			BLANKS		ON
+			STRING		ASIS
+
+			PRINT		OFF
+			LOAD		'StandardEqu.d'
+			PRINT		ON
+			PRINT		NOGEN
+
+CMSvcs		PROC	EXPORT
+
+			EXPORT	CMCreateCN,CMDeleteCN,CMGetOff
+			EXPORT	CMGetCN,CMMoveCN,CMRenameCN,CMUpdateCN
+
+			EXPORT	vCMSetUp,CMSetUp
+
+			IMPORT	BTGetRecord,BTDelete,BTInsert,BtSearch,BTUpdate
+			IMPORT	BuildKey,CMFlush,LocCNode,LocCRec,UpdCName
+			IMPORT	MarkVCB
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		CMCreateCN (Create CNode)
+;
+; Function: 	Creates a new directory or file CNode.	A new directory or file
+;				record is added to the catalog BTree.  If a directory CNode is
+;				being created, a new thread record is also added.
+;
+; Input:		A2.L  -  VCB pointer
+;				D0.L  -  parent DirID
+;				A0.L  -  CName pointer
+;				D1.L  -  new CNode type (low byte in lower half)
+;							 CMDirCN - directory
+;							 CMFilCN - file
+;						 file type (low byte of upper half)
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 CMexists = CNode already exists
+;							 CMnotfound = parent directory not found
+;							 -n = IO error
+;				D1.L  -  DirID of new directory CNode
+;				D2.L  -  new catalog hint
+;_________________________________________________________________________________
+
+CMCreateCN
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D3-D7/A0-A4,-(A6)	; save regs
+;
+; set up some initial stuff
+;
+			BSR 	 CMSetUp			; common set up routine 				   <25Oct85>
+
+			CLR.L	 VCBDirIDM(A2)		; invalidate current DirID marker
+
+			MOVE.L	 D1,D5				; D5 = CNode type / file type
+			MOVE.L	 D0,D3				; D3 = parID
+			MOVEA.L  A0,A3				; A3 = CName pointer
+;
+; make sure parent exists
+;
+			SUBA.L	 A0,A0				; no Cname
+			MOVEQ	 #0,D2				; no hint
+			JSR 	 locCRec			; locate the parent's thread record
+			BNE 	 CCExit1			; error ->
+;
+; build key for new CNode
+;
+			MOVE.L	 D3,D0				; parID
+			MOVEA.L  A3,A0				; CName pointer
+			LEA 	 ckrOff(A4),A1		; addr(key record buffer)
+			JSR 	 BuildKey			; build the key record
+
+;
+; initialize catalog data record (cdr) for directory or file
+;
+			LEA 	 cdrOff(A4),A1		; addr(data record buffer)
+			MOVEA.L  A1,A0				; clear
+			MOVE.W	 #(lencdr/2)-1,D0	;
+@2			CLR.W	 (A0)+				;
+			DBRA	 D0,@2				; ...the record first
+			MOVE.B	 D5,cdrType(A1) 	; set record type
+			MOVE.L	 Time,D2			; D2 = current date/time
+
+			CMPI.B	 #CMDirCN,D5		; creating a directory?
+			BNE.S	 @3 				; no ->
+			MOVE.L	 VCBNxtCNID(A2),D6	; assign it a DirID
+			MOVE.L	 D6,dirDirID(A1)	;
+			ADDQ.L	 #1,vcbNxtCNID(A2)	; bump next available CNode ID
+			MOVE.L	 D2,dirCrDat(A1)	; set creation date/time
+			MOVE.L	 D2,dirMdDat(A1)	; set date/time of last modified
+			MOVEQ	 #lendir,D1 		; D1 = size of directory data record
+			BRA.S	 CCAddRec			; add new record ->
+
+@3			MOVE.L	 D2,filCrDat(A1)	; set creation date/time
+			MOVE.L	 D2,filMdDat(A1)	; set date/time of last modified
+			MOVE.L	 VCBNxtCNID(A2),filFlNum(A1) ; assign it the next file number
+			ADDQ.L	 #1,VCBNxtCNID(A2)	;
+			SWAP	 D5 				; set file type
+			MOVE.B	 D5,filTyp(A1)		;
+			SWAP	 D5 				;
+			MOVEQ	 #lenfil,D1 		; D1 = size of file data record
+;
+; add new directory/file record to catalog BTree
+;
+CCAddRec
+			MOVE.W	 VCBCtRef(A2),D0	; refnum of catalog file
+			LEA 	 ckrOff(A4),A0		; addr(key record buffer)
+			JSR 	 BTInsert			; insert the record
+			BEQ.S	 @1 				; ok ->
+			CMP.W	 #BTexists,D0		; does CNode already exist?
+			BNE 	 CCExit1			; no, some other error ->
+			MOVEQ	 #CMexists,D0		; set CM result code		  <16Oct85>
+			BRA 	 CCExit1			; exit ->
+@1			MOVE.L	 D2,D7				; D7 = new hint
+;
+; build thread record for new directory CNode
+;
+CCBldThd
+			CMPI.B	 #CMDirCN,D5		; creating a directory?
+			BNE.S	 CCUpdPar			; no ->
+
+			MOVE.L	 D6,D0				; parID = new directory ID
+			SUBA.L	 A0,A0				; no CName
+			LEA 	 ckrOff(A4),A1		; addr(key record buffer)
+			JSR 	 BuildKey			; build the key record
+
+			LEA 	 cdrOff(A4),A1		; clear
+			MOVE.W	 #(lenthd/2)-1,D0	;
+@1			CLR.W	 (A1)+				;
+			DBRA	 D0,@1				; ...the record first
+
+			LEA 	 cdrOff(A4),A1		; addr(thread record)
+			MOVE.B	 #cdrThdRec,cdrType(A1) ; set record type
+			MOVE.L	 D3,thdParID(A1)	; set parent ID
+
+			MOVEA.L  A3,A0				; source = input CName
+			LEA 	 thdCName(A1),A1	; dest = thread record CName
+			JSR 	 UpdCName			; move in the CName 		  <09Sep85>
+;
+; add thread record to catalog BTree
+;
+			MOVE.W	 VCBCtRef(A2),D0	; refnum of catalog file
+			MOVE.W	 #lenthd,D1 		; length of thread record
+			LEA 	 ckrOff(A4),A0		; addr(key record)
+			LEA 	 cdrOff(A4),A1		; addr(thread record)
+			JSR 	 BTInsert			; insert the record
+			BEQ.S	 CCUpdPar			; ok ->
+;
+; couldn't add thread record, delete newly created directory record and exit
+;
+			MOVE.L	 D0,-(A6)			; save result code			 <09Sep85>
+
+			MOVE.L	 D3,D0				; parID 					 <09Sep85>
+			MOVEA.L  A3,A0				; CName pointer 			 <09Sep85>
+			LEA 	 ckrOff(A4),A1		; ptr(key record buffer)	 <09Sep85>
+			JSR 	 BuildKey			; build the key record		 <09Sep85>
+
+			MOVEA.L  A1,A0				; ptr to key				 <09Sep85>
+			MOVE.W	 VCBCtRef(A2),D0	; refnum of catalog file	 <09Sep85>
+			JSR 	 BTDelete			; delete the directory record <09Sep85>
+
+			MOVE.L	(A6)+,D0			; restore original result code <09Sep85>
+			CMP.W	 #BTexists,D0		; did thread record already exist?
+			BNE.S	 CCExit1			; no, some other error ->
+			MOVEQ	 #CMexists,D0		; set CM result code		 <16Oct85>
+			BRA.S	 CCExit1			; exit ->
+;
+; update parent directory
+;
+CCUpdPar
+			MOVE.L	 D3,D0				; ParID
+			SUBA.L	 A0,A0				; no Cname
+			MOVEQ	 #0,D2				; no hint
+			JSR 	 locCNode			; locate the directory record
+			BNE.S	 CCExit1			; error ->
+
+			ADDQ.W	 #1,dirVal(A1)		; bump valence
+			MOVE.L	 Time,dirMdDat(A1)	; set date/time last modified
+
+			MOVE.W	 VCBCtRef(A2),D0	; catalog refnum
+			JSR 	 BTUpdate			; update the BTree record
+			BNE.S	 CCExit1			; error ->
+;
+; update VCB directory and file counts
+;
+			MOVE.B	 D5,D0				; CNode type
+			MOVE.L	 D3,D1				; ParID
+			MOVEQ	 #1,D2				; increment value
+			BSR 	 UpdVCnts			; update the counts
+;
+; clean up and exit
+;
+CCExit
+			CLR.W	 D0 				; result = 'ok'
+			MOVE.L	 D6,D1				; return DirID in D1
+			MOVE.L	 D7,D2				; return hint in D2
+			JSR 	 MarkVCB			; Mark the VCB dirty (From CMCreateUpdateCNPatch) <SM1>
+			JSR 	 CMFlush			; flush the catalog
+CCExit1
+			ADD 	 #lenCMVars,A6		; de-allocate memory for CM vars
+			MOVEM.L  (A6)+,D3-D7/A0-A4	; restore regs
+
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit CMCreateCN
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		CMDeleteCN (Delete CNode)
+;
+; Function: 	Deletes an existing directory or file CNode.  The catalog
+;				BTree is first searched the designated CNode record.
+;				If not found, an error is returned. If found, the record for
+;				that CNode is deleted from the catalog.  The thread record
+;				is also deleted for directories.  Note that the valence for
+;				a directory must be zero before it can be deleted.
+;
+; Input:		A2.L  -  VCB pointer
+;				D0.L  -  DirID or parent DirID
+;				A0.L  -  CName pointer
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 CMnotfound = CNode not found
+;							 CMnotempty = directory not empty
+;							 CMRootCN = root CNode was referenced
+;							 -n = IO error
+;_________________________________________________________________________________
+; from CMDeleteCNAfterSetup patch <SM1>
+unusedBit	EQU		9					; pick unused bit in a register (D4 only uses abyte)<SM1>
+CMDeleteCN
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D1-D6/A0-A1/A3-A4,-(A6) ; save regs
+;
+; set up some common stuff
+;
+			BSR 	 CMSetUp			; common set up routine 				   <25Oct85>
+
+			CLR.L	 VCBDirIDM(A2)		; invalidate current DirID marker
+
+			MOVE.L	 D0,D3				; D3 = parID
+			MOVEA.L  A0,A3				; A3 = CName pointer
+;
+; locate subject CNode
+;
+			MOVEQ	 #0,D2				; no hint
+			JSR 	 LocCNode			; locate the CNode
+			BNE 	 DCExit1			; didn't find it, exit ->
+
+			MOVE.B	cdrType(A1),D4 		; D4 = CNode record type
+			BCLR	#unusedBit, D4		; for determining when to process file thds diffently <SM1>
+			MOVE.L	ckrParID(A0),D6		; D6 = CNode ParID
+;
+; if directory CNode, make sure it is not the root and that it is empty
+;
+DCCkDir
+			CMPI.B	 #cdrDirRec,D4		; directory record?
+			BNE.S	 DCFDelete			; no, must be a file ->	`					<SM1>
+			MOVE.L	 dirDirID(A1),D5	; save DirID
+			CMPI.L	 #FSRtDirID,D5		; root directory?
+			BNE.S	 @1 				; no ->
+			MOVEQ	 #CMRootCN,D0		; yes, set error code	<16Oct85>
+			BRA 	 DCExit1			; exit ->									<SM1>
+
+@1			TST.W	 dirVal(A1) 		; directory empty?
+			BEQ.S	 DCDelete			; yes ->
+			MOVEQ	 #CMnotempty,D0 	; set error code		<16Oct85>
+			BRA.S	 DCExit1			; exit ->
+;
+; delete catalog records for CNode and file threads if they exist					<SM1>.start
+;
+DCFDelete	MOVE.L	filFlNum(A1), D5	; save file ID
+			BTST	#fThreadFlag, filFlags(A1) ; is there  a file thread
+			BEQ.S	DCDelete	
+			BSET	#unusedBit, D4		; mark an unused bit implying file thread handling <SM1>.end
+DCDelete
+			LEA 	 ckrOff(A4),A0		; addr(key record)
+			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum
+			JSR 	 BTDelete			; delete directory/file record
+			BNE.S	 DCExit1			; error, exit->
+
+			CMPI.B	 #cdrDirRec,D4		; directory being deleted?					<SM1>.start
+			BEQ.S	 DCDelThd			; yep ->
+			BTST	 #unusedBit, D4		; was the bit set implying file thread handling
+			BEQ.S	 DCUpdPar			; no file thread, ->
+			
+DCDelThd	MOVE.L	 D5,D0				; parID = directory DirID or file ID
+			SUBA.L	 A0,A0				; no CName									<SM1>.end
+			LEA 	 ckrOff(A4),A1		; addr(key record buffer)
+			JSR 	 BuildKey			; build thread key record
+
+			LEA 	 ckrOff(A4),A0		; addr(key record)
+			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum
+			JSR 	 BTDelete			; delete thread record
+			BEQ.S	 DCUpdPar			;											<SM1>.start
+			BTST	 #unusedBit, D4		; if it was a file thd, just ignore the error
+			BEQ.S	 DCExit1			;											<SM1>.end
+;
+; update parent directory
+;
+DCUpdPar
+			MOVE.L	 D6,D0				; ParID
+			SUBA.L	 A0,A0				; no Cname
+			MOVEQ	 #0,D2				; no hint
+			JSR 	 locCNode			; locate parent directory record
+			BNE.S	 DCExit1			; error ->
+
+			SUBQ.W	 #1,dirVal(A1)		; decrement valence
+			MOVE.L	 Time,dirMdDat(A1)	; set date/time last modified
+
+			MOVE.W	 VCBCtRef(A2),D0	; catalog refnum
+			JSR 	 BTUpdate			; update the BTree record
+			BNE.S	 DCExit1			; error ->
+;
+; update VCB directory and file counts
+;
+			MOVE.B	 D4,D0				; CNode type
+			MOVE.L	 D6,D1				; ParID
+			MOVEQ	 #-1,D2 			; increment value
+			BSR 	 UpdVCnts			; update the counts
+;
+; clean up and exit
+;
+DCExit
+			CLR.W	 D0 				; result = 'ok'
+			JSR 	 MarkVCB			; Mark the VCB changed					<SM>
+			JSR 	 CMFlush			; flush the catalog
+DCExit1
+			ADD 	 #lenCMVars,A6		; de-allocate memory for CM vars
+			MOVEM.L  (A6)+,D1-D6/A0-A1/A3-A4 ; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit CMDeleteCN
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		CMGetCN (Get CNode)
+;
+; Function: 	Locates an existing directory or file CNode and returns a pointer
+;				to the CNode key and data records.
+;
+; Input:		A2.L  -  VCB pointer
+;				D0.L  -  DirID or parent DirID
+;				A0.L  -  CName pointer
+;				D2.L  -  catalog hint
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 CMnotfound = CNode not found
+;							 -n = IO error
+;				A0.L  -  pointer to catalog key record (ckr)
+;				A1.L  -  pointer to catalog data record (cdr)
+;				D2.L  -  catalog hint
+;_________________________________________________________________________________
+
+CMGetCN
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D1/D3/A3-A4,-(A6)	; save regs
+;
+; set up some common stuff
+;
+			BSR 	 CMSetUp			; common set up routine 				   <25Oct85>
+
+			CLR.L	 VCBDirIDM(A2)		; invalidate current DirID marker
+;
+; Locate directory/file BTree record for the CNode
+;
+			JSR 	 LocCNode			; locate the record
+;
+; clean up and exit
+;
+GCExit
+			ADD 	 #lenCMVars,A6		; de-allocate memory for CM vars
+			MOVEM.L  (A6)+,D1/D3/A3-A4	; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit CMGetCN
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		CMGetOff (Get Offspring)
+;
+; Function: 	Gets an offspring record from a specified directory. The directory
+;				is identified by it's DirID.  The desired offspring CNode is
+;				indicated by the value of the offspring index (1 = 1st offspring
+;				CNode, 2 = 2nd offspring CNode, etc.).
+;
+; Input:		A2.L  -  VCB pointer
+;				D0.L  -  DirID
+;				D1.W  -  offspring index
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 CMnotfound = offspring not found (no more
+;										  offspring for this directory)
+;							 -n = IO error
+;				A0.L  -  ptr(catalog key record)
+;				A1.L  -  ptr(catalog data record)
+;				D2.L  -  catalog hint
+;_________________________________________________________________________________
+
+CMGetOff
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D1/D3-D4/A4,-(A6)	; save regs
+;
+; set up some common stuff
+;
+			BSR 	 CMSetUp			; common set up routine 				   <25Oct85>
+
+			MOVE.L	 D0,D3				; D3 = DirID
+			MOVE.W	 D1,D4				; D4 = offspring index
+;
+; locate thread record for the specified DirID
+;
+			MOVE.L	 VCBDirIDM(A2),D1	; have a current DirID marker?
+			BEQ.S	 @1 				; no, search for thread record ->
+			CMP.L	 D3,D1				; same DirID?
+			BEQ.S	 GOGetOff			; yes, skip search for thread record ->
+
+@1			CLR.L	 VCBDirIDM(A2)		; invalidate current DirID marker
+			MOVE.L	 D3,D0				; DirID
+			SUBA.L	 A0,A0				; no CName
+			JSR 	 LocCRec			; locate the thread record
+			BNE.S	 GOExit 			; didn't find it, exit ->
+			MOVE.L	 D3,VCBDirIDM(A2)	; update current DirID
+			CLR.W	 VCBOffsM(A2)		; ...and offspring index markers
+;
+; get offspring record
+;
+GOGetOff
+			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum
+			MOVE.W	 D4,D1				; selection index = offspring index
+			SUB.W	 VCBOffsM(A2),D1	;	 - current offspring index marker
+			JSR 	 BTGetRecord		; get the record
+			BEQ.S	 @3 				; ok ->
+			CMP.W	 #BTnotfound,D0 	; result = 'not found'?
+			BNE.S	 @2 				; no, some other error ->
+@1			MOVEQ	 #CMnotfound,D0 	; set error code				  <16Oct85>
+@2			CLR.L	 VCBDirIDM(A2)		; invalidate current DirID marker
+			BRA.S	 GOExit 			; exit ->
+
+@3			CMP.L	 ckrParID(A0),D3	; same parent?
+			BNE.S	 @1 				; no ->
+
+			MOVE.W	 D4,VCBOffsM(A2)	; update offspring index marker
+;
+; clean up and exit
+;
+GOExit
+			ADD 	 #lenCMVars,A6		; de-allocate memory for CM vars
+			MOVEM.L  (A6)+,D1/D3-D4/A4	; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit CMGetOff
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		CMMoveCN (Move CNode)
+;
+; Function: 	Moves an existing directory or file CNode to another directory
+;				CNode.	Note that for a directory, all decendants (its offspring,
+;				their offspring, etc.) are also moved.
+;
+; Input:		A2.L  -  VCB pointer
+;				D0.L  -  source DirID or parent DirID
+;				A0.L  -  source CName pointer
+;				D1.L  -  destination DirID or parent DirID
+;				A1.L  -  destination CName pointer
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 CMexists = A CNode already exists in destination
+;										directory with same CName
+;							 -n = IO error
+;				D2.L  -  catalog hint for moved CNode
+;_________________________________________________________________________________
+
+CMMoveCN
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D1/D3-D7/A0-A1/A3-A4,-(A6) ; save regs
+;
+; set up some common stuff
+;
+			BSR 	 CMSetUp			; common set up routine 				   <25Oct85>
+
+			CLR.L	 VCBDirIDM(A2)		; invalidate current DirID marker
+
+			MOVE.L	 D1,D5				; D5 = dest DirID/ParID
+			MOVE.L	 A1,D6				; D6 = dest CName ptr
+
+			MOVE.L	 D0,D3				; D3 = source DirID/ParID
+			MOVEA.L  A0,A3				; A3 = source CName pointer
+;
+; make sure source CNode exists
+;
+MCChkSrc
+			MOVEQ	 #0,D2				; no hint
+			JSR 	 LocCNode			; locate the record
+			BNE 	 MCExit1			; didn't find source ->
+
+			MOVEQ	 #0,D4				; assume source is not a directory
+			CMPI.B	 #cdrDirRec,cdrType(A1) ; directory record?
+			BNE.S	 MCChkDest			; no ->
+			MOVE.L	 dirDirID(A1),D4	; D4 = source DirID
+;
+; make sure destination directory exists
+;
+MCChkDest
+			MOVE.L	 D5,D0				; dest DirID/ParID
+			MOVE.L	 D6,A0				; dest CName pointer
+			MOVEQ	 #0,D2				; no hint
+			JSR 	 LocCNode			; locate the record
+			BNE 	 MCExit1			; didn't find dest ->
+
+			CMPI.B	 #cdrDirRec,cdrType(A1) ; directory record?
+			BEQ.S	 @1 				; yes ->
+			MOVE.W	 #BadMovErr,D0		; set error code
+			BRA 	 MCExit1			; exit ->
+
+@1			MOVE.L	 dirDirID(A1),D7	; D7 = dest DirID
+;
+; make sure its a proper move
+;
+MCChkMove
+			TST.L	 D4 				; is source a directory?
+			BEQ.S	 MCGetSrc			; no, nothing to check ->
+
+			CMPI.L	 #FSRtDirID,D4		; source = root?
+			BEQ.S	 @3 				; yes, error ->
+
+			CMP.L	 D4,D7				; source = dest?
+			BEQ.S	 @3 				; yes, error ->
+
+@1			MOVE.L	 ckrParID(A0),D0	; source = dest ancestor?
+			CMP.L	 D4,D0				;
+			BEQ.S	 @3 				; yes, error ->
+
+			CMPI.L	 #FSRtDirID,D0		 ; up to root directory?
+			BLE.S	 MCGetSrc			; yes, done checking ->
+
+@2			SUBA.L	 A0,A0				; locate next directory up the tree
+			MOVEQ	 #0,D2				;
+			JSR 	 LocCNode			;
+			BNE 	 MCExit1			; didn't find it ->
+			BRA.S	 @1 				; continue checking ->
+
+@3			MOVE.W	 #BadMovErr,D0		; result = 'bad move'
+			BRA 	 MCExit1			; exit ->
+;
+; locate the source CNode and copy the key and data record
+;
+MCGetSrc
+			MOVE.L	 D3,D0				; source DirID/ParID
+			MOVEA.L  A3,A0				; source CName pointer
+			MOVEQ	 #0,D2				; no hint
+			JSR 	 LocCNode			; locate the record
+			BNE 	 MCExit1			; didn't find it ->
+
+			CMP.L	 ckrParID(A0),D7	; source ParID = dest DirID?
+			BNE.S	 @2 				; no ->
+			MOVE.L	 D2,D7				; D7 = new hint
+			BRA 	 MCExit 			; all done ->
+
+@2			MOVE.L	 A1,-(SP)			; save ptr(data record)
+			LEA 	 ckrOff(A4),A1		; dest = key record in CM vars
+			MOVEQ	 #1,D0				; get key length (include length byte)
+			ADD.B	 (A0),D0			;
+			_BlockMove					; copy the key
+			MOVEA.L  (SP)+,A0			; A0 = ptr(data record)
+
+			LEA 	 cdrOff(A4),A1		; dest = data record in CM vars
+			MOVE.W	 D1,D0				; length = len(data record)
+			EXT.L	 D0 				;
+			_BlockMove					; copy the data record
+;
+; insert new source CNode record in BTree with new key
+;
+MCInsert
+			LEA 	 ckrOff(A4),A0		; addr(key record)
+			MOVE.L	 ckrParID(A0),D4	; D4 = source ParID
+			MOVE.L	 D7,ckrParID(A0)	; set ParID to new one
+			LEA 	 cdrOff(A4),A1		; addr(source data record)
+
+			MOVEQ	 #lenfil,D1 		; assume its a file record
+			CMPI.B	 #cdrFilRec,cdrType(A1) ; file record?
+			BEQ.S	 @1 				; yes ->
+			MOVEQ	 #lendir,D1 		; use length of a directory record
+			MOVE.L	 Time,dirMdDat(A1)	; set date/time last modified
+
+@1			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum
+			JSR 	 BTInsert			; insert the new record
+			BEQ.S	 @2 				; ok ->
+			CMPI.W	 #BTexists,D0		; record already exist?
+			BNE 	 MCExit1			; no, some other error ->
+			MOVEQ	 #CMExists,D0		; result = 'CNode already exists'  <16Oct85>
+			BNE 	 MCExit1			; exit ->
+
+@2			MOVE.L	 D2,D7				; D7 = new hint
+			MOVE.L	 ckrParID(A0),D0	; D0 = dest DirID
+;
+; update destination directory record
+;
+MCUpdDest
+			EXG 	 D5,D0				; D0 = dest DirID/ParID, D5 = dest DirID
+			MOVE.L	 D6,A0				; dest CName pointer
+			MOVEQ	 #0,D2				; no hint
+			JSR 	 LocCNode			; locate the record
+			BNE 	 MCExit1			; didn't find it ->
+
+			ADDQ.W	 #1,dirVal(A1)		; bump its valence
+			MOVE.L	 Time,dirMdDat(A1)	; set date/time last modified
+
+			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum
+			JSR 	 BTUpdate			; update the BTree record
+			BNE 	 MCExit1			; error ->
+;
+; update root directory counts
+;
+			LEA 	 cdrOff(A4),A1		; ptr(source data record)
+			MOVE.B	 cdrType(A1),D0 	; Cnode Type
+			MOVE.L	 D5,D1				; dest DirID
+			MOVEQ	 #1,D2				; increment
+			BSR 	 UpdRtCnts			; update the counts
+;
+; delete old source CNode record
+;
+MCDelSrc
+			MOVE.L	 D3,D0				; source DirID/ParID
+			MOVEA.L  A3,A0				; source CName pointer
+			MOVEQ	 #0,D2				; no hint
+			JSR 	 LocCNode			; locate the record
+			BNE.S	 MCExit1			; didn't find it ->
+
+			LEA 	 ckrOff(A4),A0		; addr(key record)
+			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum
+			JSR 	 BTDelete			; delete directory/file record
+			BNE.S	 MCExit1			; error ->
+;
+; update source thread record if a directory was moved
+;
+MCUpdThd
+			LEA 	 cdrOff(A4),A1		; ptr(source data record)
+			CMPI.B	 #cdrDirRec,cdrType(A1) ; source = directory?
+			BEQ.S	 MCUpdDThd			;		(from CMMoveCNAfterSetup)	<SM1>.start
+			BTST	 #fThreadFlag, filFlags(A1)
+			BEQ.S	 MCUpdPar			; no file thread ->
+			MOVE.L	 filFlNum(A1), D0
+			BRA.S	 MCUpdThd1
+MCUpdDThd	MOVE.L	 dirDirID(A1),D0	; source DirID
+MCUpdThd1	SUBA.L	 A0,A0				; no Cname							<SM1>.end
+			MOVEQ	 #0,D2				; no hint
+			JSR 	 LocCRec			; locate thread record
+			BNE.S	 MCExit1			; didn't find it ->
+
+			MOVE.L	 D5,thdParID(A1)	; new ParID = dest DirID
+			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum
+			JSR 	 BTUpdate			; update BTree record
+			BNE.S	 MCExit1			; error ->
+;
+; update source parent directory
+;
+MCUpdPar
+			MOVE.L	 D4,D0				; source ParID
+			SUBA.L	 A0,A0				; no Cname
+			MOVEQ	 #0,D2				; no hint
+			JSR 	 locCNode			; locate parent directory record
+			BNE.S	 MCExit1			; didn't find it ->
+
+			SUBQ.W	 #1,dirVal(A1)		; decrement valence
+			MOVE.L	 Time,dirMdDat(A1)	; set date/time last modified
+
+			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum
+			JSR 	 BTUpdate			; update the BTree record
+			BNE.S	 MCExit1			; error ->
+;
+; update root directory counts
+;
+			LEA 	 cdrOff(A4),A1		; ptr(source data record)
+			MOVE.B	 cdrType(A1),D0 	; Cnode Type
+			MOVE.L	 D4,D1				; source ParID
+			MOVEQ	 #-1,D2 			; increment
+			BSR 	 UpdRtCnts			; update the counts
+;
+; clean up and exit
+;
+MCExit
+			CLR.W	 D0 				; result = 'ok'
+			MOVE.L	 D7,D2				; return new hint in D2
+			JSR 	 MarkVCB			; Mark the VCB changed				<SM1>
+			JSR 	 CMFlush			; flush the catalog
+MCExit1
+			ADD 	 #lenCMVars,A6		; de-allocate memory for CM vars
+			MOVEM.L  (A6)+,D1/D3-D7/A0-A1/A3-A4 ; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit CMMoveCN
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		CMRenameCN (Rename CNode)
+;
+; Function: 	Renames an existing directory or file CNode.
+;
+; Input:		A2.L  -  VCB pointer
+;				D0.L  -  DirID or parent DirID
+;				A0.L  -  CName pointer
+;				A1.L  -  CName pointer (new CName)
+;				D2.L  -  catalog hint
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 CMnotfound = CNode not found
+;							 CMexists = CNode already exists for new CName
+;							 -n = IO error
+;				D2.L  -  new catalog hint
+;_________________________________________________________________________________
+
+CMRenameCN
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D1/D3-D7/A0-A1/A3-A4,-(A6) ; save regs
+;
+; set up some common stuff
+;
+			BSR 	 CMSetUp			; common set up routine 				   <25Oct85>
+
+			CLR.L	 VCBDirIDM(A2)		; invalidate current DirID marker
+
+			MOVE.L	 D0,D3				; D3 = parID
+			MOVEA.L  A0,A3				; A3 = ptr(old CName)
+			MOVE.L	 A1,D5				; D5 = ptr(new CName)
+;
+; locate subject CNode
+;
+			JSR 	 LocCNode			; locate the CNode
+			BNE 	 RCExit1			; didn't find it, exit ->
+			MOVE.L	 D2,D4				; D4 = hint for old CNode record
+			MOVE.W	 D1,D6				; D6 = len(CNode data record)
+;
+; save copy of data record
+;
+			MOVEA.L  A1,A0				; source ptr = cdr
+			LEA 	 cdrOff(A4),A1		; dest ptr = CM vars
+			MOVE.W	 D6,D0				; length = len(data record)
+			EXT.L	 D0 				;
+			_BlockMove					; copy the record
+;
+; insert old CNode record in BTree with new key
+;
+RCInsert
+			LEA 	 ckrOff(A4),A1		; addr(key record buffer)
+			MOVE.L	 ckrParID(A1),D0	; ParID = same as before
+			MOVEA.L  D5,A0				; new CName ptr
+			JSR 	 BuildKey			; build new key
+
+			MOVEA.L  A1,A0				; addr(key record)
+			LEA 	 cdrOff(A4),A1		; addr(data record)
+
+@2			MOVE.W	 D6,D1				; record size
+			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum
+			JSR 	 BTInsert			; insert the new record
+			BEQ.S	 RCDelOld			; ok -> 					  <09Sep85>
+
+			CMP.W	 #BTExists,D0		; CNode already exist?		  <09Sep85>
+			BNE 	 RCExit1			; no, some other error ->	  <09Sep85>
+;
+; new CNode already exists, locate the existing one
+;
+			LEA 	 ckrOff(A4),A1		; ptr(key record buffer)	  <09Sep85>
+			MOVE.L	 ckrParID(A1),D0	; ParID = same as before	  <09Sep85>
+			MOVEA.L  D5,A0				; new CName ptr 			  <09Sep85>
+			MOVEQ	 #0,D2				; no hint					  <09Sep85>
+			JSR 	 LocCNode			; locate the CNode			  <09Sep85>
+			BNE 	 RCExit1			; error ->					  <09Sep85>
+			MOVE.L	 D2,D7				; save new hint
+;
+; check if same CNode
+;
+RCChkSame
+			MOVE.L	 A0,D6				; save ptr to ckr in BTree node  <09Sep85>
+			LEA 	 cdrOff(A4),A0		; p0int to old data record
+			MOVE.B	 cdrType(A0),D0 	; same CNode type?
+			CMP.B	 cdrType(A1),D0 	;
+			BNE.S	 @2 				; no, error ->
+
+			CMPI.B	 #cdrDirRec,D0		; directory CNode?
+			BNE.S	 @1 				; no ->
+			MOVE.L	 dirDirID(A1),D1	; same DirID?
+			CMP.L	 dirDirID(A0),D1	;
+			BEQ.S	 RCReplace			; yes, replace the name ->	   <09Sep85>
+			BRA.S	 @2 				; no, error ->
+
+@1			MOVE.L	 filFlNum(A1),D1	; same file number?
+			CMP.L	 filFlNum(A0),D1	;
+			BEQ.S	 RCReplace			; yes, replace the name ->	   <09Sep85>
+
+@2			MOVEQ	 #CMExists,D0		; result = 'CNode already exists' <16Oct85>
+			BRA.S	 RCExit1			; exit ->
+;
+; replace the name in the existing CNode key
+;
+RCReplace
+			MOVEA.L  D6,A1				; restore ptr to ckr buffer    <09Sep85>
+			LEA 	 ckrCName(A1),A1	; dest = CName in ckr		   <09Sep85>
+			MOVEA.L  D5,A0				; source = new CName		   <09Sep85>
+			JSR 	 UpdCName			; replace the name			   <09Sep85>
+
+			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum		   <09Sep85>
+			JSR 	 BTUpdate			; update BTree record		   <09Sep85>
+			BRA.S	 RCUpdThd			; update thread ->			   <09Sep85>
+;
+; delete old CNode record
+;
+RCDelOld
+			MOVE.L	 D2,D7				; save hint for new record
+
+			MOVE.L	 D3,D0				; DirID/ParID
+			MOVEA.L  A3,A0				; CName pointer
+			MOVE.L	 D4,D2				; hint
+			JSR 	 LocCNode			; locate the record
+			BNE.S 	 RCExit1			; didn't find it ->
+
+			LEA 	 ckrOff(A4),A0		; addr(key record)
+			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum
+			MOVEQ	 #0,D2				; no hint
+			JSR 	 BTDelete			; delete directory/file record
+			BNE.S	 RCExit1			; error, exit->
+;
+; update thread record if a directory was renamed
+;
+RCUpdThd
+			LEA 	 cdrOff(A4),A1		; ptr to cdr in CM buffer <09Sep85>
+			CMPI.B	 #cdrDirRec,cdrType(A1) ; directory CNode?
+			BEQ.S	 RCUpdDThd			; (from CMRenameCNAfterSetup)	<SM1>.start
+			BTST	 #fThreadFlag, filFlags(A1)
+			BEQ.S	 RCExit 			; no file thread, all done ->
+			MOVE.L	 filFlNum(A1), D0
+			BRA.S	 RCUpdThd1
+
+RCUpdDThd	MOVE.L	 dirDirID(A1),D0	; source DirID
+RCUpdThd1	SUBA.L	 A0,A0				; no Cname						<SM1>.end	
+			CLR.L	 D2 				; no hint
+			JSR 	 LocCRec			; locate thread record
+			BNE.S	 RCExit1			; didn't find it ->
+
+			MOVEA.L  D5,A0				; ptr to new CName
+			LEA 	 thdCName(A1),A1	; ptr to CName in thread record
+			JSR 	 UpdCName			; update the CName				 <09Sep85>
+
+			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum
+			JSR 	 BTUpdate			; update BTree record
+;
+; clean up and exit
+;
+RCExit
+			CLR.W	 D0 				; result = 'ok'
+			MOVE.L	 D7,D2				; return new hint in D2
+			JSR 	 MarkVCB			; Mark the VCB changed			<SM1>
+			JSR 	 CMFlush			; flush the catalog
+RCExit1
+			ADD 	 #lenCMVars,A6		; de-allocate memory for CM vars
+			MOVEM.L  (A6)+,D1/D3-D7/A0-A1/A3-A4 ; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit CMRenameCN
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		CMUpdateCN (Update CNode)
+;
+; Function: 	Marks the Catalog BTree node identified by the given catalog hint
+;				as 'dirty'.
+;
+; Input:		A2.L  -  VCB pointer
+;				D2.L  -  catalog hint
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 CMnotfound = CNode not found
+;							 -n = IO error
+;_________________________________________________________________________________
+
+CMUpdateCN
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D1-D2/A0-A1,-(A6)	; save regs
+
+			BSR.S 	 CMSetUp			; common set up routine 				   <25Oct85>
+
+			MOVE.W	 VCBCtRef(A2),D0	; catalog file refnum
+			JSR 	 BTUpdate			; mark the node 'dirty'
+			BEQ.S	 UCExit 			; ok, all done ->
+			CMPI.W	 #BTnotfound,D0 	; node not found?
+			BNE.S	 UCExit1			; no, some other error ->
+			MOVEQ	 #CMnotfound,D0 	; result = 'not found'					 <16Oct85>
+			BRA.S	 UCExit1			; exit ->
+UCExit
+			JSR 	 MarkVCB			; Mark the VCB dirty (From CMCreateUpdateCNPatch) <SM1>
+			JSR 	 CMFlush			; flush the catalog
+UCExit1
+			ADD 	 #lenCMVars,A6		; de-allocate memory for CM vars		 <25Oct85>
+			MOVEM.L  (A6)+,D1-D2/A0-A1	; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit CMUpdateCN
+
+
+
+
+
+;__________________________________________________________________________________
+;
+; Internal Subroutines
+;__________________________________________________________________________________
+
+
+
+;__________________________________________________________________________________
+;
+; Subroutine:	CMSetUp (CM Set Up)
+;
+; Function: 	Sets up for all CM service calls.  Space for the CM variable storage area
+;				(CMVars) is allocated on the A6 stack.
+;
+; Input:		none
+;
+; Output:		A4.L  -  pointer to CMVars
+;__________________________________________________________________________________
+
+CMSetUp
+			MOVE.L	jCMSetUp,-(SP)		; jumptable entry for vCMSetUp				 <25Oct85>
+			RTS 						; go there									 <25Oct85>
+vCMSetUp								; 'vectored' CMSetUp routine				 <25Oct85>
+
+			SUB 	#lenCMVars,A6		; allocate memory for CM vars				 <25Oct85>
+			MOVEA.L A6,A4				; A4 = pointer to CM vars					 <25Oct85>
+			RTS 						; exit CMSetUp								 <25Oct85>
+
+
+
+
+
+;__________________________________________________________________________________
+;
+; Subroutine:	UpdVCnts (Update Volume Counts)
+;				UpdRtCnts (Update Root Counts)
+;
+; Function: 	Updates Volume directory and file counts.
+;
+; Input:		A2.L  -  pointer to VCB
+;				D0.B  -  CNode type
+;				D1.L  -  ParID
+;				D2.L  -  increment value (+1 or -1)
+;
+; Output:		none
+;__________________________________________________________________________________
+
+UpdVCnts
+			CMPI.B	 #CMDirCN,D0		; add/delete a directory?
+			BNE.S	 @1 				; no ->
+			ADD.L	 D2,VCBDirCnt(A2)	; adjust volume directory count
+			BRA.S	 UpdRtCnts			; ->
+@1			ADD.L	 D2,VCBFilCnt(A2)	; adjust volume file count
+
+UpdRtCnts
+			CMPI.L	 #FSRtDirID,D1		; add/delete to root?
+			BNE.S	 @2 				; no, all done ->
+			CMPI.B	 #CMDirCN,D0		; adding/deleting a directory?
+			BNE.S	 @1 				; no ->
+			ADD.W	 D2,VCBNmRtDirs(A2) ; adjust root directory count
+			BRA.S	 @2
+@1			ADD.W	 D2,VCBNmFls(A2)	; adjust root file count
+
+@2			RTS 						; exit UpdVCnts/UpdRtCnts
+
+		   END
+

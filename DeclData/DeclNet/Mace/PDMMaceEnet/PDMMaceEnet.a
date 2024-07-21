@@ -1,0 +1,1748 @@
+;
+;	File:		PDMMaceEnet.a
+;
+;	Contains:	Ethernet Data Link level driver for builtin MACE Ethernet on PDM.  
+;
+;	Converted for PDM
+;	by Dave Calvert 	November 18,1992
+;
+;	Based on the Cyclone ENET driver
+;	Written by:	Mark A. Law	,3-March-92
+;
+;	Copyright:	й 1991-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;   This file is used in these builds:  Mac32
+;
+;	Change History (most recent first):
+;
+;	  <SM12>	  7/1/93	GMR		Make the receive handler ignore the packet if there was a Mace
+;									overrun error.
+;	  <SM11>	 6/10/93	GMR		Changed the handling transmit deferrals.
+;	  <SM10>	  6/2/93	GMR		Minor changes to the receive handler.
+;	   <SM9>	 5/27/93	dwc		Added support for AMIC work-around code.
+;	   <SM8>	 5/25/93	dwc		Clean up for Alpha.
+;	   <SM7>	  5/4/93	dwc		Added debug code to work around AMIC's returning  FF's on the
+;									first read and removed some obsolete code and equates.
+;	   <SM6>	  4/6/93	dwc		Updated for level #4 DMA interrupts.
+;	   <SM5>	 3/24/93	dwc		Remove obsolete code and added code to try to recover from
+;									lowered interrupt level during packet handling.
+;	   <SM4>	  3/5/93	dwc		Removed some obsolete code and comments.
+;	   <SM3>	 2/25/93	dwc		Enabled receive and loopbacktests.
+;	   <SM2>	 2/24/93	dwc		Removed some debug code and checked in for the PDM D5 ROM build.
+;	   <SM1>	  2/4/93	dwc		first checked in
+;
+;	To Do:
+;
+; Replace BIT24 with Supports24Bit
+; Remove some unused equates
+;
+
+
+			PRINT		OFF
+			LOAD		'StandardEqu.d'
+			INCLUDE 	'Slots.a' 						; Slot interrupt equates
+			INCLUDE		'GestaltEqu.a'
+			INCLUDE		'HardwarePrivateEqu.a'
+			INCLUDE		'UniversalEqu.a'				; lowmem global records
+			INCLUDE 	'ATalkMacros.a' 				; Nifty Macros
+
+; Conditional compile equates
+COUNTERS	EQU			0
+BUFDEBUG	EQU			0
+BIT24		EQU			0								; SuperMario always 32-bit
+DEBUG		EQU			0
+PROM		EQU			0								; Promiscous mode support
+Logging		EQU			1								; 
+
+			PRINT		NOGEN,NOMDIR,ON
+			INCLUDE 	'PDMMaceEqu.a' 					; Mace definitions
+			INCLUDE 	'AMICEqu.a' 					; AMIC definitions
+			INCLUDE 	'ENETEqu.a' 					; Driver definitions
+			INCLUDE 	'SNMPLAP.a' 					; SNMP definitions
+			EJECT
+
+NumTxBuffers	EQU 		8							; "optimal" number of xmit buffers
+NumRxBuffers	EQU 		16							; "optimal" number of recv buffers
+NumRxChains		EQU 		4							; "optimal" number of recv buffer chains
+
+OurV		RECORD		0								; our variables
+OurDCE		DS.l		1								; Offset to our DCE pointer in variables
+MACEBase	DS.l		1								; MACE base address
+	IF PROM THEN
+PromiscRHA	DS.l		1								; Contains status lw when in promiscuous mode
+														; еее WARNING: do not separate from RHA!
+	ENDIF
+RHA 		DS.b		EHdrSize						; Read Header Area
+;___________________________________________________________________________
+;
+; The LAP protocol handler table starts here. Format:
+;	.BYTE InUseFlag1,..., InUseFlagN	; Entry in use flag
+;	.wORD ProtCode1, ..., ProtCodeN 	; Protocol type codes
+;		  .lONG PHAddr1, ..., PHAddrN			; Protocol handler addresses
+;		  .lONG RdQueueHd1, ..., RdQueueHdN 	  ; Read queue heads
+;___________________________________________________________________________
+LAPTblSz	EQU 		16								; Size of LAP protocol handler table (even)
+InUseFlag	DS.b		LAPTblSz						; Entry in use flag
+Protocols	DS.w		LAPTblSz						; List of active protocols
+Handlers	DS.l		LAPTblSz						; List of handler addresses
+RdQueueHd	DS.l		LAPTblSz						; Read queue heads
+LAPTblEnd	EQU 		*								; End of LAP table
+
+;___________________________________________________________________________
+;
+; Multicast address table.	Entry format:
+;	Ethernet address (6 bytes)
+;	Use count (1 byte). Zero means entry free.
+;	Unused (1 byte)
+;___________________________________________________________________________
+
+MTblSz		EQU 		16								; Size (in entries) of multicast address table
+MEntrySz	EQU 		8								; Size of an entry (power of 2)
+MUseCount	EQU 		EAddrSz 						; Offset to use count in entry
+
+		ALIGN 4
+MultiCTbl	DS.b		MTblSz*MEntrySz 				; A list of valid addresses
+		ALIGN 4
+XmitWait	DS.b		1								; non-zero = DoWrite waiting for buffers
+		IF PROM THEN			
+Promiscflg	DS.b		1								; non-zero = Promiscuous operation mode
+		ENDIF
+deferCtl	DS.b		1								; non-zero = deferring control call
+		ALIGN 2
+VBLQEL		DS.b		14								; VBL for control call deferrals
+		ALIGN 4
+	IF BIT24 THEN
+AddrMask	DS.l		1								; 32 bit mask for addresses
+	ENDIF
+MemMove		DS.l		1								; trap address of block move
+	IF COUNTERS	THEN
+EtherRcvCnt	DS.l		1								; # of times Deferred Recv Task called 
+XmitPend	DS.l		1								; Cnt of DoWrite calls from TimeMgr task 
+	ENDIF
+	IF BUFDEBUG	THEN
+XmtDnActive	DS.l		1
+	ENDIF
+MCfg		DS			MACECfg							; MACE config data from config rsrc
+		ALIGN 4
+InfoStart	EQU 		*								; Old "GetInfo" network statistics start
+OurAddr 	DS.b		EAddrSz 						; Our Ethernet address
+			DS.l		3								; fill for compatibility with old getinfo
+EtherStats	DS			NetStats
+InfoEnd 	EQU 		*								; End of returned info
+MultiRecvd	DS.l		1								; # of multicast pkts received
+BcastRecvd	DS.l		1								; # of broadcast pkts received
+; SNMP vars
+LAPStats	DS			LAPMIBStats						; SNMP MIB stats for any link access protocol
+Dt3Entry	DS			Dot3Entry						; SNMP status info and control vars
+Dt3Stats	DS			Dot3StatsEntry					; SNMP stats for an 802.3 link
+OurVarSz	EQU 		*								; End of variables
+			ENDR
+
+;_______________________________________
+;
+; Other definitions
+;_______________________________________
+
+AMaxDataSz	EQU 		768-EHdrSize					; Maximum data size for AppleTalk mode
+
+INTLockOut	EQU 		$0700							; SR value to disable ALL interrupts
+DMALockOut	EQU 		$0400							; SR value to disable PSC DMA interrupts
+
+BlockMoveTrap EQU		$A02E							; trap value for _BlockMove
+
+ORBuffrsrc	EQU 		'ebfr'							; res type for buffer count override
+
+		IF PROM THEN			
+Promiscuous	EQU		  	1								; Bit #1 of Open()'s paramblk->ioFlags
+		ENDIF
+			EJECT
+
+			EJECT
+			
+ENETDriver	MAIN		EXPORT
+			STRING		PASCAL
+			MACHINE 	MC68020
+
+			EXPORT		TranslateAddress, GetMemory, FreeMemory
+			IMPORT		MACEInit,MACEXmit,MACEAddMulti,MACEDelMulti,MACEHalt,NormAddr
+			IMPORT		LOOPBACKTEST,MACESetProm,MACEXmitProm, AddToLog
+
+			WITH		MACERegs,OurV
+			WITH		LAPMIBStats,Dot3StatsEntry,Dot3Entry
+
+; *****************************************
+; * 									  *
+; * 	  Start of ENET driver			  *
+; * 									  *
+; *****************************************
+ENET
+;
+;	Driver header
+;
+			DC.w		$4400							; Control, Locked, no Goodbye
+			DC.w		0,0 							; No time, no events
+			DC.w		0								; No menu
+
+;
+;		  Entry points offset table
+;
+			DC.w		Open-ENET
+			DC.w		AnRts-ENET
+			DC.w		Control-ENET
+			DC.w		AnRts-ENET
+			DC.w		Close-ENET
+
+			DC.w		'.ENET' 						; Driver name
+			ALIGN		2
+
+			INCLUDE		'VersionPDMMaceEnet.a'
+
+;________________________________________________________________________
+;
+; Open - initialize the ENET driver
+;
+;	Call:
+;			D0 = 0
+;			A0 -> queue element
+;			A1 -> DCE
+;
+;	Return:
+;			D0 = 0, no error
+;			D0 != 0, if error
+;________________________________________________________________________
+
+OpenRec		RECORD		{A6Link}
+LinkSz		EQU 		*
+pbblkptr	DS.l		1								; copy of parameter block ptr
+A6Link		DS.l		2								; link and return addr
+			ENDR
+Open
+		
+			Link		A6,#OpenRec.LinkSz				; mark the stack for easy exit
+
+			Move.l		A0,OpenRec.pbblkptr(A6)			 ; Save paramblock ptr for later access
+
+			Move.l		#gestaltVMAttr,D0				; see if VM is running
+			_Gestalt
+			Bne.s		@noVM							; it is'nt if call failed
+			Move.l		A0,D0
+			Btst		#gestaltVMPresent,D0
+			Beq.s		@noVM							; zero result means no VM running
+			BSet		#VMImmuneBit,dCtlFlags+1(A1)	; tell VM to leave our calls alone
+@noVM			
+			Lea 		OurVarPtr,A3					; A3 -> variable pointer
+;
+; Allocate our variables
+;
+			Move.l		#OurVarSz,D0					; variables size
+			_NewPtr		,SYS,CLEAR						; get memory for our variables
+			Bne			OpenError
+			
+			Move.l		A0,(A3)							; save variable pointer
+			MoveA.l		A0, A2							; A2 -> our vars
+
+			Move.b		MaceEnet,DCtlQueue+1(A1) 		; Version number goes here
+			Move.l		A1,OurDCE(A2)					; Save our DCE address
+
+			Move.w		#BlockMoveTrap,D0
+			_GetTrapAddress
+			Move.l		A0,MemMove(A2)					; save trap address in our vars
+
+;
+; Look for an alternate address resource for this slot
+;
+			SubQ		#4,SP							; Make room for handle
+			Move.l		#EAddrRType,-(SP)				; Push resource type
+			MoveQ		#0,D0							; Clear out D0
+			Move.b		dCtlSlot(A1),D0 				; Get the slot number
+			Move		D0,-(SP)						; Set slot number as resource ID
+			_GetResource								; Get it
+			MoveQ		#-1, D0							; Assume error
+			Move.l		(SP)+,D1						; D1 = handle to resource
+			Beq			@30		 						; Do nothing, if not there
+			Move.l		D1,A0							; A0 = handle to resource
+			Move.l		(A0),A0 						; A0 = pointer to resource
+			BTst		#0,(A0) 						; Make sure it's not a multicast addr
+			Bne			OpenError 						; EXIT, if it is
+			Move.l		(A0)+,OurAddr(A2)				; Move four bytes to our address
+			Move		(A0)+,OurAddr+4(A2) 			; Move the last two bytes
+@30
+
+			Clr.l		-(SP)							; room for result
+			Move.l		#ORBuffrsrc,-(SP)
+			MoveQ		#0,D0							; Clear out D0
+			Move.b		dCtlSlot(A1),D0 	
+			Move		D0,-(SP)						; Set slot number as resource ID
+			_GetResource
+			Move.l		(SP)+,D0
+			Beq.s		@31								; no buff override rsrc, branch
+			MoveA.l 	D0,A0
+			MoveA.l 	(A0),A0
+
+@31
+
+; 
+; Determine our Ethernet Address from Address Prom, if address not provided
+; via EAddrRType resource
+;
+			Lea 		OurAddr(A2),A1
+			Tst.l		(A1)
+			Bne.s		@45 							; already have an address
+			Tst.w		4(A1)
+			Bne.s		@45 							; already have an address
+
+			Move.l		D3, -(SP)
+			Lea 		AddrPROM, A0 					; Address of Ethernet Address PROM
+			MoveQ		#0, D1							; Setup to checksum the PROM address
+			MoveQ		#7, D0							; Do 8 bytes
+			MoveQ		#1, D3							; Offset to address byte
+													; Checksum the addresss PROM
+@Xor		Move.b		(A0,D3.w), D2					; get byte to XOR
+			Eor.b		D2, D1
+			AddI		#$10, D3						; Inc offset to next byte
+			DBra		D0, @Xor						; do them all
+			Move.l		(SP)+, D3
+			CmpI.b		#$FF, D1						; end result should be $FF
+			Bne			OpenError						; return with generic error (D0=-1)			
+													; Get our Ethernet addresss from the PROM
+			AddQ		#EAddrSz, A1 					; go from last to first
+			MoveQ		#EAddrSz-1, D2					; Get 6 addr bytes
+			Move.l		D3, -(SP)
+			MoveQ		#$51, D3						; Offset to last address byte
+
+@35			Move.b		(A0,D3.w), D0					; D0=inverted address
+			Bsr 		NormAddr						; Normalize it
+			Move.b		D0, -(A1)						; Store in our vars
+			SubI		#$10, D3						; Dec offset to previous byte
+			DBra		D2, @35
+			Move.l		(SP)+, D3
+@45
+
+		WITH	MACEInitParms
+			SubA		#IPSize, SP 					; make room for parms
+	
+			Move.l		UnivInfoPtr, A0					; Get ptr to ProductInfo
+			Add.l		ProductInfo.DecoderInfoPtr(A0), A0		; Point to the base address table
+			Move.l		DecoderInfo.MACEAddr(A0), MACEBase(A2)	; Save base address of Mace
+	
+			Pea 		EtherRecv						; addr of packet reception rtn
+			Move.l		(SP)+, RecvRtn(SP)
+			Move.l		A2, RecvPrms(SP)
+			Lea			XmitBuffAvail, A0				; xmit completion rtn
+			Move.l		A0, XmitRtn(SP)
+			Move.l		A2, XmitPrms(SP)
+			clr.l		MACECfgPtr(SP)					; ptr to MACE config record (none)
+			Pea			Dt3Stats(A2)
+			Move.l		(SP)+, Dot3NetStats(SP)			; where to store 802.3 stats
+			Pea			LAPStats(A2)
+			Move.l		(SP)+, LAPMIBNetStats(SP)		; where to store LAP MIB stats
+			Pea			OurAddr(A2)
+			Move.l		(SP)+, EnetAddr(SP)				; ptr to our Ethernet address
+			Move.l		MemMove(A2), FastMoveRtn(SP)	; addr of fast move memory rtn
+		
+			Bsr			MACEInit
+			Bne			OpenError
+
+			AddA		#IPSize, SP						; Strip parms
+		ENDWITH
+			
+			Lea 		VBLQEL(A2),A0
+			Move		#vType,vblType(A0)
+			Pea 		ControlDefer
+			Move.l		(SP)+,vblAddr(A0)
+			Move		#32767,vblCount(A0) 			; setup control call deferral timer
+			_VInstall
+			
+;		
+; Perform 3 MACE loopback tests, if any fails, return an open error
+;
+			Move.l		#MaceEnetLongStrEnd-MaceEnetLongStr-1, -(SP) ; pass size of loopback
+														; data, minus 1 since pascal string
+			Pea			MaceEnetLongStr+1				; pass ptr to loopback data			
+			Pea			OurAddr(A2)						; pass ptr to our address
+			MoveA.l		OurDCE(A2),A1					; get ptr to DCE
+			Move		dCtlRefNum(A1),D0
+			Move.l		D0,-(SP)						; pass our refnum for ctl calls
+
+			MoveA.l		MACEBase(A2),A3 			; MACE base address
+
+													; Perform Internal, no MENDEC, Lpbk
+													; Note: network packet reception disabled
+			Move.b		#INTLPB, MACE_USER_TEST_REG(A3) ; set user test reg
+			nop
+			Bsr			LOOPBACKTEST					; D0 н 0 if passed
+			Beq			LoopError						; failed
+
+													; Perform Internal, with MENDEC, Lpbk
+													; Note: network packet reception disabled
+			Move.b		#MENDECLPB, MACE_USER_TEST_REG(A3) ; set user test reg
+			nop										; Allow write to complete
+			Bsr			LOOPBACKTEST					; D0 н 0 if passed
+			Beq			LoopError						; failed
+
+			Move.b		#EXTLPB, MACE_USER_TEST_REG(A3) ; perform external loopback
+			nop										; Allow write to complete
+			Bsr 		LOOPBACKTEST					; D0 н 0 if passed
+			Beq			LoopError						; failed
+
+			Move.b		#NOLPB, MACE_USER_TEST_REG(A3) 	; disable loopback
+
+			Bsr.s		InitSNMP
+		IF PROM THEN			
+;														
+; Check if we're opened in promiscuous mode
+;
+			Move.l		OpenRec.pbblkptr(A6), A0		; Restore paramblock ptr
+			BTst.b		#Promiscuous, ioFlags+1(A0)	  	; Are we being opened in Promiscuous mode?
+			Beq.s		@notprm
+			ST			Promiscflg(A2)			 		; Yes, indicate we're in promiscuous mode 
+			Move.b		MACE_MAC_CNFG(A3), D0			; get current config
+			OrI.b		#(1<<PROMISC), D0
+			Move.b		D0, MACE_MAC_CNFG(A3) 			; enable MACE promiscous mode
+			nop											; Allow write to complete
+			AddQ		#4, SP							; clean up parms
+@notprm
+		ENDIF
+			MoveQ		#noErr,D0						; Indicate no error
+			Unlk		A6
+			Rts 										; And return
+
+;
+; Loopback test error - 1 of 3 loopback tests failed
+;
+LoopError
+			AddQ		#8,SP							; strip loopback test parms
+			Bsr			Close							; shut down MACE
+			MoveQ		#-1,D0
+			Bra.s		OpenErrDone						; return with open error			
+;
+; Open error - clear out variable pointer for next try
+;
+OpenError
+			Move.w		D0,D3							; Save error code
+
+			Lea			OurVarPtr, A3
+			Tst.l 		(A3)							; Our variable pointer
+			Beq.s		@56 							; Mem not allocated
+			MoveA.l		(A3), A0
+			_DisposPtr									; Free it up
+			Clr.l		(A3)							; Clear it out
+@56			
+			Move.w		D3,D0
+OpenErrDone
+			CmpI.w		#-1,D0							; Translate generic error
+			Bne.s		@60
+			MoveQ		#openErr,D0
+@60
+			Tst.w		D0
+			Unlk		A6
+			Rts 										; Return with error
+
+		Align 2
+; Strings used when building LAPStats.ifdescr string
+RevStrStart	Equ		*
+RevStr		DC.B	'.  Hardware Revision:     '
+RevStrEnd	Equ 	*
+RevStrLen	Equ		RevStrEnd-(RevStrStart+1)			; str length, minus length byte
+		Align 2
+;________________________________________________________________________
+;
+; Initialize SNMP statistic arrays
+;
+;	Call: A2 - globals
+;
+;	Return: none
+;
+;	Destroys: A0,A1,D0,D3
+;________________________________________________________________________
+
+InitSNMP	
+
+; Initialize LAPStats
+													; Copy Pascal String MaceEnetLongStr
+			Lea			LAPStats.ifDescr(A2), A1		; A1 -> ifDescr
+			Lea			MaceEnetLongStr, A0				; A0 -> where to move from
+			MoveQ		#0, D3							; Init for BlockMove
+			Move.b		(A0), D3						; D0.B = strlen of MaceEnetLongStr
+			Cmp			#255, D3						; is str be greater than 255?
+			Bls			@doit							; no
+			Move		#255, D3						; yes, move what we can
+@doit		AddQ		#1, D3							; move len byte too
+			Move.l		D3, D0
+			_BlockMove  								; Move it
+			Add.l		D3, A1							; A1 -> new end of ifDescr
+			
+			Add.l		#RevStrLen, D3  				; ifDescr + RevStr
+			Cmp			#255, D3						; would new str be greater than 255?
+			Bgt.s		@cont							; yes, done with ifDescr
+			
+														; get MACE Chip ID and convert to ascii
+			Lea			RevStrEnd, A0
+			MoveA.l		MACEBase(A2), A3 				; MACE base address
+			MoveQ		#0, D0
+			Move.b		MACE_CHIP_ID_HIGH(A3), D0		; get high byte MACE Chip ID
+			Ror.l		#4, D0							; get high nibble
+			Add.b		#$30, D0						; convert to ascii
+			Move.b		D0, -4(A0)						; save it in RevStr
+			Clr.b		D0
+			Rol.l		#4, D0							; get low nibble
+			Add.b		#$30, D0						; convert to ascii
+			Move.b		D0, -3(A0)						; save it in RevStr
+			Move.b		MACE_CHIP_ID_LOW(A3), D0		; get low byte MACE Chip ID
+			Ror.l		#4, D0							; get high nibble
+			Add.b		#$30, D0						; convert to ascii
+			Move.b		D0, -2(A0)						; save it in RevStr
+			Clr.b		D0
+			Rol.l		#4, D0							; get low nibble
+			Add.b		#$30, D0						; convert to ascii
+			Move.b		D0, -1(A0)						; save it in RevStr
+
+													; Append RevStr, minus len byte, to ifDescr
+			Lea			RevStrStart+1, A0				; A0 -> where to move from, will skip length byte
+														; A1 -> current end of ifDescr
+			Move.l		#RevStrLen, D0					; D0.l = strlen of RevStr
+			_BlockMove  								; Move it
+
+			Lea			LAPStats.ifDescr(A2), A1		; A1 -> ifDescr
+			Add.b		#RevStrLen, (A1) 				; Set final string length
+@cont
+
+			Move.l		#SNMPVersion, LAPStats.ifVersion(A2) ; Set version to 1.0.0
+			Move.l		#iso88023_csmacd, LAPStats.ifType(A2)	; indicate we're an 802.3 link
+			Move.l		#EMaxDataSz, LAPStats.ifMaxMTU(A2)
+			Move.l		#ESpeed, LAPStats.ifSpeed(A2)
+
+			Move.b		#EAddrSz, LAPStats.ifPhysAddress(A2)		; set len of ifPhyAddr to #6
+			Move.l		OurAddr(A2), LAPStats.ifPhysAddress+1(A2)	; copy first 4 bytes of address
+			Move		OurAddr+4(A2), LAPStats.ifPhysAddress+5(A2)	; copy last 2 bytes of address
+			Move.l		#ifStatusUp, LAPStats.ifAdminStatus(A2)
+			Move.l		#ifStatusUp, LAPStats.ifOperStatus(A2)
+			Move.l		Ticks, LAPStats.ifLastChange(A2)
+
+; Initialize Dt3Stats
+
+			Move.l		#SNMPVersion, Dt3Stats.dot3StatsVersion(A2) ; Set version to 1.0.0
+			Move.l		#0, Dt3Stats.dot3StatsIndex(A2)	; Set index to 0
+
+; Initialize Dt3Entry
+												
+			Move.l		#SNMPVersion, Dt3Entry.dot3Version(A2)	; Set version = 1.0.0
+			Move.l		#$0, Dt3Entry.dot3Index(A2)
+			Move.l		#2, Dt3Entry.dot3InitializeMac(A2)
+			Move.l		#1, Dt3Entry.dot3SubLayerStatus(A2)
+			Move.l		#1, Dt3Entry.dot3MulticastReceiveStatus(A2)
+			Move.l		#1, Dt3Entry.dot3TxEnabled(A2)
+			Move.l		#0, Dt3Entry.dot3TestTdrValue(A2)
+			
+			Rts
+			
+;________________________________________________________________________
+;
+; Translate Logical to Physical Address Routine
+;
+;    Call:
+;			8(A6).l -> logical address
+;			12(A6).l -> logical size
+;
+;    Return:
+;       	D0.w < 0 -> ERROR
+;			D0.l = physical address
+;			CC's are set
+;________________________________________________________________________
+
+;	Ptr TranslateAddress(laddr,lsize)					; translate logical to physical addrs
+MemBlk		RECORD		0
+address 	DS.l		1
+count		DS.l		1
+			ENDR
+
+TraAdd		RECORD		{A6Link}
+LinkSz		EQU 		*
+logical 	DS			MemBlk
+physical	DS			MemBlk
+A6Link		DS.l		2								; link and return addr
+laddr		DS.l		1								; logical address
+lsize		DS.l		1								; logical size
+			ENDR
+
+TranslateAddress
+
+		WITH	TraAdd
+			Link		A6,#LinkSz
+			Move.l		laddr(A6),logical.address(A6)
+			Move.l		lsize(A6),logical.count(A6)
+			Lea 		logical(A6),A0					; A0->translation table
+			Lea 		1,A1							; A1=count to translate
+			MoveQ		#5,D0							; GetPhysical
+
+			_MemoryDispatch
+		IF BUFDEBUG THEN
+			Beq.s		@cont							; success
+			_Debugger									; failure ?!?
+@cont
+		ELSE
+			Blt.s		@exit							; error, exit
+		ENDIF
+
+			Move.l		physical.Address(A6),D0 		; return lowest physical address
+@exit		Unlk		A6
+			Rts
+
+		ENDWITH
+			
+;___________________________________________________________________________
+;
+; GetMemory - Get mem and then, optionally, make it contiguous & locked & 
+;				non-cacheable
+;
+;    Call:
+;			8(A6).w -> mem options requested
+;			10(A6).l -> mem size requested
+;
+;    Return:
+;       	D0.w < 0 -> ERROR, couldn't get mem or couldn't lockmemcontig it
+;			D0.l = Ptr to locked, contig, non-cacheable mem
+;			CC's are set
+;___________________________________________________________________________
+
+GetMem		RECORD		{A6Link}
+LinkSz		EQU 		*
+A6Link		DS.l		2								; link and return addr
+memoptions	DS.w		1								; requested options
+memsize		DS.l		1								; requested size
+			ENDR
+
+GetMemory
+		WITH	GetMem
+			Link		A6,#LinkSz
+			Move.l		memsize(A6), D0
+			_NewPtr 	,SYS,CLEAR						; get the memory
+			Blt.s		@exit							; error, exit
+
+			Move.l		A0, -(SP)						; save ptr to new mem
+			Move		memoptions(A6), D1
+									; want mem locked, contiguous, or non-cacheable?
+			AndI		#(1<<Locked)+(1<<Contig)+(1<<CacheOff), D1						
+			Beq.s		@cont							; no
+														; yes, fall thru
+;
+; Should align memsize(A6) to a pageboundary via get/setptrsz  so we can 
+; save some mem here cause once we lockmemcontig it, we've potentially locked 
+; more than we want 'cause lockmemcontig rounds down the start and up the end 
+; to page boundaries.
+;
+@doit		Move.l		memsize(A6), A1					; length of buffer
+			MoveQ		#4, D0							; LockMemoryContiguous
+			_MemoryDispatch
+			Beq.s		@cont							; success
+		IF BUFDEBUG THEN
+			_Debugger									; failure ?!?		
+		ENDIF
+			Move.l		(SP), A0						; get mem ptr
+			Move		D0, (SP)						; save err code
+			_DisposPtr									; failure, get rid of mem
+		IF BUFDEBUG THEN
+			Beq.s		@ok1							; success
+			_Debugger									; failure ?!?		
+@ok1			
+		ENDIF
+			Move		(SP), D0						; restore err code
+			Bra.s		@exit							; couldn't get mem
+
+@cont		Move.l		A0, D0							; setup return value
+@exit		Unlk		A6
+			Rts
+			
+		ENDWITH
+		
+			EJECT
+;___________________________________________________________________________
+;
+; FreeMemory - Free mem and then, optionally, UN-make it contiguous & locked & 
+;				non-cacheable
+;
+;    Call:
+;			8(A6).w -> mem options
+;			10(A6).l -> mem address to free
+;			14(A6).l -> mem size to free
+;
+;    Return:
+;       	D0 = noErr
+;			CC's are set
+;___________________________________________________________________________
+
+FreeMem		RECORD		{A6Link}
+LinkSz		EQU 		*
+A6Link		DS.l		2					; link and return addr
+memoptions	DS.w		1					; requested options
+memaddr		DS.l		1					; address of mem to free
+memsize		DS.l		1					; size of mem to UN-(lock,contig,noncache)
+			ENDR
+
+FreeMemory
+		WITH	FreeMem
+			Link		A6,#LinkSz
+			
+			Move		memoptions(A6), D1				; get mem options
+												; was mem locked,contiguous,or non-cacheable?
+			AndI		#(1<<Locked)+(1<<Contig)+(1<<CacheOff), D1						
+			Beq.s		@free							; no
+			
+			Move.l		memaddr(A6), A0					; address of buffer
+			Move.l		memsize(A6), A1					; length of buffer
+			MoveQ		#3, D0							; UnLockMemory
+			_MemoryDispatch
+		IF BUFDEBUG THEN
+			Beq			@ok								; success
+			_Debugger									; failure ?!?		
+@ok			
+		ENDIF
+@free		Move.l		memaddr(A6), A0					; address of buffer
+			_DisposPtr									; free the memory
+		IF BUFDEBUG THEN
+			Tst			D0
+			Beq			@ok1							; success
+			_Debugger									; failure ?!?		
+@ok1			
+		ENDIF
+			MoveQ		#0, D0							; no error
+			Unlk		A6
+			Rts
+		ENDWITH
+			
+			EJECT
+
+;________________________________________________________________________
+;
+; Control - control requests to driver - all ENET calls come in here.
+;
+;	Call:	   
+;			A0 -> I/O queue element
+;			A1 -> device control entry
+;________________________________________________________________________
+
+ControlDefer											; task to complete a deferred control call
+			Move.w		#32767,vblCount(A0) 			; next task is a long time maybe
+			_StackSpace 								; D0 = avail. stack space
+			Tst.l		D0
+			Bmi.s		@defer							; defer if negative space
+			CmpI.l		#512,D0 						; is there a little room?
+			Bhs.s		@doControl						; yes
+@defer
+			Move.w		#1,VBLCount(A0) 				; restart fast timer
+@exit
+			Rts 										; and get out
+@doControl
+			Lea 		-VBLQEL(A0),A2					; A2->our vars
+			BClr		#0,deferCtl(A2)
+			Beq.s		@exit							; return to VBL if not really deferring
+
+			MoveA.l 	OurDCE(A2),A1					; A1->our DCE
+			MoveA.l 	dCtlQHead(A1),A0				; A0->param block in use
+			Bra.s		doControl
+Control
+			Move.w		ioTrap(A0),D0					; get trap word that called us
+
+			BTst		#asyncTrpBit,D0 				; is this a synchronous call?
+			Beq.s		doControl						; yes, bypass stack check
+
+			_StackSpace 								; D0 = avail. stack space
+			Tst.l		D0
+			Bmi.s		@defer							; defer if negative space
+			CmpI.l		#512,D0 						; is there a little room?
+			Bhs.s		doControl						; yes
+@defer
+			MoveA.l 	OurVarPtr,A2					; A2->our vars
+			BSet		#0,deferCtl(A2) 				; indicate we are deferring
+			Move.w		#1,vblCount+VBLQEL(A2)			; set next vbl to tick fast
+CRts
+			MoveQ		#noErr,D0						; good return for now
+			Rts 										; get out and get stack back
+doControl
+			Move.l		OurVarPtr,A2					; A2 -> our variables
+			Move.w		CSCode(A0),D2					; Pickup control code
+			SubQ		#KillCode,D2					; Check for OS kill I/O call
+			Beq.s		CRts							; return if so
+
+			MoveQ		#ControlErr,D0					; Assume a control error
+			Move.l		OurVarPtr,A2					; A2 -> our variables
+			Sub 		#FirstENET-KillCode,D2			; Subtract off lowest command
+			Blt 		ENETDone						; Return error if too low
+			Cmp 		#LastENET-FirstENET,D2			; Make sure not too high
+			Bgt 		ENETDone						; Return error if too high
+			Move		CSParam(A0),D1					; D1 = 1st parameter word
+			Move.l		CSParam+2(A0),D3				; D3 = 1st parameter longword
+;
+; Pick up routine address for this command and jump to routine
+;
+			Move.w		(ControlTable,D2.w*2),D2		; get offset of routine
+			Jmp 		(ControlTable,D2.w) 			; go do the call
+
+;_________________________________________________________________________
+;
+; Control dispatch table - must be in the same order as the ENET commands.
+;	 Specifies offsets to the command-handling routines.
+;_________________________________________________________________________
+
+ControlTable
+			DC.w		LapGetDot3Entry-ControlTable	; 238
+			DC.w		ENETDONE-ControlTable			; 239 LapSetDot3Entry
+			DC.w		LapDot3Stats-ControlTable		; 240
+			DC.w		ENETDONE-ControlTable			; 241 LapDot3CollStats
+			DC.w		LapGetLinkStatus-ControlTable	; 242
+			DC.w		ENETOK-ControlTable				; 243 CloseSAP
+			DC.w		ENETOK-ControlTable				; 244 OpenSAP
+			DC.w	   	DoDelMulti-ControlTable			; 245
+			DC.w		DoAddMulti-ControlTable			; 246
+			DC.w		DoAttachPH-ControlTable			; 247
+			DC.w		DoDetachPH-ControlTable			; 248
+			DC.w		DoWrite-ControlTable			; 249
+			DC.w		DoRead-ControlTable				; 250
+			DC.w		DoRdCancel-ControlTable			; 251
+			DC.w		DoGetInfo-ControlTable			; 252
+			DC.w		ENETOK-ControlTable				; 253 DoSetGeneral
+			
+;___________________________________________________________________________
+;
+; LapGetDot3Entry - Get Dt3Entry 
+;
+;    Call:
+;			A0 -> queue element
+;			A2 -> our variables
+;       	D3 = Link Stats Pointer
+;
+;    Return:
+;       	D0 = noErr
+;			EBuffSize(A0) = bytes returned
+;___________________________________________________________________________
+
+LapGetDot3Entry
+			Move.l   	#0, D0   						; Clear out D0
+			Move		EBuffSize(A0), D0    			; D0 = # of bytes to move
+			Cmp 		#Dot3EntrySz, D0 			  	; Asking for more than we have?
+			Bls.s   	@OKsize     					; no
+			Move 		#Dot3EntrySz, D0  			 	; yes, just return what we have
+@OKsize
+			Move		D0, EDataSize(A0)				; Return eDataSize
+			Move.l		D3, A1    						; A1 -> user's Dot3Entry buffer
+			LEA			Dt3Entry(A2), A0
+			_BlockMove
+
+			Bra			ENETOK
+
+;___________________________________________________________________________
+;
+; LapGetLinkStatus - Return LAPMIBStats record info 
+;
+;    Call:
+;			A2 -> our variables
+;       	D3 = Link Stats Pointer
+;
+;    Return:
+;       	D0 = noErr
+;			EBuffSize(A0) = bytes returned
+;___________________________________________________________________________
+
+LapGetLinkStatus
+			Move.l		MultiRecvd(A2), D0
+			Add.l		BcastRecvd(A2), D0
+			Move.l		D0, LAPStats.ifInNUcastPkts(A2)	; update non-unicast cnt
+
+			Move.l   	#0, D0   						; Clear out D0
+			Move		EBuffSize(A0), D0    			; D0 = # of bytes to move
+			Cmp 		#LAPMIBStatsSz, D0 			  	; Asking for more than we have?
+			Bls.s   	@OKsize     					; no
+			Move 		#LAPMIBStatsSz, D0  			; yes, just return what we have
+@OKsize
+			Move		D0, EDataSize(A0)				; Return eDataSize
+			MoveA.l		D3, A1    						; A1 -> user's LAPMIBStats buffer
+	 		Lea			LAPStats(A2), A0 
+			_BlockMove
+
+			Bra			ENETOK
+			
+;___________________________________________________________________________
+;
+; LapDot3Stats - return Dot3Stats record info 
+;
+;    Call:
+;			A2 -> our variables
+;       	D3 = 802.3 Stats Pointer
+;
+;    Return:
+;       	D0 = noErr
+;			EBuffSize(A0) = bytes returned
+;___________________________________________________________________________
+
+LapDot3Stats	
+			Move.l   	#0, D0   						; Clear out D0
+			Move		EBuffSize(A0), D0    			; D0 = # of bytes to move
+			Cmp 		#Dot3StatsEntrySz, D0 			  	; Asking for more than we have?
+			Bls.s   	@OKsize     					; no
+			Move 		#Dot3StatsEntrySz, D0  				; yes, just return what we have
+@OKsize
+			Move		D0, EDataSize(A0)				; Return eDataSize
+			MoveA.l		D3, A1    						; A1 -> user's Dot3Stats buffer
+	 		Lea			Dt3Stats(A2), A0
+			_BlockMove
+
+			Bra			ENETOK
+			
+;___________________________________________________________________________
+;
+; DoAddMulti - add a multicast address to the list
+;
+;	Call:
+;			A2 -> our variables
+;			D1 = first two bytes of address
+;			D3 = last four bytes of address
+;
+;	Return:
+;			D0 = error code
+;
+; 	Finds a free entry in the Multicast Table, stores the multicast address, 
+;	and increments the use count.  Calls Mace rtn to update Mace Logical 
+;	Address Filter (LAF).
+;___________________________________________________________________________
+
+DoAddMulti
+			MoveQ		#eMultiErr,D0					; Assume invalid address or table full
+			BTst		#8,D1							; Make sure multicast bit is set
+			Beq 		ENETDone						; Return error if invalid multicast address
+			Bsr 		FindMEntry						; D2 = entry number for this address
+			Bpl.s		@40 							; Branch if found it
+;
+; Look for the first free one
+;
+			MoveQ		#MTblSz-1,D2					; D2 = no. of entries in multicast table
+@30 		Tst.b		(MultiCTbl+MUseCount,A2,D2*MEntrySz)
+														; This one free?
+			DBeq		D2,@30							; Loop until checked them all or got one
+@35 		Bne 		ENETDone						; Error if none free
+
+;
+; Set in table, then compute and set hash bit in Logical Address Filter (LAF)
+;
+@40 		Move.l		D3,(MultiCTbl+2,A2,D2*MEntrySz) 
+														; Set second part of address	
+			Move		D1,(MultiCTbl,A2,D2*MEntrySz)	
+														; Set first part of address
+			AddQ.b		#1,(MultiCTbl+MUseCount,A2,D2*MEntrySz) 
+			
+			Bsr.l		MACEAddMulti					; Let Mace update LAF
+			
+			Bra			ENETOK
+			
+;___________________________________________________________________________
+;
+; DoDelMulti - delete a multicast address from the list
+;
+;	Call:
+;			A2 -> our variables
+;			D1 = first two bytes of address
+;			D3 = last four bytes of address
+;
+;	Return:
+;			D0 = error code
+;
+; 	Finds the multicast address in the Multicast Table and decrements the use  
+;	count. Calls Mace rtn to update Mace Logical Address Filter (LAF).
+;___________________________________________________________________________
+
+DoDelMulti	MoveQ		#eMultiErr,D0					; Assume address not found
+			Bsr.s		FindMEntry						; D2 = entry number in table
+			Bmi			ENETDone						; Return error if not found
+			SubQ.b		#1,(MultiCTbl+MUseCount,A2,D2*MEntrySz)  ; Decrement use count
+
+			Bsr.l		MACEDelMulti					; Let Mace update LAF
+			
+			Bra			ENETOK
+
+;
+; FindMEntry - find this address's entry in the multicast table
+;
+;	Call:
+;			D1 = high two bytes of address
+;			D3 = low four bytes of address
+;			A2 -> our variables
+;
+;	Return:
+;			D2 = entry number within table (minus if not found). CCR set.
+;
+
+FindMEntry	MoveQ		#MTblSz-1,D2					; D2 = no. of entries in multicast table
+@10 		Tst.b		(MultiCTbl+MUseCount,A2,D2*MEntrySz)
+														; Is this entry in use?
+			Beq.s		@20 							; Branch if not
+			Cmp 		(MultiCTbl,A2,D2*MEntrySz),D1	
+														; This it?
+			Bne.s		@20 							; Branch if not
+			Cmp.l		(MultiCTbl+2,A2,D2*MEntrySz),D3 
+														; Is it?
+			Beq.s		@30 							; Branch if got it
+@20 		DBra		D2,@10							; Loop until checked them all
+@30 		Tst 		D2								; Set CCR
+			Rts 										; And return
+
+;___________________________________________________________________________
+;
+; DoAttachPH - attach protocol handler control call
+;
+;	 Call:
+;			A2 -> our variables
+;			D3.l = address of protocol handler's packet-receive code or zero
+;			D1.w = protocol type code 
+;
+;	 Return:
+;			D0 = error code
+;___________________________________________________________________________
+
+DoAttachPH
+		IF BIT24 THEN
+			And.l		AddrMask(A2),D3 				; 32 bit clean
+		ENDIF
+			MoveQ		#LAPProtErr,D0					; Assume an invalid protocol error
+
+		IF PROM	THEN
+			Tst.B 		Promiscflg(A2)					; Are we in Promiscuous mode? 
+		 	Beq.S 		@10	 							; No, Note: not set until pass lpbk test
+			Tst.w		D1
+			Bne.s		ENETDone						; Force	attach to ONLY prot type 0			
+@10
+		ENDIF
+;
+; Read down the active protocol table, searching for a match
+;
+	 		Bsr.s		GetProt 						; See if it's there
+			Bpl.s		ENETDone						; Return error if protocol already active
+;
+; Now scan for the first free one . . .
+;
+			MoveQ		#LAPTblSz-1,D2					; Index into active protocols list
+@20 		Tst.b		InUseFlag(A2,D2)				; Check this entry
+			DBeq		D2,@20							; Loop until get one or end
+			Bne.s		ENETDone						; Error if none
+			Move.l		D3,(Handlers,A2,D2*4)			; Fill Handlers in first (in case of interrupt)
+			Clr.l		(RdQueueHd,A2,D2*4) 			; Clear out read queue head
+			Move		D1,Protocols(A2,D2*2)			
+														; Fill protocol type in
+			ST			InUseFlag(A2,D2)				; Indicate in use
+ENETOK		Clr 		D0								; Indicate no error
+ENETDone
+			Move.l		OurDCE(A2),A1					; Make sure A1 has DCE address
+			MoveA.l 	JIODone,A0
+			Jmp 		(A0)							; all done now
+			
+;
+; Lookup D1 in the protocol table. Return D2 = index to protocol (negative = error).
+;
+GetProt 	MoveQ		#LAPTblSz-1,D2					; Index into active protocols list
+@10 		Tst.b		InUseFlag(A2,D2)				; In use?
+			Beq.s		@20 							; Branch if not
+			Cmp 		Protocols(A2,D2*2),D1			; Match?
+			Beq.s		@30 							; Branch if so
+@20 		DBra		D2,@10							; Keep going until got one
+@30 		Tst 		D2								; Set CCR to D2
+			Rts 										; Return (BPL for match)
+;___________________________________________________________________________
+;
+; DoDetachPH - detach protocol handler control call
+;
+;	 Call:
+;			A2 -> our variables
+;			D1.w = protocol type code
+;
+;	 Return:
+;			D0 = error code
+;___________________________________________________________________________
+
+DoDetachPH
+			MoveQ		#LAPProtErr,D0					; Assume no such protocol active
+
+		IF PROM	THEN
+			Tst.B 		Promiscflg(A2)					; Are we in Promiscuous mode? 
+		 	Beq.S 		@5	 							; No, Note: not set until pass lpbk test
+			Tst.w		D1
+			Bne.s		ENETDone						; Force	deattach to ONLY prot type 0			
+@5
+		ENDIF
+			Bsr.s		GetProt 						; D2 = index to protocol
+			Bmi.s		ENETDone						; Return error if at end of table
+			Clr.b		InUseFlag(A2,D2)				; Indicate entry free
+			Tst.l		(Handlers,A2,D2*4)				; Default handler?
+			Bne.s		@10 							; All done if not
+			Bsr.s		AbortAll						; Abort all active reads
+@10 		Bra.s		ENETOK							; Complete this call
+
+
+;
+; AbortAll - abort all active read requests.
+;
+;	Call:
+;			A2 -> our variables
+;			D2 = flag offset into protocol table
+;			Uses D1,A0
+;
+; Assumes InUseFlag(A2,D2) cleared out already so no interrupts
+;
+
+AbortAll	Move.l		(RdQueueHd,A2,D2*4),D1			; D1 -> first read, if any
+			Beq.s		@10 							; Branch if none
+			Move.l		D1,A0							; A0 -> queue element
+			Move.l		(A0),(RdQueueHd,A2,D2*4)		; Remove from queue
+			Move		#reqAborted,D0					; Set error code
+			Bsr 		CompleteReq 					; Return error
+			Bra.s		AbortAll						; And loop
+
+@10 		Rts
+
+;___________________________________________________________________________
+;
+; DoWrite - write out a packet on Ethernet
+;
+;	Called:
+;			A2 -> our variables
+;			D3 = WDS pointer
+;
+;	Return:
+;			D0 = error code; nobuff => chip drvr out of xmit buffers
+;							 eLenErr => sum of data in WDS > max. pkt size
+;							 noErr => chip drvr gave pkt to chip or put pkt
+;										in xmit queue for transmission
+;
+;	Notes:	Depends on MACEXmit to check maximum WDS length
+;			
+;___________________________________________________________________________
+
+DoWrite
+			MoveQ		#eLenErr, D0					; Assume length error
+			Move.l		D3,A0							; A0 -> WDS
+			Cmp 		#EHdrSize,(A0)					; First entry must have whole header
+			Blo			ENETDone						; Error if not
+
+			Move.l		2(A0),A0						; A0 -> first WDS entry
+			Move.l		OurAddr(A2),ESrcAddr(A0)		; Set our address in it
+			Move		OurAddr+4(A2),ESrcAddr+4(A0)	
+
+	IF Logging THEN
+			move.l		#'DoWr',-(sp)
+			move.l		ESrcAddr(A0),-(sp)
+			move.l		ESrcAddr+4(A0),-(sp)
+			bsr			AddToLog
+			add.w		#12,sp
+	ENDIF
+			
+			Move.l		D3, -(SP)						; Push WDS ptr
+			Bsr 		MACEXmit						; send the packet
+			AddQ		#4, SP							; Strip parms
+			Tst.l		D0								; Error?
+			Bne.s		@xmitfail						; yes, check it
+			Bra			ENETDone						; no, complete write req. w/no error
+
+@xmitfail	Cmp.l		#nobuff, D0						; temporarily out of xmit buffs?
+		IF BUFDEBUG THEN
+			Bne.s		@chklenerr						; no, it must be a len err; lets chk
+		ELSE
+			Bne			ENETDone						; no, its a len err; return err		
+		ENDIF
+
+			MoveQ		#noErr,D0
+			Rts 										; Return, don't complete write yet
+
+		IF BUFDEBUG THEN
+@chklenerr	Cmp.l		#eLenErr, D0					; WDS length error?
+			Beq.s		@ok								; yes
+			_Debugger									; no, what the heck?
+@ok			Bra			ENETDone						; complete write req. w/error
+		ENDIF
+			
+		
+;___________________________________________________________________________
+;
+;	XmitBuffAvail - xmit completion routine
+;		
+;	Call: 
+;			d0 - transmit waiting flag (!=0 means a write is pending)
+;	 
+;	Return: 
+;			no return value/status
+;
+;	Notes: called via time manager after DoWrite gets no buff available error
+;			from MACEXmit call.
+;___________________________________________________________________________
+TxPrm		RECORD		4
+TxParm		DS.l		1								; my xmitdone parm
+TxPrmSz		EQU			*
+			ENDR
+			
+XmitBuffAvail	
+
+	IF Logging THEN
+			move.l		#'WrDn',-(sp)
+			clr.l		-(sp)
+			clr.l		-(sp)
+			bsr			AddToLog
+			add.w		#12,sp
+	ENDIF
+
+			MoveA.l 	OurVarPtr,A0					; get ptr to our vars
+
+	IF BUFDEBUG THEN
+			AddQ.l		#1, XmtDnActive(A0)
+			CmpI.l		#1, XmtDnActive(A0)
+			Beq.s		@ok
+			_Debugger									; oooppppsss!
+@ok
+	ENDIF
+
+			Tst.b		d0								; waiting for xmit buffs?
+			Beq.s		@exit							; no
+			
+	IF COUNTERS	THEN
+			AddQ.l		#1, XmitPend(A0)
+	ENDIF
+
+			MoveM.l 	A0/A2/A3/D3, -(SP)				; save C regs
+			MoveA.l 	A0, A2							; A2->our vars
+			MoveA.l 	OurDCE(A2), A1					; A1->our DCE
+			Move.l		dCtlQHead(A1),d0
+			beq.s		@done
+			move.l		d0,A0							; A0->waiting write param blk
+			Move.l		CSParam+2(A0), D3				; D3 = 1st parameter longword (e.g. WDSP)
+			Bsr 		DoWrite 						; process the write
+@done		MoveM.l 	(SP)+, A0/A2/A3/D3				; restore C regs
+
+	IF BUFDEBUG THEN
+			SubQ.l		#1, XmtDnActive(A0)
+	ENDIF
+@exit		Rts
+
+			EJECT
+;___________________________________________________________________________
+;
+; DoRead - read a packet off the Ethernet
+;
+;	 Call:
+;			A0 -> queue element
+;			A1 -> our DCE
+;			A2 -> our variables
+;			D1 = protocol type code 
+;
+;	 Return:
+;			D0 = error code
+;___________________________________________________________________________
+
+DoRead		MoveQ		#LAPProtErr,D0					; Assume an error
+			Bsr 		GetProt 						; D2 = index into PH table
+			Bmi 		ENETDone						; Error if not there
+			Tst.l		(Handlers,A2,D2*4)				; Is it the default?
+			Bne 		ENETDone						; Error if not
+			Move		#buf2SmallErr,D0				; Assume buffer not big enough
+			Cmp 		#EHdrSize,EBuffSize(A0) 		; Must hold at least header
+			Blo 		ENETDone						; Return error if not
+;
+; Dequeue the request from the system queue and queue it on ours (in order)
+;
+			Lea 		(RdQueueHd,A2,D2*4),A3			; A3 -> queue head
+			Move		SR,-(SP)            			; Save interrupt status
+			Move		#DMALockOut, D1
+			_SETINTMASK	D1
+@10 		Tst.l		(A3)							; Is there a next element?
+			Beq.s		@20 							; Branch if not
+			Move.l		(A3),A3 						; Point to it if so
+			Bra.s		@10 							; And keep going until end
+
+@20
+		IF BIT24 THEN
+			Exg 		D0,A0
+			And.l		AddrMask(A2),D0
+			Exg 		D0,A0							; 32 bit clean
+		ENDIF
+			Move.l		A0,(A3) 						; Put queue element on our queue
+			BClr		#DrvrActive,DCtlFlags+1(A1) 	
+														; Clear driver active flag
+			Move.l		IOLink(A0),DCtlQHead(A1)		; Set next element addr in head
+			Bne.s		@30 							; Branch if there is none
+			Clr.l		DCtlQTail(A1)					; Clear tail if not
+@30 		Clr.l		IOLink(A0)						; Indicate it's last one on our queue
+			Move.l		DCtlQHead(A1),D0				; Any more requests?
+			Beq.s		@40 							; Branch if not
+			BSet		#DrvrActive,DCtlFlags+1(A1) 	
+														; We're active again
+			Move		(SP)+,SR						; Restore interrupt state
+			Move.l		D0,A0							; A0 -> new queue element
+			MoveQ		#0,D0							; D0 should be clear
+	IF Logging THEN
+			move.l		#'DoRd',-(sp)
+			move.l		a0,-(sp)
+			clr.l		-(sp)
+			bsr			AddToLog
+			add.w		#12,sp
+	ENDIF
+			Bsr 		Control 						; Call ourselves
+			MoveQ		#0,D0							; Return no error for previous call
+			Rts 										; Return
+
+@40 		Move		(SP)+,SR						; Restore interrupt state
+			Rts 										; Return
+;___________________________________________________________________________
+;
+; DoRdCancel - abort a pending read call
+;
+;	 Call:
+;			A2 -> our variables
+;			D3 = pointer to queue element to abort
+;
+;	 Return:
+;			D0 = error code
+;___________________________________________________________________________
+
+DoRdCancel	Move		#CBNotFound,D0					; Assume an error
+		IF BIT24 THEN
+			And.l		AddrMask(A2),D3 				; 32 bit clean
+		ENDIF
+			Move.l		D3,A1							; A1 -> queue element
+			Move		EProtType(A1),D1				; D1 = protocol type
+			Bsr 		GetProt 						; D2 = index into PH table
+			Bmi.s		@60 							; Error if not there
+			Tst.l		(Handlers,A2,D2*4)				; Is it the default?
+			Bne.s		@60 							; Error if not
+			Lea 		(RdQueueHd,A2,D2*4),A3			; A3 -> queue head
+			Move		SR,-(SP)            			; Save interrupt status
+			Move		#DMALockOut, D1
+			_SETINTMASK	D1
+@30 		Move.l		(A3),D3 						; D3 -> next element in queue
+		IF BIT24 THEN
+			And.l		AddrMask(A2),D3 				; 32 bit clean
+		ENDIF
+			Beq.s		@50 							; Error if no more
+			Sub.l		A1,D3							; Subtract out desired one
+			Beq.s		@40 							; Branch if it's the one
+			Move.l		(A3),A3 						; A3 -> next in queue
+			Bra.s		@30 							; Keep looking
+
+@40 		Move.l		(A1),(A3)						; Point previous to next
+			Move		(SP)+,SR						; Restore interrupts
+;
+; Complete the ERead with an error, then the ERdCancel
+;
+			Move.l		A1,A0							; A0 -> ERead queue element
+			Move		#ReqAborted,D0					; D0 = aborted error
+			Bsr.s		CompleteReq 					; Complete it with error
+			Bra 		ENETOk							; Return no error for RdCancel
+
+@50 		Move		(SP)+,SR						; Restore interrupt state
+@60 		Bra 		ENETDone						; Return not found error
+
+
+;________________________________________________________________________
+;
+; CompleteReq - this code basically executes the parts of IODone necessary to
+;		   complete the user's request (sets result code and executes the user's
+;		   completion routine)
+;
+;	Call:
+;			D0 = result code
+;			A0 -> I/O queue element
+;________________________________________________________________________
+
+CompleteReq Move.w		D0,IOResult(A0) 				; Set the result code
+			MoveM.l 	D1-D3/A0-A3,-(SP)				; Save registers
+
+	IF Logging THEN
+			move.l		#'COMP',-(sp)
+			move.l		a0,-(sp)
+			clr.l		-(sp)
+			bsr			AddToLog
+			add.w		#12,sp
+	ENDIF
+			Move.l		IOCompletion(A0),D1 			; Check if there's a completion routine
+			Beq.s		@10 							; Branch if not - just return
+			Move.l		D1,A1							; Get it if so
+			Tst.w		D0								; IODone does this
+			Jsr 		(A1)							; Call completion routine
+@10 		MoveM.l 	(SP)+,D1-D3/A0-A3				; Restore registers
+			Rts 										; Return
+;___________________________________________________________________________
+;
+; DoGetInfo - return stats in the following form:
+;				Our address, 3 lw's of 0's, Netstats record
+;
+;	 Call:
+;			A0 -> queue element
+;			A2 -> our variables
+;			D3 -> buffer for response
+;
+;	 Return:
+;			D0 = error code
+;___________________________________________________________________________
+
+DoGetInfo
+		IF BIT24 THEN
+			And.l		AddrMask(A2),D3 				; 32 bit clean
+		ENDIF
+			Move		#buf2SmallErr,D0				; Assume buffer not big enough
+			Cmp 		#6,EBuffSize(A0) 				; Must hold at least address
+			Blo 		ENETDone						; Return error if not
+			
+			MoveQ		#0, D0
+			Move		EBuffSize(A0),D0				; D0 = buffer size
+			Cmp 		#InfoEnd-InfoStart,D0			; Asking for more than we have?
+			Bls.s		@10 							; no, branch
+			MoveQ		#InfoEnd-InfoStart,D0			; yes, just return what we have
+@10 		Move.l		D3,A1							; A1 -> where to move to
+			Lea 		InfoStart(A2),A0				; A0 -> where to move from
+
+;
+; Copy netstat info from Dot2stat and LAPMIBstat areas to "old" getinfo area
+;
+			Move.l		(LAPStats.ifOutUcastPkts,A2), D1
+			Add.l		(LAPStats.ifOutNUcastPkts,A2), D1
+			Move.l		D1, (EtherStats.TxOK,A2)
+			Move.l		(Dt3Stats.dot3StatsSingleCollisionFrames,A2), (EtherStats.sCollFrame,A2)
+			Move.l		(Dt3Stats.dot3StatsMultipleCollisionFrames,A2), (EtherStats.mCollFrame,A2)
+; EtherStats.CollFrame doesn't make sense and is left 0
+			Move.l		(Dt3Stats.dot3StatsDeferredTransmissions,A2), (EtherStats.DefTx,A2)
+			Move.l		(Dt3Stats.dot3StatsLateCollisions,A2), (EtherStats.LateColl,A2)
+			Move.l		(Dt3Stats.dot3StatsExcessiveCollisions,A2), (EtherStats.ExcessColl,A2)
+			Move.l		(Dt3Stats.dot3StatsExcessiveDeferrals,A2), (EtherStats.ExcessDef,A2)
+			Move.l		(Dt3Stats.dot3StatsInternalMacTransmitErrors,A2), (EtherStats.InMACTxErr,A2)
+			Move.l		(LAPStats.ifInUcastPkts,A2), (EtherStats.RxOK,A2)
+			Move.l		MultiRecvd(A2), (EtherStats.MultiRxOK,A2)
+			Move.l		BcastRecvd(A2), (EtherStats.BroadRxOK,A2)
+			Move.l		(Dt3Stats.dot3StatsFCSErrors,A2), (EtherStats.FCSerr,A2)
+			Move.l		(Dt3Stats.dot3StatsAlignmentErrors,A2), (EtherStats.FAerr,A2)
+			Move.l		(LAPStats.ifInErrors,A2), (EtherStats.MPerr,A2)
+
+			_BlockMove  								; Move it
+			Bra 		ENETOK							; Return no error
+			
+;___________________________________________________________________________
+;
+; EtherRecv - .ENET packet receive routine 
+;
+;	Call:
+;			Received packet(s) pointed to by buffer(s) on InUse Queue 
+;
+;	Return:
+;			Empty InUse Queue
+;
+;	Destroys:
+;   Notes: 
+;			EtherRecv is called by the MACE since we passed a ptr to EtherRecv 
+;			as the RecvRtn in the MACEInit call. 
+;
+;	Calls:
+;			Upper layer handler, or Default Handler, to receive packet.
+;___________________________________________________________________________
+
+EtherRecv
+		WITH	RcvParms
+			Link		A6, #Size
+
+	IF Logging THEN
+			move.l		#'Ethr',-(sp)
+			move.l		#'Recv',-(sp)
+			move.l		PktStat(A6),-(sp)
+			bsr			AddToLog
+			add.w		#12,sp
+	ENDIF
+			Move.l		PktStat(A6), D0					; get packet status
+			AndI.w		#(1<<RcvOFLO)+(1<<RcvCLSN)+\
+							(1<<RcvFRAM)+(1<<RcvFCS),D0 ; packet with error?
+			Bne			@86								; ignore packet with error
+
+			MoveM.l		A2-A5/D3,-(SP)					; save used C regs
+
+			MoveA.l		Parm(A6), A2					; Our variables
+	IF COUNTERS	THEN
+			AddQ.l		#1, EtherRcvCnt(A2)
+	ENDIF
+			move.l		PktLen(A6),D1					; D1=size of packet, including FCS
+			Sub 		#EHdrSize+4,D1					; Subtract out header & FCS bytes from total
+;
+; Copy the Ethernet header from the packet into the RHA
+;
+			Lea 		RHA(A2), A3						; A3 -> RHA
+			MoveA.l		PktData(A6), A0					; A0 -> packet data
+			Move.l		(A0)+, (A3)+					; Move header into buffer
+			Move.l		(A0)+, (A3)+					; Hard code for speed
+			Move.l		(A0)+, (A3)+
+			Move		(A0)+, (A3)+					; A3 -> buffer after header
+
+;
+; Check if dest. addr. a broadcast or one of our multicasts 
+;
+			Move	  	RHA(A2), D3    					; D3 = first 2 bytes of dest address	
+			BTst		#8, D3   						; Is it a broadcast or multicast?
+			Beq.s   	@45     						; Branch if not, it must be our physical address
+			MoveQ   	#-1, D2      					; D2 = $FFFFFFFF
+			Cmp		   	D2, D3   						; Is packet a broadcast?
+			Beq.s		@last4							; Maybe, check last 4 bytes of dest address
+			Move.l	  	RHA+2(A2), D3    				; No, D3 = last 4 bytes of dest address	
+			Bra	   		@120    						; Go check if one of our registered multicasts
+@last4		Move.l	  	RHA+2(A2), D3    				; D3 = last 4 bytes of dest address	
+			Cmp.l   	D2, D3   						; Is packet a broadcast?
+			Bne		   	@120    						; No, go check if one of our registered multicasts
+			AddQ.l		#1, BcastRecvd(A2)				; Yes, inc. broadcast pkt cntr
+			Bra.s		@50
+			
+@45			AddQ.l		#1, (LAPStats.ifInUcastPkts,A2)	; inc. non-multi/bcast pkt cntr
+
+;
+; Search the protocol handler table for this protocol
+;
+
+@50 		Move		EType-EHdrSize(A3),D0			; D0 = protocol type or 802.3 length
+			Cmp.w		#EMaxDataSz,D0					; is it an 802.3?
+			Bhi			@110							; if not, try other protocols
+
+			Clr 		D0								; Handler will be for type zero
+			Exg 		D0,D1							; D1 = protocol type, D0 = old D1
+			Bsr 		GetProt 						; D2 = offset in table
+			Exg 		D0,D1							; Restore D0, D1
+			Bmi.s		@90 							; Branch if not found
+;			Move		EType-EHdrSize(A3),D0			; D0 = protocol type
+
+@70 		Lea 		EReadPacket,A4					; A4 -> our ReadPacket routine
+			Lea 		DefaultPH,A5					; use default maybe
+			Move.l		(Handlers,A2,D2*4),D3			; get the protocol handler
+			Beq.s		@80 							; use default
+			MoveA.l 	D3,A5							; use table entry's protocol handler
+
+@80			
+			Jsr 		(A5)							; Call protocol handler
+
+@85			MoveM.l 	(SP)+, A2-A5/D3					; Restore registers
+@86			Unlk		A6
+			Rts 										; That's it
+
+@90			AddQ.l		#1, LAPStats.ifInUnknownProtos(A2)
+			Bra.s		@85
+;
+; Find Protocol handler for non 802.3 packet
+;
+@110
+			Exg 		D0,D1							; D1 = protocol type, D0 = old D1
+			Bsr 		GetProt 						; D2 = offset in table
+			Exg 		D0,D1							; Restore D0, D1
+			Bmi.s		@90 							; Branch if not found
+
+			Bra.s		@70 							; Process it
+
+;
+; Packet is a multicast.  Check if it matches one of our multicast addresses.
+; 	
+;	Call:
+;			A2 -> our variables
+;			D3 = last 4 bytes of destination address 
+;
+@120		Move		D1,D0   						; Save length in case packet's for us
+			Move		RHA(A2),D1  					; D1 = high two bytes of address
+			Bsr 		FindMEntry  					; D2 = entry within multicast table
+			Bmi.s   	@150     						; Ignore it if not found
+			AddQ.l  	#1, MultiRecvd(A2)   			; Inc count of multicast pkts recv'd
+			Move		D0,D1   						; Restore packet length
+			Bra			@50     						; And process packet
+
+@150		AddQ.l  	#1, LAPStats.ifInDiscards(A2)   ; Increment count of packets not for us
+			Bra.s   	@85     						; Ignore this packet
+
+
+
+;___________________________________________________________________________
+;
+;	EReadPacket - read in the specified number of bytes into the specified
+;			buffer. Asking for more than there is is an error.
+;
+;	EReadRest - read in the rest of the packet, putting the specified number
+;			of bytes into the specified buffer, and ignoring the rest.
+;
+;	Call:
+;			A0 -> current location in card memory
+;			A1 -> card registers
+;			A3 -> buffer to read into
+;			A4 -> start of ReadPacket
+;			D1 = number of bytes left to come in (caller may decrease)
+;			D3 = byte count to read
+;
+;	Return:
+;			D0 = error byte (Z bit set in CCR)
+;			D1 updated (ReadPacket)
+;			D2 saved
+;			D3	= 0 if exact number of bytes requested were read
+;				> 0 indicates number of bytes requested but not read
+;					(packet smaller than requested maximum)
+;				< 0 indicates number of extra bytes read but not returned
+;					(packet larger than requested maximum)
+;			A0,A1 preserved by ReadPacket, modified by ReadRest
+;			A2 saved
+;			A3 -> one past where last character went
+;			A4,A5 saved (until packet's all in or error)
+;___________________________________________________________________________
+
+EReadPacket Bra.s		EDoRP							; Need this for two entry points
+
+EReadRest	Move		D3,D0							; D0 = number of bytes to return
+			Sub 		D1,D0							; D0 = remainder count
+			Tst 		D3								; Check for zero
+			Beq.s		@10 							; If so, don't waste our time
+			Bsr.s		MoveBytes						; Move the bytes in
+@10 		Move		D0,D3							; D3 = remainder count
+			MoveQ		#0,D0							; No error no matter what
+			Rts
+EDoRP
+			Cmp.w		D3,D1
+			Blo.s		@5								; error in request
+			Bsr.s		MoveBytes						; Move in the bytes
+			Tst 		D3								; Moved them all?
+			Beq.s		@10 							; Branch if moved all ok
+@5			MoveQ		#eLenErr,D0 					; Set length error
+@10 		Rts 										; Return
+;___________________________________________________________________________
+;
+; DefaultPH - default protocol handler - complete an ERead call if there
+;
+;	Call:
+;			A0,A1: preserve until ReadRest
+;			A2 -> local variables
+;			A4 -> EReadPacket
+;			A5 usable until ReadRest
+;			D0 = protocol type
+;			D2 = index into protocol table
+;			
+;	Notes:	Interrupts are off
+;
+;___________________________________________________________________________
+
+DefaultPH
+			Move.l		(RdQueueHd,A2,D2*4),D0			; D0 -> first ERead on queue
+			Beq.s		@20 							; Skip packet if none
+			Move.l		D0,A5							; A5 -> ERead queue element
+			Move.l		(A5),(RdQueueHd,A2,D2*4)		; Remove from queue
+			Move.l		D0,D2							; D2 = queue element pointer
+			Move.l		EBuffPtr(A5),A3 				; A3 -> buffer to read into
+			Move		EBuffSize(A5),D3				; D3 = maximum size to read
+			Sub 		#EHdrSize,D3					; Adjust for header
+		IF PROM THEN			
+			Tst.B 		Promiscflg(A2)					; Are we in Promiscuous mode? 
+		 	Beq.S 		@5	 							; No, Note: not set until pass lpbk test
+			Lea 		PromiscRHA(A2), A5				; A5 -> header info including pkt status lw
+			Move.l		(A5)+,(A3)+ 					; Move pkt status into buffer
+			Bra.s		@6
+@5			Lea 		RHA(A2),A5						; A5 -> header info
+@6			
+		ELSE
+			Lea 		RHA(A2),A5						; A5 -> header info
+		ENDIF
+			Move.l		(A5)+,(A3)+ 					; Move header into buffer
+			Move.l		(A5)+,(A3)+ 					; Hard code for speed
+			Move.l		(A5)+,(A3)+ 					; (AssumeEq?)
+			Move		(A5)+,(A3)+ 					; A3 -> buffer after header
+			Jsr 		2(A4)							; Read in the whole thing (D0=0)
+			Move.l		D2,A0							; A0 -> queue element again
+			Move		EBuffSize(A0),D1				; D1 = original request size
+			Sub 		D3,D1							; D1 = total packet size
+			Move		D1,EDataSize(A0)				; Set in queue element
+			Tst 		D3								; Check for buffer overflow
+			Bpl.s		@10 							; Branch if no overflow
+			Move		#buf2SmallErr,D0				; Set error
+@10 		Bra 		CompleteReq 					; Complete request and return
+
+@20 		MoveQ		#0,D3							; Indicate no buffer
+			Jmp 		2(A4)							; Ignore packet and return
+
+
+;___________________________________________________________________________
+;
+; MoveBytes - move bytes from card memory to desired place
+;
+;	Call:
+;			A0 -> current location in card memory
+;			A3 -> place to move bytes to
+;			D1 = number of bytes left in packet
+;			D3 = number of bytes to move
+;
+;	Return:
+;			A0 adjusted
+;			A3 adjusted past bytes moved in
+;			D1 adjusted
+;			D3 = zero if all could be moved, remainder otherwise
+;___________________________________________________________________________
+
+MoveBytes
+
+			MoveM.l 	D0/D2/A1/A2,-(SP)				; Save registers
+			Move.l		OurVarPtr,A2					; A2 -> our variables
+		IF BIT24 THEN
+			Exg 		D0,A3
+			And.l		AddrMask(A2),D0
+			Exg 		D0,A3							; 32 bit clean
+		ENDIF
+			Move.l		A3,A1							; A1 -> where to move to
+			MoveQ		#0,D0							; D0 = number of bytes to move
+			Move		D3,D0							; Assume we can move all asked for
+			Cmp 		D1,D3							; Can we move all asked for?
+			Bls.s		@10 							; Branch if so
+			Move		D1,D0							; Else move all we can
+@10 		Sub 		D0,D1							; Adjust count left to come in
+			Sub 		D0,D3							; D3 = bytes not moved
+			AddA.w		D0,A3
+
+			Move.l		D1,-(SP)						; save this one
+			Move.l		A0,-(SP)
+			Move.l		D0,-(SP)
+			Jsr 		([MemMove,A2])					; call block move routine
+			MoveA.l 	(SP)+,A0
+			AddA.l		(SP)+,A0						; adjust pointer
+			Move.l		(SP)+,D1
+
+@30 		MoveM.l 	(SP)+,D0/D2/A1/A2				; Restore registers
+			Rts 										; That's it
+;________________________________________________________________________
+;
+; Close - close the ENET driver.
+;
+;	Call:
+;			A1 -> DCE
+;________________________________________________________________________
+
+Close
+;	This code is only called if one of the LoopBack tests failed.  Closing is 
+;   not a supported function since there is no way for me to know how many 
+;	clients are using the driver; ie. AppleTalk using 802.3 and MacTCP using
+;	Ethernet.  If the Device Manager passed all open calls to the driver a
+;	use-count could be implemented and I could truely support Close.
+			MoveA.l		OurVarPtr, A2					; A2 -> our variables
+
+			Bsr 		MACEHalt						; stop MACE
+
+			MoveQ		#LAPTblSz-1,D2					; D2 = Index into active protocols list
+@10 		Tst.b		InUseFlag(A2,D2)				; Active?
+			Beq.s		@20 							; Branch if not
+			Tst.l		(Handlers,A2,D2*4)				; Default handler
+			Bne.s		@20 							; Branch if not
+			Bsr 		AbortAll						; Abort all requests
+@20 		DBra		D2,@10							; On to next
+
+			Lea 		VBLQEL(A2),A0
+			Tst.l		vblAddr(A0) 					; did we launch ctl call VBL?
+			Beq.s		@50
+			_VRemove									; remove VBL task if so
+@50
+			MoveA.L		OurVarPtr,A0
+			_DisPosPtr									; free our var mem
+
+			Lea 		OurVarPtr,A2					; A2 -> variable pointer
+			Clr.l		(A2)							; Clear it out (no variables)
+			MoveQ		#0,D0							; Indicate no error
+AnRts		Rts 										; And return
+	
+;
+; Variable storage
+;
+OurVarPtr	DC.l		0								; Pointer to our variables
+			END
+
+
+

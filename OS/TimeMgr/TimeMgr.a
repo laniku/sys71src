@@ -1,0 +1,1151 @@
+;
+;	File:		TimeMgr.a
+;
+;	Contains:	The Macintosh OS Time Manager
+;
+;	Written by:	Gary G. Davidian
+;
+;	Copyright:	© 1988-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM5>	 11/9/93	KW		added some eieioSTP macros.  Only expands for CygnusX1 ROM
+;	   <SM4>	11/12/92	PN		Get rid of ≥ 020 conditionals for ROM builds
+;        <3>     9/10/92    AEK     Roll in new _microseconds and PrimeTime fix from Quicktime 
+;                                   code for _microseconds was already there, so just remove old one
+;		 <2>	 3/27/92	JSM		Merge in Philip’s change: Export Labels for Patch roll-in.
+;		 <1>						• Pre-SuperMario comments follow •
+;		 <9>	 2/12/92	JSM		Moved this file to TimeMgr folder, keeping all the old
+;									revisions.
+;		 <8>	11/16/91	DTY		Checked in Wayne Meretzky’s new version of __MicroSeconds,
+;									conditionalized for TheFuture.
+;		 <7>	  9/9/91	JSM		Cleanup header.
+;		 <6>	 9/22/90	dba		Break some routines into separate PROCs so they can be cut back
+;									in the linked patch version. Also change conditionals so the the
+;									linked patch version of the Time Mgr. is universal (does not
+;									assume 68020 or existence of the Power Mgr. chip). This file is
+;									now used as the source both of the Time Mgr. in ROM and of the
+;									Time Mgr. patches.
+;		 <5>	 9/19/90	BG		Removed <3>. 040s are behaving more reliably now.
+;		 <4>	 7/25/90	GGD		Added support for the _MicroSeconds trap which returns a 64 bit
+;									Microsecond counter which is usefull for timestamping and
+;									timing. Deleted some Eclipse NOPs which would not be assembled
+;									for 68040s
+;		 <3>	 6/20/90	CCH		Added some NOPs for flaky 68040's.
+;		 <2>	 1/12/90	CCH		Added include of “HardwarePrivateEqu.a”.
+;	   <1.4>	11/13/89	MSH		Pmgr equates now in record format.
+;	   <1.3>	 2/23/89	GGD		Stored the underflow retry adjustment constant in RAM to allow
+;									better patching flexability. On systems with PowerManagers,
+;									switch into fast mode in FreezeTime, and restore mode in
+;									ThawTime, to reduce drift in the time critical section, and to
+;									prevent a potential loop in the underflow path.
+;	   <1.2>	 1/30/89	GGD		Added new features for BigBang and the new ROMs. This includes
+;									support for extended time manager tasks, and improves accuracy
+;									and reduces drift even more.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.4>	10/16/88	GGD		Changed resolution to 20µs with range of 1 day. Improved long
+;									term accuracy, and added initialization code to do runtime
+;									timings to make it processor speed independent. Coded around the
+;									bug in Rockwell VIA timers. Removed machine specific
+;									conditionals in favor of the "Cpu" equate. Improved conversion
+;									constants for better accuracy. Went back to having state in the
+;									system heap.
+;	  <•1.3>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.2>	 8/16/88	GGD		Added InitTimeMgr initialization routine. Changed usage of
+;									TimeVars, is now head of active list, no state in SysHeap.
+;	   <1.1>	  8/5/88	GGD		Completely re-written. Lots of bug fixes and new features.
+;				 7/26/88	GGD		Completely re-wrote the Time Manager, replacing all of the code
+;									and comments from the old version. This version fixes numerous
+;									bugs, and adds several new features.
+;	   <1.0>	 2/10/88	BBM		Adding file for the first time into EASE…
+;
+
+			TITLE	'Time Manager - Macintosh Time Manager'
+
+;_______________________________________________________________________
+;
+;	Macintosh Time Manager.
+;
+;	Written by Gary G. Davidian, July 26, 1988.
+;
+;_______________________________________________________________________
+
+			print	off
+
+			load	'StandardEqu.d'
+			include	'HardwarePrivateEqu.a'
+
+			print	on,nomdir
+
+		if forROM then
+				use68020Opcodes: equ 1
+				machine	MC68020
+		else
+			use68020Opcodes: equ 0
+			machine	MC68020					; some 020 opcodes in stuff that is run-time determined
+		endif
+
+; globals in system heap (same RECORD in TimeMgrPatch.a; move it to an equate file if you like)
+
+TimeMgrPrivate	record	0,increment			; time manager private storage
+ActivePtr		ds.l	1					; pointer to soonest active request
+TimerAdjust		ds.b	1					; number of VIA ticks used loading timer
+TimerLowSave	ds.b	1					; low byte of VIA timer from last FreezeTime		<4>
+RetryAdjust		ds.w	1					; number of via ticks for underflow retry
+CurrentTime		ds.l	1					; number of virtual ticks since boot
+BackLog			ds.l	1					; number of virtual ticks of ready tasks
+**** NOTE: The ordering of the following 4 fields must not change (FreezeTime Depends on it)	<4>
+HighUSecs		ds.l	1					; high 32 bits of microsecond count					<4>
+LowUSecs		ds.l	1					; low 32 bits of microsecond count					<4>
+FractUSecs		ds.w	1					; 16 bit fractional microsecond count				<4>
+CurTimeThresh	ds.w	1					; CurrentTime threshold for updating µsec count		<4>
+**** end of order dependent fields																<4>
+PrivateSize		equ		*-TimeMgrPrivate	; size of this record
+				endr
+
+USecsInc		equ		$FFF2E035			; 65522.8758µsec	(16.16 fixed point)				<4>
+ThreshInc		equ		3208				; = 3208 internal ticks 							<4>
+			eject
+;_______________________________________________________________________
+;
+;	The time manager maintains a linked list of tasks that are waiting for
+;	their timer to run out.  The list is ordered by expiration time, with
+;	ActivePtr pointing to the task with the earliest timeout.  The tmCount
+;	field of the each task on the list contains the number of virtual ticks
+;	a task must wait after the task in front of it expires.  For the task
+;	at the head of the list, this is the time to wait after the VIA timer
+;	expires.
+;	The TimerAdjust variable is used to account for the number of VIA ticks
+;	that go by while we are trying to load a new timer value.  This is
+;	computed at runtime, so that it is processor speed independent.
+;
+;_______________________________________________________________________
+
+
+;_______________________________________________________________________
+;
+;	User visible changes since Inside Macintosh Vol. 4 was published.
+;
+;	1)	tmCount field is a LONGINT, not an INTEGER (documentation error).
+;
+;	2)	RmvTime, and PrimeTime now correctly return a result code (noErr)
+;		in register D0.  Numerous other bugs that were not as visible have
+;		also been fixed.
+;
+;	3)	Time can be represented in microseconds as well as milliseconds.
+;		Negative values represent negated microseconds. (Although microseconds
+;		can be specified, the actual resolution of the time manager is
+;		currently closer to 20 microseconds).
+;
+;	4)	The high order bit of qType is now a flag to indicate that the
+;		task timer is active.  Set by PrimeTime, cleared when time expires
+;		or RmvTime is called.  Initialized cleared by InsTime.
+;
+;	5)	tmAddr may be set to zero to indicate that no completion routine
+;		should be called. (The flag mentioned above may be used to determine
+;		if the time has expired).
+;
+;	6)	The completion routine is now passed a pointer (in register A1) to
+;		the TMTask record associated with it.  This makes it more usable
+;		under Multi-Finder.
+;
+;	7)	When RmvTime is called on an active task, the tmCount field will
+;		be returned with the amount of remaining time that had not been
+;		used (in negative microseconds, or positive milliseconds).  If
+;		the task had already expired, tmCount will contain zero.  This
+;		allows the Time Manager to be used to compute elapsed times, which
+;		is useful for performance measurments.
+;
+;	8)	In order to provide better resolution than 1 millisecond, the maximum
+;		delay time was reduced from about 24 days, to currently about 1 day.
+;		Larger delay times may still be specified to PrimeTime, but they will
+;		be converted to the largest possible time instead.
+;
+;	9)	Support for Extended Time Manager Tasks has been added, _InsXTime is
+;		used to install them.  The new field tmWakeUp is used by the TimeMgr
+;		to remember when a _PrimeTime is supposed to expire.  When _PrimeTime
+;		is called, if tmWakeUp is non-zero, then the new wakeup time will be
+;		relative to the old tmWakeUp, instead of relative to the current time.
+;		This allows for drift free fixed frequency timing tasks, which is needed
+;		by the Sound Manager.
+;
+;_______________________________________________________________________
+			TITLE	'Time Manager - Equates'
+
+TaskActiveBit		equ		7			; high bit of QType word is active flag
+ExtendedTmTaskBit	equ		6			; indicates an extended TmTask record
+T2IntBit			equ		5			; VIER/VIFR bit num for VIA Timer 2
+
+;_______________________________________________________________________
+;
+;	Representations of time in the Time Manager.
+;
+;	Time is represented externally in two ways, both are stored in a longword,
+;	if the value is positive, it represents milliseconds, and if it is
+;	negative, it represents negated microseconds.  This representation is used
+;	as the delay time input to PrimeTime, and as the unused remaining time
+;	output by RmvTime.
+;
+;	The VIA1 Timer2 is the 16 bit hardware timer used by the time manager.
+;	On all current machines, it decrements at a rate of 783360 Hz, and
+;	generates an interrupt, and keeps counting, when it counts through zero.
+;	This provides resolution of 1.276 µsec, and a range of 83.660 msec.
+;
+;	Internally the time manager represents time as a virtual unsigned 36 bit
+;	VIA timer, which gives a range of about 1 day.  However, since we only
+;	have 32 bits to store time in, we drop the low 4 bits of the timer,
+;	which reduces the resolution by a factor of 16 to 20.425 µsec.
+;
+;	Converting between the external and internal forms of time is done by
+;	multiplying by the proper fixed point constants, and shifting the binary
+;	point of the 64 bit result to get just the integer portion of the result.
+;	The computation of the 32 bit conversion constants requires 64 bit
+;	intermediate results, and unfortunatly the assembler only provides 32
+;	bit expression evaluation, so the proper constants were computed with
+;	a 64 bit hex caculator, and hard coded here (yuck!).  These are not
+;	"Magic Numbers", the formula for computing them is provided, so that
+;	they may be re-computed if any of the parameters ever change.
+;
+;_______________________________________________________________________
+
+TicksPerSec			equ		783360		; VIA Timer clock rate
+TickScale			equ		4			; Internal time is VIA ticks >> TickScale
+
+MsToIntFractBits	equ		26			; number of fraction bits in 64 bit result
+*MsToInternal		equ		((TicksPerSec<<(MsToIntFractBits-TickScale))\
+							+999)/1000
+MsToInternal		equ		$C3D70A3E	; msec to internal time multiplier
+
+UsToIntFractBits	equ		32			; number of fraction bits in 64 bit result
+*UsToInternal		equ		((TicksPerSec<<(UsToIntFractBits-TickScale))\
+							+999999)/1000000
+UsToInternal		equ		$0C88A47F	; µsec to internal time multiplier
+
+IntToMsFractBits	equ		32			; number of fraction bits in 64 bit result
+*InternalToMs		equ		((1000<<(IntToMsFractBits+TickScale))\
+							+TicksPerSec-1)/TicksPerSec
+InternalToMs		equ		$053A8FE6	; internal time to msec multiplier
+
+IntToUsFractBits	equ		27			; number of fraction bits in 64 bit result
+*InternalToUs		equ		((1000000<<(IntToUsFractBits+TickScale))\
+							+TicksPerSec-1)/TicksPerSec
+InternalToUs		equ		$A36610BC	; internal time to µsec multiplier
+
+
+			macro	;	Macro for interfacing with the MultAndMerge routine.
+			Convert	&Multiplier,&FractionBits
+			bsr.s	MultAndMerge			; input/output is D0
+			dc.l	&Multiplier			; conversion multiplier
+			if		&eval(&FractionBits)=32 then
+			dc.l	0						; merge mask (low 32 bits all fraction)
+			else
+			dc.l	-1<<&FractionBits	; merge mask (some low bits not fraction)
+			rol.l	#32-&FractionBits,d0	; position result after merge
+			endif
+			endm
+			TITLE	'Time Manager - Remove Time Manager Task'
+
+TimeMgr		proc	export
+
+			export	__InsTime				; Install Time Manager Task
+			export	__RmvTime				; Remove Time Manager Task
+			export	__PrimeTime				; Initiate Time Manager Task Delay
+			import	FreezeTime				; Stop timer
+			entry	ThawTime				; Start timer (used by InitTimeMgr)
+			entry	Timer2Int				; Interrupt handler (vector set up by InitTimeMgr)
+			with	TimeMgrPrivate
+
+;_______________________________________________________________________
+;
+;  Routine:		RmvTime
+;  Inputs:		A0 - pointer to Time Manager Task to remove
+;  Outputs:		D0 - error code (noErr)
+;  Destroys:	none
+;  Calls:		FreezeTime, ThawTime, MultAndMerge
+;  Called by:	OsTrap dispatcher
+;
+;  Function:	Removes the specified Time Manager Task from the control
+;				of the Time Manager.  If PrimeTime had been previously
+;				called for this task, and the time has not expired yet,
+;				the amount of unused time will be returned in the tmCount
+;				field. The unused time will be represented in negated
+;				microseconds, if it is not too large to fit within 32 bits
+;				otherwise it will be represented in positive milliseconds.
+;				Additionally, the TaskActiveBit of the QType field will
+;				be cleared to indicate that the timer task is no longer
+;				active.
+;
+;_______________________________________________________________________
+
+			export  AfterFreezeTimeInRmvTime
+__RmvTime									; a0-a2/d1-d2 saved by dispatcher
+			move.l	d3,-(sp)				; save d3 also
+
+			jsr		FreezeTime				; setup to manipulate time queue
+AfterFreezeTimeInRmvTime
+			moveq.l	#0,d2					; D2 : total time remaining
+			lea		ActivePtr-Qlink(a2),a1	; A1 : previous := head
+@SearchLoop	move.l	QLink(a1),d0			; D0 : next := previous.QLink
+			beq.s	@NotActive				; if end, not an active task
+			exg.l	a1,d0					; A1 : previous := next (save old previous)
+			move.l	tmCount(a1),d1			; get delay between previous and next
+			add.l	d1,d2					; add to total time remaining
+			cmpa.l	a0,a1					; is this the one to remove?
+			bne.s	@SearchLoop				; loop until it is found
+
+			movea.l	d0,a1					; A1 : old previous
+			move.l	QLink(a0),d0			; get successor to removee
+			move.l	d0,QLink(a1)			; previous points to successor
+			beq.s	@Removed				; if no successor, don't adjust time
+			movea.l	d0,a1					; get pointer to successor
+			add.l	d1,tmCount(a1)			; pass removees time to successor
+@Removed	move.l	d2,d0					; setup total time remaining in D0
+
+@NotActive									; at this point D0 is total time remaining
+			sub.l	BackLog(a2),d0			; don't count the backlog
+			bhs.s	@GotRemaining			; if still time remaining
+			moveq.l	#0,d0					; otherwise, all backlog, return zero time
+@GotRemaining
+			bsr.w	ThawTime				; done manipulating time queue
+
+			movea.l	d0,a1					; save a copy of internal time
+			convert	InternalToUs,IntToUsFractBits	; convert internal to µsec
+			neg.l	d0						; µsecs are passed negated
+			bmi.s	@ConvertDone			; if it fits we're done
+
+			move.l	a1,d0					; restore copy of internal time
+			convert	InternalToMs,IntToMsFractBits	; convert internal to msec
+@ConvertDone
+			move.l	d0,tmCount(a0)			; return unused delay time
+
+			move.l	(sp)+,d3				; restore saved d3
+			moveq.l	#0,d1					; clear all of the flags
+; (fall in)	bra.s	__InsTime				; mark task inactive, return with success
+			TITLE	'Time Manager - Install Time Manager Task'
+
+;_______________________________________________________________________
+;
+;  Routine:		InsTime
+;  Inputs:		A0 - pointer to Time Manager Task to install
+;  Outputs:		D0 - error code (noErr)
+;  Destroys:	none
+;  Calls:		none
+;  Called by:	OsTrap dispatcher, RmvTime (falls into)
+;
+;  Function:	Initializes the fields of a Time Manager Task, to indicate
+;				that it is inactive.
+;
+;  NOTE:	This routine is documented in Inside Machintosh Vol 4., and
+;			was used by the old Time Manager to install the task on the
+;			Time Manager queue.  In this version of the Time Manager, the
+;			queue only contains active tasks, so installation is done by
+;			_PrimeTime now.
+;
+;_______________________________________________________________________
+
+__InsTime									; a0-a2/d1-d2 saved by dispatcher
+			moveq.l	#$1F,d0					; mask to clear flag bits in QType
+			and.b	QType(a0),d0			; clear the flags
+			andi.w	#$0600,d1				; isolate 2 flag bits from trap word
+			lsr.w	#4,d1					; position the 3 flag bits (high bit zeroed)
+			or.b	d1,d0					; merge into QType high byte
+			move.b	d0,QType(a0)			; save flags, mark the task initially inactive
+			moveq.l	#noErr,d0				; return success
+			rts								; all done
+			TITLE	'Time Manager - Multiply 32 by 32'
+
+;_______________________________________________________________________
+;
+;  Routine:		MultAndMerge
+;  Inputs:		D0				- 32 bit multiplier
+;				(return PC) 	- 32 bit multiplicand
+;				(return PC+4)	- 32 bit merge mask
+;  Outputs:		D0 - upper 32 bits of 64 bit product, merged with selected
+;				bits of lower 32 bits of 64 bit product as specified by
+;				merge mask.
+;  Destroys:	A2, D1, D2, D3
+;  Calls:		none
+;  Called by:	PrimeTime, RmvTime
+;
+;  Function:	Performs a 32 by 32 bit multiply producing a 64 bit result.
+;				Same function as the 68020 MULU.L D0,D0:D1 instruction.
+;				The 64 bit product is then merged into a 32 bit result, by
+;				using a merge mask which has bits set corresponding to which
+;				bits in the low 32 bits of the product are to be merged into
+;				the corresponding bit positions of the high 32 bits of the
+;				product. If the bits specified in the merge mask an non-zero
+;				in the high 32 bits of the product, then a result of all ones
+;				will be returned to indicate overflow.
+;				This routine is used to perform fixed point multiplication,
+;				where the position of the implied binary point may vary.
+;
+;  Note:		D0 = A B,  D1 := C D.  Product is derived as follows.
+;				      B*D
+;				+   B*C
+;				+   A*D
+;				+ A*C
+;
+;_______________________________________________________________________
+
+			macro
+			mulud0d168000
+
+			; result in d0, d1
+			; trashes d2, d3
+
+			move.l	d4,-(sp)				; preserve d4
+			move.l	d1,d2					; D2 := C D
+			move.l	d1,d3					; D3 := C D
+			mulu.w	d0,d1					; D1 := B*D
+			swap	d1						;
+			swap	d3						; D3 := D C
+			mulu.w	d0,d3					; D3 := B*C
+			swap	d0						; D0 := B A
+			ext.l	d0						; D0 := A (sign extended)
+			move.w	d0,d4					; D4 := A
+			beq.s	@ShortMul				; if A is zero, skip next 2 mults
+
+			mulu.w	d2,d4					; D4 := A*D
+			swap	d2						; D2 := D C
+			mulu.w	d2,d0					; D0 := A*C
+			add.l	d4,d3					; D3 := A*D + B*C
+			clr.w	d4						;
+			addx.w	d4,d4					; D4 := carry from A*D + B*C
+
+@ShortMul	add.w	d3,d1					; add middle product to low product
+			swap	d1						; D1 := low 32 bits of product
+			move.w	d4,d3					; D3 := copy saved carry
+			swap	d3						; D3 := high 17 bits of A*D + B*C
+			addx.l	d3,d0					; D0 := high 32 bits of product
+			move.l	(sp)+,d4				; restore d4
+
+			endm
+
+		export  MultAndMerge
+MultAndMerge
+			movea.l	(sp)+,a2				; pop return address
+			move.l	(a2)+,d1				; get multiplicand
+
+	if forROM then
+			mulu.l	d0,d0:d1				; d0:d1 := d0*d1
+	else
+
+			tst.b	CPUFlag					; are we on a machine with long multiply?
+			bz.s	@noLongMultiply
+			mulu.l	d0,d0:d1				; d0:d1 := d0*d1
+			bra.s	@didMultiply
+@noLongMultiply
+			mulud0d168000					; d0:d1 := d0*d1 (trash d2, d3)
+@didMultiply
+
+	endif
+
+			move.l	(a2)+,d2				; get merge mask
+			beq.s	@Done					; if zero, result in d0 is correct
+			and.l	d2,d1					; get the non-fraction bits from d1
+			add.l	d0,d2					; corresponding bits in d0 should be zero
+			subx.l	d2,d2					; d2 = -1 if d0 overflowed, else zero
+			or.l	d2,d0					; return d0 = -1 if overflow
+			or.l	d1,d0					; merge bits from d1 into d0
+@Done		jmp		(a2)					; return to code after constant list
+			TITLE	'Time Manager - Prime Time Manager Task'
+
+;_______________________________________________________________________
+;
+;  Routine:		PrimeTime
+;  Inputs:		A0 - pointer to Time Manager Task to schedule
+;				D0 - [long] if >= 0, Delay Time in positive milliseconds
+;							if < 0,  Delay Time in negated microseconds
+;  Outputs:		D0 - error code (noErr)
+;  Destroys:	none
+;  Calls:		FreezeTime, ThawTime, MultAndMerge
+;  Called by:	OsTrap dispatcher
+;
+;  Function:	Schedules a Time Manager Task to run after the specified
+;				Delay Time expires.  The Delay Time may be specified in
+;				milliseconds, in which case, it must be a positive number,
+;				or it can be specified in microseconds, in which case, it
+;				must be negated first.
+;				Additionally, the TaskActiveBit of the QType field will
+;				be set to indicate that the timer task is currently active,
+;				and will be cleared when the specified time has expired.
+;
+;  NOTE:	The Time Manager does not support delay times as long as the
+;			maximum number of milliseconds that can be passed to this call.
+;			If delay time specified is too large, then the maximum delay
+;			time supported will be used instead.
+;
+;_______________________________________________________________________
+			export	AfterFreezeTimeInPrimeTime
+											; a0-a2/d1-d2 saved by dispatcher
+__PrimeTime	move.l	d3,-(sp)				; save d3 also
+
+;_______________________________________________________________________
+;
+; start of code from Quicktime patch
+; attempts to keep backlog from becoming very large
+;
+
+			btst.b	#ExtendedTmTaskBit, qType(a0)
+			beq.s	@notExtended
+			lea		3+tmReserved(a0), a1
+			tst.l	tmWakeUp(a0)
+			beq.s	@startNew
+			tst.l	d0
+			beq.s	@checkCount
+@startNew:
+			clr.b	(a1)
+			bra.s	@notExtended
+@checkCount:
+			addq.b	#1, (a1)
+			bpl.s	@notExtended
+			bclr.b	#ExtendedTmTaskBit, qType(a0)
+@notExtended:
+
+;
+; end of code from Quicktime patch
+;
+;_______________________________________________________________________
+
+			tst.l	d0						; see if +msec or -µsec
+			bpl.s	@msec					; µsec are negated, msec pos
+
+@usec		neg.l	d0						; get positive number of µsecs
+			convert	UsToInternal,UsToIntFractBits	; convert µsec to internal
+			bra.s	@ConvertDone			; join common code
+
+@msec		convert	MsToInternal,MsToIntFractBits	; convert msec to internal
+@ConvertDone
+			jsr		FreezeTime				; setup to manipulate time queue
+AfterFreezeTimeInPrimeTime
+			bset.b	#TaskActiveBit,QType(a0); mark the task as active
+			bne.s	@AlreadyActive			; if already on the queue don't touch it
+
+			btst.b	#ExtendedTmTaskBit,QType(a0)	; check for extended tmTask
+			beq.s	@AddToActive			; of standard tmTask, nothing special to do
+
+			move.l	CurrentTime(a2),d2		; get current time
+			move.l	tmWakeUp(a0),d1			; get wake time from last _PrimeTime
+			beq.s	@SetNewWakeTime			; if not set, delay relative to CurrentTime
+			sub.l	d2,d1					; d1 := time since/till last wakeup
+			bpl.s	@WakeInFuture			; if time till, just add to it
+			add.l	d1,d0					; subtract time since from desired delay
+			bcs.s	@SetNewWakeTime			; if time still positive, use it
+
+			add.l	d0,d2					; new wakeup := old + delay
+			bne.s	@WakeupInPast			; zero is special wakeup value, don't allow it
+			moveq.l	#1,d2					; use one instead of zero
+@WakeupInPast
+			move.l	d2,tmWakeUp(a0)			; update wakeup.
+			move.l	d0,d1					; remember negated delay
+			sub.l	d0,BackLog(a2)			; remember how late we are
+			moveq.l	#0,d0					; for negative delay, use zero
+			lea		ActivePtr-Qlink(a2),a1	; A1 : previous := head
+			move.l	QLink(a1),d2			; D2 : next := previous.QLink
+			beq.s	@Insert					; if empty, make it the head
+			exg.l	a1,d2					; A1 : previous := next (save old previous)
+			sub.l	d1,tmCount(a1)			; add backlog of new task to old first task
+			exg.l	a1,d2					; restore prior previous and next ptrs
+			bra.s	@Insert					; add it to the active list
+
+@WakeInFuture
+			add.l	d1,d0					; add time till desired delay
+@SetNewWakeTime
+			add.l	d0,d2					; new wakeup := old + delay
+			bne.s	@StoreWakeup			; zero is special wakeup value, don't allow it
+			moveq.l	#1,d2					; use one instead of zero
+@StoreWakeup
+			move.l	d2,tmWakeUp(a0)			; update wakeup.
+
+@AddToActive
+			add.l	BackLog(a2),d0			; run it after all pending tasks
+			lea		ActivePtr-Qlink(a2),a1	; A1 : previous := head
+@SearchLoop	move.l	QLink(a1),d2			; D2 : next := previous.QLink
+			beq.s	@Insert					; if end, insert after previous
+			exg.l	a1,d2					; A1 : previous := next (save old previous)
+			move.l	tmCount(a1),d1			; get delay between previous and next
+			sub.l	d1,d0					; subtract from our delay time
+			bhs.s	@SearchLoop				; loop until our delay between prev and next
+
+			add.l	d1,d0					; d0 := delay between previous and new
+			sub.l	d0,d1					; d1 := delay between new and next
+			move.l	d1,tmCount(a1)			; adjust next task delay time
+			exg.l	a1,d2					; restore prior previous and next ptrs
+
+@Insert		move.l	d2,QLink(a0)			; new task followed by next task
+			move.l	d0,tmCount(a0)			; setup new task delay time
+			move.l	a0,QLink(a1)			; previous task followed by new task
+
+@AlreadyActive
+			bsr.s	ThawTime				; done manipulating time queue
+			move.l	(sp)+,d3				; restore saved d3
+			moveq.l	#noErr,d0				; return success
+			rts								; all done
+			TITLE	'Time Manager - Timer 2 Interrupt Handler'
+
+;_______________________________________________________________________
+;
+;  Routine:		Timer2Int
+;  Inputs:		none
+;  Outputs:		none
+;  Destroys:	A0, A1, A2, A3, D0, D1, D2, D3
+;  Calls:		FreezeTime, ThawTime, tmAddr service routine.
+;  Called by:	VIA 1 system interrupt handler
+;
+;  Function:	Services the timer interrupt, and calls the service routine
+;				if task at the head of the list has expired, or continues
+;				it running if more time remaining.  If nothing on timer
+;				list, just disables the timer.
+;
+;  NOTE:	The TaskActiveBit in the QType field will be cleared when the
+;			task timer expires so that applications can poll the timer for
+;			completion.  If the tmAddr field is zero, the service routine
+;			will not be called. When the service routine is called, A0 points
+;			to the service routine itself, and A1 points to the expired
+;			Time Manager task.
+;
+;_______________________________________________________________________
+
+			export  AfterFreezeTimeInTimer2Int
+Timer2Int									; a0-a3/d0-d3 saved by IntHand
+			jsr		FreezeTime				; stop the timer, adjust time remaining				<4>
+AfterFreezeTimeInTimer2Int
+			move.l	ActivePtr(a2),d0		; get pointer to first active timer task
+			beq.s	ThawTime				; if nothing in queue, just exit
+
+			movea.l	d0,a0					; A0 := pointer to timer task
+			tst.l	tmCount(a0)				; see if timer expired
+			bne.s	ThawTime				; if not, let it continue running
+
+			move.l	QLink(a0),ActivePtr(a2)	; remove it from the active list
+			bclr.b	#TaskActiveBit,QType(a0); mark the task as completed
+			bsr.s	ThawTime				; start next timer running
+
+			move.l	tmAddr(a0),d0			; get service routine address
+			beq.s	@NoHandler				; if no service routine, just exit
+			movea.l	a0,a1					; A1 := pointer to queue element
+			movea.l	d0,a0					; A0 := address of service routine
+			jmp		(a0)					; return through the service routine
+@NoHandler	rts								; all done
+			TITLE	'Time Manager - Thaw Time'
+
+;_______________________________________________________________________
+;
+;  Routine:		ThawTime
+;  Inputs:		A2 - ptr to TimeMgrPrivate
+;				D3.hi - saved SR (interrupt priority)
+;				D3.lo - value read from the low byte of the VIA timer masked
+;						to virtual ticks.
+;  Outputs:		none
+;  Destroys:	D1, D2, A1, A2
+;  Calls:		none
+;  Called by:	RmvTime, PrimeTime, Timer2Int
+;
+;  Function:	Starts timer, based upon head of timer list, adjusts
+;				time remaining for head of list.  Restores interrupt
+;				priority level.
+;
+;_______________________________________________________________________
+
+ThawTime	move.l	#$0000FFFF>>TickScale,d2; max range (internal form) of VIA timer
+			add.b	TimerAdjust(a2),d3		; add in the timer loading overhead
+			move.l	ActivePtr(a2),d1		; check pointer to first active timer task
+			beq.s	@StartTimer				; if no tasks, just start timer with max
+
+			movea.l	d1,a1					; point to head of active list
+			move.l	tmCount(a1),d1			; get time remaining for head
+			sub.l	BackLog(a2),d1			; remove as much backlog as possible
+			bhs.s	@NoBacklog				; if tmCount >= BackLog
+			neg.l	d1						; BackLog - tmCount
+			move.l	d1,BackLog(a2)			; update backlog
+			moveq.l	#0,d1					; run immediatly
+			bra.s	@FindMax				; update timer
+@NoBackLog	clr.l	BackLog(a2)				; no backlog remaining
+@FindMax	cmp.l	d2,d1					; check remaining time against max
+			bhs.s	@UseMax					; if remaining >= max, use the max instead
+			move.l	d1,d2					; otherwise, use time remaining
+@UseMax		sub.l	d2,d1					; remaining := remaining - timer value
+			move.l	d1,tmCount(a1)			; update time remaining
+
+@StartTimer	movea.l	VIA,a1					; get base address of VIA1
+			lea		vT2C(a1),a1				; point to low byte of counter for speed
+			move.w	d3,d1					; save copy of adjusted original low byte
+@Retry		add.l	d2,CurrentTime(a2)		; update current time
+			lsl.w	#TickScale,d2			; convert internal form to VIA form
+			lea		vT2CH-vT2C(a1),a2		; point to high byte for speed
+
+; *** Begining of time critical section
+		eieioSTP
+			sub.b	vT2C-vT2C(a1),d3		; see how many ticks of overhead used
+		eieioSTP
+			sub.w	d3,d2					; subtract out overhead ticks
+			bls.s	@Underflow				; if less than 1 tick, fix it up
+
+;	VIAs from Rockwell (which we have been shipping for several years) and possibly
+;	other vendors have a bug.  If you load the counter high byte in the same clock
+;	as the old counter value is counting through zero, when the new counter value
+;	counts through zero the VIA will not generate an interrupt. To work around this
+;	"feature", we first load a dummy non-zero value into the high byte of the counter,
+;	and then load the value we really wanted.  This should allow enough time to
+;	guarantee that it will not be counting through zero at the time we load the real
+;	counter value.  This fixes the "AppleShare server hang problem".
+
+		eieioSTP
+			move.b	d1,vT2CH-vT2CH(a2)		; *** ROCKWELL VIA FIX, DON'T REMOVE ***
+		eieioSTP
+			move.b	d2,vT2C-vT2C(a1)		; setup timer low byte latch
+		eieioSTP
+	if use68020Opcodes then					; 68020 shifting is fast
+			lsr.w	#8,d2					; get high byte of time
+		eieioSTP
+			move.b	d2,vT2CH-vT2CH(a2)		; load high byte of timer, start timer
+		eieioSTP
+	else									; 68000 shifting is slower than memory
+			move.w	d2,-(sp)				; get high byte of time
+		eieioSTP
+			move.b	(sp)+,vT2CH-vT2CH(a2)	; load high byte of timer, start timer
+		eieioSTP
+	endif
+; *** End of time critical section
+
+	if forROM then
+		if hasPowerMgr then
+			movea.l	PMgrBase,a2				; PMgr gobals.
+			cmpi.b	#1,PMgrRec.saveSpeedo(a2)	; see if we need to be idle
+			bne.s	@RemainFast				; if not, remain running at fast speed.
+			tst.w	Clock1M					; return processor to idle.
+@RemainFast
+		endif
+	endif
+
+			swap	d3						; get saved sr from high word
+			move.w	d3,sr					; restore interrupt priority level
+			rts								; all done
+
+@Underflow	add.w	d2,d3					; recompute original delay value
+			sub.b	d3,d1					; adjust initial timer low byte
+			neg.w	d2						; make excess time positive
+			movea.l	TimeVars,a2				; point to TimeMgrPrivate
+			add.w	RetryAdjust(a2),d2		; round up before conversion, add in some extra time
+			lsr.w	#TickScale,d2			; convert it to virtual ticks
+			add.l	d2,BackLog(a2)			; remember how negative we are for next freeze
+			move.w	d1,d3					; restore initial timer low byte
+			bra.s	@Retry					; now go reload the timer
+			endproc
+			TITLE	'Time Manager - Read 64 bit MicroSecond counter'
+;_______________________________________________________________________						<4>
+;
+;  Routine:		MicroSeconds
+;  Inputs:		none
+;  Outputs:		A0/D0 - 64 bit counter (A0=High, D0=Low)
+;  Destroys:	none
+;  Calls:		none
+;  Called by:	OsTrap dispatcher
+;
+;  Function:	Returns the value of the 64 bit microsecond counter, which
+;				is useful for timestamping.
+;
+;_______________________________________________________________________
+
+__MicroSeconds: proc	export					; a0-a2/d1-d2 saved by dispatcher
+
+			with	TimeMgrPrivate
+			
+			movem.l	d3-d5,-(sp)				; save some others as well
+			movea.l	VIA,a1					; get base address of VIA1
+			movea.l	TimeVars,a0				; point to TimeMgrPrivate
+			moveq.l	#0,d1					; d1 := 0
+
+			move.w	sr,-(sp)
+			ori.w	#$0700,sr				; disable interrupts
+
+			;	First we'll read the VIA timer.  This is complicated by three
+			;	bits of trivia.  First, if an interrupt is pending then reading
+			;	lower eight bits would clear that interrupt so we'll avoid that by
+			;	not reading the actual value in the low eight bits but just using
+			;	zero instead.  In fact, because the interrupt may become pending
+			;	between reading the upper and lower bytes we won't read the
+			;	lower byte if the upper byte is a zero even if no interrupt is yet
+			;	pending.  The second problem is that between reading the upper
+			;	byte and the lower byte, the lower byte could decrement from 00
+			;	to FF which would mean the upper byte value is wrong.  So we'll
+			;	re-read the upper byte after reading the lower byte and if they're
+			;	not equal we'll retry the entire read operation.  Finally, in
+			;	the case where the interrupt is pending we must adjust the value
+			;	to take into account the implied latency.
+			;
+			;	When we're done we'll have a 32-bit signed value in d1 which can
+			;	be combined with CurrentTime to yield the actual time.  Also,
+			;	we'll have the low eight bits from the VIA in d0.
+
+		eieioSTP
+			move.b	vT2CH(a1),d1			; d1 := MSBs of timer
+		eieioSTP
+			btst.b	#T2IntBit,vIFR(a1)		; is the interrupt pending?
+		eieioSTP
+			beq.s	no_overflow
+
+overflow:	moveq.l	#-1,d1					; force upper bits to ones
+			move.b	d1,d0					; generate fake LSBs
+		eieioSTP
+			move.b	vT2CH(a1),d1			; re-read timer in case of roll-over
+		eieioSTP
+			rol.w	#8,d1					; position MSBs; LSBs become 1's
+			bra.s	done_reading_via
+
+no_overflow:tst.b	d1
+retry:		beq.s	dont_read_lsbs			; don't clear the interrupt
+		eieioSTP
+			move.b	vT2C(a1),d0				; d0 := LSBs of timer
+		eieioSTP
+			move.b	vT2CH(a1),d2			; d2 := MSBs of timer
+		eieioSTP
+			cmp.b	d2,d1					; did the MSBs roll?
+			beq.s	have_both_halves
+			move.b	d2,d1
+			bra.s	retry
+
+dont_read_lsbs:
+			moveq.l	#0,d0					; pretend they're zeros
+
+have_both_halves:
+			lsl.w	#8,d1					; slide the MSBs into position
+			move.b	d0,d1					; insert LSBs
+
+done_reading_via:
+
+			;	So now we have a 32-bit signed value in d1 which indicates
+			;	where time really is with respect to the value in CurrentTime.
+			;	In d0 we have the LSBits of the via timer.  Now we convert
+			;	these values into  microseconds.  This is pretty contorted
+			;	because the unit of VIA ticks is not a rational number.
+
+			moveq.l	#(1<<TickScale)-1,d2	; d2 := virtual tick rounding factor
+			add.l	d2,d1					; round to virtual ticks
+			asr.l	#TickScale,d1			; convert to virtual ticks by discading LSBs
+			move.l	CurrentTime(a0),d2		; d2 := time of next interrupt
+			sub.l	d1,d2					; correct with value in VIA
+
+			lea		HighUSecs(a0),a1		; form pointer for speed
+			move.l	(a1)+,d3				; d3.l := High 32 bits of uSeconds
+			move.w	(a1)+,d4				; d4.w := Next 16 bits of uSeconds
+			move.l	(a1)+,d5				; d5.l := 16 LSBs of uSec and 16 bit fraction
+			swap	d0						; put VIA LSBs in d0.hi
+			move.w	(a1)+,d0				; d0.w := threshold
+
+			move.w	(sp)+,sr				; now we can enable interrupts
+
+			;	Recall that MicroSeconds are maintained internally as an 80 bit
+			;	number with 64 bits of mantissa and 16 bits of fraction.
+			;
+			;	The first part of the conversion is to do a huge division by
+			;	repeated subtraction.  We look at the CurrentTime and the
+			;	Threshold and increment the Threshold by a value X until it
+			;	is greater than the CurrentTime.  Each time we add X to the
+			;	Threshold we add Y to the 80 bit microsecond counter.  X and Y
+			;	have been carefully chosen so that X is as close to 2^12 as
+			;	possible and is such that X * Via_Tick_Units is exactly
+			;	representable in a 32.16 fixed point value.
+			
+check_threshold:
+			cmp.w	d0,d2					; compare CurrentTime to Threshold
+			bmi.s	threshold_ok
+			addi.w	#ThreshInc,d0			; update threshold
+			addi.l	#USecsInc,d5			; update Microseconds
+			bcc.s	check_threshold
+			addq.w	#1,d4					; propagate carry
+			bcc.s	check_threshold
+			addq.l	#1,d3					; propagate carry
+			bra.s	check_threshold
+
+threshold_ok:
+			swap	d4
+			swap	d5
+			move.w	d5,d4					; d3:d4 := 64 bit microseconds count, nearly
+			swap	d5						; d5    := 16 bit fractional part
+
+			;	At this point:
+			;	D0.Hi	=> lower 8 bits of the upper word are the low VIA byte
+			;	D0.Lo	=> Updated Threshold
+			;	D2		=> Updated CurrentTime
+			;	D3.L 	=> 32 high order bits of microseconds counter
+			;	D4.L 	=> 32 low order bits of microseconds counter
+			;	D5.W 	=> 16 bits of microseconds fraction
+
+
+adjust_for_residual:
+
+			;	Now we need to use the remaining part of Threshold and the four
+			;	LSBs of the VIA timer to provide further accuracy.
+
+			move.l	d0,d1					; d1.hi := VIA LSBs
+			swap	d1						; d1.lo := VIA LSBs
+			neg.b	d1						; convert it to be additional time
+			ror.l	#TickScale,d1			; move it into high byte for insertion
+
+			sub.w	d0,d2					; CurrentTime := CurrentTime - CurTimeThresh
+			addi.w	#ThreshInc,d2			; compute additional time
+			move.w	d2,d1					; combine with VIA MSBs
+			rol.l	#TickScale,d1			; convert to un-scaled VIA time
+			mulu.w	#InternalToUs>>16,d1	; convert to microseconds
+		if 32-IntToUsFractBits-TickScale <> 1 then
+			lsl.l	#32-IntToUsFractBits-TickScale,d1	; align to form 16.16 fixed point result
+		else
+			add.l	d1,d1					; align to form 16.16 fixed point result
+		endif
+			add.w	d5,d1					; add in FractUSecs, set ccr.x to carry out
+			clr.w	d1						; clear out fraction bits
+			swap	d1						; get additional µsecs
+			addx.l	d1,d4					; add additional time to LowUSecs
+			subx.l	d1,d1					; -1 if ccr.x = 1, 0 if ccr.x = 0
+			sub.l	d1,d3					; propagate carry into HighUSecs
+
+			movea.l	d3,a0					; put result in result registers
+			move.l	d4,d0
+			movem.l	(sp)+,d3-d5				; restore saved registers
+			rts								; all done											<4>
+
+			endproc
+
+			TITLE	'Time Manager - Freeze Time'
+
+;_______________________________________________________________________
+;
+;  Routine:		FreezeTime
+;  Inputs:		none
+;  Outputs:		A2 - ptr to TimeMgrPrivate
+;				D3.hi - saved SR (interrupt priority)
+;				D3.lo - value read from the low byte of the VIA timer masked
+;						to virtual ticks.
+;  Destroys:	D1, D2, A1
+;  Calls:		none
+;  Called by:	RmvTime, PrimeTime, Timer2Int
+;
+;  Function:	Saves current interrupt priority level, disables all interrupts.
+;				Reads the VIA timer 2, adjusts tmCount field of all active
+;				Time Manager Tasks to reflect actual time remaining.
+;
+;_______________________________________________________________________
+
+FreezeTime	proc	export
+
+			with	TimeMgrPrivate
+
+			move.w	sr,d3					; save interrupt priority level
+			swap	d3						; sr -> high word, zero -> low word
+			move.w	#$0100-(1<<TickScale),d3; setup virtual tick mask
+			movea.l	VIA,a1					; get base address of VIA1
+			lea		vT2CH(a1),a1			; point to timer high byte for speed
+			movea.l	TimeVars,a2				; point to TimeMgrPrivate
+			ori.w	#$0700,sr				; disable all interrupts
+	if forROM then
+		if hasPowerMgr then
+		eieioSTP
+			tst.w	Clock16M				; force processor out of idle.
+		eieioSTP
+		endif
+	else
+
+			; NOP this out on machines without Power Mgr. chips
+
+			export	PoundThreeNOPsHereIfNoPowerMgr
+PoundThreeNOPsHereIfNoPowerMgr:
+		eieioSTP
+			tst.w	Clock16M				; force processor out of idle.
+		eieioSTP
+
+	endif
+
+;	The VIA Timer is constantly decrementing, and after the high byte is read, but
+;	before the low byte is read, the low byte may decrement from 00 -> FF, which
+;	would mean that the high is off by one, which would be an error of 256 ticks.
+;	By reading the high byte twice, we can detect and correct this situation.
+;	We also correct for the case where the high byte counted from 00 -> FF, in which
+;	case the interrupt pending bit may have been incorrect at the time we read it.
+
+		eieioSTP
+			move.b	vT2CH-vT2CH(a1),d2		; get high byte of counter
+		eieioSTP
+			moveq.l	#1<<T2IntBit,d1			; setup mask to check int pending
+		eieioSTP
+			and.b	vIFR-vT2CH(a1),d1		; get interrupt pending bit
+		eieioSTP
+			neg.l	d1						; d1.hi := -1 if int pending, else 0
+	if use68020Opcodes then					; 68020 shifting is fast
+			move.b	d2,d1					; insert timer high byte
+			lsl.w	#8,d1					; position it in the right place
+	else									; 68000 shifting is slower than memory
+			move.b	d2,-(sp)				; insert timer high byte
+			move.w	(sp)+,d1				; position it in the right place
+	endif
+		eieioSTP
+			move.b	vT2C-vT2CH(a1),d1		; insert timer low byte
+		eieioSTP
+			sub.b	vT2CH-vT2CH(a1),d2		; see if high byte changed
+		eieioSTP
+			beq.s	@TimeOK					; if not, time is correct
+
+			subx.l	d2,d2					; d2 := -1 if counted through zero
+			or.l	d2,d1					; update sign bits
+	if use68020Opcodes then					; 68020 shifting is fast
+		eieioSTP
+			move.b	vT2CH-vT2CH(a1),d1		; re-read timer high byte
+		eieioSTP
+			lsl.w	#8,d1					; position it in the right place
+	else									; 68000 shifting is slower than memory
+		eieioSTP
+			move.b	vT2CH-vT2CH(a1),-(sp)	; re-read timer high byte
+		eieioSTP
+			move.w	(sp)+,d1				; position it in the right place
+	endif
+		eieioSTP
+			move.b	vT2C-vT2CH(a1),d1		; insert timer low byte
+		eieioSTP
+@TimeOK
+		eieioSTP
+			move.b	d1,TimerLowSave(a2)		; save low byte of VIA timer						<4>
+			moveq.l	#(1<<TickScale)-1,d2	; prepare to round to virtual ticks
+			add.l	d2,d1					; if virtual tick not complete, don't count it
+			and.b	d1,d3					; save VIA timer truncated to virtual ticks
+			asr.l	#TickScale,d1			; convert ticks to internal time form
+			sub.l	d1,CurrentTime(a2)		; update current time
+
+			move.w	CurrentTime+2(a2),d2	; get low word of current time						<4>
+@chkThresh	lea		CurTimeThresh(a2),a1	; point to CurTimeThresh							<4>
+			cmp.w	(a1),d2					; see if next threshold has been reached			<4>
+			bmi.s	@threshOK				; if not reached yet, don't need to increment		<4>
+			addi.w	#ThreshInc,(a1)			; update the next threshold							<4>
+			addi.l	#USecsInc,-(a1)			; update microsecond counter (low word, and fract)	<4>
+			bcc.s	@chkThresh				; if no carry to prop, see if thresh adjusted		<4>
+			addq.w	#1,-(a1)				; propagate the carry								<4>
+			bcc.s	@chkThresh				; if no carry to prop, see if thresh adjusted		<4>
+			addq.l	#1,-(a1)				; propagate the carry								<4>
+			bra.s	@chkThresh				; see if threshold adjusted							<4>
+@threshOK									;													<4>
+			move.l	ActivePtr(a2),d2		; get pointer to first active timer task
+			beq.s	@UpdateBacklog			; if no active tasks, no backlog (d2=0)
+
+			movea.l	d2,a1					; setup pointer to task at head
+			moveq.l	#0,d2					; assume new backlog will be zero
+			sub.l	BackLog(a2),d1			; adjust the timer, account for backlog
+			bpl.s	@Early					; extra time, no backlog of any kind
+
+			add.l	tmCount(a1),d1			; tmCount := tmCount - backlog
+			bcs.s	@UpdateHead				; if no remaining backlog, use remaining count
+			sub.l	d1,d2					; setup remaining backlog
+			moveq.l	#0,d1					; no remaining time
+@UpdateHead	move.l	d1,tmCount(a1)			; setup new time remaining
+@UpdateBacklog
+			move.l	d2,BackLog(a2)			; update backlog time, if any
+			rts								; all done
+
+@Early		add.l	tmCount(a1),d1			; add excess time to time remaining
+			bra.s	@UpdateHead				; update the time remaining counter
+			endproc
+			TITLE	'Time Manager - Initialize Time Manager'
+
+;_______________________________________________________________________
+;
+;  Routine:		InitTimeMgr
+;  Inputs:		none
+;  Outputs:		none
+;  Destroys:	none
+;  Calls:		none
+;  Called by:	StartInit
+;
+;  Function:	Allocates and initializes the Time Manager's global data
+;				structures at system boot time.  Sets up VIA 1 Timer2
+;				interrupt handler.  Computes the timer adjustment value
+;				at runtime, since it is processor speed dependent.
+;
+;_______________________________________________________________________
+
+InitTimeMgr	proc	export
+
+			import	Timer2Int
+			import	ThawTime
+			with	TimeMgrPrivate
+
+@SavedRegs	reg		a0-a4/d0-d5				; registers to preserve
+			movem.l	@SavedRegs,-(sp)		; save the registers
+
+			moveq.l	#PrivateSize,d0			; size to allocate
+			_NewPtr	,SYS,CLEAR				; allocate and clear the structure
+			move.l	a0,TimeVars				; setup pointer to private storage
+			movea.l	a0,a2					; setup for ThawTime
+
+	if forROM then
+			move.w	#(1<<(TickScale-1))\	; round up before conversion
+					+(1<<TickScale),RetryAdjust(a2)	; add in some extra time
+	else
+			moveq	#(1<<(TickScale-1))\	; round up before conversion
+					+(2<<TickScale),d0		; add in some extra time (value for 68000)
+			tst.b	CPUFlag					; what processor do we have?
+			bz.s	@gotRetryAdjust			; 68000, use value computed above
+			moveq	#(1<<(TickScale-1))\	; round up before conversion
+					+(1<<TickScale),d0		; add in some extra time (value for 68020)
+@gotRetryAdjust
+			move.w	d0,RetryAdjust(a2)		; store the computed value
+	endif
+
+			lea 	Timer2Int,a1			; get interrupt handler address
+			move.l	a1,Lvl1DT+(T2IntBit*4)	; put into interrupt table
+
+			move.w	sr,-(sp)				; save interrupt level
+			ori.w	#$0700,sr				; disable interrupts
+
+			movea.l	Via,a4					; get VIA pointer
+			lea		vT2C(a4),a1				; point to low byte of timer 2 for speed
+			lea		vT1C(a4),a3				; point to low byte of timer 1 for speed
+			lea		vACR(a4),a4				; point to AUX control reg for speed
+
+			moveq.l	#-$80+(1<<T2IntBit),d1	; enable timer 2 interrupts
+		eieioSTP
+			move.b	d1,vIER-vT2C(a1)		; initialize the interrupt enable bit
+		eieioSTP
+
+			moveq.l	#~(1<<5),d5				; mask to set timer 2 into timed interrupt mode
+		eieioSTP
+			and.b	vACR-vACR(a4),d5		; save old AUX control reg
+		eieioSTP
+			moveq.l	#%00111111,d0			; force timer 1 into one-shot mode
+			and.b	d5,d0					; clear the bits
+		eieioSTP
+			move.b	d0,vACR-vACR(a4)		; setup temporary AUX control reg
+		eieioSTP
+			moveq.l	#0,d3					; setup timer low byte value
+			move.w	sr,d3					; get sr
+			swap	d3						; sr in high word
+
+		eieioSTP
+			move.b	d1,vT1CH-vT1C(a3)		; load and start timer 1
+		eieioSTP
+			move.b	d1,vT2CH-vT2C(a1)		; load and start timer 2
+		eieioSTP
+			move.b	vT2C-vT2C(a1),d0		; get timer 2 low byte
+		eieioSTP
+			sub.b	vT1C-vT1C(a3),d0		; get initial timer skew
+		eieioSTP
+			jsr		ThawTime				; run the critical section, start timer
+		eieioSTP
+			move.b	vT2C-vT2C(a1),d1		; get timer 2 low byte
+		eieioSTP
+			sub.b	vT1C-vT1C(a3),d1		; get final timer skew
+		eieioSTP
+
+			sub.b	d0,d1					; don't count initial skew
+			subi.w	#(($FFFF>>TickScale)<<TickScale),d1	; subtract out loaded timer value
+			move.b	d1,TimerAdjust(a0)		; setup the fudge factor
+
+		eieioSTP
+			move.b	d5,vACR-vACR(a4)		; restore AUX control reg
+		eieioSTP
+			st		vT2CH-vT2C(a1)			; load and start timer 2
+		eieioSTP
+			move.w	(sp)+,sr				; restore interrupt level
+			movem.l	(sp)+,@SavedRegs		; restore the registers
+			rts								; Time Manager is initialized
+			endproc
+			end
+

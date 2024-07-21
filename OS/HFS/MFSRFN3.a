@@ -1,0 +1,458 @@
+;
+;	File:		MFSRFN3.a
+;
+;	Contains:	This file contans the MFS equivalents to FXM and VSM for file block
+;				allocation and mapping.
+;
+;	Copyright:	© 1982-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <2>	 9/12/91	JSM		Add a header.
+;	   <1.2>	  3/2/89	DNF		removed references to forROM; HFS now builds identically for ram
+;									or rom
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				 10/8/85	LAK		Added vector for Lg2Phys.
+;				 10/1/85	LAK		D0 now returns a result code (no longer calls _SysError).
+;				 8/15/83	LAK		Added safety check to prevent directory overwrites; D0 now
+;									returns end block + 1.
+;				 1/17/83	LAK		Changed to add alloc blk offset in.
+;				12/22/82	LAK		Changed to use alloc blk size in bytes.
+;				12/16/82	LAK		Rewrote to reflect new file system data structures; Now passes
+;									back block parameter; takes allocation size into account.
+;
+
+;_______________________________________________________________________
+;
+; Routine:		Lg2Phys
+; (c) 1983 Apple Computer Inc.
+;
+; Arguments:	  A2.L (input)	-- VCB ptr
+;				  (A1,D1.W) (input) -- FCB pointer
+;				  D4.L (input)	-- number of bytes desired (multiple of 512)
+;				  D5.L (input)	-- current file position (multiple of 512)
+;				  D3.L (output) -- physical block start for current position		 <01Oct85>
+;				  D0.W (output) -- result code (0 or FSDSIntErr).					 <01Oct85>
+;				  D6.L (output) -- number of consecutive bytes available, up to D4
+;				  All other registers are preserved
+;				  Note that Lg2Phys assumes we won't run off the end of a file.
+; Called By:	FileRead,FileWrite,MyRead
+; Calls:		GtNxBlk
+; Function: 	Transforms file block number to volume block number and
+;				determines max number of consecutive disk bytes available.
+;
+; Modification History:
+;  16 Dec 82  LAK  Rewrote to reflect new file system data structures;
+;				   Now passes back block parameter; takes allocation size
+;				   into account.
+;  22 Dec 82  LAK  Changed to use alloc blk size in bytes.
+;  17 Jan 83  LAK  Changed to add alloc blk offset in.
+;  15 Aug 83  LAK  Added safety check to prevent directory overwrites;
+;					D0 now returns end block + 1.
+;  <01Oct85>  LAK  D0 now returns a result code (no longer calls _SysError).
+;  <08Oct85>  LAK  Added vector for Lg2Phys.
+;_______________________________________________________________________
+
+Lg2Phys
+
+			BLANKS		ON
+			STRING		ASIS
+
+			MOVE.L	jLg2Phys,-(SP)		; jumptable entry for vLg2Phys			<08Oct85>
+			RTS 						; go there								<08Oct85>
+vLg2Phys								; 'vectored' Lg2Phys routine			<08Oct85>
+
+			BSR 	 TFSVolTst			; If it's an MFS volume,                <01Oct85>
+			BNE.S	@0					;  br for MFS file block mapping.		<01Oct85>
+			JMP 	 MapFBlock			; Otherwise, do the TFS file mapping	<01Oct85>
+
+@3			_HFSDebug 223				;
+
+@0			MOVEM.L D1-D2/D4-D5/D7,-(SP)   ; preserve dem regs
+
+			MOVE.L	VCBAlBlkSiz(A2),D7	; number of bytes in an alloc blk
+			MOVE.W	FCBSBlk(A1,D1),D3	; start alloc block for file
+
+			IF		HFSDebug THEN
+			MOVE.L	D4,D0				; make sure byte count is non-zero		<01Oct85>
+			BEQ.S	@3					;  512-byte multiple . . .				<01Oct85>
+			AND.W	#$FE00,D0
+			CMP.W	D0,D4
+			BNE.S	@3
+			MOVE.L	D5,D0				; make sure byte position is			<01Oct85>
+			AND.W	#$FE00,D0			;  512-byte multiple . . .				<01Oct85>
+			CMP.W	D0,D5
+			BNE.S	@3
+			ENDIF
+
+			ADD.L	D5,D4				; current file pos + bytes desired
+			SUBQ.L	#1,D4				; actual ending byte.
+			MOVEQ	#9,D1				; shift count.
+			MOVEQ	#0,D6				; no bytes available so far
+
+			LSR.L	D1,D4				; end file (512-byte) block
+			LSR.L	D1,D7				; num of 512-byte blks in alloc blk
+			MOVE.L	D5,D2				; current file byte position
+			LSR.L	D1,D2				; current (512-byte) file block
+			BRA.S	@2					; br to end condition test
+
+@1			BSR.S	GtNxBlk 			; get block linked to by this block
+			MOVE.W	D5,D3				; next linked blk -> cur block
+			SUB.W	D7,D4				; one alloc blk closer to the end block
+			SUB.W	D7,D2				; reached the desired alloc block?
+@2			CMP.W	D7,D2				; less than alloc blk size?
+			BCC.S	@1					; keep looping until found
+
+			MOVE.W	D3,D0				; cur alloc blk
+			SUB.W	#2,D0				; adjust (1st alloc blk is blk 2)
+			MULU	D7,D0				; convert to 512-byte blocks
+			ADD.W	D2,D0				; add offset within alloc blk
+			ADD.W	VCBAlBlSt(A2),D0	; add offset to alloc blk space on disk
+			MOVE.L	D0,-(SP)			; starting block (save for return)			<01Oct85>
+
+L2PPrt2 	MOVE.W	D7,D0				; alloc blk size (mult of 512-bytes)
+			SUB.W	D2,D0				; number of 512-byte blks avail this
+			ADD.W	D0,D6				; add incremental 512-byte blks available
+			SUB.W	D0,D4				; done enough blocks?
+			BMI.S	@0					; yup.
+			BSR.S	GtNxBlk 			; no, look into the next block
+			MOVEQ	#0,D2				; entire alloc block
+			ADDQ.W	#1,D3				; check for consecutive blocks
+			CMP.W	D3,D5				; is it the next block?
+			BEQ.S	L2PPrt2 			; yes, keep going
+
+; All done- give back needed info
+
+@0			MOVE.L	(SP)+,D3			; start physical 512-byte block 		<01Oct85>
+
+			MOVE.W	D3,D0				; block start
+			ADD.W	D6,D0				; last block in string
+
+; this is important data, capable of trashing a diskette if wrong, so
+; make sure it's in the allocation block range . . .
+
+			MOVE.W	VCBAlBlSt(A2),D4	; first 512-byte alloc block
+			MULU	VCBNmAlBlks(A2),D7	; number of alloc blocks
+			ADD.W	D4,D7				; last 512-byte alloc block + 1
+
+			CMP.W	D7,D0				; last block in range?
+			BHI.S	@2					; br if not
+			CMP.W	D4,D3				; is start block > alloc start blk?
+			BCS.S	@2					; br if not ok
+
+			ASL.L	D1,D6				; num blocks avail*512 = available bytes
+			MOVEM.L (SP)+,D1-D2/D4-D5/D7   ; restore regs
+			CMP.L	D4,D6				; don't allow D6 larger than D4
+			BLS.S	@1
+			MOVE.L	D4,D6
+
+@1			MOVEQ	#0,D0				; success								<01Oct85>
+			RTS
+
+@2			MOVEM.L (SP)+,D1-D2/D4-D5/D7   ; restore regs						<01Oct85>
+			MOVE.W	#FXRangeErr,D0		; use an appropriate TFS int err code	<01Oct85>
+			RTS 						;										<01Oct85>
+
+;_______________________________________________________________________
+;
+; Routine:		GtNxBlk
+; (c) 1983 Apple Computer Inc.
+;
+; Arguments:	  A2.L (input)	-- VCB pointer
+;				  D3.W (input)	-- current block number (alloc blk size)
+;				  D5.W (output) -- block pointed to by D3
+;				  Preserves all registers
+;				  Sets CCR according to D5 value
+; Called By:	Alloc,DAlBlks,Lg2Phys,SetEOF,SuckEmUp
+; Function: 	Figures next block in link.
+;
+; Modification History:
+;  16 Dec 82  LAK  Reformatted
+;  22 Dec 82  LAK  Changed to take VCB pointer as input
+;  13 Jan 82  LAK  Modified for allocation blocks offset from start of disk.
+;
+; - note the 32K size limitation for block maps?
+;_______________________________________________________________________
+
+GtNxBlk 	MOVEM.L D0/A2,-(SP) 		; preserve all regs used
+			MOVE.L	VCBMAdr(A2),A2		; get volume block map address
+
+			MOVE.W	D3,D0				; current alloc block
+			SUBQ.W	#2,D0				; first alloc block is number 2
+			MULU	#BtsPrBlk,D0		; cur blk's bit position in block map
+			ROR.L	#4,D0				; word bound, save bit pos in hi word
+
+			ASL.W	#1,D0				; for indexing by words
+			MOVE.L	0(A2,D0.W),D5		; get the long word the block is in
+			CLR.W	D0					; prepare for shift count
+			ROL.L	#4,D0				; get shift cnt from hi word
+			ADD.W	#12,D0				; make into a rotate left count
+			ROL.L	D0,D5				; rotates proper block into low 12 bits
+			AND.W	#$0FFF,D5			; only give 12 bits
+
+			MOVEM.L (SP)+,D0/A2
+			RTS
+
+;_______________________________________________________________________
+;
+; Routine:		Alloc,Alloc1
+; (c) 1983 Apple Computer Inc.
+;
+; Arguments:	  A2.L (input)	-- VCB ptr
+;				  (A1,D1.W) (input) -- FCB pointer
+;				  D4.L (input)	-- number of bytes extra to allocate
+;				  D0.W (output) -- Error code, 0 if no error.
+;									(only error: dskfull)
+;				  D6.L (output) -- number of bytes actually allocated (always
+;									a multiple of 512-bytes).
+;				  All other registers are preserved
+; Called By:	FileWrite,SetEOF,FileAlloc
+; Calls:		GtNxBlk,SubMrk
+; Function: 	Allocate new blocks to a file.	(Does not check lock bits!)
+;				Alloc entry point does nothing if it can't get all the bytes
+;				requested; Alloc1 entry gets what it can.
+;
+; Modification History:
+;  22 Dec 82  LAK  Rewrote to reflect new file system data structures;
+;				   No reclamation of space is now needed from undeleted
+;				   files; always checks number of free bytes available
+;				   on the volume before proceeding; now has 2 entry points.
+;  17 Jan 83  LAK  Changes for alloc blks offset from diskette start.
+;
+;_______________________________________________________________________
+
+MFSAlloc
+			MOVE.L	D4,D0				; flag to get requested bytes or none
+
+AllocSt 	MOVEM.L  D1-D5/D7/A0-A3,-(SP) ; preserve all but D0, D6
+
+			MOVE.L	VCBAlBlkSiz(A2),D7	; number of bytes in an alloc blk
+			MOVE.L	D7,D6
+			MULU	VCBFreeBks(A2),D6	; number of free bytes available
+			CMP.L	D6,D4				; pin it at number of free blocks avail
+			BLS.S	@1
+			MOVE.L	D6,D4				; actual
+
+@1			CMP.L	D0,D4				; is this enough?
+			BCC.S	FigEndBlk			; br if so . . .
+
+			MOVEQ	#DskFulErr,D0		; report disk full
+
+AllocXit	MOVEM.L (SP)+,D1-D5/D7/A0-A3 ; restore regs used
+			RTS
+
+; D4 now contains the number of extra bytes needed, and we know they are out there
+
+FigEndBlk	MOVE.L	FCBPLen(A1,D1.W),D2 ; current physical length
+			MOVEQ	#0,D6				; bytes allocated so far
+			MOVE.W	FCBSBlk(A1,D1),D3	; start block for file
+			BNE.S	@2					; br if there is a first block
+
+			BSR.S	GetFreeBk			; find a free block (put in D3)
+			MOVE.W	D5,FCBSBlk(A1,D1.W) ; only place we set this in file system
+			MOVE.W	D5,D3				; now the current block
+			MOVEQ	#1,D5				; mark this as the ending block
+			BSR 	SubMrk
+			BRA.S	AlCkDone			; and join in with regular alloc code
+
+@1			MOVE.W	D5,D3				; next alloc blk in list
+@2			BSR.S	GtNxBlk 			; get block linked to by this block
+			CMP.W	#1,D5				; terminal block?
+			BNE.S	@1
+
+; notice at this point,
+;	D3=current last block (alloc size)
+;	D2=physical file length (eventually)
+;	D4=bytes extra we need
+;	D6=# allocated already
+;	D7=num bytes in an alloc blk
+
+;  Now at the end of the file. start allocating
+
+AlNxtBlk	CMP.W	VCBNmBlks(A2),D3	; > # blocks on the disk?
+			BHI.S	AlNtAtEnd			; br if so. (remember, 1st blk is #2)
+			ADDQ.W	#1,D3				; next blk free?
+			BSR.S 	GtNxBlk
+			SUBQ.W	#1,D3				; back up to block that is in file
+			TST.W	D5					; is it avail?
+			BNE.S	AlNtAtEnd			; br if not
+			MOVE.W	D3,D5				; mark it for this file
+			ADDQ.W	#1,D5				;
+
+AlLinkIn	BSR 	SubMrk				; link block D3 to D5
+			MOVE	D5,D3				; now mark block D5 as 1 (EOF)
+			MOVEQ	#1,D5
+			BSR.S	SubMrk
+
+AlCkDone	ADD.L	D7,D6				; another block added
+			ADD.L	D7,D2				; extends physical length by alloc size
+
+			SUBQ.W	#1,VCBFreeBks(A2)	; decrease num of free alloc blks on vol
+
+			CMP.L	D6,D4				; have we added enough?
+			BHI.S	AlNxtBlk			; no, allocate more at the end
+
+; have allocated all we need.  restore regs, calc params, go home
+
+			MOVE.L	D2,FCBPlen(A1,D1.W) ; set new physical length
+			BSR 	MarkVCB 			; mark volume block map modified
+			MOVEQ	#0,D0				; no errors
+			BRA.S	AllocXit
+
+AlNtAtEnd	BSR.S	GetFreeBk			; find a free one with some room
+			BRA.S	AlLinkIn			; then link it in . . .
+
+;  Comes here when we need to allocate a block but the next block in the
+;  file is not available (or when there are no blocks allocated to a file)
+
+GetFreeBk	MOVEM.L D0-D4/D6/A1/A3,-(SP)
+
+			SUB.L	D6,D4				; bytes needed - bytes allocated so far
+			CMP.L	VCBClpSiz(A2),D4	; is this more than minimum clump?
+			BCC.S	@1					; br if so
+			MOVE.L	VCBClpSiz(A2),D4	; make this our minimum search size
+
+@1			MOVE.L	VCBMAdr(A2),A1		; block map address
+			MOVE.W	VCBNmBlks(A2),A3	; number of alloc blocks
+			ADDQ	#1,A3				; last alloc block number (1st one is 2)
+			MOVEQ	#0,D5				; odd/even counter
+			MOVEQ	#2,D0				; current block number
+			MOVEQ	#2,D2				; last string block number start
+			MOVEQ	#0,D3				; contiguous byte count
+			MOVEQ	#0,D6				; max contiguous byte count
+			CLR.W	-(SP)				; block number of max string start
+
+; we have 2 cases for the 12 bits we are after in the bit map:
+;
+; case 0:  A1 => [nib0][nib1] [nib2][xxxx]
+;
+; case 1:  A1 => [xxxx][nib0] [nib1][nib2]
+
+Scan4Free	MOVE.B	(A1)+,D1			; get next bitmap byte
+			LSL.W	#8,D1				; make room for 4-8 more bits
+			BCHG	#0,D5				; are we odd or even?
+			BNE.S	@1					; branch if we were in the middle of a byte
+
+			MOVE.B	(A1),D1 			; get the next 4 bits, don't increment ptr
+			LSR.W	#4,D1				; move it back down to ground-zero
+			BRA.S	@2					; go check for free . . .
+
+@1			MOVE.B	(A1)+,D1			; so get the other 8 . . .
+			AND.W	#$0FFF,D1			; we only got 4 bits so far for this case
+
+@2			BNE.S	NotFree 			; br if not zero (i.e., not free)
+			ADD.L	D7,D3				; incr contiguous free byte count
+
+			CMP.L	D6,D3				; is this greater than our max so far?
+			BLS.S	@3					; br if not
+			MOVE.L	D3,D6				; if so, make this our new max
+			MOVE.W	D2,(SP) 			; max string block start
+			CMP.L	D4,D3				; is it more than we need?
+			BCC.S	GtFreeXit			; then we are done
+
+@3			ADDQ.W	#1,D0				; increment current block number
+			BRA.S	NF1
+
+NotFree 	ADDQ.W	#1,D0				; increment current block number
+			MOVE.W	D0,D2				; assume it starts a new string of freebees
+			MOVEQ	#0,D3				; zero current contiguous byte count
+
+NF1 		CMP.W	A3,D0				; past the end?
+			BLS.S	Scan4Free			; br if not
+
+GtFreeXit	MOVE.W	(SP)+,D5			; get the max so far
+			MOVEM.L (SP)+,D0-D4/D6/A1/A3 ; restore all registers except D5 result
+			RTS
+
+;_______________________________________________________________________
+;
+; Routine:		SubMrk
+; (c) 1983 Apple Computer Inc.
+;
+; Arguments:	  D3.W (input)	-- block (alloc size) to mark
+;				  D5.W (input)	-- mark value to put into the 12-bits
+;				  A2.L (input)	-- VCB pointer
+;				  All registers are preserved
+; Called by:	SetEOF,Alloc
+; Function: 	Set a value into a particular location in the block map:
+;				puts D5 into (D3).	(effectively linking D3 to D5)
+;
+; Modification History:
+;
+;  22 Dec 82  LAK  Reformatted; now takes VCB ptr as input; saves all regs;
+;  17 Jan 83  LAK  Changed for alloc blks diskette offset.
+;_______________________________________________________________________
+
+SubMrk
+			MOVEM.L D0/D6/A2,-(SP)		; preserve all regs
+			MOVE.L	VCBMAdr(A2),A2		; need addr of disk map.
+
+			MOVE.W	D3,D0				; current alloc block
+			SUBQ.W	#2,D0				; first alloc block is number 2
+			MULU	#BtsPrBlk,D0		; cur blk's bit position in block map
+			ROR.L	#4,D0				; put bit shift count into high 4 bits
+			ASL.W	#1,D0				; make word index, don't disturb HO byte
+
+			MOVE.L	0(A2,D0.W),D6		; get old stuff
+			SWAP	D0					; get shift count into low word
+			LSR.W	#8,D0				; get count into low order bits
+			LSR.W	#4,D0				; all the way down---
+			ADD 	#12,D0				; make into a rol shift count
+
+			ROL.L	D0,D6				; get the block into the 12 ls bits
+			AND.W	#$F000,D6			; make it 0,
+			OR		D5,D6				; put new value in it.
+			ROR.L	D0,D6				; put it back in order
+			SWAP	D0					; get word index back
+			MOVE.L	D6,0(A2,D0.W)		; stuff it back into the table
+
+			MOVEM.L (SP)+,D0/D6/A2		; restore regs
+			RTS 						; that's all folks
+
+;_______________________________________________________________________
+;
+; Routine:		DAlBlks
+; (c) 1983 Apple Computer Inc.
+;
+; Arguments:	  D3.W (input)	-- start of chain of blocks (of alloc size)
+;				  A2.L (input)	-- VCB pointer
+;				  D0.W (output) -- error code
+;				  All registers are preserved.
+; Calls:		GtNxBlk,SubMrk
+; Called by:	Delete,SetEOF
+; Function:
+;
+; Modification History:
+;
+;  22 Dec 82  LAK  Reformatted; preserves regs (necessary?)
+;  17 Jan 83  LAK  Don't preserve regs cause we don't have to.
+;
+; - note that deallocated blocks still exist on the diskette until allocated
+;	to new files and rewritten.
+;_______________________________________________________________________
+
+; DAlBlks- deallocate blocks. Enter with D3=start of chain
+;	exits with all blocks marked 0 in map table. does not write to disk
+
+DAlBlks
+			TST.W	D3					; any blocks?
+			BEQ.S	DAlDone 			; if no blocks, all done.
+
+@1			BSR 	GtNxBlk 			; get the next in the chain.
+			MOVE.W	D5,-(SP)			; save the link
+			CLR.W	D5					; link cur blk to 00
+			BSR.S	SubMrk				; and mark it.
+
+			ADDQ.W	#1,VCBFreeBks(A2)	; increase num of free alloc blks on vol
+
+			MOVE.W	(SP)+,D3			; next linked block
+			CMP.W	#1,D3				; last block?
+			BNE.S	@1					; no, do whole list.
+
+			BSR 	MarkVCB 			; mark volume block map modified
+
+DAlDone 	RTS 						; that's all folks.
+
+

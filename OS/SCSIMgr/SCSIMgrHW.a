@@ -1,0 +1,1539 @@
+;
+;	File:		SCSIMgrHW.a
+;
+;	Copyright:	© 1989-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM10>	  2/5/93	CSS		Rollin from Horror: clear flag indicating drive is now spun down.
+;	   <SM9>	 11/3/92	SWC		Changed SCSIEqu.a->SCSI.a.
+;	   <SM8>	  9/9/92	CSS		Changed three bra.w's to bra.l's when modular makes
+;									caused the files to get to far apart.
+;	   <SM7>	 6/20/92	PN		Roll in patchIIciROM.a. New and improved bus errorhandler
+;	   <SM6>	  6/2/92	kc		Revert to <SM4>
+;	   <SM5>	  6/1/92	CS		Roll more cyclone stuff in.
+;	   <SM4>	 5/17/92	kc		Include PowerPrivEqu.a. The powerCntl equ was moved inside the
+;									pmCommandRec record.
+;	   <SM3>	  5/4/92	FM		Undo last change and let Kurt deal with it :^)
+;	   <SM2>	  5/4/92	FM		Roll in changes from PatchIICiRom.a file that were "lost" in the
+;									review process… Making the SCSIBusErrHandler a little more
+;									robust.
+;		<13>	12/27/91	RB		Rolled in Terror changes.  Cleaned up a bit.
+;		<12>	 10/2/91	JSM		Don’t use any onXXMac conditionals at all, don’t use forROM,
+;									isUniversal, or hasPwrControls since they are always true for
+;									this file, don’t check for Cpu ≥ 020 since it always is.
+;		<11>	 9/16/91	JSM		Cleanup header.
+;		<10>	 9/21/90	BG		Removed <8>, <9>. 040s are behaving more reliably now.
+;		 <9>	 7/19/90	BG		Found another place or two where EclipseNOPs were needed.
+;		 <8>	 6/22/90	CCH		Added a NOP for flaky 68040's.
+;		 <7>	 5/16/90	MSH		Added hasPowerControls to hcmac conditional.
+;		 <6>	 2/20/90	BG		Added (simplistic) 040 bus error handling. Updated *Transfer* to
+;									decide which MaxBusErr value to use (000/020/030 vs. 040).
+;		 <5>	 1/18/90	JWK		Needed for Zone5 - Fixes to old SCSI Mgr DMA routines for
+;									SCSIStat support and variable blind timeouts.
+;		 <4>	 1/14/90	JWK		Needed for F19 - Added calls to LockMemory and UnlockMemory for
+;									VM support.
+;		 <3>	 1/11/90	CCH		Added include of “HardwarePrivateEqu.a”.
+;		 <2>	  1/8/90	JK		Needed for F19: Fixed CD-ROM bug in slow read routines - better
+;									loss of phase error checking.
+;	   <1.7>	12/10/89	jwk		NEEDED FOR F19 - Optimized DMA code
+;	   <1.6>	 11/2/89	MSH		Rolled in updated sleeptask from hcmac reality sources.
+;	   <1.5>	 9/11/89	jwk		NEEDED FOR F19 - Cleaned up DMA code, added support for SE and
+;									Plus
+;	   <1.4>	 7/17/89	jwk		NEEDED FOR AURORA - Changed to use "padForOverPatch" conditional
+;	   <1.3>	 7/15/89	jwk		NEEDED FOR AURORA - Code review changes, F19 routines
+;	   <1.2>	 6/29/89	jwk		NEEDED FOR AURORA - Fixed Tape Drive and Slow Write timing bugs
+;	   <1.1>	 6/19/89	SWC		Replaced bit constants for equated versions for OSS interrupt
+;									register tests.
+;	   <1.0>	 6/13/89	jwk		Reorganizing SCSI sources to be Universal-ROM friendly
+;
+;	Old comments are saved for historical purposes in the SCSIMgrOld.a file.				<v1.3>
+;
+;-----------------------------------------------------------
+
+			BLANKS		ON
+			STRING		ASIS
+			PRINT		OFF
+
+	IF (&TYPE('dbSymbols') = 'UNDEFINED') THEN
+dbSymbols		EQU		0						; for debugging purposes				<v1.5>
+	ENDIF
+
+	IF (&TYPE('phaseLogging') = 'UNDEFINED') THEN
+phaseLogging	EQU		0
+	ENDIF
+
+			LOAD		'StandardEqu.d'
+			INCLUDE		'HardwarePrivateEqu.a'
+			INCLUDE		'UniversalEqu.a'				; <13> rb
+			INCLUDE		'PowerPrivEqu.a'
+			INCLUDE 	'SCSI.a'
+			INCLUDE 	'SCSIPriv.a'
+			INCLUDE		'SCSIEqu96.a'					; <13> rb
+
+			PRINT		ON
+
+SCSIHW		PROC		EXPORT	
+
+			EXPORT	Arb,			Sel,			Delay22,		SCSIIntHnd
+			EXPORT	Transfer,		SlowComp,		FastComp
+			EXPORT	SlowRead,		SlowWrite,		FastRead,		FastWrite
+			EXPORT	VFastReadOSS,	VFastRead,		VFastWriteOSS,	VFastWrite
+			EXPORT	PFastReadOSS,	PFastRead,		PFastWriteOSS,	PFastWrite
+			EXPORT	FastReadOSS,	FastWriteOSS									;<v1.3>
+			EXPORT	BusErrHandler													;<v1.5>
+
+			EXPORT	ClearIRQ
+			EXPORT	DisEnable
+
+			IMPORT	ClearSCSIInt,	EnableSCSIInts,	DisableSCSIInts
+
+			WITH	scsiPB,scsiPrivPB, scsiGlobalRecord, dcInstr, PmgrRec
+
+			EXPORT	SleepTask,		DoSpinDown
+
+;-------------------------------------------------------------------
+;
+;	DoSpinDown - Turn hard drive power off.										<v1.1><v1.2>
+;
+;	It is assumed that the drive power is on - the power is cut unconditionally.
+;
+			with 	pmCommandRec
+DoSpinDown
+			link	a6,#-14						; storage for Power Mgr param blk	<v1.1>
+@cutPower
+			lea.l	-14(a6),a0					; point to the parameter block		<v1.1>
+			move.w	#powerCntl,pmCommand(a0)	; power off the SCSI +5V and +12V	<v1.1>
+			move.w	#1,pmLength(a0)				; one byte of data in buffer		<v1.1>
+			move.w	#hdOff*256,-2(a6)			; hdOff command						<v1.1>
+			pea.l	-2(a6)						; address of send buffer			<v1.1>
+			move.l	(sp)+,pmSBuffer(a0)			; save the send buffer pointer		<v1.1>
+			move.l	zeroReg,pmRBuffer(a0)		; no data to be received			<v1.1>
+			_PmgrOp								; send it off to the Power Mgr		<v1.1>
+			tst.w	d0							; was there an error ?				<v1.1>
+			bne.s	@exit						; if there was, don't freeze the timer	<v1.8>
+@success
+			MOVE.L	PmgrBase,A0					; get pointer to pmgr locals		<v2.1>
+			clr.l	LastHd(A0)					; stop calling - disk is spun down	<v1.8>
+			bclr.b	#HDPowerOn,PmgrFlags(a0)	; clear flag indicating drive is now spun down	<t11> djw <SM10> CSS
+@exit
+			unlk	a6							; release local storage				<v1.1>
+			rts									;									<v1.1>
+			endwith
+;-------------------------------------------------------------------
+;
+;	SleepTask - Turn hard drive power off, if necessary									<v1.2>
+;
+;	If the Sleep timer goes off, or the user decides to go immediately to sleep, this task
+;	is called.  If no SCSI I/O is in progress, the power is turned off to the drive.	<v1.2>
+;
+SleepTask
+			MOVE.L	A1,-(SP)					; save A1
+			cmpi.w	#SleepDemand,d0				; is it a sleep demand ?				<v1.4>
+			beq.s	@spin						; if so, do it 							<v1.4>
+			cmpi.w	#SleepNow,d0				; is it a sleep now ?					<v1.4><v1.6>
+			beq.s	@spin						; if so, do it 							<v1.4>
+			cmpi.w	#SleepRequest,d0			; is it a sleep request ?				<v1.4>
+			bne.s	@exit						; if not, ignore it						<v1.4>
+
+			move.l	SCSIGlobals,a1				; point to SCSI Mgr globals				<v1.4>
+			tst.l	scsiQHead(a1)				; is the new SCSI Mgr busy ?			<v1.2>
+			bne.s	@err						; we're busy, so we won't sleep		<v1.4><v1.3>
+@spin
+			MOVE.L	PmgrBase,A1					; use pointer to spin down routine		<v1.5>
+			MOVE.L	HDvector(A1),A1
+			JSR		(A1)
+@exit		
+			clr.l	d0							;										<v1.3>
+@err
+			move.l	(sp)+,a1					; restore a1						<v1.2><v1.3>
+			rts									; we're out of here						<v1.4>
+
+;
+;	ClearIRQ
+;
+;	Function:	Clears the SCSI IRQ bit and the VIA interrupt flag, if necessary.
+;
+ClearIRQ:
+			move.b	sRESET(a3),d1			; clear the IRQ interrupt bit
+			bra.l	ClearSCSIInt			; <SM8> call InterruptHandlers.a to clear SCSI intr latch (if any) <v1.3>
+
+;
+;	DisEnable
+;
+;	Called by:	SCSIDT, ArbSel, SCSIIntHnd, MsgIn
+;
+;	Calls:		_PrimeTime (on the Mac Plus)
+;
+;	On entry:	d0 - If zero, disable SCSI interrupts, else enable SCSI interrupts
+;	
+;	Function:	Enable/disable the CPU's SCSI interrupt.
+;
+DisEnable:
+			tst.l	d0							; disable or enable ?
+			beq.s	@disable					; if zero, disable interrupts
+@enable
+			bra.l	EnableSCSIInts				; <SM8> use routine in InterruptHandlers.a					<v1.3>
+@disable
+			bra.l	DisableSCSIInts				; <SM8> use routine in InterruptHandlers.a					<v1.3>
+
+;
+;	BusErrHandler -- Hardware-handshaking bus error handler
+;
+
+aeXFrameType		EQU		$07					; Access Error Exception Stack Frame type value	<6>
+aeXFrameSize		EQU		30*2				; size (words) of 040 AE Exception Frame		<6>
+shortBEXFrameType	EQU		$0A					; Short bus cycle fault stack frame (020/030)	<6>
+
+BusErrHandler:
+			move.l	d0,-(sp)					; save d0									<PN>
+			moveq.l	#$ffffff9c,d0				; mask = $ffffff9c							<Start> <PN>
+			and.l	4+$10(sp),d0				; clear variable bits of the fault address 	<PN>
+			cmp.l	SCSIHsk,d0					; was it a SCSI chip access ?				<PN>
+			beq.s	@start						; if so, start processing the bus error		<PN>
+			
+			movem.l	d1/a4,-(sp)					; save what we will trash					<PN>
+			move.l	SCSIGlobals,a4				; load our globals reference				<PN>
+			move.l	SCSI2Base,d1				; is the external SCSI chip base address valid?	<PN>
+			beq.s	@NoSCSIBus2					; -> no, cleanup and bail					<PN>
+			
+			cmp.l	hhsk5380_2(a4),d0			; was it an external SCSI chip access ?		<PN>
+			beq.s	@Is2ndSCSI					; if so, start processing the bus error		<PN>
+			
+@NoSCSIBus2										; 											<PN>
+			movem.l	(sp)+,d1/a4					; restore d1/a4								<PN>
+
+
+			move.l	(sp)+,d0					; restore d0
+			move.l	OldBusErrVct(a6),-(sp)		; put old bus error handler addr on stack	<end>
+			rts									; jump to old handler, assuming it'll RTE	<PN>
+
+@Is2ndSCSI										;											<PN>
+			movem.l	(sp)+,d1/a4					; restore d1/a4								<PN>
+
+@start
+
+			subq.w	#1,BusErrCount(a6)			; retry until we get tired
+			beq.s	CleanUp
+			
+			move.w	TimeDBRA,d0					; DBRA's per millisecond					<v1.3>
+			lsr.w	#4,d0						; 1ms/16 = approximately 62us (was 50us) 	<v1.3>
+@ErrWait	dbra	d0,@ErrWait					; recovery time	(was 50us)	<C865/PB208>	<v1.3>
+			move.l	(sp)+,d0					; restore d0								<v2.0>
+			rte									; haven't reached max, so restart
+Cleanup
+			addq.l	#4,sp						; throw away copy of d0 on stack			<29>
+			
+			move.w	(sp),d0						; get sr from stack
+			bfextu	6(sp){0:4},d1				; get format code from stack
+			cmp.b	#aeXFrameType,d1			; check for 040 Access Error Exception Frame	<6>
+			beq.s	Drop040XFrame				; dispose of 040 AE except. frame				<6>
+			cmp.b	#shortBEXFrameType,d1		; short 020/030 exception frame?
+			bne.s	Drop46w						; no, so use larger frame
+			adda.w	#16*2,sp					; dispose of the 16-word frame
+			bra.s	DummyFrame					;  and finish up
+
+Drop040XFrame									; 040 Bus Error frame-cleaning done here		<6>
+			add.w	#aeXFrameSize,sp			; remove 040 Access Error Exception Frame		<6>
+			bra.s	DummyFrame					;  and create dummy return frame				<6>
+Drop46w
+			add.w	#46*2,sp					; size of exception frame
+DummyFrame
+			;
+			; Fake a format code 0 exception frame (4 words) to finish cleaning up
+			;
+			move.w	zeroReg,-(sp)				; format code 0
+			pea		FinishErr					; PC value
+			move.w	d0,-(sp)					; sr value
+			rte									; 'return' from the fake exception
+
+FinishErr
+			moveq.l	#scBusTOErr, d0				; assume slow peripheral				<13> rb
+			TestFor	SCSI96_1Exists				; use macro to check if we have 		<13> rb
+			beq.s	@noSCSI96					;  a SCSI96 chip.  Bra. if not			<13> rb
+			
+			;In c96 DMA mode, if the phase changes while transfer count > 0 
+			; during transfer info then c96 generates a bus service interrupt.
+			
+			rts									; But return SCSI Bus TimeOut for now	<13> rb
+@noSCSI96			
+			btst.b	#bPM, (a1)					; phase change?							<13> rb
+			bne.s	@ErrorDone					; phase matches: slow peripheral		<13> rb
+			moveq.l	#scPhaseErr, d0				; return phase change error				<13> rb
+@ErrorDone
+			rts
+
+
+;
+;	Arb
+;
+;	Called by:	SCSIDT
+;
+;	Calls:		Delay22.
+;
+;	On entry:	a3 - ptr to SCSI read base address
+;				a4 - ptr to SCSI Mgr globals
+;
+;	On exit:	d0 - result code
+;
+;	Function:	Arbitrates for the SCSI bus.
+;
+Arb:
+			movem.l	a0-a3/d1-d2,-(sp)				; save registers
+			move.w	#scsiArbitrated,scsiResult(a5)	; we're arbitrating
+			moveq.l	#noErr,d0						; assume success
+
+			btst.b	#sOSSExists,G_Reserved0+3(a4)		; see if we really have an OSS
+			beq.s	@notGDUOSS							; if not, skip it
+			btst.b	#sSCSIDMAExists,G_Reserved0+3(a4)	; see if we have a SCSI DMA chip
+			beq.s	@notGDUOSS							; not the correct combination
+
+			move.l	#$FFFFFFFF,sDTIME(a3)		; set timer to an outlandish value		<v1.3><v1.5>
+			move.l	G_Reserved2(a4),sDCTRL(a3)	; enable auto-arbitration					<v1.2>
+			move.b	#iARB,sMR+WrOffs(a3)		; attempt arbitration
+
+			move.w	TimeDBRA,d2					; DBRA's per millisecond					<v1.3>
+			lsr.w	#6,d2						; 1ms/64 = 15us								<v1.3>
+@delay
+			dbra.w	d2,@delay					; delay at least 15us						<v1.3>
+
+			move.l	sDCTRL(a3),d1				; get an image of the DMA control register
+			btst.l	#bWONARB,d1					; did we win ?
+			beq.s	@busyGDU					; we didn't win
+			move.b	sRESET(a3),d1				; clear the interrupt						<v1.3>
+			move.l	#iINTREN,sDCTRL(a3)			; enable chip interrupts					<v1.3>
+			bra.s	@exit						; we won									<v1.3>
+@busyGDU
+			move.l	#iINTREN,sDCTRL(a3)			; turn off auto-arbitration					<v1.3>
+			bra.s	@busy						; continue									<v1.3>
+@notGDUOSS
+			move.b	G_ID(a4),sODR+WrOffs(a3)	; put CPU's ID out on the bus
+			move.b	#iARB,sMR+WrOffs(a3)		; attempt arbitration
+			btst.b	#bAIP,sICR(a3)				; check for AIP (Arbitration In Progress) bit
+			beq.s	@busy						; the bus is busy
+@delay22:
+			movea.l	jvDelay22(a4),a0			; delay at least 2.2us
+			jsr		(a0)						; go to the routine
+@checkWin:
+			btst.b	#bLA,sICR(a3)				; did we lose arbitration ?
+			bne.s	@busy						; if we lost, get out
+			move.b	G_ID(a4),d2					; CPU's SCSI ID								<v1.3>
+			move.b	sCDR(a3),d1					; check ID's on the bus
+			eor.b	d2,d1						; take out our ID							<v1.3>
+			cmp.b	d2,d1						; is there a higher ID on the bus ?
+			bhi.s	@busy						; if so, we lost, so get out
+			btst.b	#bLA,sICR(a3)				; check again - did we lose arbitration ?
+			beq.s	@exit						; we won - d0 is set correctly
+@busy:
+			bset.b	#waitingForIRQ,state1(a4)	; we're waiting for a Loss of BSY interrupt		<v1.5>
+			move.b	zeroReg,sMR+WrOffs(a3)		; turn off arbitration
+			move.b	#iMBSY,sMR+WrOffs(a3)		; set up for "Loss of BSY" interrupt
+			moveq.l	#scArbNBErr,d0				; we didn't win
+@exit:
+			movem.l	(sp)+,a0-a3/d1-d2			; restore registers (d0 is not restored)
+			tst.l	d0							; set condition codes
+			rts
+;
+;	Sel
+;
+;	Called by:	SCSIDT
+;
+;	Calls:		Delay22.
+;
+;	On entry:	a3 - ptr to SCSI read base address
+;				a4 - ptr to SCSI Mgr globals
+;				a5 - ptr to SCSI request parameter block
+;
+;	On exit:	d0 - result code
+;
+;	Function:	Selects a device.
+;
+Sel:
+			movem.l	scsiRegs,-(sp)				; save registers
+			move.w	#scsiSelection,scsiResult(a5)	; we're attempting to select
+			move.b	#iSEL+iBSY,sICR+WrOffs(a3)	; assert SEL as well as BSY since we won
+			move.b	zeroReg,sMR+WrOffs(a3)		; turn off arbitration
+			movea.l	jvDelay22(a4),a0			; delay at least 1.2us (800+400ns)			<v1.3>
+			jsr		(a0)						; go to the routine
+@select:										; start selection
+			move.b	zeroReg,sTCR+WrOffs(a3)		; clear *I/O bit to become initiator
+			moveq.l	#1,d1						; build the select mask...
+			move.b	scsiReqID(a5),d2			; Target ID
+			lsl.b	d2,d1						; shift the bit to the appropriate spot
+			or.b	G_ID(a4),d1					; merge CPU ID with Target ID
+			move.b	d1,sODR+WrOffs(a3)			; set select mask (ready to be output onto bus)
+			move.b	#iBSY+iSEL+iDB+iATN,sICR+WrOffs(a3)	; assert *SEL,*DB, and *ATN
+			move.b	zeroReg,sSER+WrOffs(a3)		; disable reselection interrupts
+			move.l	zeroReg,d0					; disable all SCSI interrupts
+			move.l	jvDisEnable(a4),a0			; addr of intr enable/disable routine
+			jsr		(a0)						; disable SCSI interrupts
+			move.b	#iSEL+iDB+iATN,sICR+WrOffs(a3)	; *SEL, *DB, and *ATN - no *BSY
+			movea.l	jvDelay22(a4),a0			; bus settle delay (400ns)
+			jsr		(a0)						; go to the routine
+@timeout
+			move.w	scsiSelTO(a5),d2			; selection timeout in milliseconds
+			mulu.w	TimeSCSIDB,d2				; get number of DBRA's
+			move.l	d2,d0						; set up d0 as high word
+			swap	d0
+@wfbsy
+			btst.b	#bBSY,sCSR(a3)				; test for *BSY
+			dbne.w	d2,@wfbsy					; loop until *BSY or timeout
+			dbne.w	d0,@wfbsy
+			bne.s	@noerror					; *BSY is asserted
+@nobsy
+			move.b	#iSEL,sICR+WrOffs(a3)		; de-assert data bus
+			move.w	TimeSCSIDB,d2				; delay 200us
+			lsr.w	#2,d2						; 1ms/4 = 250us (greater than 200us)
+@delay
+			dbra.w	d2,@delay					; wait 250us
+			btst.b	#bBSY,sCSR(a3)				; *BSY asserted ?
+			bne.s	@noerror					; if asserted, we're done
+@error
+			move.w	#scsiSelectTOErr,d0			; selection timed out						<v1.3>
+			move.b	zeroReg,sICR+WrOffs(a3)		; release the lines
+			bra.s	@exit						; done
+@noerror
+			movea.l	jvDelay22(a4),a0			; bus settle delay (400ns)
+			jsr		(a0)						; go to the routine
+			move.b	#iATN,sICR+WrOffs(a3)		; assert *ATN only
+			moveq.l	#noErr,d0					; indicate success
+@exit:
+			movem.l	(sp)+,scsiRegs				; restore registers (d0 is not restored)
+			tst.l	d0							; set condition codes
+			rts
+			
+;
+;	Delay22();	
+;
+;	Called by:	Arb, Sel
+;
+;	Calls:		None.
+;
+;	Function:	Provides a delay of at least 2.2us, using three VIA accesses				<v1.3>
+;				as a time constant.															<v1.3>
+;
+Delay22:
+			movea.l	VIA,a0						; point to the VIA							<v1.3>
+			tst.b	vIFR(a0)					; access the VIA							<v1.3>
+			tst.b	vIFR(a0)
+			tst.b	vIFR(a0)
+			rts
+;
+;	SCSIIntHnd
+;
+;	Called by:	Macintosh Interrupt Dispatcher
+;
+;	Calls:		Command, Status, Data, MsgIn, MsgOut
+;
+;	Function:
+;		This is the SCSI interrupt handler.  (On the Mac Plus, a second timer is used to 
+;		monitor the SCSI chip's interrupt line.)
+;
+
+SCSIIntHnd:
+		IF	dbSymbols	THEN
+			link	a6,#0						; no globals, no locals
+			nop
+		ENDIF
+			movem.l	intrRegs,-(sp)				; save registers
+			movea.l	SCSIGlobals,a4				; get pointer to SCSI Manager globals		<v1.7>
+SCSIIntHndCommon
+			movea.l	activeReq(a4),a5			; point to the active request, if any		<v1.3>
+			moveq.l	#0,zeroReg					; clear out the zero register
+			move.l	zeroReg,d0					; disable all SCSI interrupts
+			move.l	jvDisEnable(a4),a0			; addr of intr enable/disable routine
+			jsr		(a0)						; disable SCSI interrupts
+			move.l	base5380(a4),a3				; SCSI read base address
+
+			move.w	sr,-(sp)					; save current status register contents
+			ori.w	#HiIntMask,sr				; no interrupts during Reselection handshake
+			move.b	sBSR(a3),d0					; fetch Bus and Status Register
+			btst.l	#bIREQ,d0					; is the IRQ bit set ?
+			beq.w	@Spurious					; if not, check for spurious interrupt
+			lsl.w	#8,d0						; put BSR in upper byte
+			move.b	sCSR(a3),d0					; put Current SCSI Bus Status in lower byte
+
+			move.w	d0,d1						; get a copy of BSR and CSR registers
+			andi.w	#mReselect,d1				; clear don't care bits
+			cmpi.w	#iReselect,d1				; is it a Reselection interrupt ?
+			bne.s	@chkEOP						; if not, check for an End Of Process interrupt
+@Reselect
+;
+;			Since we're not a system with Parity implemented, we can't check for parity
+;			on Reselection.  It's not worth the trouble to keep track of the ID's that implement
+;			Parity.
+;
+;			btst.l	#bDBP,d0					; is /DBP asserted ?
+;			beq.w	@Spurious					; if not, bad parity, don't respond
+			move.b	sCDR(a3),d1					; get ID of reselecting device
+			beq.w	@Spurious					; no ID bits set
+			move.b	G_ID(a4),d0					; get our ID bit
+			eor.b	d0,d1						; remove our ID bit
+			beq.w	@Spurious					; only our ID bit was set, invalid reselection
+			move.b	zeroReg,sSER+WrOffs(a3)		; disable reselection interrupts
+			move.b	sICR(a3),d0					; assert *BSY
+			ori.b	#iBSY,d0
+			move.b	d0,sICR+WrOffs(a3)
+			moveq.l	#scResel,d0					; send a reselect message to dTask (ID mask in d1.b)
+			bra.s	@ClearIRQ					; clear interrupt and leave
+@chkEOP
+			move.w	d0,d1						; get a copy of BSR and CSR registers
+			andi.w	#mEOP,d1					; clear don't care bits
+			cmpi.w	#iEOP,d1					; is it an End Of Process interrupt ?
+			bne.s	@PhaseMm					; if not, check for Phase Mismatch
+@EOPIntr
+			move.b	zeroReg,sMR(a3)				; clear EOP interrupt (and turn off pDMA)
+			move.b	zeroReg,sICR(a3)			; deassert the data bus (for writes)		<v1.3>
+			moveq.l	#scEOP,d0					; send an EOP message to dTask
+			bra.s	@ClearIRQ					; clear interrupt and leave
+@PhaseMm
+			move.w	d0,d1						; get a copy of BSR and CSR registers
+			andi.w	#mPhaseMm,d1				; clear don't care bits
+			cmpi.w	#iPhaseMm,d1				; is it a Phase Mismatch interrupt ?
+			bne.s	@LossBsy					; if not, check for Loss of BSY				<v1.3>
+			moveq.l	#scPhaseMm,d0				; send a Phase Mismatch message to dTask
+			bra.s	@ClearIRQ					; clear interrupt and leave
+@LossBsy
+			move.w	d0,d1						; get a copy of BSR and CSR registers
+			andi.w	#mLossBsy,d1				; clear don't care bits
+			cmpi.w	#iLossBsy,d1				; is it a Loss of BSY interrupt ?
+			bne.s	@BusReset					; if not, check for SCSI Bus Reset
+			moveq.l	#scLossBsy,d0				; send a Loss of BSY message to dTask
+			bra.s	@ClearIRQ					; clear interrupt and leave
+@BusReset			
+			move.w	d0,d1						; get a copy of BSR and CSR registers
+			andi.w	#mBusReset,d1				; clear don't care bits
+			cmpi.w	#iBusReset,d1				; is it a SCSI Bus Reset interrupt ?
+			bne.s	@Parity						; if not, check for a Parity interrupt
+;			moveq.l	#scBusReset,d0				; send a Bus Reset message to dTask			<v1.3>
+			bra.s	@Spurious					; clear IRQ, leave as if nothing happened	<v1.3>
+@Parity	
+			move.w	d0,d1						; get a copy of BSR and CSR registers
+			andi.w	#mParity,d1					; clear don't care bits
+			cmpi.w	#iParity,d1					; is it a Parity Error interrupt ?
+			bne.s	@Spurious					; if not, spurious interrupt				<v1.5>
+			moveq.l	#scParity,d0				; send a Parity error message to dTask
+			; fall through to clear interrupt request and leave								<v1.3>
+@ClearIRQ
+			movea.l	jvMessage(a4),a0			; addr of messaging routine					<v1.3>
+			jsr		(a0)						; send the message to the deferred task		<v1.3>
+			movea.l	jvClearIRQ(a4),a0			; addr of ClearIRQ routine
+			jsr		(a0)						; clear the SCSI interrupt (and VIA, if necessary)
+			move.w	(sp)+,sr					; restore the sr
+		IF	phaseLogging		THEN
+			nop									; good place to jump to phase-logging routine
+		ENDIF
+			bra.s	@inthndRTS					; we're done
+@Spurious
+			move.w	(sp)+,sr					; restore the sr
+
+			btst.b	#sSCSIDMAExists,G_Reserved0+3(a4)	; do we have a SCSI DMA chip ?		<v1.3>
+			beq.s	@DMAdone							; if not, skip						<v1.3>
+
+			move.l	sDCTRL(a3),d0				; get a snapshot of DMA control register	<v1.3>
+			btst.l	#bTIMEP,d0					; did the watchdog timer go off ?			<v1.3>
+			beq.s	@DMAdone					; if not, continue							<v1.3>
+		 if dbSymbols then
+			_Debugger
+		 endif
+			move.w	#scsiBusTOErr,d0			; report that the watchdog timer expired
+			movea.l	jvLogError(a4),a0			; note the SCSI error in the PB
+			jsr		(a0)						; send it
+			moveq.l	#-1,d0						; clear the timer interrupt					<end>
+			move.l	d0,sDTIME(a3)				; hit the watchdog timer to clear the intr	<v1.3>
+@DMAdone
+			movea.l	jvClearIRQ(a4),a0			; addr of ClearIRQ routine
+			jsr		(a0)						; clear the VIA interrupt, if necessary
+			moveq.l	#1,d0						; flag to enable interrupts
+			movea.l	jvDisEnable(a4),a0			; addr of interrupt enable/disable routine
+			jsr		(a0)						; turn interrupts back on
+
+@inthndRTS
+			movem.l	(sp)+,intrRegs				; restore registers
+		IF	dbSymbols THEN
+			unlk	a6
+			rts									; finished
+			dc.b	'INTHND  '					; MacsBug label
+		ELSE
+			rts
+		ENDIF
+;
+;	Transfer - 
+;
+;	Called by:	Data
+;
+;	Calls:		The primitive data transfer routines
+;
+;	Registers:	d0	<-- error, if any
+;				d1	<-- bytes transferred
+;				d2	--> number of bytes to transfer
+;				d3	--> bDMAR (6)															<v1.3>
+;				d4	--> type of transfer to perform (offset into "dataTable")
+;
+;				a2	--> ptr to data buffer
+;
+;	Function:	Sets up and dispatches to the simple data-transfer routines
+;
+;	All primitive data transfer routines assume:
+;
+;		d0 - <-- error (if any)
+;		d1 - <-- bytes transferred
+;		d2 - --> number of bytes to transfer
+;		d3 -     scratch - saved
+;		d4 - --> type of transfer to perform
+;		d5 -     scratch - saved
+;		d6 -     scratch - saved
+;
+;		a0 - scratch - saved
+;		a1 - saved - sBSR(a3)
+;		a2 - ptr to data buffer - saved
+;		a3 - SCSI read base address
+;		a4 - ptr to SCSI Mgr globals
+;		a5 - scratch - saved
+;
+Transfer:
+			link	a6,#LocalSize				; allocate local storage
+			moveq	#MaxBusErr,d0				; upper limit for 680x0's				<v1.3><v1.5><6>
+			cmp.b	#cpu68040,CpuFlag			; check if we're on an 040							<6>
+			bne.s	@storeValue					; NO  ... leave BusErrCount alone					<6>
+			moveq	#Max040BusErrs,d0			; YES ... use 040 MaxBusErr value					<6>
+@storeValue										;													<6>
+			move.w	d0,BusErrCount(a6)			; store upper limit for allowable bus errors		<6>
+
+			moveq.l	#noErr,d0					; assume no error
+			move.l	d2,d1						; make a copy of the count - is it zero ?
+			beq.s	@exit						; if so, get out
+
+			movem.l a1-a5/d2-d6,-(sp)			; save registers
+
+			lea.l	sBSR(a3),a1					; save later indexing
+			moveq.l	#bDMAR,d3					; bit DRQ test on sBSR(a3) (for speed)
+
+			move.l	BusErrVct,OldBusErrVct(a6)	; keep old vector
+			move.l	jvBusErr(a4),BusErrVct
+
+			lea.l	dataTable(a4),a0			; point to data transfer table in globals
+			movea.l	0(a0,d4.l),a0				; get the routine address
+			
+			jsr		(a0)						; go to the appropriate routine
+			
+@done
+			move.l	OldBusErrVct(a6),BusErrVct	; restore previous Bus Error vector
+			movem.l (sp)+,a1-a5/d2-d6			; restore these guys
+			tst.w 	d0							; set the condition codes
+@exit
+			unlk	a6							; release local storage
+			rts
+
+;
+;	All primitive data transfer routines use this convention:
+;
+;		d0 - type of transfer to perform	/	error (if any)
+;		d1 - number of bytes to transfer	/	bytes transferred
+;		d2 - number of bytes to transfer
+;		d3 - bDMAR (6)
+;		d4 - scratch - saved
+;		d5 - scratch - saved
+;		d6 - scratch - saved
+;
+;		a0 - special I/O address (pDMA or hhsk base, plus input/output register offset)
+;		a1 - sBSR(a3)
+;		a2 - ptr to data buffer
+;		a3 - SCSI read base address
+;		a4 - ptr to SCSI Mgr globals
+;		a5 - scratch - saved
+;
+
+;
+;	SlowRead
+;
+;	Called by:	Transfer
+;
+SlowRead:
+@RdSetup
+			move.l	pdma5380(a4),a0				; use the global	<C406/12Nov86>
+			adda.l	#sIDR,a0					; input data offset	<C406/12Nov86>
+			subq.l	#1,d2						; decr. for DBRA	<C478/10Dec86>
+			move.l	d2,d5						; make a copy of the byte count
+			swap	d5							;  and get hiword in d5
+@wait
+			btst.b	d3,(a1)						; DRQ ?										<v1.3>
+			bne.s	@SnRd						; if so, start the transfer					<v1.3>
+			btst.b	#bREQ,sCSR(a3)				; look for REQ								<v1.3>
+			beq.s	@wait						; can't check phase until REQ is asserted	<v1.3>
+			btst.b	#bPM,(a1)					; we have REQ, do we have a phase match ?	<v1.3>
+			beq.s	@RdPhaseErr					; if not, bail out with an error			<v1.3>
+;
+;	This is the loop for polled reads. Byte count is in d2,d5
+;
+@SnRd
+			btst.b	d3,(a1) 					; DRQ?	<C478/10Dec86>
+			beq.s	@SnRdChk					; (9)
+			move.b	(a0),(a2)+ 					; read bytes into user space (13)
+			dbra	d2,@SnRd					; decrement count
+			dbra	d5,@SnRd					; high word of count
+			bra.s	@RdDone						; we're done
+@SnRdChk
+			bsr.w	NewPhaseCheck				; check more carefully for phase match		<1>
+			bne.s	@SnRd						; continue if it is
+@RdPhaseErr
+			moveq.l	#scPhaseErr,d0				; return error
+			bra.s	@exit
+			
+@RdDone
+			btst.b	#bACK,sBSR(a3)				; check for ACK				<3.0>
+			beq.s	@exit						; if no ACK, we're done		<3.0>
+@ACK
+@wfnREQ
+			btst.b	#bREQ,sCSR(a3)				; test for *REQ				<3.0>
+			beq.s	@exit						; if it's gone, we're done	<3.0>
+			btst.b	#bPM,(a1)					; still in same phase?		<3.0>			<v1.3>
+			bne.s	@RdDone						; if so, go back and wait	<3.0>
+@exit
+			swap	d5							; calculate bytes left to transfer
+			move.w	d2,d5						; lower word of count
+			addq.l	#1,d5						; undo adjustment for dbra
+			sub.l	d5,d1						; number of bytes transferred
+			rts
+
+;
+;	SlowWrite
+;
+;	Called by:	Transfer
+;
+SlowWrite:
+@WrSetup
+			move.l	pdma5380(a4),a0				; point to special address space
+			adda.w	wrOffset(a4),a0				; add in write offset, if any
+@ckphase
+			btst.b	#bREQ,sCSR(a3)				; check for REQ
+			beq.s	@ckphase					; if no REQ, wait for synchronization
+@ready
+			move.b	zeroReg,sTCR+WrOffs(a3)		; match data out<C846/PM116/19Mar87>
+			move.b	#iDMA,sMR+wrOffs(a3)		; set DMA mode
+			move.b	#iDB,sICR+wrOffs(a3)		; assert data bus
+
+			btst.b	#sSCSIDMAExists,G_Reserved0+3(a4)				; see if we really have the DMA chip		<2.8>
+			beq.s	@DMAdone					; if not, skip it							<2.8>
+
+			move.l	#iHSKEN+iINTREN,sDCTRL(a3)	; turn on hhsk 		<C914>					<v1.3>
+@DMAdone
+			move.b	zeroReg,sDMAtx+wrOffs(a3)	; start write DMA
+@test
+			btst.b	#bPM,(a1)					; we have REQ, are we in phase ?			<v1.3>
+			bne.s	@wrContinue					; if in phase, continue						<v1.3>
+@wrPhaseErr
+			moveq.l	#scPhaseErr,d0				; return a phase error
+			bra.s	@WrDone						; get out
+
+@wrContinue
+			move.l	d2,d1						; make a copy of the byte count
+			subq.l	#1,d2						; decr. for DBRA		<C478/10Dec86>
+			move.l	d2,d5						; make a copy of the byte count
+			swap	d5							;  and get hiword in d5
+;
+;	This is the loop for polled writes. Byte count is in d2,d5
+;
+@SnWr
+			btst.b	d3,(a1) 					; DRQ?	<C478/10Dec86>
+			beq.s	@SnWrChk
+			move.b	(a2)+,(a0)					; write bytes
+			dbra	d2,@SnWr					; decrement count
+			dbra	d5,@SnWr
+			bra.s	@WrDone						; we're finished			<v2.3>
+@SnWrChk
+			btst.b	#bPM,(a1) 					; phase OK?	<C478/10Dec86>
+			bne.s	@SnWr						; continue if it is
+			moveq.l	#scPhaseErr,d0				; return a phase error
+			bra.s	@DMAOff						; we're done for now
+			
+@WrDone		; NOTE: we shouldn't turn off DMA mode before the last byte was taken.
+			; If the NCR chip asserts DRQ, then the peripheral got the byte.
+			; If the peripheral changes the bus phase, then it must have also got it.
+			; This section check is from <C138/29Sep86>.  Modified <C780>.
+
+			btst.b	#sSCSIDMAExists,G_Reserved0+3(a4)	; do we have a SCSI DMA chip ?
+			beq.s	@noDMA								; if not, skip
+@wrWait1
+			btst.b	d3,sBSR(a3)					; check for DRQ
+			bne.s	@DMAOff						; if DRQ, peripheral got the byte
+			btst.b	#bPM,sBSR(a3)				; are we still in phase ?
+			bne.s	@wrWait1					; if so keep waiting
+@noDMA
+@wrWait2
+			btst.b	d3,sBSR(a3)					; check for DRQ
+			bne.s	@DMAOff						; if DRQ, peripheral got the byte
+			btst.b	#bPM,sBSR(a3)				; are we still in phase ?
+			bne.s	@wrWait2					; if so, keep waiting
+
+@DMAOff
+			move.b	zeroReg,sICR+WrOffs(a3)		; disable data bus
+			move.b	zeroReg,sMR+WrOffs(a3)		; clear DMA mode
+			btst.b	#sSCSIDMAExists,G_Reserved0+3(a4)				; see if we really have the DMA chip		<2.8>
+			beq.s	@DMAdone2					; if not, skip it							<2.8>
+			move.l	#iINTREN,sDCTRL(a3)			; turn off hhsk		<C914>					<v1.3>
+@DMAdone2
+			swap	d5							; calculate number of bytes left to transfer
+			move.w	d2,d5						; low-order word of count
+			addq.l	#1,d5						; adjust for DBRA
+			sub.l	d5,d1						; number of bytes transferred
+			rts									; we're done
+
+
+;
+;	VFastWriteOSS -- Virtual address interface to the SCSI DMA circuitry					<v1.3>
+;
+;	Called by:	Transfer
+;
+;	Function:	This routine calls a service routine to get the physical translation
+;				for the virtual address/count pair passed in a2/d2.  If the virtual
+;				data transfer cannot be performed in one DMA operation (crosses a page
+;				or memory bank boundary,) the virtual transfer will be completed later
+;				by a virtual transfer of the remaining bytes.
+;
+VFastWriteOSS:									;
+			movea.l	scsiPrivate(a5),a0			; get ptr to private storage record			<v1.3>
+			lea.l	scsiVAddr(a0),a0			; point to record for GetPhysical routine	<start>
+			move.l	a2,d0						; get the virtual address					<v1.5>
+			jsr		([JStripAddress])			; clean up that address						<v1.5>
+			move.l	d0,(a0)						; set the virtual address field				<v1.5>
+@translate
+			move.l	d2,4(a0)					; set the virtual count field
+			moveq.l	#1,d0						; number of physical addr/count pairs
+			move.l	d0,a1						; set up for GetPhysical call
+			moveq.l	#5,d0						; GetPhysical selector
+			_MemoryDispatch						; perform the translation (a0 undisturbed)
+			bne.s	@error						; if error, bail out (what to do ???)
+@callPhysical
+			move.l	8(a0),a2					; set up the physical address
+			move.l	12(a0),d2					; set up the physical count
+			move.l	d2,d1						; number of bytes to transfer
+			movea.l	jvPFW(a4),a0				; address of fast physical write routine
+			jmp		(a0)						; move the data
+@error
+		 if	dbSymbols then
+			_Debugger
+		 endif
+@exit
+			rts									; we're done
+
+
+;
+;	PFastWriteOSS -- Physical address interface to the SCSI DMA circuitry
+;
+;	Called by:	Transfer
+;
+PFastWriteOSS:
+			moveq.l	#noErr,d0					; noErr, yet
+			move.b	zeroReg,sTCR+WrOffs(a3)		; match data out<C846/PM116/19Mar87>
+			move.b	#iDMA,sMR+WrOffs(a3)		; set DMA mode		<C478/10Dec86>
+			move.b	#iDB,sICR+WrOffs(a3)		; assert data bus	<C478/10Dec86>
+			move.l	#iHSKEN,sDCTRL(a3)			; turn on hhsk 		<C914>
+			move.b	zeroReg,sDMAtx+WrOffs(a3)	; start write DMA	<C478/10Dec86>
+@start											; blind write
+			move.l	#$FFFFFFFF,sDTIME(a3)		; incredible Timer value					<v1.5>
+			move.l	#iTIMEEN+iINTREN+iDMAEN,sDCTRL(a3)	; enable true DMA
+			move.l	a2,sDADDR(a3)				; set up DMA addr
+			move.l	d2,sDCNT(a3)				; set up byte count
+			move.b	#iIEOP+iDMA,sMR(a3)			; pDMA,EOP intr enabled
+			move.b	#iDB,sICR(a3)				; assert the data bus
+			move.b	zeroReg,sDMAtx(a3)			; start DMA write
+			bset.b	#waitingForIRQ,state1(a4)	; we're DMAing, so bail and wait for intr	<v1.5>
+@exit
+			rts
+
+
+PFastWrite:										; unimplemented on all other machines
+			rts
+
+
+;
+;	VFastWrite -- Same as FastWrite for the old SCSI Manager
+;
+;	Called by:	Transfer
+;
+VFastWrite:										; all other machines
+;
+;	FastWrite
+;
+;	Called by:	Transfer
+;
+FastWrite:
+
+;patch roll in from PatchIIciROM.a															<SMx><SES>
+;_________________________________________________________________________________________
+;	FastWriteFix  -  patch to FastWrite
+;
+;	This code replaces the low level data transfer routine for fast writes in the SCSI
+;	manager.  It is rewritten to assume psuedo-dma is always on, and to do the device
+;	synchronization (looking for *REQ and DRQ), after loading a data byte into the
+;	output register of the 5380.  We don't have to worry about zero-byte transfers.  They
+;	are filtered out in the calling routine (Transfer).
+;
+;	Entry:	d2	=	number of bytes to transfer
+;			a1	=	addr of sBSR(a3) - by convention, and used by bus error handler
+;			a2	=	ptr to data buffer to transfer
+;			a3	=	base addr of NCR 53C80
+;			a4	=	ptr to SCSI globals
+;
+;	Exit:	d1	=	number of bytes actually transfered.  This value is only good if
+;					the transfer was good with no errors.  It is inaccurate when an
+;					error aborts the transfer.
+
+			;This code is intended for use with 5380 ONLY, so check to make sure we			<SMx><SES>
+			;need to do it. Note that we're assuming that SCSIExists implies a 5380.		<SMx><SES>
+			TestFor	SCSIExists				;												<SMx><SES>
+			beq		@Done					; don't do it if we're not using a 5380			<SMx><SES>
+
+			move.l	hhsk5380(a4),a0			; point to addr for hardware handshaking
+			adda.w	wrOffset(a4),a0			; add in write offset
+			move.l	d2,d1					; save to return number of bytes transfered
+
+;	Pre-load the NCR 53C80's output register with a byte of data.  If we are in
+;	the middle of a multi-block write, *ACK is currently asserted.  Writing a byte
+;	to the output register will release *ACK, completing the handshaking, allowing
+;	the target to assert *REQ.  Is there a chance We do not need to check for DRQ at this point (to see
+;	if the chip is ready for the next byte), because all data out routines always
+;	wait to make sure the last byte got out.
+
+			sub.l	#1,d2					; dec number of bytes to xfer
+			move.b	(a2)+,(a0)				; write data byte to output register
+
+;	With *ACK released, determine if the target is in sync.  We cannot look for
+;	*REQ to be asserted, because the target may have already accepted the data byte
+;	and released *REQ at this point.  We can sync on DRQ which will signal when
+;	the NCR 53C80 is ready to accept a data byte, meaning a *REQ from the target
+;	must have already occurred and our data byte was taken.
+
+@syncWait
+			btst.b	#bDMAR,(a1)				; check bus & status reg for DRQ
+			bne.s	@doWrite				; DRQ present - sync-ed up so proceed
+			btst.b	#bREQ,sCSR(a3)			; no DRQ - is *REQ present ?
+			beq.s	@syncWait				; no *REQ yet - wait for sync
+			btst.b	#bPM,(a1)				; with *REQ, check phase lines
+			bne.s	@syncWait				; still in data out phase - wait
+			moveq.l	#0,d1					; out of phase - did not xfer any bytes
+			moveq.l	#scPhaseErr,d0			; return error
+			bra.s	@Done					; exit
+
+;	Perform the write to the SCSI chip.  First align the bytes to longs, then
+;	align them to 32 byte chunks.  Transfer the bulk of the data in 32 byte
+;	blocks.
+;	Reg d2.l = number of bytes to move
+
+@doWrite
+			cmpi.l	#3,d2					; check for very short copy
+			bls.s	@veryShort				; skip alignment if very short
+
+			move.l	a2,d0					; get addr of data buffer
+			andi.l	#$00000003,d0			; check for long word alignment
+			beq.s	@Aligned				; if no alignment needed
+			subq.l	#4,d0					; bias by 4 to get correct index
+			jmp		@Aligned(d0.w*2)		; do the alignment
+			move.b	(a2)+,(a0)				; move a byte
+			move.b	(a2)+,(a0)				; move a byte
+			move.b	(a2)+,(a0)				; move a byte
+@Aligned
+			add.l	d0,d2					; adjust the byte count (d0 = neg)
+			move.l	d2,d4					; save tail byte count
+			lsr.w	#2,d2					; adjust to number of longs to move
+			moveq.l	#7,d0					; mask for starting index
+			and.l	d2,d0					; number of long words to move first
+			neg.w	d0						; negate to index backwards
+			lsr.l	#3,d2					; number of 32 byte blocks to move
+			move.l	d2,d3					; get number of 32*64K byte blks to move
+			swap	d3						; count in low word
+			jmp		@CopyStart(d0.w*2)		; jump into the loop
+
+@CopyLoop	move.l	(a2)+,(a0)				; move a 32 byte block of data....
+			move.l	(a2)+,(a0)				; ... 4 bytes at a time
+			move.l	(a2)+,(a0)
+			move.l	(a2)+,(a0)
+			move.l	(a2)+,(a0)
+			move.l	(a2)+,(a0)
+			move.l	(a2)+,(a0)
+			move.l	(a2)+,(a0)
+@CopyStart	dbra	d2,@CopyLoop			; loop in chunks of 32 bytes
+			dbra	d3,@CopyLoop			; loop in chunks of 32*64K bytes
+
+			andi.l	#$00000003,d4			; check for tail alignment
+			move.l	d4,d2					; d2 = number of bytes remaining
+
+@veryShort
+			neg.w	d2						; negate to index backwards
+			jmp		@Remaining(d2.w*2)		; write remaining bytes
+			move.b	(a2)+,(a0)				; move a byte
+			move.b	(a2)+,(a0)				; move a byte
+			move.b	(a2)+,(a0)				; move a byte
+@Remaining
+
+;	Before exiting this routine, make sure that the peripheral has actually accepted
+;	the data byte.  Wait for a DRQ (meaning the SCSI chip is ready for another byte)
+;	before exiting.
+
+@DoneWait
+			moveq.l	#0,d0					; set good return
+
+			btst.b	#bDMAR,(a1)				; check for DRQ (a1 = sBSR(a3))
+			bne.s	@Done					; if DRQ, peripheral got the byte
+			btst.b	#bREQ,sCSR(a3)			; no DRQ - is *REQ present ?
+			beq.s	@DoneWait				; no *REQ yet - wait for it
+			btst.b	#bPM,(a1)				; are we still in phase ?
+			bne.s	@DoneWait				; if so, keep waiting
+
+@Done
+			rts								; we're done
+
+;end FastWrite patch roll in from PatchIIciROM.a									<SMx><SES>
+			
+			
+;
+;	FastWriteOSS -- Old SCSI Mgr virtual address interface to the SCSI DMA circuitry
+;
+;	Called by:	Transfer
+;
+;	NOTE:
+;		Because the SCSI Bus Error handler counts on the a6 linkage that is in
+;		effect when this routine is called, the local storage needed by this routine
+;		to perform a DMA operation is simply allocated by moving the stack pointer.
+;
+;		After allocating the local storage, the stack appears as follows:
+;
+;			SP --->	virtAddress		\	The stack pointer points to the
+;					virtCount		 \	parameter block for the GetPhysical	call.
+;					physAddress		 /  (All values are long words.)
+;					physCount		/
+;					- reserved -		Extra long word
+;					cleanAddress		Pushed after StripAddress
+;					returnAddr		<--- SP on entry
+;					...
+;
+FastWriteOSS:
+			move.l	a2,d0						; make the buffer address 32-bit clean
+			jsr		([JStripAddress])			; clean up that address
+			move.l	d0,-(sp)					; save the 32-bit clean address			<4>
+
+			lea.l	-AddLocalSize(sp),sp		; allocate additional storage			<v1.7start>
+			move.l	d0,vAddr(sp)				; set the virtual address field			<4>
+			move.l	d2,vCount(sp)				; set the virtual count field			<4>
+			
+			movea.l	d0,a0						; virtual address						<4>
+			movea.l	d2,a1						; virtual count							<4>
+			moveq.l	#2,d0						; LockMemory selector					<4>
+			_MemoryDispatch						; lock the buffer (a0 undisturbed)		<4>
+			bne.w	@badAddrError				; if error, then bail out				<4>
+			
+			movea.l	sp,a0						; a0 -> logical/physical param block
+			movea.w	#1,a1						; number of physical addr/count pairs
+			moveq.l	#5,d0						; GetPhysical selector
+			_MemoryDispatch						; perform the translation (a0 undisturbed)
+			bne.w	@badAddrError				; if error, then bail out				<v1.7>
+@ckphase
+			btst.b	#bREQ,sCSR(a3)				; check for REQ
+			beq.s	@ckphase					; if no REQ, wait (synchronization)
+@ready
+			move.b	zeroReg,sTCR+WrOffs(a3)		; match data out<C846/PM116/19Mar87>
+			move.b	#iDMA,sMR+WrOffs(a3)		; set DMA mode		<C478/10Dec86>
+			move.b	#iDB,sICR+WrOffs(a3)		; assert data bus	<C478/10Dec86>
+			moveq.l	#iHSKEN,d5					;										<v1.7>
+			move.l	d5,sDCTRL(a3)				; turn on hhsk 		<C914>				<start>
+			move.b	zeroReg,sDMAtx+WrOffs(a3)	; start write DMA	<C478/10Dec86>
+@wait
+			btst.b	d3,sBSR(a3)					; is DRQ asserted ?
+			bne.s	@start						; if so, ACK must be true (pDMA)
+			btst.b	#bREQ,sCSR(a3)				; check for REQ for phase check
+			beq.s	@wait						; no REQ yet
+			btst.b	#bPM,sBSR(a3)				; are we still in phase ?				<end>
+			bne.s	@wait						; keep waiting							<v1.7>
+@wrPhaseErr
+			moveq.l	#scPhaseErr,d0				; return a phase error
+			bra.w	@WrDone						; get out
+
+@start											; at this point, d0 = noErr				<v1.7start>
+			bset.b	#doingDMA,state1(a4)		; we're DMAing, so don't bother the chip	<5>
+			move.l	G_Reserved1(a4),sDTIME(a3)	; set Timer value							<5>
+			moveq.l	#iTIMEEN+iINTREN+iDMAEN,d5	;
+			move.l	d5,sDCTRL(a3)				; enable true DMA
+			move.l	pAddr(a0),sDADDR(a3)		; set up DMA addr
+			move.l	pCount(a0),sDCNT(a3)		; set up byte count
+			move.b	#iIEOP+iDMA,sMR(a3)			; pDMA,EOP intr enabled
+			move.b	#iDB,sICR(a3)				; assert the data bus
+			move.b	zeroReg,sDMAtx(a3)			; start DMA write
+			;
+			; The pCount field is used to flag the need to move more data.
+			; If pCount is zero, it reflects that no more data needs to be moved.
+			; If pCount is nonzero, a translation will be performed, leaving pCount nonzero.
+			;
+			move.l	vCount(a0),pCount(a0)		; any bytes left to transfer ?
+			beq.s	@noPreflight				; if not, nothing to translate
+			movea.w	#1,a1						; number of physical addr/count pairs
+			moveq.l	#5,d0						; GetPhysical selector
+			_MemoryDispatch						; perform the translation (a0 undisturbed)
+			bne.w	@badAddrError				; if error, then bail out
+@noPreflight
+			movea.l	OSS,a1						; point to base of OSS chip
+@waitForIntr
+			btst.b	#OSSIntSCSI-8,OSSIntStat(a1)	; check for a SCSI interrupt
+			beq.s	@waitForIntr				; wait for a SCSI interrupt
+			move.l	sDCTRL(a3),d5				; check for success
+			andi.w	#iDMABERR+iTIMEP,d5			; DMA bus error or watchdog timeout ?
+			bne.s	@badAddrError				; if so, handle it
+			tst.l	sDCNT(a3)					; did we transfer all the data ?
+			bne.s	@badAddrError				; if not, report an error
+			move.b	zeroReg,sMR(a3)				; clear EOP interrupt (and turn off pDMA)
+			tst.b	sRESET(a3)					; clear SCSI interrupt
+@chkDone
+			tst.l	pCount(a0)					; were any bytes left to transfer ?		<end>
+			bne.s	@start						; continue until all bytes transferred	<v1.7>
+
+			move.l	d2,d1						; return number of bytes transferred
+			
+@WrDone		; NOTE: we shouldn't turn off DMA mode before the last byte was taken.
+			; If the NCR chip asserts DRQ, then the peripheral got the byte.
+			; If the peripheral changes the bus phase, then it must have also got it.
+			; This section check is from <C138/29Sep86>.  Modified <C780>.
+			btst.b	#bACK,sBSR(a3)				; check for ACK				<3.0>
+			beq.s	@DMAOff						; if no ACK, we're done		<3.0>
+@ACK
+@wfnREQ
+			btst.b	#bREQ,sCSR(a3)				; test for *REQ				<3.0>
+			beq.s	@DMAOff						; if it's gone, we're done	<3.0>
+			btst.b	#bPM,sBSR(a3)				; still in same phase?		<3.0>			<v1.7>
+			bne.s	@WrDone						; if so, go back and wait	<3.0>
+
+@DMAOff
+			move.b	zeroReg,sMR+WrOffs(a3)		; clear DMA mode
+			move.b	zeroReg,sICR+WrOffs(a3)		; disable data bus
+			moveq.l	#iINTREN,d5					;											<v1.7>
+			move.l	d5,sDCTRL(a3)				; turn off hhsk		<C914>			<v1.3>	<start>
+			
+			bclr.b	#doingDMA,state1(a4)		; we're finished DMAing						<5>
+
+			lea.l	AddLocalSize(sp),sp			; deallocate additional storage on the stack
+			
+			movea.l	(sp)+,a0					; set virtual address						<4>
+			movea.l	d2,a1						; set virtual count							<4>
+			move.w	d0,-(sp)					; save result from SCSI I/O					<4>
+			moveq.l	#3,d0						; UnlockMemory selector						<4>
+			_MemoryDispatch						; unlock the buffer (a0 undisturbed)		<4>
+			move.w	(sp)+,d0					; restore original result					<4>
+			
+			rts
+
+@badAddrError
+			moveq.l	#scBusTOErr,d0				; return a SCSI bus timeout error			<end>
+			bra.s	@DMAOff						;											<v1.7>
+			rts									; we're done
+
+			
+;
+;	VFastReadOSS -- Virtual address interface to the DMA circuitry							<v1.3>
+;
+;	Called by:	Transfer
+;
+;	Function:	This routine calls a service routine to get the physical translation
+;				for the virtual addr/count pair that is passed in a2/d2.  If the virtual
+;				data transfer cannot be performed in one DMA operation (crosses a page or
+;				memory bank boundary,) the virtual transfer will be completed later by
+;				a virtual transfer of the remaining bytes.
+;
+VFastReadOSS:
+			movea.l	scsiPrivate(a5),a0			; get ptr to private storage record			<v1.3>
+			lea.l	scsiVAddr(a0),a0			; point to record for GetPhysical routine	<start>
+			move.l	a2,d0						; get the virtual address					<v1.5>
+			jsr		([JStripAddress])			; clean up that address						<v1.5>
+			move.l	d0,(a0)						; set the virtual address field				<v1.5>
+@translate
+			move.l	d2,4(a0)					; set the virtual count field
+			moveq.l	#1,d0						; number of physical address/count pairs
+			move.l	d0,a1						; set up for GetPhysical call
+			moveq.l	#5,d0						; GetPhysical selector
+			_MemoryDispatch						; perform the translation (a0 undisturbed)
+			bne.s	@error						; if error, then bail out (what to do ???)
+@callPhysical
+			move.l	8(a0),a2					; set up the physical address
+			move.l	12(a0),d2					; set up the physical count
+			move.l	d2,d1						; number of bytes to transfer
+			movea.l	jvPFR(a4),a0				; address of fast physical data transfer routine
+			jmp		(a0)						; move the data
+@error
+		 if	dbSymbols then
+			_Debugger
+		 endif
+@exit
+			rts
+
+
+;
+;	PFastRead -- Physical address interface to the DMA circuitry
+;
+;	Called by:	Transfer
+;
+PFastReadOSS:
+			moveq.l	#noErr,d0					; noErr, yet
+@start
+			move.l	#$FFFFFFFF,sDTIME(a3)		; incredible Timer value					<v1.5>
+			move.l	#iTIMEEN+iINTREN+iDMAEN,sDCTRL(a3)	; enable true DMA
+			move.l	a2,sDADDR(a3)				; set up DMA addr
+			move.l	d2,sDCNT(a3)				; set up byte count
+			move.b	#iIEOP+iDMA,sMR(a3)			; pDMA,EOP intr enabled
+			move.b	zeroReg,sIDMArx(a3)			; start DMA read
+			bset.b	#waitingForIRQ,state1(a4)	; we're DMAing, so bail and wait for intr	<v1.5>
+@exit
+			rts
+
+
+;
+;	PFastRead -- Physical address interface to the DMA circuitry
+;
+;	Called by:	Transfer
+;
+PFastRead:										; all other machines
+			rts									; unimplemented
+
+
+
+
+;
+;	VFastRead -- For all other machines, same as old SCSI Mgr FastRead routine
+;
+;	Called by:	Transfer
+;
+VFastRead:
+;
+;	FastRead
+;
+;	Called by:	Transfer
+;
+FastRead:
+@RdSetup
+			move.l	hhsk5380(a4),a0				; use the global	<C406/12Nov86>
+			adda.l	#sIDR,a0					; input data offset	<C406/12Nov86>
+@wait
+			btst.b	d3,(a1) 					; DRQ?	<C478/10Dec86>
+			bne.s	@start						; have DRQ, so let's go
+			btst.b	#bREQ,sCSR(a3)				; test for REQ in case of phase error
+			beq.s	@wait						; no REQ, so wait
+@ckphase
+			btst.b	#bPM,(a1) 					; phase OK?	<C478/10Dec86>
+			bne.s	@start						; continue if in phase
+@RdPhaseErr
+			moveq.l	#scPhaseErr,d0				; return error
+			bra.w	@exit
+@start
+			move.l	d2,d1						; copy of transfer count
+			moveq.l	#3,d4						; mask for long alignment
+			cmp.l	d4,d2						; enough bytes to align?
+			bhi.s	@over3						; more than three bytes
+			moveq.l	#-1,d5						; fudge to calculate normally
+			moveq.l	#-1,d6						; more fudging
+			bra.s	@BlRdRmdr					; do them one at a time
+@over3
+			move.l	a2,d5						; get destination address
+			neg.l	d5							; negate to get odd byte count
+			and.l	d4,d5						; mask off to get 0-3 count
+			sub.l	d5,d2						; d2 = count after alignment
+			bra.s	@1							; in case it's already aligned
+@0
+			move.b	(a0),(a2)+					; do the leading unaligned bytes
+@1
+			dbra	d5,@0						; loop until long-word aligned
+			move.l	d2,d5						; copy of the count
+			lsr.l	#5,d5						; divide by 32		<A356/06Nov86>
+			bne.s	@over32						; more than 32 bytes left
+			moveq.l	#-1,d5						; fudge to calculate normally
+			moveq.l	#-1,d6						; more fudging
+			bra.s	@BlRdRmdr					; get the remaining bytes
+@over32
+			subq.l	#1,d5						; adjust for dbra
+			move.l	d5,d6						; high order word of count
+			swap	d6							; number of 32-byte moves
+			moveq.l	#$1F,d4						; 32-1				<A356/06Nov86>
+			and.l	d4,d2						; remainder count after 32-byte moves
+
+@BlRd32											; <A356/06Nov86>
+			move.l	(a0),(a2)+					; do 8 aligned longs (32 bytes)
+			move.l	(a0),(a2)+
+			move.l	(a0),(a2)+
+			move.l	(a0),(a2)+
+			move.l	(a0),(a2)+
+			move.l	(a0),(a2)+
+			move.l	(a0),(a2)+
+			move.l	(a0),(a2)+
+
+			dbra	d5,@BlRd32					; low word of # of 32-byte moves
+			dbra	d6,@BlRd32					; high order word
+			bra.s	@BlRdRmdr
+
+@BlRdSingle
+			move.b		(a0),(a2)+
+@BlRdRmdr
+			dbra	d2,@BlRdSingle
+			swap	d6							; calculate bytes left to transfer
+			move.w	d5,d6						; get low order word
+			addq.l	#1,d6						; groups of 32
+			lsl.l	#5,d6						; multiply by 32
+			ext.l	d2							; make d2 a long
+			addq.l	#1,d2						; single bytes left
+			add.l	d2,d6						; add to total
+			sub.l	d6,d1						; result
+
+@RdDone
+			btst.b	#bACK,sBSR(a3)				; check for ACK				<3.0>
+			beq.s	@exit						; if no ACK, we're done		<3.0>
+@ACK
+@wfnREQ
+			btst.b	#bREQ,sCSR(a3)				; test for *REQ				<3.0>
+			beq.s	@exit						; if it's gone, we're done	<3.0>
+			btst.b	#bPM,(a1)					; still in same phase?		<3.0>			<v1.3>
+			bne.s	@RdDone						; if so, go back and wait	<3.0>
+@exit
+			rts
+
+;
+;	FastReadOSS -- Old SCSI Mgr virtual address interface to the DMA circuitry
+;
+;	Called by:	Transfer
+;
+;	NOTE:
+;		Because the SCSI Bus Error handler counts on the a6 linkage that is in
+;		effect when this routine is called, the local storage needed by this routine
+;		to perform a DMA operation is simply allocated by moving the stack pointer.
+;
+;		After allocating the local storage, the stack appears as follows:
+;
+;			SP --->	virtAddress		\	The stack pointer points to the
+;					virtCount		 \	parameter block for the GetPhysical	call.
+;					physAddress		 /  (All values are long words.)
+;					physCount		/
+;					- reserved -		Extra long word
+;					cleanAddress		Pushed after StripAddress
+;					returnAddr		<--- SP on entry
+;					...
+;
+FastReadOSS:		
+			move.l	a2,d0						; make the address 32-bit clean
+			jsr		([JStripAddress])			; clean up that address
+			move.l	d0,-(sp)					; save the 32-bit clean virtual address	<4>
+
+			lea.l	-AddLocalSize(sp),sp		; allocate additional storage			<v1.7start>
+			move.l	d0,vAddr(sp)				; set the virtual address				<4>
+			move.l	d2,vCount(sp)				; set the virtual count					<4>
+
+			movea.l	d0,a0						; virtual address						<4>
+			movea.l	d2,a1						; virtual count							<4>
+			moveq.l	#2,d0						; LockMemory selector					<4>
+			_MemoryDispatch						; lock the buffer (a0 undisturbed) 		<4>
+			bne.w	@badAddrError				; if error, then bail out				<4>
+			
+			movea.l	sp,a0						; a0 -> logical/physical param block	<4>
+			movea.w	#1,a1						; number of physical address/count pairs
+			moveq.l	#5,d0						; GetPhysical selector
+			_MemoryDispatch						; perform the translation (a0 undisturbed)
+			bne.w	@badAddrError				; if error, then bail out
+@wait
+			btst.b	d3,sBSR(a3) 				; DRQ?	<C478/10Dec86>
+			bne.s	@start						; have DRQ, so let's go
+			btst.b	#bREQ,sCSR(a3)				; test for REQ in case of phase error
+			beq.s	@wait						; no REQ, so wait						<end>
+			btst.b	#bPM,sBSR(a3) 				; phase OK?	<C478/10Dec86>				<v1.7>
+			bne.s	@start						; continue if in phase
+@RdPhaseErr
+			moveq.l	#scPhaseErr,d0				; return error
+			bra.w	@exit
+
+@start											; at this point, d0 = noErr				<v1.7start>
+			bset.b	#doingDMA,state1(a4)		; we're DMAing, so don't bother the chip	<5>
+			move.l	G_Reserved1(a4),sDTIME(a3)	; set Timer value							<5>
+			moveq.l	#iTIMEEN+iINTREN+iDMAEN,d5	;
+			move.l	d5,sDCTRL(a3)				; enable true DMA
+			move.l	pAddr(a0),sDADDR(a3)		; set up DMA addr
+			move.l	pCount(a0),sDCNT(a3)		; set up byte count
+			move.b	#iIEOP+iDMA,sMR(a3)			; pDMA,EOP intr enabled
+			move.b	zeroReg,sIDMArx(a3)			; start DMA read
+			;
+			; The pCount field is used to flag the need to move more data.
+			; If pCount is zero, it reflects that no more data needs to be moved.
+			; If pCount is nonzero, a translation will be performed, leaving pCount nonzero.
+			;
+			move.l	vCount(a0),pCount(a0)		; any bytes left to transfer ?
+			beq.s	@noPreflight				; if not, nothing to translate
+			movea.w	#1,a1						; number of physical address/count pairs
+			moveq.l	#5,d0						; GetPhysical selector
+			_MemoryDispatch						; perform the translation (a0 undisturbed)
+			bne.w	@badAddrError				; if error, then bail out
+@noPreflight
+			movea.l	OSS,a1						; point to base of OSS chip
+@waitForIntr
+			btst.b	#OSSIntSCSI-8,OSSIntStat(a1)	; check for a SCSI interrupt
+			beq.s	@waitForIntr				; wait for a SCSI interrupt
+			move.l	sDCTRL(a3),d5				; check for success
+			andi.w	#iDMABERR+iTIMEP,d5			; DMA bus error or watchdog timeout ?
+			bne.s	@badAddrError				; if so, handle it
+			tst.l	sDCNT(a3)					; did we transfer all the data ?
+			bne.s	@badAddrError				; if not, report an error
+			move.b	zeroReg,sMR(a3)				; clear the EOP interrupt, turn off pDMA
+			tst.b	sRESET(a3)					; clear SCSI interrupt
+			move.b	#iDMA,sMR(a3)				; turn on pDMA
+			move.b	zeroReg,sIDMArx(a3)			; kick the pDMA mode
+@chkDone
+			tst.l	pCount(a0)					; any bytes left to transfer ?			<end>
+			bne.s	@start						; keep going until all bytes transferred
+
+			move.l	d2,d1						; return number of bytes transferred	<v1.7>
+
+@RdDone
+			btst.b	#bACK,sBSR(a3)				; check for ACK				<3.0>
+			beq.s	@exit						; if no ACK, we're done		<3.0>
+@ACK
+@wfnREQ
+			btst.b	#bREQ,sCSR(a3)				; test for *REQ				<3.0>
+			beq.s	@exit						; if it's gone, we're done	<3.0>
+			btst.b	#bPM,sBSR(a3)				; still in same phase?		<3.0>		<v1.3><v1.7>
+			bne.s	@RdDone						; if so, go back and wait	<3.0>
+@exit
+			bclr.b	#doingDMA,state1(a4)		; we're finished DMAing						<5>
+
+			lea.l	AddLocalSize(sp),sp			; deallocate additional storage				<v1.7>
+			
+			movea.l	(sp)+,a0					; set virtual address					<4>
+			movea.l	d2,a1						; set buffer length						<4>
+			move.w	d0,-(sp)					; save result from SCSI I/O				<4>
+			moveq.l	#3,d0						; UnlockMemory selector					<4>
+			_MemoryDispatch						; unlock the buffer (a0 undisturbed) 	<4>
+			move.w	(sp)+,d0					; restore original result				<4>
+			
+			rts
+
+@badAddrError
+			moveq.l	#scBusTOErr,d0				; report a "bus timeout error"				<v1.7>
+			bra.s	@exit						;											<end>
+			rts
+
+
+
+
+;
+;	SlowComp																				<v1.3>
+;																							<start>
+;	Called by:	Transfer
+;
+SlowComp:
+@CompSetup
+			move.l	pdma5380(a4),a0				; use the global	<C406/12Nov86>
+			adda.l	#sIDR,a0					; input data offset	<C406/12Nov86>
+			subq.l	#1,d2						; decr. for DBRA	<C478/10Dec86>
+			move.l	d2,d5						; make a copy of the byte count
+			swap	d5							; and get hiword in d5
+@wait
+			btst.b	#bDMAR,(a1)					; DRQ ?
+			bne.s	@SnComp						; if so, start the transfer
+			btst.b	#bREQ,sCSR(a3)				; look for REQ
+			beq.s	@wait						; can't check phase until REQ is asserted
+			btst.b	#bPM,(a1)					; we have REQ, do we have a phase match ?
+			beq.s	@CompPhaseErr				; if not, bail out with an error
+@SnComp											; Slow compare loop. Byte count in d2,d5
+			btst.b	#bDMAR,(a1) 				; DRQ?	<C478/10Dec86>
+			beq.s	@SnCompChk					; no, so check phase <A244/27Oct86>
+			move.b	(a0),d3 					; get data byte <29Oct85>
+			cmp.b	(a2)+,d3					; same? <29Oct85>
+			beq.s	@SnComp1					; if so, continue
+			moveq.l	#scCompareErr,d0 			; record compare error <29Oct85>
+@SnComp1
+			dbra	d2,@SnComp					; repeat
+			dbra	d5,@SnComp					; repeat
+			bra.s	@RdDone						; let's get out of here
+@SnCompChk
+			bsr.w	NewPhaseCheck				; check more carefully for phase match		<1>
+			bne.s	@SnComp						; continue if it is
+@CompPhaseErr
+			moveq.l	#scPhaseErr,d0				; return error
+			bra.s	@exit						; let's get out here
+@RdDone
+			btst.b	#bACK,sBSR(a3)				; check for ACK				<3.0>
+			beq.s	@exit						; if no ACK, we're done		<3.0>
+@ACK
+@wfnREQ
+			btst.b	#bREQ,sCSR(a3)				; test for *REQ				<3.0>
+			beq.s	@exit						; if it's gone, we're done	<3.0>
+			btst.b	#bPM,(a1)					; still in same phase?		<3.0>
+			bne.s	@RdDone						; if so, go back and wait	<3.0>
+@exit
+			swap	d5							; calculate bytes left to transfer
+			move.w	d2,d5						; lower word of count
+			addq.l	#1,d5						; undo adjustment for DBRA
+			sub.l	d5,d1						; number of bytes transferred
+			moveq.l	#bDMAR,d3					; restore d3
+			rts
+
+;
+;	FastComp
+;
+;	Called by:	Transfer
+;
+FastComp:
+@CompSetup
+			movea.l	hhsk5380(a4),a0				; use the global
+			adda.l	#sIDR,a0					; input data register offset
+			subq.l	#1,d2						; decr. for DBRA	<C478/10Dec86>
+			move.l	d2,d5						; make a copy of the byte count
+			swap	d5							; and get hiword in d5
+@wait
+			btst.b	#bDMAR,(a1)					; DRQ ?
+			bne.s	@BlCmp						; have DRQ, so let's go
+			btst.b	#bREQ,sCSR(a3)				; test for REQ in case of phase error
+			beq.s	@wait						; no REQ, so wait
+@ckPhase
+			btst.b	#bPM,(a1)					; phase OK ?
+			bne.s	@BlCmp						; continue if in phase
+@RdPhaseErr
+			moveq.l	#scPhaseErr,d0				; return error
+			bra.s	@exit						; let's get out here
+
+@BlCmp
+			move.b	(a0),d3						; blind compare <29Oct85> -- no optimization
+			cmp.b	(a2)+,d3
+			beq.s	@BlCmp1
+			moveq.l	#scCompareErr,d0			; record compare error
+@BlCmp1
+			dbra	d2,@BlCmp
+			dbra	d5,@BlCmp
+
+@RdDone
+			btst.b	#bACK,sBSR(a3)				; check for ACK				<3.0>
+			beq.s	@exit						; if no ACK, we're done		<3.0>
+@ACK
+@wfnREQ
+			btst.b	#bREQ,sCSR(a3)				; test for *REQ				<3.0>
+			beq.s	@exit						; if it's gone, we're done	<3.0>
+			btst.b	#bPM,(a1)					; still in same phase?		<3.0>
+			bne.s	@RdDone						; if so, go back and wait	<3.0>
+@exit
+			swap	d5							; calculate bytes left to transfer
+			move.w	d2,d5						; lower word of count
+			addq.l	#1,d5						; undo adjustment for DBRA
+			sub.l	d5,d1						; number of bytes transferred				<end>
+			moveq.l	#bDMAR,d3					; restore d3								<v1.3>
+			rts
+			
+;
+;	This "improved" phase checking routine will fix the CD-ROM problem on Zone5.			<1>
+;	On the SCSI DMA chip it's possible to have a DRQ without a phase match, and if an		<start>
+;	interrupt occurs between checks of the BSR register, it appears that a disasterous
+;	phase change has occurred.
+;	To fix this problem, a snapshot is taken of the BSR register.  If either DRQ or PM
+;	are set, then it is okay to continue.  If both are cleared, a phase error has occurred.
+;	If DRQ or PM are set, the Zero flag is cleared.
+;	If neither are set, the Zero flag is set.
+;
+;	Destroys d6
+;
+NewPhaseCheck:
+			moveq.l	#iDMAR+iPM,d6				; if DRQ or PM is set, all is well
+			and.b	sBSR(a3),d6					; get a snapshot of the register			<end>
+			rts									; if either is set, then Z=0				<1>
+
+			
+		ENDWITH
+		END 
+

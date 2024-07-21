@@ -1,0 +1,340 @@
+;
+;	File:		SWIMIOP.aii
+;
+;	Contains:	Interface between the Kernel and Drivers for the SWIM IOP.
+;
+;	Written by:	Gary G. Davidian
+;
+;	Copyright:	© 1987-1990 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <2>	  1/2/90	GGD		NEEDED FOR ZONE-5: Adding Idle Loop Task Dispatching.
+;	   <1.3>	 11/2/89	GGD		NEEDED FOR ZONE-5 Moved the routines HandleDMA1Int,
+;									HandleDMA2Int, SWIMShutDown, SWIMStopPolling, and SWIMGetIcon
+;									into SWIMDriver.aii
+;	   <1.2>	  7/8/89	CCH		Added EASE comments to file.
+;	  <¥1.1>	 6/15/89	GGD		Updated to use equates for the latest rev of the IOP chip,
+;									re-formated tab stops in source.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;
+;	To Do:
+;
+				eject
+				title	'SWIM IOP -  Kernel / Driver Interface for the SWIM IOP'
+
+				machine m65C02
+				codechk off
+				datachk off
+				longa	off
+				longi	off
+				print	nomdir
+				include 'IOPDefs.aii'
+				include 'SWIMDefs.aii'
+				title	'SWIM IOP - Initialization and Unused Interrupt Handlers'
+
+				import	InitADBDrvr
+				import	InitSWIMDrvr
+				entry	Primes
+
+				seg 	'code'
+SWIMIOP 		proc
+
+				export	InitDrivers
+InitDrivers 	lda 	#1*SCCISM+1*BYPASS
+				sta 	SCCControlReg		; initialize SCC Control Reg
+				lda 	#SwimIOCtlReg
+				sta 	IOControlReg		; initialize I/O Control Reg
+				lda 	#3					; max send / receive
+				sta 	RCVMsgMax			; initialize receive max
+				sta 	XMTMsgMax			; initialize transmit max
+				jsr 	InitADBDrvr 		; initialize the ADB Driver
+				jmp 	InitSWIMDrvr		; initialize the SWIM Driver and return
+
+				export	HandleSCCInt
+				export	HandleXMTMsg4
+				export	HandleXMTMsg5
+				export	HandleXMTMsg6
+				export	HandleXMTMsg7
+				export	HandleRCVMsg1
+				export	HandleRCVMsg4
+				export	HandleRCVMsg5
+				export	HandleRCVMsg6
+				export	HandleRCVMsg7
+
+HandleSCCInt
+HandleXMTMsg4
+HandleXMTMsg5
+HandleXMTMsg6
+HandleXMTMsg7
+HandleRCVMsg1
+HandleRCVMsg4
+HandleRCVMsg5
+HandleRCVMsg6
+HandleRCVMsg7
+
+Unimplemented	brk
+				bra 	Unimplemented
+
+
+				export	RunIdleTasks
+RunIdleTasks	pha
+				phx
+				phy
+				jsr		Primes				; look for primes
+				jsr		@unused				; reserve space to patch in
+				jsr		@unused				; a few more tasks
+				jsr		@unused
+				ply
+				plx
+				pla
+@unused			rts
+
+				endproc
+				title	'SWIM IOP - Idle Task for Prime Number Computations'
+
+ResultWidth		equ		32
+
+
+;		Page zero variables
+
+				seg 	'zdata'
+PrimeVarsZ		record
+Remainder		ds.b	1					; byte
+Numerator		ds.b	4					; long
+				endr
+
+				seg 	'data'
+PrimeVars 		record
+PrimeVarsStart	equ 	*
+				ds.b	1					; 1 byte of padding for logic analyzer alignment
+
+PrimesFound		ds.b	4					; long
+PrimesFoundOff	equ		*-PrimeVarsStart
+
+HighestPrime	ds.b	4					; long
+HighestPrimeOff	equ		*-PrimeVarsStart
+
+CurrentDenom	ds.b	2					; word
+CurrentDenomOff	equ		*-PrimeVarsStart
+
+				ds.b	2					; word
+MaxDenom		ds.b	2					; word		(2 bytes of zeros needed before)
+MaxDenomOff		equ		*-PrimeVarsStart	;			(2 bytes of zeros needed after)
+				ds.b	2					; word
+PossiblePrime	ds.b	4					; long		(1 byte of zeros needed before)
+PossiblePrimeOff equ	*-PrimeVarsStart
+
+MaxDenomSquared	ds.b	4					; long
+MaxDenomSquaredOff equ	*-PrimeVarsStart
+
+PrimeVarsSize	equ		*-PrimeVarsStart	; number of bytes of PrimeVars
+				endr
+
+
+
+				seg 	'code'
+Primes	 		proc
+				with	PrimeVarsZ,PrimeVars; globals used throughout
+
+;	Depends upon memory being initialized to zeros at reset
+
+				lda		CurrentDenom+1		; get the last denom used
+				lsr		a					; test the low bit
+				bcs		Resume				; if odd, resume the computations
+				bne		Suspend				; if even and non-zero, we found all primes
+											; if zero, it's initialization time
+				lda		#3
+				sta		PossiblePrime+3		; PossiblePrime := 3
+				sta		MaxDenom+1			; MaxDenom := 3
+				lda		#9
+				sta		MaxDenomSquared+3	; MaxDenomSquared := 9
+				inc		PrimesFound+3		; PrimesFound := 1
+
+FoundPrime		ldx		#PossiblePrimeOff
+				ldy		#HighestPrimeOff
+				jsr		MoveLong			; HighestPrime := PossiblePrime
+
+				ldy		#PrimesFoundOff
+				lda		#1
+				jsr		AddImmedLong		; PrimesFound := PrimesFound + 1
+				bra		TryNextPossible		; goto TryNextPossible
+
+PrimeCheckLoop	ldy		#CurrentDenomOff
+				lda		#2
+				jsr		AddImmedWord		; CurrentDenom := CurrentDenom + 2
+
+CheckForPrime	ldx		#CurrentDenomOff
+				ldy		#MaxDenomOff
+				jsr		TestEqualWord		; if CurrentDenom = MaxDenom
+				beq		FoundPrime			; then goto FoundPrime
+
+;	Before each divide, we return to the Idle Loop to give other tasks a chance
+
+Suspend			rts							; go back to idle loop
+Resume										; retuned from idle loop
+
+	if ResultWidth <= 16 then
+											; Remainder := PossiblePrime MOD CurrentDenom
+				lda		PossiblePrime+3		; Numerator := PossiblePrime
+				sta		<Numerator+3
+				lda		PossiblePrime+2
+				sta		<Numerator+2
+
+				lda		#0					; Remainder := 0
+
+				ldy		#16					; loop counter for 16/8 remainder
+
+@RemLoop		rol		<Numerator+3		; Shift Numerator into Remainder
+				rol		<Numerator+2
+				rol		a
+				bcs		@RemSub
+
+				cpa		CurrentDenom+1		; compare denominator
+				blt		@RemNext			; If Remainder < CurrentDenom, leave it
+
+@RemSub			sbc		CurrentDenom+1		; Remainder := Remainder - CurrentDenom
+
+@RemNext		dey							; decrement loop counter
+				bne		@RemLoop			; loop for all 32 bits
+
+				tax							; test remainder for zero
+											; if PossiblePrime mod CurrentDenom <> 0
+				bne		PrimeCheckLoop		; then goto PrimeCheckLoop
+	else
+											; Remainder := PossiblePrime MOD CurrentDenom
+				ldx		#5					; loop count/index for 5 byte copy
+@RemCopyLoop	lda		PossiblePrime-1-1,x	; Numerator := PossiblePrime
+				sta		<Remainder-1,x		; Remainder := 0
+				dex							; update loop count/index
+				bne		@RemCopyLoop		; loop through all 5 bytes
+
+				ldy		#32+1				; loop counter for 32/15 remainder
+*				ldx		#0					; Remainder := 0 (from dex above)
+
+@RemLoop		txa							; get low byte of remainder
+				dey							; decrement loop counter
+				beq		@RemDone			; loop for all 32 bits
+
+@RemShift		rol		<Numerator+3		; Shift Numerator into Remainder
+				rol		<Numerator+2
+				rol		<Numerator+1
+				rol		<Numerator+0
+				rol		a
+				tax
+				rol		<Remainder+0
+
+				cpx		CurrentDenom+1		; compare low byte of remainder
+				lda		<Remainder+0		; get high byte of remainder
+				sbc		CurrentDenom+0		; subtract denominator
+				blt		@RemLoop			; If Remainder < CurrentDenom, leave it
+
+				sta		<Remainder+0		; Remainder := Remainder - CurrentDenom
+*				sec							; setup carry for subtraction
+				txa							; get low byte of remainder
+				sbc		CurrentDenom+1		; subtract denominator
+				dey							; decrement loop counter
+				bne		@RemShift			; loop for all 32 bits
+
+@RemDone		ora		<Remainder+0		; if PossiblePrime mod CurrentDenom <> 0
+				bne		PrimeCheckLoop		; then goto PrimeCheckLoop
+	endif
+
+TryNextPossible	lda		#3
+				sta		CurrentDenom+1
+				stz		CurrentDenom+0		; CurrentDenom := 3
+
+				ldy		#PossiblePrimeOff
+				lda		#2
+				jsr		AddImmedLong		; PossiblePrime := PossiblePrime + 2
+
+				ldx		#PossiblePrimeOff
+				ldy		#MaxDenomSquaredOff
+				jsr		TestEqualLong		; if PossiblePrime <> MaxDenomSquared
+				bne		CheckForPrime		; then goto CheckForPrime
+
+				ldy		#MaxDenomOff
+				lda		#2
+	if ResultWidth <= 16 then
+				jsr		AddImmedByte		; MaxDenom := MaxDenom + 2
+				bne		Done				; if carry out, we're done
+	else
+;	The divide algorithm used only allows 15 bit denominators, it would be
+;	considerrably slower and bigger to handle all 16 bits, so we exit when we
+;	reach 16 bits, which allows prime checking up to $3FFF0001 (1,073,676,289)
+				jsr		AddImmedWord		; MaxDenom := MaxDenom + 2
+				lda		MaxDenom			; see if carry into sign bit
+				bmi		Done				; if negative, we're done
+	endif
+
+											; MaxDenomSquared := MaxDenom * MaxDenom
+
+				ldx		#MaxDenomOff+2		; MaxDenom High, Zeros Low
+				ldy		#MaxDenomSquaredOff
+				jsr		MoveLong			; MaxDenomSquared := MaxDenom High, Zeros Low
+
+				lda		#16					; loop counter for 16x16 multiply
+@SquareLoop		pha							; save loop counter
+
+				ldx		#MaxDenomSquaredOff
+				jsr		AddToMaxDenomSquared; MaxDenomSquared := MaxDenomSquared * 2
+				bcc		@SquareNext			; if no carry, skip the add
+
+				ldx		#MaxDenomOff
+				jsr		AddToMaxDenomSquared; MaxDenomSquared := MaxDenomSquared + MaxDenom
+
+@SquareNext		pla							; restore loop counter
+				dea							; decrement loop counter
+				bne		@SquareLoop			; loop for all 16 bits
+
+				bra		TryNextPossible		; goto TryNextPossible
+
+Done			asl		CurrentDenom+1		; force an even, non-zero value
+				rts							; all done
+
+
+MoveLong		jsr		MoveWord
+MoveWord		jsr		MoveByte
+MoveByte		dex
+				lda		PrimeVarsStart,x
+				dey
+				sta		PrimeVarsStart,y
+				rts
+
+AddImmedLong	jsr		AddImmedWord
+AddImmedWord	jsr		AddImmedByte
+AddImmedByte	clc
+				dey
+				adc		PrimeVarsStart,y
+				sta		PrimeVarsStart,y
+				lda		#0
+				rol		a
+				rts
+
+AddToMaxDenomSquared
+				ldy		#4-1
+				clc
+@AddLoop		dex
+				lda		PrimeVarsStart,x
+				adc		MaxDenomSquared,y
+				sta		MaxDenomSquared,y
+				dey
+				bpl		@AddLoop
+				rts
+
+TestEqualLong	jsr		TestEqualWord
+				bne		NotEqual
+TestEqualWord	jsr		TestEqualByte
+				bne		NotEqual
+TestEqualByte	dex
+				lda		PrimeVarsStart,x
+				dey
+				cpa		PrimeVarsStart,y
+NotEqual		rts
+
+				endwith
+				endproc
+
+				end
+
+

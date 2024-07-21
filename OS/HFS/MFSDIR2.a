@@ -1,0 +1,284 @@
+;
+;	File:		MFSDIR2.a
+;
+;	Contains:	This file contains file-level routines which use filenames.
+;
+;	Copyright:	© 1982-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <2>	 9/12/91	JSM		Add a header.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				 9/24/86	BB		Updated to use new MPW equates
+;				10/20/85	LAK		Flush control cache on exit of MFSDelete, MFSRename.
+;				 10/9/85	LAK		One more bug fixed in MFSRename.
+;				 10/8/85	LAK		Fixed bugs introduced in MFSRename use of A6 stack change.
+;				 10/1/85	LAK		Adjusted for new use of cache. Rename now uses A6 stack. Delete
+;									trashes file blocks in cache.
+;				  9/5/85	LAK		Don't allow Rename of locked files.
+;				 8/31/85	LAK		Set VCB time after rename to signal Finder that something
+;									changed (don't dirty it since mod-date isn't so important).
+;				 3/10/85	PWD		Created from FSDir2.Text; now contains only MFS-specific code.
+;									FileDelete and Rename trap entries are in TFSDir2.
+;				 8/29/83	LAK		Changed ReName to update affected FCBs FCBFlPos (rename may
+;									cause a directory entry to migrate).
+;				  6/4/83	LAK		No longer calls DtrmVol (this is done by FndFilNam) since case
+;									of write-protected diskette is a low-percentage hit. Uses
+;									CkFilMod subroutine to save code.
+;				 4/20/83	LAK		Minor change to CkFileBusy.
+;				  2/8/83	LAK		Fixed rename bug (A5 trash)
+;				 1/16/83	LAK		Added latest changes; cosmetic and documentation updates.
+;				 1/16/83	LAK		Modified RemovEntry for new directory format (no entry length);
+;									updated documentation.
+;				12/14/82	LAK		Removed undelete scheme.
+;				12/10/82	LAK		Broke out routine to search FCBs by filenum (share it with
+;									GetFileInfo).
+;				 12/9/82	LAK		Redid for new file data structures.
+;
+
+;_______________________________________________________________________
+;
+; External Routines:	 MFSDelete,MFSReName
+;
+; Internal Routines:	 RemoveEntry
+;
+;_______________________________________________________________________
+
+;_______________________________________________________________________
+;
+; Routine:		MFSDelete
+;
+; (c) 1983 Apple Computer, Inc.
+;
+; Arguments:	  A0.L (input)	-- pointer to I/O parameter block; uses:
+;							   IOFileName,IOFileType
+;				  D0.W (output) -- error code
+;				  This call may be executed asynchronously.
+; Calls:		FSQueue,CkFileBusy,DAlBlks,RemovEntry,CmdDone
+; Function: 	Delete a file from an MFS volume.  The file is removed from
+;				the directory and its blocks are freed up (both resource and
+;				normal fork blocks are deallocated). The entry is zeroed and
+;				any following entries are moved down.  All blocks associated
+;				with the file are marked free in the block map and the VCB
+;				info is marked dirty.
+;
+;  Modification History:
+;  09 Dec 82  LAK  Redid for new file data structures.
+;  10 Dec 82  LAK  Broke out routine to search FCBs by filenum (share it
+;					with GetFileInfo).
+;  14 Dec 82  LAK  Removed undelete scheme.
+;  16 Jan 83  LAK  Modified RemovEntry for new directory format (no entry
+;					length); updated documentation.
+;  04 Jun 83  LAK  No longer calls DtrmVol (this is done by FndFilNam) since
+;					case of write-protected diskette is a low-percentage hit.
+;					Uses CkFilMod subroutine to save code.
+;_______________________________________________________________________
+
+MFSDelete
+;
+; Begin by checking if file is locked or busy:
+
+
+			BLANKS		ON
+			STRING		ASIS
+
+			MOVEQ	#FLckdErr,D0		; assume locked
+			BTST	#FlWrtFlag,FlFlags(A5) ; well, is it?
+			BNE.S	MFDelExit			; br if so
+
+			BSR		CkFileBusy			; is the file busy?
+			BNE.S	MFDelExit			; exit if so . . .
+
+			SUBQ.W	#1,VCBNmFls(A2) 	; one less file
+			BSR 	MarkVCB 			; mark VCB info dirty
+
+			MOVE.W	FlStBlk(A5),D3		; get start block to D3
+			BSR 	DAlBlks 			; deallocate the blocks
+
+			MOVE.W	FlRStBlk(A5),D3 	; deallocate the resource blocks also
+			BSR 	DAlBlks
+
+			MOVE.L	FlFlNum(A5),D0		; save file number from MFS dir entry	<01Oct85>
+
+			BSR.S	RemovEntry			; remove entry from the directory, mark block dirty
+
+			JSR 	TrashFBlocks		; trash all file blocks (pass A2,D0)	<01Oct85>
+
+			BSR 	MFSCtlFlush 		; flush control cache if it's too full  <20Oct85>
+
+			MOVEQ	#0,D0				; success
+
+MFDelExit	BRA 	CmdDone
+
+GtEntryLen	MOVEQ	#0,D0
+			MOVE.B	FlNam(A5),D0
+			ADD.W	#FlNTLen+2,D0
+			BCLR	#0,D0
+			RTS
+
+; delete file pointed to by A5 in block at A1 by moving all following entries
+; down and zeroing the rest of the block (shared with Rename)
+
+RemovEntry	MOVEM.L A0/A1/A5/D0,-(SP)
+
+			MOVE.L	A1,A0				;										<01Oct85>
+			JSR 	MarkBlock			; mark this buffer dirty				<01Oct85>
+
+			CLR.L	VCBDirIndex(A2) 	; invalidate our index,blk num pair
+
+			MOVE.L	A5,A0				; start of entry to delete
+			BSR.S	GtEntryLen			; length of entry -> D0
+			ADD.L	D0,A5				; next entry
+			ADD.W	#BufSiz,A1			; point to end of buffer
+
+@1			CMP.L	A1,A5				; check for end of buffer
+			BCC.S	@2					; br if done
+			MOVE.W	(A5)+,(A0)+ 		; move rest of entries down
+			BRA.S	@1
+
+@2			CLR.W	(A0)+				; leave rest of block zeroed
+			CMP.L	A1,A0
+			BCS.S	@2
+
+			MOVEM.L (SP)+,A0/A1/A5/D0
+			RTS
+
+;_______________________________________________________________________
+;
+; Routine:		ReName
+; Arguments:	  A0 (input)  -- pointer to parameter block:
+;				  D0 (output) -- error code
+; Calls:		FSQueue,DtrmVol,FndFilNam,CVFlgs,RemovEntry,FndFilSpc,
+;				 GtEntryLen,CmdDone
+; Function: 	Rename a file or a volume.	For files, the directory is
+;				first searched for the target name (to make sure we don't
+;				get two files with the same name).	If not found, the directory
+;				is then searched for the real file (using the source name);
+;				the entry is copied onto the stack and removed from the directory
+;				block.	FndFilSpc is used to find space for the changed entry.
+;
+;				Also note that a file may not be renamed with the same name.
+;
+; Modification History:
+; 09 Dec 82  LAK  Changed to use a new rename algorithm; updated for new
+;				   file system data structures.
+; 16 Jan 83  LAK  Updated for final data structures.
+; 05 Jun 83  LAK  Added change to allow rename of a file to itself (for case
+;				   changes).
+; 29 Aug 83  LAK  Fixed bug: rename now updates FCBs for the renamed file (opened
+;				   files may be renamed) to point to correct directory block.
+;
+; Test: no more room in directory case	. . .
+;		renaming a volume
+;		renaming both file and volume with 0-length name.
+;_______________________________________________________________________
+
+MFSReName:
+			MOVE.L	A0,-(SP)			; preserve parameter block pointer
+			MOVE.W	D2,D0				; old name length
+			MOVE.L	A4,A0				; old name ptr
+			MOVEM.L FSTemp8,D2/A4		; get back new name ptr and length
+			SWAP	D0
+			MOVE.W	D2,D0				; new name length
+			MOVE.L	A4,A1				; new name ptr
+			_CmpString					; see if it's a case of the same name
+			MOVE.L	(SP)+,A0
+			BEQ.S	@2					; br if so (skip the conflict check)
+
+			BSR 	FndFN2				; look for the dest name in directory
+			BNE.S	@1					; (uses src volume)
+
+			MOVEQ	#DupFNErr,D0		; duplicate file name if found
+@1			CMP 	#FNFErr,D0			; file should not have been found
+			BNE.S	MRNmExit			; also exit for ext fs, vol offline errs
+
+@2			BSR 	FndFilName			; search directory for the source file
+			BNE.S	MRNmExit			; if not around, bummers
+
+			MOVEQ	#FLckdErr,D0		; assume locked 						<05Sep85>
+			BTST	#FlWrtFlag,FlFlags(A5) ; well, is it?						<05Sep85>
+			BNE.S	MRNmExit			; exit if so							<05Sep85>
+
+; At this point, A5 points to the file entry, and A1 points to the start of the
+;  buffer the directory block is in. We save the old entry on the A6 stack.
+
+SavOldNtry	MOVE.L	A6,A4				; save our stack pointer				<01Oct85>
+
+			MOVE.L	A5,A3				; copy pointer to entry
+			BSR.S 	GtEntryLen			; entry length -> D0
+
+@1			MOVE.W	-2(A3,D0),-(A6) 	; move it onto stack, backwards 		<01Oct85>
+			SUBQ	#2,D0
+			BGT.S	@1
+
+; now reclaim the space for the old entry and mark the block dirty
+
+			BSR.S	RemovEntry
+
+			MOVE.L	FSTemp8,D2			; get back dest name length 			<08Oct85>
+			BSR 	FndFilSpc			; go find us space						<01Oct85>
+			BNE.S	NoSpace 			; br if none							<08Oct85>
+
+; ok, we have the space, so move in the new entry:
+;  A2.L = VCB ptr
+;  D2.W = new dir entry name length
+;  D5.W = entry total length
+;  A4.L = old stack pointer
+;  A5.L = pointer to space to put entry
+
+			MOVE.L	A5,A3				; save pointer to entry for AdjFlPos	<09Oct85>
+
+			MOVEQ	#(FlNtLen/2)-1,D0	; move this much of the old entry
+@3			MOVE.W	(A6)+,(A5)+ 		; move word by word 					<01Oct85>
+			DBRA	D0,@3
+
+			MOVE.L	A4,A6				; get our old stack pointer back		<01Oct85>
+
+			MOVEM.L FSTemp8,D2/A4		; retrieve dest name ptr and length
+			MOVE.B	D2,(A5)+			; name length
+@4			MOVE.B	(A4)+,(A5)+ 		; move byte by byte, including len byte
+			SUBQ.W	#1,D2
+			BGT.S	@4
+
+			BSR.S	AdjFlPos			; adjust file position for any FCBs
+
+			BSR 	MarkVCBTime 		; change the time in VCB to signal Finder	<31Aug85>
+
+			BSR 	MFSCtlFlush 		; flush control cache if it's too full  <20Oct85>
+
+			MOVEQ	#0,D0				; no errors
+MRNmExit	BRA 	CmdDone
+
+; the directory didn't have enough space, so at least try to get back to
+; where we started . . .
+
+NoSpace 	MOVE.B	FlNam(A6),D2		; get back src name length				 <08Oct85>
+			BSR 	FndFilSpc			; we should be able to get back at least <01Oct85>
+			BEQ.S	@1					;
+			MOVE.L	A4,A6				; get our old stack pointer back		<01Oct85>
+			MOVEQ	#fsRnErr,D0 		; some days are like this				<24Sep86>
+			BRA.S	MRNmExit
+
+@1			MOVE.L	A5,A3				; save pointer to entry for AdjFlPos	<09Oct85>
+
+@2			MOVE.W	(A6)+,(A5)+ 		; move word by word 					<01Oct85>
+			CMP.L	A6,A4				; get back to where we started			<01Oct85>
+			BNE.S	@2
+
+			BSR.S	AdjFlPos
+
+			MOVEQ	#DirFulErr,D0		; directory was too full
+			BRA.S	MRNmExit			; so exit . . .
+
+AdjFlPos	MOVE.L	FlFlNum(A3),D2		; file number of this file				<09Oct85>
+
+			MOVE.W	CurDB,D0			; get block number in D0				<01Oct85>
+			BSR 	Gt1stMatch			; update any matching files
+			BNE.S	@2					; exit if none
+@1			MOVE.W	D0,FCBFlPos(A1,D1)	; update file block
+			BSR 	GtNxtMatch
+			BEQ.S	@1
+@2			RTS
+

@@ -1,0 +1,163 @@
+;
+;	File:		DeferredTaskMgr.a
+;
+;	Contains:	Deferred Task Manager
+;
+;	Written by:	Gary Davidian
+;
+;	Copyright:	© 1986-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM6>	10/14/93	pdw		Removing DTInstallHead routine - no longer needed and certainly
+;									not wanted.
+;	   <SM5>	 9/12/93	pdw		Added DTInstallHead routine.
+;	   <SM4>	 4/11/93	chp		Modify DTInstall to run the specified task immediately if all
+;									interrupts are already enabled and neither deferred tasks nor
+;									VBL tasks are currently executing.
+;	   <SM3>	 12/4/92	SWC		Moved InitDTQueue here from StartInit.a.
+;	   <SM2>	 5/21/92	kc		Append "Trap" to the names of DTInstall,Enqueue and Dequeue to
+;									avoid name conflict with the glue.
+;	   <1.2>	  3/6/89	GGD		Moved DisptchTsk from InterruptHandlers.a to DeferredTaskMgr.a
+;									Re-Wrote DisptchTsk to remove windows where higher priority
+;									interrupts doing DTinstall might be forgotten until the next
+;									interrupt. Modified DTInstall to optimize for the success path.
+;
+
+;
+;	This file contains the core routines pertaining to the Deferred Task Manager.
+;
+;	The purpose of these routines is to allow lengthy interrupt tasks to be deferred
+;	until all interrupts can be enabled. The interrupt handlers check the status of
+;	the deferred task queue every time before exiting and dispatch queue tasks if the
+;	interrupt mask is about to be restored to zero (all interrupts enabled).
+;
+;	DTINSTALL installs a routine into the deferred task queue. There is one queue
+;	maintained for all interrupt levels. A low memory variable,	DTQueue, contains
+;	the queue header.
+;
+;	Tasks are removed from the queue automatically before they are dispatched by a
+;	routine in the interrupt handling code.
+;
+;	  written by Rich Castro	23-November-86
+;	  re-written by Gary Davidian	4-March-89
+;
+
+			PRINT		PUSH, ON
+			LOAD		'StandardEqu.d'
+			INCLUDE		'HardwarePrivateEqu.a'
+			PRINT		POP
+
+			MACHINE		MC68020
+
+
+DTCORE	 	PROC	EXPORT	
+
+			EXPORT	InitDTQueue, DTInstallTrap, DisptchTsk, vDisptch
+			IMPORT	InitQueue, ENQUEUETRAP, DEQUEUETRAP
+
+
+;_______________________________________________________________________
+;
+; Routine:		InitDTQueue
+;
+; Arguments:	none
+;
+; Function:		called by the system init sequence in StartInit to
+;				initialize the Deferred Task Manager queue
+;
+; Registers Used: A1
+;_______________________________________________________________________
+
+InitDTQueue	LEA		DTQueue,A1						; init deferred task queue
+			BSR.L	InitQueue						; go do it
+			LEA		DTInstallTrap,A1				; get ptr to deferred task install routine
+			MOVE.L	A1,jDTInstall					; and init jump vector to it
+			RTS
+
+
+;_______________________________________________________________________
+;
+; Routine:		DTINSTALL
+;
+; Arguments:	A0 (input) :	address of deferred task queue element
+;				D0 (output):	error code -	0  no error
+;												-2 invalid queue element
+;
+; Function: 	Installs a deferred task queue element into the deferred
+;				task queue pointed to by the low memory QHdr DTQueue.
+;
+;				Format of the deferred task queue element is:
+;
+;				DTLink		Link to next queue element (pointer)
+;				DTType		element ID (word = DTQType)
+;				DTFlags		optional flags (word)
+;				DTAddr		address of deferred task routine (pointer)
+;				DTParm		optional A1 parameter (long)
+;				DTReservd	reserved for future use (long)
+;
+; Registers Used: D0,A1
+;_______________________________________________________________________
+
+DTInstallTrap
+				CMP.W 	#DTQType,DTType(A0)		; is it the proper type?
+				BNE.S	TypeErr				; return error if not
+				LEA		DTQueue,A1				; get ptr to queue
+				JSR		ENQUEUETRAP				; go add element
+
+;	If a task is installed in the deferred task queue by non-interrupt code,				<LW2>
+;	it normally just sits there until an arbitrary time later when a system
+;	interrupt occurs and causes it to be executed. This patch checks to see if
+;	the interrupt mask is already zero and dispatches deferred tasks immediately
+;	if it can.
+goToIt
+				MOVE	SR,D0
+				ANDI.W	#$0700,D0				; test interrupt mask
+				BNE.S	@Defer					; if all interrupts are enabled:
+				MOVEM.L	A0-A3/D1-D3,-(SP)		; save regs normally saved by int handler
+				JSR		([jDisptch])			; dispatch deferred tasks immediately
+				MOVEM.L	(SP)+,A0-A3/D1-D3
+				ANDI.W	#$F8FF,SR				; reenable interrupts (disabled by dispatcher)
+@Defer
+
+				MOVEQ.L	#noErr,D0				; no errors
+				RTS								; return to caller
+
+TypeErr			MOVEQ.L	#VTypErr,D0 			; else flag the error
+				RTS								; and return with error code in D0
+
+				
+;______________________________________________________________________
+;
+; Dispatch routine for deferred tasks. This routine checks the deferred
+; task queue and removes and executes all tasks found. Regs D0-D3
+; and A0-A3 are saved prior to call.
+;
+;______________________________________________________________________
+
+DisptchTsk		MOVE.L	jDisptch,-(SP)			; get jump vector
+				RTS								; and use it
+				
+vDisptch		BTST.B	#INVBL,QFLAGS+VBLQUEUE 	; doing VBL tasks?
+				BNE.S	@Exit					; if so, keep deferring
+				BSET.B	#InDTQ,DTQFlags			; already in dispatcher?
+				BEQ.S	@DspStart				; check the queue if not
+@Exit			RTS								; otherwise exit
+
+@DspLoop		MOVEA.L	D0,A0					; else setup ptr for use
+				LEA		DTQueue,A1				; get ptr to queue
+				JSR		DEQUEUETRAP				; dequeue task to be executed
+				MOVEA.L	DTAddr(A0),A2			; get ptr to first task
+				MOVEA.L	DTParm(A0),A1			; get optional parameter
+				ANDI.W	#$F8FF,SR				; enable all ints
+				JSR		(A2)					; and go do task
+@DspStart		ORI.W	#HiIntMask,SR			; disable all ints
+				MOVE.L	DTskQHdr,D0				; get queue head
+				BNE.S	@DspLoop				; loop if tasks	exist
+				
+				BCLR.B	#InDTQ,DTQFlags			; clear indicator
+				RTS								; and exit
+
+
+				END 
+

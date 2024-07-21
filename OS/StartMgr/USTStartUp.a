@@ -1,0 +1,2257 @@
+;
+;	File:		USTStartUp.a
+;
+;	Contains:	StartTest is the routine which performs the necessary hardware tests to verify
+;				everythings ok before we attempt booting.  After performing critical tests,
+;				it executes a series of non-critical tests whose results are logged to PRAM.
+;				The sequence of events performed by StartTest are as follows:
+;
+;				 1) Setup exception vectors (at loc 0 for 68000, in ROM on 68020/68030
+;				 2) Check for diag ROMs, jump into them if present
+;				 3) If we have an IOP SCC, set into bypass mode if present
+;				 4) Check for factory loopback, if present, go to PRAM logging routine
+;				 5) Checksum the ROMs												(d7.w = 01)
+;				 6) If on a Normandy decoder, test it unique features
+;				 7) Size memory, returning (sp) pointing to memory chunk table		(d7.w = 11)
+;				 8) Make call to BootBeep, to let user know we're alive
+;				 9) Perform data bus test on 1st location in first bank found		(d7.w = 0E)
+;				10) See if we might have Parity memory, and flag this
+;				11) If cold boot, test all banks of memory							(d7.w = 03-04)
+;				12) Run dynamic bus size test for cpu's ³ 020						(d7.w = 13)
+;				13) Run non-critical tests
+;					a) SCC reg test			(d7.w = 84)
+;					b) SCC timer test		(d7.w = 86)
+;					c) SCC loopback test	(d7.w = 85)
+;					d) VIA test				(d7.w = 87)
+;					e) SCSI test			(d7.w = 88)
+;					f) ASC reg test			(d7.w = 89)
+;					g) RBV test				(d7.w = 8b)
+;					h) SWIM test			(d7.w = 8c)
+;					i) FPU test				(d7.w = 8d)
+;					j) Parity test			(d7.w = 8e)
+;					k) FMC reg test			(d7.w = 8f)
+;					l) FMC Cache test		(d7.w = 90)
+;					m) OSS reg test			(d7.w = 91)
+;					n) OSS Int test			(d7.w = 92)
+;					o) RPU test				(d7.w = 93)
+;					p) V8 VRAM test			(d7.w = 97) note: this test performs some necessary hw initialization
+;				14) Return to StartInit
+;
+;	Written by:	Dave Holzer
+;
+;	Copyright:	© 1983-1994 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM42>	  2/6/94	kc		Add call to TNTBootBeep.
+;	  <SM40>	 1/28/94	chp		Reenable almost all the code that was hacked out for
+;									TNT-specific bringup builds. Only the actual calls to BootBeep
+;									code remain disabled.
+;	  <SM39>	12/13/93	PN		Roll in KAOs and Horror changes to support Malcom and AJ
+;									machines.
+;	  <SM38>	11/17/93	KW		forSTP601 read pram B0 to determine if 040 should boot
+;	  <SM37>	11/10/93	chp		Conditional out some code during TNT debugging builds and add a
+;									check for PDM-style machines before doing PDM-style PDS resets.
+;	  <SMG3>	 9/22/93	chp		Added a NOP in some forRomulator code to avoid an assembler
+;									warning.
+;	  <SM36>	 11/7/93	SAM		Roll in <MC6> from mc900ftjesus.
+;	   <MC6>	10/31/93	GMR		Added code to reset PDM/CF/CS's PDS card if a ConfigROM exists
+;									with a special signature near the end of it.
+;	  <SM35>	10/15/93	SAM		Roll in <MC5> from mc900ftjesus.
+;	   <MC5>	10/15/93	SAM		Added some informative comments to the Emu warmstart code.
+;									Also, I no longer set the constant if its already set (Oops).
+;	  <SM34>	10/12/93	SAM		Roll in <MC4> from mc900ftjesus.
+;	   <MC4>	10/12/93	SAM		Changed the Emu warmstart code to use the diagnostic page for a
+;									home.
+;	  <SM33>	10/10/93	SAM		Roll in <MC2> and <MC3> from mc900ftjesus.
+;	   <MC3>	10/10/93	SAM		Added a call to NuBusReset for machines with BART.  Added
+;									jGetExtHardwareInfo.  No longer do a ROM checksum if the machine
+;									started up with a 68k emulator.
+;	   <MC2>	 9/24/93	SAM		Learning to add.  Adjusted the emu warmstart location.
+;	  <SM32>	 9/13/93	SAM		Changed USTInit to look at a flag to determine if it should call
+;									SizeMem (again).  Made the default boot case NOT call sizemem
+;									more than once.  Changed the "has68kemu" path to not call the
+;									UST stuff at all because those machines have native diagnostics.
+;	  <SM31>	 8/23/93	SAM		Don't whack RAM off ASCBase if it is pointing into ROM.
+;									Commented out the parity RAM check.  Added some warmstart
+;									bootbeep stuff for machines that start up with an emulator.
+;	  <SM30>	 6/28/93	SAM		For PDM, added a check after sizemem to call PDM's bootbeep code
+;									if we're warm starting (hardware init plays the bootbeep on cold
+;									starts).
+;	  <SM29>	 6/14/93	kc		Roll in Ludwig (Fix the last checkin).
+;	  <SM28>	 5/21/93	kc		Move SizeV8VRAM call to where it was before SM26 so the
+;									productinfo registers would be set up. Q950 boots again.
+;	  <SM27>	 5/14/93	joe		The moving of the bootbeep call was so that we could (on PDM)
+;									play the sound using the framebuffer RAM.  Now that we don't
+;									need to do that any more, move the call to bootbeep back to
+;									where it was.
+;	  <SM26>	  5/6/93	joe		Moved BootBeep to happen after SizeMem.
+;	  <SM25>	  5/6/93	SAM		Fixed <LW2> roll in.  Straightened up some things.
+;	  <SM24>	 4/22/93	joe		Enable call to BootBeep code on PDM.
+;	  <SM23>	 4/12/93	rab		Put back CheckLoopBack routine that was removed in the last
+;									checkin. Q900/950s break on boot without this code.
+;	  <SM22>	 3/31/93	chp		Synchronize SuperMario with changes from <LW2>.
+;	   <LW2>	 3/21/93	fau		Removed the initial loopback tests (before bootbeep).  Moved
+;									some of the ASC setup code into BootBeep.a so that it didn't get
+;									executed on Cyclone.
+;	  <SM21>	01-11-93	jmp		Updated various BoxFlag names.
+;	  <SM20>	 12/2/92	SWC		Removed the call to InitWallyWorld since that's done in
+;									PortableCheck.
+;	  <SM19>	 11/3/92	rab		Rolled in Horror changes. Added testchk routine from Horror.
+;	  <SM18>	11/01/92	HY		Conditionalize call to InitWallyWorld (PG&E stuff) for LC930.
+;	  <SM17>	10/25/92	HY		Put in support for boxMacLCII boxflag.
+;	  <SM16>	10/21/92	fau		Got rid of the <P8> <SM3> changed that did a Cuda command on
+;									Cyclone using an MMCExists test;  It was deemed not necessary by
+;									gjs and me (since a CudaInit had already been done).
+;	  <SM15>	10/18/92	CCH		Bypass some things for PDM bringup.
+;	  <SM15>	10/18/92	CCH		Bypass some things for PDM bringup.
+;	  <SM14>	10/12/92	RB		(HY) Change ElsieROMBase from $00A00000 to $40A00000 so that LC
+;									II will work correctly.
+;	  <SM13>	 9/25/92	RB		Added a conditional ROMinRAM to avoid things that cannot work
+;									when putting a ROM image in RAM. Changed a few BSR6 macros to
+;									jumps.
+;	  <SM12>	 8/20/92	CCH		Removed now-obsolete conditional for Cub Card.
+;	  <SM11>	  8/19/92	CSS		Update from Reality:
+;									<43> 8/18/92 DTY	Change the name of BootGlobs to StartGlobals to avoid confusion
+;														with BootGlobals, which is used by the boot code in Boot[1-3].a.
+;	  <SM10>	  8/9/92	CCH		Skip cold starts on RISC Quadras for now.
+;	   <SM9>	 7/7/92		CSS		Roll-in reality changes: 
+;									Remove references to boxApollo changed to boxClassicII.
+;	   <SM8>	 6/26/92	GS		Remove the InitCuda/InitEgret Code from the USTStartUp.a file.
+;									This initialization has been moved to the Universal.a file just
+;									after the INITVias call.  The Cuda Firmware now invokes a
+;									SyncAck function that will disable the asynchronous messages
+;									sources until the system is initialized enough to respond.
+;	   <SM7>	  6/1/92	kc		<gjs> Always enable Keyboard NMI. Removed code to disable.
+;	   <SM6>	 5/26/92	RB		Test for an MMC decoder before attempting to talk to Cuda. This
+;									crashes non Cuda machines.  ¥ This check should be changed later
+;									for a real Cuda check.
+;	   <SM5>	 5/22/92	RB		Added changes from Pandora, mostly to deal with Cuda.
+;	   <SM3>	  5/2/92	kc		Roll in Horror. Comments follow:
+;	   <H13>	 3/10/92	AL		Changed the check for startup condition in two places to use the
+;									correct equate value (a diagnostics-specific equate, not the
+;									WarmStartFlag). The wrong value was being checked and was
+;									allowing some tests to be run at startup that shouldn't, which
+;									subsequently crashed Quadras.
+;	   <H12>	  3/6/92	AL		Moved the routine SetVectorTable to USTTestMgr.a because it was
+;									more efficient due to the reorganization of the UST files. The
+;									reorg was made necessary by the PROC conditionalization by jmp,
+;									because we found out that the UST stuff had outgrown its
+;									allocated space in the ROM. Modified the non-critical sequence
+;									to use CTE v2.1.
+;	   <H11>	  2/5/92	NV		Commented out the code to skip boot beep - now calls bootbeep.
+;	   <H10>	01/27/92	jmp		Conditionalized the PROC parts of this file for use in lining up
+;									the UST part of HORROR with that of TERROR/Zydeco.
+;		<H9>	 1/14/92	SWC		Updated boxFlag labels to use shipping product names.
+;		<H8>	 1/13/92	SWC		Modified USTPMGRSendCommand, USTPMgrSendByte, USTPMgrRecvByte to
+;									get the low-level PMGR-based PRAM code working correctly.
+;		<H7>	12/20/91	JC		Temporarily not Accessing VIA or calling Bootbeep on Sonora1 as
+;									it does bad things and forcing warmstart
+;		<H6>	 12/3/91	SWC		Use the MSC to turn on SCC clocks in USTPmgrTurnOn since SCC
+;									clock control is handled by MSC instead of the PMGR.
+;		<H5>	10/23/91	jmp		Updating from the Zydeco-TERROR project.
+;		<H4>	10/15/91	SWC		Moved InitWallyWorld closer to the beginning, since there are
+;									some PRAM users that can't otherwise be properly supported.
+;		<H3>	 8/22/91	SWC		Added USTPMgrRecvByte so we can receive replies from the PMGR.
+;									Added a call to InitWallyWorld to download code into those PMGR
+;									microcontrollers that support it.
+;		<H2>	  8/8/91	SWC		Added in support for new PMGR for DB-Lite.  Rewrote
+;									USTPmgrTurnOn to use a common send command routine
+;									(USTPmgrSendcommand), and export USTPMGRSendCommand so that
+;									other routines will have a higer-level interface.
+;	   <SM3>	  3/3/92	PN		Add missing semicolon
+;	   <SM2>	  3/2/92	kc		Add yet another VBR allignment.
+;		<42>	 1/23/92	RB		Aligned the vbr for Romulator
+;		<41>	 1/13/92	RB		Rolled in Terror version. Cleaned up a record label.
+;
+;	==================== Terror History =====================
+;
+;		<14>	 6/25/91	CCH		Rolled out previous change to have MDU-based machines use second
+;									bank of RAM during startup.
+;		<13>	 4/22/91	ag		Exported "USTPMGRSendByte" for use in "econo mode" code.
+;		<12>	  4/2/91	CCH		Rolled in Scott Smyers' changes: Made some ambiguous data
+;									structures names more unique/descriptive. Added support for the
+;									new word sized subtest IDs. Moved the universal SizeVRAM routine
+;									to USTNonCritTsts.a, where it's actually called.
+;		<11>	  4/1/91	BG		In the Eclipse Egret initialization sequence, added a call to
+;									SendEgretCmd to DISable power-down messages. This will allow you
+;									to turn off your Eclipse with the keyswitch before we start
+;									reading in the System file.
+;		<10>	 3/19/91	BG		Removed the 800ms wait loop added in <T7>. The Eclipse RESET
+;									problem is going to be handled in HW so this is no longer
+;									necessary.
+;		 <9>	 3/13/91	CCH		Rolled in RBI changes from Scott Smyers.
+;		 <8>	 2/18/91	djw		Rolled in Scott Smyers changes
+;		 <7>	 2/14/91	BG		Added an 800ms delay loop to allow Caboose to come out of RESET
+;									before we attempt any timed assertions to initialize/synchronize
+;									with Caboose.
+;		 <6>	 1/14/91	CCH		Rolled in Scott Smyers changes.
+;		 <5>	12/14/90	HJR		Removed non reference NCTest Table.  Made set vector table work
+;									with reanimator and added support for machine dependent NCTest
+;									tables.
+;		 <4>	 12/6/90	CCH		Changed the check for whether Egret exists to also check for
+;									ClockEgret as well as ADBEgret, since Eclipses have the former
+;									and not the latter but still need to do the initialization.
+;		 <3>	10/25/90	CCH		Added support for ReAnimator when forRomulator equate is set.
+;		 <2>	 9/17/90	CCH		Added modifications for the 68040.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;	  Pre-TERROR ROM comments begin here.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;		<12>	 5/31/90	BA		Rolling in changes from Reality. Original comments below.
+;		{23}	 5/31/90	SS		moved the call to egretinit so that the DFAC is initialized
+;									before ROM test.  It need to be inited before the error tones
+;									can be heard.
+;		<11>	 5/18/90	CV		Rolling in changes from mainproj. Original comments below.
+;		{22}	  5/2/90	SS		Added calls to SendEgretCmd to enable keyboard NMI during
+;									startup tests (just before boot beep), then disable it just
+;									before leaving the startup tests.
+;		<10>	 4/27/90	CV		Rolling in changes from mainproj. Original comments below.
+;		{21}	 4/24/90	SS		Moved the equates for Critical, NonCritical and CritBit into
+;									STEqu.a.
+;		{20}	 4/22/90	JJ		Remove support for Elsie VISA1 decoder.
+;		{19}	 4/19/90	SS		Exported ElsieTMVectors.  These are needed in the serial test
+;									manager for running critical tests on Elsie.
+;		 <9>	 4/11/90	JJ		Modify test of BURNIN bit on Erickson and Elsie
+;		 <8>	  4/9/90	JJ		Changed code to set BURNIN bit to input state before checking
+;									burnin value on Elsie.
+;		 <7>	  4/2/90	CV		Rolling in changes from mainproj. Original comments below.
+;		{16}	 3/30/90	SS		Moved the call to SendNOPcmd from after the RAM tests to after
+;									the ROM tests but before the boot beep.  Also changed the name
+;									of this routine to EgretInit.  EgretInit turns off tick packets
+;									and ADB autopolling and it initializes the DFAC so that the boot
+;									beep works on Elsie.
+;		{15}	 3/27/90	JJ		Made burnin jumper test conditional on VISA I vs. VISA 2.
+;		{14}	 3/27/90	SS		Removed the conditional code to correct for polarity of burn-in
+;									jumper on Elsie's VISA1.
+;		{13}	 3/26/90	SS		Made the critical test bit an equate, instead of an ugly
+;									hardcoded number.  Also, added an instruction to zero out the
+;									results register (d6) before calling each non-critical test.
+;									Removed the runtime check for the VISA decoder which prevented
+;									the non-critical tests from running on an Elsie.
+;		{12}	 3/23/90	JJ		Added conditional to do correct check for Burnin for VISA1.
+;		 <6>	 3/26/90	CV		Rolling in changes from mainproj. Original comments below.
+;		{11}	 3/21/90	SS		Moved the Egret initialization code from StartInit.a to here
+;									after the RAM tests.
+;		{10}	 3/19/90	SS		Added a vector table for the test manager which is Elsie
+;									specific (i.e., it points to things as if ROM started at
+;									A00000).  Added a runtime check to decide which vector table to
+;									use.
+;		 <5>	 3/12/90	CV		Rolling in changes from mainproj. Original comments below.
+;		 {9}	  3/9/90	SS		Look for RBI PRAM signature in 2 locations (primary and
+;									alternate) for power fail recovery operation.
+;		 <4>	  3/2/90	CV		Replacing file with file from mainproj.
+;		 <8>	 2/27/90	SS		Added support for the critical/non-critical flag in the test
+;									table.  Also added support for testing for the burnin jumper on
+;									systems that have a VISA decoder.
+;		 <7>	 2/16/90	SS		Removed dummy entry in the non-critical startup test table.
+;									Also added a revision flag to all statements which changed for
+;									Ericson.
+;		 <6>	 2/13/90	MA		Removed PramTest from the non-critical power-on test table.
+;		 <5>	 2/12/90	MA		NCTest table has crit/noncrit bit in ErrCode.  Added macros to
+;									build NCTestTable.  Added check in NCTest loop to see how to
+;									handle error (crit or non crit).  NC Tests skipped for Elsie for
+;									now.  Preserve A1 between calls to RDXByte.  NonCrit test loop
+;									now saves A1.
+;		 <3>	  1/3/90	SES		Made changes for Mark ApplemanAdded FMCCacheTest to the
+;									NCTestTable. Removed the OSSCntrTest (the OSS sys. counter has
+;									gone away).
+;		 <2>	12/26/89	GMR		Added call to non-critical RPU test.
+;	   <3.2>	 12/8/89	GMR		Use RPUReset, now defined in HardwareEqu.a, for the write offset
+;									to the RPU chip.
+;	   <3.1>	 12/7/89	GMR		NEEDED FOR ZONE5: Updated Level7 int handler for Zone-5 parity
+;									interrupts.
+;	   <3.0>	11/21/89	MSH		Power on command had too many things going on.
+;	   <2.9>	11/15/89	KON		corrected bad (dog) conditional - ENDIF was being used as a
+;									label
+;	   <2.8>	11/15/89	GMR		NEEDED FOR ZONE5. Modified checkForParity to enable parity if
+;									the RPU chip is present.
+;	   <2.7>	11/13/89	SES		Added diagnostics for FMC shift register, OSS registers, counter
+;									and interrupt.
+;	   <2.6>	11/11/89	rle		needed for ZoneV: fixed bugs inadvertantly introduced when
+;									rewriting STStartUp: updated board burnin algorithm for ZoneV,
+;									altered warmstart algorithm to support board burnin
+;	   <2.5>	 11/3/89	JJJ		Changed conditional to allow warmstart in non-RBV, non-Universal
+;									builds.
+;	   <2.4>	 10/7/89	GMR		NEEDED FOR ZONE5: Changed SetSCCIopBypass to no longer returns
+;									error in d6, since it's used by the serial test manager. Now
+;									just sets Z flag if good exit.
+;	   <2.3>	 8/22/89	GMR		Added call to power manager to turn on everything except modem.
+;	   <2.2>	 7/25/89	CCH		Changed to adjust exception vectors to new ROM image location if
+;									forRomulator flag is set. Also sets warmstart flag in case
+;									Romulator is running on an old ROM.
+;	   <2.1>	 7/15/89	GMR		Exported SetVectorTable for use by USTTestMgr. Made
+;									jGetHardwareInfo turn off interrupts before calling
+;									GetHardwareInfo.
+;	   <2.0>	 6/28/89	GMR		Moved call to BootBeep after RomChecksum, to delay for refresh
+;									before SizeMem. Made checkForParity more robust (check both
+;									states of parity bit). Setup RAM vector table before calling
+;									non-critical tests, so they don't need to.
+;	   <1.9>	 6/26/89	GMR		Changed to use (sp) instead of sp when referencing memory chunk
+;									table, to work with new size memory output. Exits with a6
+;									pointing to chunk table, and stack pointer initialized to 32K
+;									above base of 1st bank.
+;	   <1.8>	 6/17/89	GMR		Allocated a real stack at 32K above base of RAM for non-critical
+;									tests, so they won't blow away bootGlobs when using stack. Fixed
+;									register bug in checkForParity.
+;	   <1.7>	 6/13/89	GMR		Added calls to Gary D's fast Mod3Test.
+;	   <1.6>	 6/13/89	GGD		Modified to work with latest version of Beep.a, leave cache on,
+;									pass VIA1 base to Beep calls in A5.
+;	   <1.5>	 6/12/89	GMR		Optimized parity scan using movem of 4 longs at a time.
+;	   <1.4>	 6/12/89	GMR		Added scan through memory on parity machines on warmstart, and
+;									execute ram tests if scan generates parity error.
+;	   <1.3>	 6/11/89	GGD		Fixed wrong register bug in UStarttest1, and typo in SetupUSP.
+;	   <1.2>	 6/11/89	GMR		Fixed Int level 6 to make universal, and some assembly bugs.
+;	   <1.1>	 6/11/89	GMR		Removed INCLUDES, now in header file which includes all others.
+;	   <1.0>	 6/11/89	GMR		Added new universal StartTest files for first time to EASE.
+;
+;------------------------------------------------------------------------------
+
+					INCLUDE	'UniversalEqu.a'			;
+
+StartTest	PROC
+
+		eXPoRT	testchk	; ¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥ Ack ¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+		
+		EXPORT	StartTest1
+		EXPORT	JGetHardwareInfo
+		EXPORT	JGetExtHardwareInfo
+		EXPORT	USTPMGRSendByte					;									<13> ag
+		EXPORT	USTPMGRRecvByte					;									<H3>
+		EXPORT	ReadPramSig
+		EXPORT	USTPMGRSendCommand
+		EXPORT	USTPmgrTurnOn					;export it for the test manager
+		EXPORT	USTInit
+		EXPORT	SizeV8VRAM						;	<32>
+		EXPORT	TMVectors
+		EXPORT	ElsieTMVectors					;									<19>
+		IMPORT	SetVectorTable					;
+		IMPORT	SetupForExecuteDTM				; Needed to use CTE v2.1 from Startup. HAL
+		IMPORT	GetHardwareInfo
+		IMPORT	GetExtHardwareInfo
+		IMPORT	SetupBases
+		IMPORT	BaseOfROM
+		IMPORT	StartInit1
+		IMPORT	BootBeep6
+		IMPORT	SizeMemory
+		IMPORT	StartUpROMTest
+		IMPORT	Mod3Test
+		IMPORT	dynamic_bussize_test
+		IMPORT	Error1Handler
+		IMPORT	NCErrorHandler
+		IMPORT	GoTM
+		IMPORT	SetSCCIopBypass
+		IMPORT	EgretInit						; <GAA><16><11>
+		IMPORT	SendEgretCmd					;<22>
+		IMPORT	RBIMgr
+		IMPORT	RdXByte
+		IMPORT	WrXByte
+		IMPORT	ClkWpOff
+		IMPORT	diagROMentry					;<31>
+		IMPORT	SendCudaCmd						; <SM3> rb
+		IMPORT	CudaInit						; <SM3> rb
+		IMPORT	USTGetSubTest					; <SM3> rb
+		IMPORT	PDMBeep
+		IMPORT	TNTBootBeep
+		IMPORT	GetCPUIDReg
+		
+;---------------------------------------------------------------------------
+;
+;  This exception table is used by the Ikki Test Manager and the power up
+;  test code.  The 68020 Vector base register is pointed at this table.
+;
+;  Aladdin code has these vectors also, however they are not accessible in
+;  the 68000 environment.  They are copied to RAM after completion of the first
+;  set of power up tests.
+;
+;---------------------------------------------------------------------------
+
+	WITH DecoderKinds,DecoderInfo
+
+;
+; The folling vector table is for use by Elsie only.  It is needed because the base of
+; Elsie's ROM is different than for other Mac32 machines.
+;
+
+ElsieROMBase	EQU		$40A00000		;Elsie's base of ROM								<10><SM14> rb
+
+ElsieTMVectors												;								<10>
+	dc.l	$00002000										;$00 space for initial SP		<10>
+	dc.l	StartTest1		-BaseOfROM + ElsieROMBase		;$04 space for initial PC		<10>
+	dc.l	BusError		-BaseOfROM + ElsieROMBase		;$08 Bus Error vector			<10>
+	dc.l	AdrError		-BaseOfROM + ElsieROMBase		;$0C Address error vector		<10>
+	dc.l	illError		-BaseOfROM + ElsieROMBase		;$10 illegal inst error vector	<10>
+	dc.l	ZerError		-BaseOfROM + ElsieROMBase		;$14 zero divide				<10>
+	dc.l	ChkError		-BaseOfROM + ElsieROMBase		;$18 Chk,Chk2 instructions		<10>
+	dc.l	xTrapx			-BaseOfROM + ElsieROMBase		;$1C cpTrapcc,Trapcc,TrapV		<10>
+	dc.l	PrivError		-BaseOfROM + ElsieROMBase		;$20 Privilege violation		<10>
+	dc.l	Trace			-BaseOfROM + ElsieROMBase		;$24 Trace bit					<10>
+	dc.l	LineA			-BaseOfROM + ElsieROMBase		;$28 line A trap				<10>
+	dc.l	LineF			-BaseOfROM + ElsieROMBase		;$2C line F trap				<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$30 not assigned				<10>
+	dc.l	cpProtocol		-BaseOfROM + ElsieROMBase		;$34 cp protocol violation		<10>
+	dc.l	FormatX			-BaseOfROM + ElsieROMBase		;$38 format error				<10>
+	dc.l	SpurInterrupt	-BaseOfROM + ElsieROMBase		;$3C unitialized interrupt		<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$40 not assigned				<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$44 not assigned				<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$48 not assigned				<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$4C not assigned				<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$50 not assigned				<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$54 not assigned				<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$58 not assigned				<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$5C not assigned				<10>
+	dc.l	SpurInterrupt	-BaseOfROM + ElsieROMBase		;$60 spurious interrupt			<10>
+	dc.l	IntLevel1		-BaseOfROM + ElsieROMBase		;$64 Level 1 interrupt			<10>
+	dc.l	IntLevel2		-BaseOfROM + ElsieROMBase		;$68 Level 2 interrupt			<10>
+	dc.l	IntLevel3		-BaseOfROM + ElsieROMBase		;$6C Level 3 interrupt			<10>
+	dc.l	IntLevel4		-BaseOfROM + ElsieROMBase		;$70 Level 4 interrupt			<10>
+	dc.l	IntLevel5		-BaseOfROM + ElsieROMBase		;$74 Level 5 interrupt			<10>
+	dc.l	IntLevel6		-BaseOfROM + ElsieROMBase		;$78 Level 6 interrupt			<10>
+	dc.l	IntLevel7		-BaseOfROM + ElsieROMBase		;$7C Level 7 interrupt NMI)		<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$80 Trap #0					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$84 Trap #1					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$88 Trap #2					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$8C Trap #3					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$90 Trap #4					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$94 Trap #5					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$98 Trap #6					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$9C Trap #7					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$A0 Trap #8					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$A4 Trap #9					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$A8 Trap #10					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$AC Trap #11					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$B0 Trap #12					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$B4 Trap #13					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$B8 Trap #14					<10>
+	dc.l	Trap#N			-BaseOfROM + ElsieROMBase		;$BC Trap #15					<10>
+	dc.l	FPCP#1			-BaseOfROM + ElsieROMBase		;$C0 FPCP bra or set on unordered cond<10>
+	dc.l	FPCP#2			-BaseOfROM + ElsieROMBase		;$C4 FPCP inexact result		<10>
+	dc.l	FPCP#3			-BaseOfROM + ElsieROMBase		;$C8 FPCP divide by zero		<10>
+	dc.l	FPCP#4			-BaseOfROM + ElsieROMBase		;$CC FPCP underflow				<10>
+	dc.l	FPCP#5			-BaseOfROM + ElsieROMBase		;$D0 FPCP operand error			<10>
+	dc.l	FPCP#6			-BaseOfROM + ElsieROMBase		;$D4 FPCP overflow				<10>
+	dc.l	FPCP#7			-BaseOfROM + ElsieROMBase		;$D8 FPCP signaling NAN			<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$DC not assigned				<10>
+	dc.l	PMMUConfig		-BaseOfROM + ElsieROMBase		;$E0 PMMU configuration			<10>
+	dc.l	PMMUillegal		-BaseOfROM + ElsieROMBase		;$E4 PMMU illegal operation		<10>
+	dc.l	PMMUAccess		-BaseOfROM + ElsieROMBase		;$E8 PMMU access level violation<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$EC not assigned				<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$F0 not assigned				<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$F4 not assigned				<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$F8 not assigned				<10>
+	dc.l	NotAss			-BaseOfROM + ElsieROMBase		;$FC not assigned				<10>
+
+;
+; The following vector table is for use with all Mac32 machines except Elsie.
+;
+
+TMVectors
+	dc.l	$00002000									;$00 space for initial SP
+	dc.l	StartTest1		-BaseOfROM + RomStart		;$04 space for initial PC
+	dc.l	BusError		-BaseOfROM + RomStart		;$08 Bus Error vector
+	dc.l	AdrError		-BaseOfROM + RomStart		;$0C Address error vector
+	dc.l	illError		-BaseOfROM + RomStart		;$10 illegal inst error vector
+	dc.l	ZerError		-BaseOfROM + RomStart		;$14 zero divide
+	dc.l	ChkError		-BaseOfROM + RomStart		;$18 Chk,Chk2 instructions
+	dc.l	xTrapx			-BaseOfROM + RomStart		;$1C cpTrapcc,Trapcc,TrapV
+	dc.l	PrivError		-BaseOfROM + RomStart		;$20 Privilege violation
+	dc.l	Trace			-BaseOfROM + RomStart		;$24 Trace bit
+	dc.l	LineA			-BaseOfROM + RomStart		;$28 line A trap
+	dc.l	LineF			-BaseOfROM + RomStart		;$2C line F trap
+	dc.l	NotAss			-BaseOfROM + RomStart		;$30 not assigned
+	dc.l	cpProtocol		-BaseOfROM + RomStart		;$34 cp protocol violation
+	dc.l	FormatX			-BaseOfROM + RomStart		;$38 format error
+	dc.l	SpurInterrupt	-BaseOfROM + RomStart		;$3C unitialized interrupt
+	dc.l	NotAss			-BaseOfROM + RomStart		;$40 not assigned
+	dc.l	NotAss			-BaseOfROM + RomStart		;$44 not assigned
+	dc.l	NotAss			-BaseOfROM + RomStart		;$48 not assigned
+	dc.l	NotAss			-BaseOfROM + RomStart		;$4C not assigned
+	dc.l	NotAss			-BaseOfROM + RomStart		;$50 not assigned
+	dc.l	NotAss			-BaseOfROM + RomStart		;$54 not assigned
+	dc.l	NotAss			-BaseOfROM + RomStart		;$58 not assigned
+	dc.l	NotAss			-BaseOfROM + RomStart		;$5C not assigned
+	dc.l	SpurInterrupt	-BaseOfROM + RomStart		;$60 spurious interrupt
+	dc.l	IntLevel1		-BaseOfROM + RomStart		;$64 Level 1 interrupt
+	dc.l	IntLevel2		-BaseOfROM + RomStart		;$68 Level 2 interrupt
+	dc.l	IntLevel3		-BaseOfROM + RomStart		;$6C Level 3 interrupt
+	dc.l	IntLevel4		-BaseOfROM + RomStart		;$70 Level 4 interrupt
+	dc.l	IntLevel5		-BaseOfROM + RomStart		;$74 Level 5 interrupt
+	dc.l	IntLevel6		-BaseOfROM + RomStart		;$78 Level 6 interrupt
+	dc.l	IntLevel7		-BaseOfROM + RomStart		;$7C Level 7 interrupt NMI)
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$80 Trap #0
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$84 Trap #1
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$88 Trap #2
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$8C Trap #3
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$90 Trap #4
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$94 Trap #5
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$98 Trap #6
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$9C Trap #7
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$A0 Trap #8
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$A4 Trap #9
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$A8 Trap #10
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$AC Trap #11
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$B0 Trap #12
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$B4 Trap #13
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$B8 Trap #14
+	dc.l	Trap#N			-BaseOfROM + RomStart		;$BC Trap #15
+	dc.l	FPCP#1			-BaseOfROM + RomStart		;$C0 FPCP bra or set on unordered cond
+	dc.l	FPCP#2			-BaseOfROM + RomStart		;$C4 FPCP inexact result
+	dc.l	FPCP#3			-BaseOfROM + RomStart		;$C8 FPCP divide by zero
+	dc.l	FPCP#4			-BaseOfROM + RomStart		;$CC FPCP underflow
+	dc.l	FPCP#5			-BaseOfROM + RomStart		;$D0 FPCP operand error
+	dc.l	FPCP#6			-BaseOfROM + RomStart		;$D4 FPCP overflow
+	dc.l	FPCP#7			-BaseOfROM + RomStart		;$D8 FPCP signaling NAN
+	dc.l	NotAss			-BaseOfROM + RomStart		;$DC not assigned
+	dc.l	PMMUConfig		-BaseOfROM + RomStart		;$E0 PMMU configuration
+	dc.l	PMMUillegal		-BaseOfROM + RomStart		;$E4 PMMU illegal operation
+	dc.l	PMMUAccess		-BaseOfROM + RomStart		;$E8 PMMU access level violation
+	dc.l	NotAss			-BaseOfROM + RomStart		;$EC not assigned
+	dc.l	NotAss			-BaseOfROM + RomStart		;$F0 not assigned
+	dc.l	NotAss			-BaseOfROM + RomStart		;$F4 not assigned
+	dc.l	NotAss			-BaseOfROM + RomStart		;$F8 not assigned
+	dc.l	NotAss			-BaseOfROM + RomStart		;$FC not assigned
+
+
+BusError
+		btst	#beok,d7					;are we expecting this BusError?
+		beq.s	@10							;no, must be a baddie
+		move.l	a5,a7						;yes, restore sp to caller's original
+		RTS6								;then exit to caller's return point
+@10
+		or.w	#BECode,d7					;BusError exception code
+		bra.s	JmpHandler
+AdrError
+		or.w	#ADCode,d7					;Address Error exception code
+		bra.s	JmpHandler
+illError
+		or.w	#ILCode,d7					;illegal Error exception code
+		bra.s	JmpHandler
+ZerError
+		or.w	#ZDCode,d7					;Zero divide Error exception code
+		bra.s	JmpHandler
+ChkError
+		or.w	#CICode,d7					;Check inst Error exception code
+		bra.s	JmpHandler
+xTrapx
+		or.w	#TPCode,d7					;cpTrapcc,Trapcc,TrapV exception code
+		bra.s	JmpHandler
+PrivError
+		or.w	#PVCode,d7					;Privilege violation exception code
+		bra.s	JmpHandler
+Trace
+		or.w	#TECode,d7					;Trace exception code
+		bra.s	JmpHandler
+LineA
+		or.w	#ATCode,d7					;Line A exception code
+		bra.s	JmpHandler
+LineF
+		or.w	#FTCode,d7					;Line F exception code
+		bra.s	JmpHandler
+NotAss
+		or.w	#UNCode,d7					;unassigned exception code
+		bra.s	JmpHandler
+cpProtocol
+		or.w	#CPCode,d7					;CP protocol violation
+		bra.s	JmpHandler
+FormatX
+		or.w	#FMCode,d7					;format exception
+		bra.s	JmpHandler
+SpurInterrupt
+		or.w	#SICode,d7					;spurious interrrupt exception code
+		bra.s	JmpHandler
+Trap#N
+		or.w	#TNCode,d7					;Trap inst exception code
+		bra.s	JmpHandler
+IntLevel1
+		or.w	#L1Code,d7					;Interrupt level 1 code
+		bra.s	JmpHandler
+IntLevel2
+		or.w	#L2Code,d7					;Interrupt level 2 code
+		bra.s	JmpHandler
+IntLevel3
+		or.w	#L3Code,d7					;Interrupt level 3 code
+		bra.s	JmpHandler
+IntLevel4
+		or.w	#L4Code,d7					;Interrupt level 4 code
+		bra.s	JmpHandler
+
+IntLevel5
+		or.w	#L5Code,d7					;Interrupt level 5 code
+								;
+JmpHandler
+		bra		ExceptionHandler			;...island to handler...
+
+IntLevel6
+		or.w	#L6Code,d7					;Interrupt level 6 code, jerk power cord on MacII's
+		moveq	#0,d2						;no hint										<1.2>
+		BSR6	JGetHardwareInfo			;Find base addresses for our machine			<1.2>
+		move.l	VIA2Addr(a0),a0				;point to VIA 2 base							<1.2>
+		bset	#Poff,VDirB(a0)				;set power off direction bit
+		bclr	#Poff,VBufB(a0)				;and jerk the power cord
+@die	bra.s	@die						;and wait fo....cough...choke
+
+IntLevel7
+;----------------------------------------------------------------------------
+;
+; This interrupt handler has to deal with potentially intentional parity errors
+; it detects this by looking at a signature in d0 to determine if a parity
+; error is expected.
+;
+;----------------------------------------------------------------------------
+
+		btst.l	#beok,d7				;are bus errors OK?
+		beq.s	@notParity				;no, then level 7's aren't allowed either
+
+		cmp.l	#PGCParity,d0			;is this an expected PGC parity error?
+		bne.s	@notRBV					;continue if not
+		
+		move.l	a5,a7					;restore sp to caller's orginal					<v2.8>
+		movea.l	DecoderInfo.VIA1Addr(a0),a1 ;Get VIA1 base address
+		move.b	vBufB(a1),d1			;read Via register								<v2.8>
+		bclr.b	#vPGCErr,vDirB(a1)		;change direction to input						<v2.9>
+		beq.s	@dataValid				;if already an input, data is already valid		<v2.9>
+		move.b	vBufB(a1),d1			;read Via register								<v2.8>
+		bset.b	#vPGCErr,vDirB(a1)		;change direction back to output				<v2.9>
+
+@dataValid									;												<v2.9>
+		btst	#vPGCErr,d1				;is this a real parity error?					<v2.8>
+		bne.s	@notParity				;no, handle normal NMI							<v2.8>
+		bset	#vPGCEnb,VBufB(a1)		;disable parity checking
+		tst.b	(a1)					;avoid any race conditions						<v3.0>
+		bclr	#vPGCEnb,VBufB(a1)		;enable PGC parity interrupts
+		tst.b	(a1)					;avoid any race conditions
+		RTS6							;back to normal processing
+		
+@notRBV
+		
+		cmp.l	#RPUParity,d0			;is this an expected RPU parity error?
+		bne.s	@notRPU					;continue if not
+		
+										;else, a0 = decoder info ptr
+		move.l	a5,a7					;restore sp to caller's orginal
+		movea.l	DecoderInfo.OSSAddr(a0),a1	;get OSS address
+		move.w	OSSIntStat(a1),d1
+		btst	#OSSIntRPU,d1			;did the RPU cause the interrupt?
+		beq.s	@notParity				;no, handle normal NMI
+
+		movea.l	DecoderInfo.RPUAddr(a0),a1	;Get RPU  base address
+		st.b	rpuReset(a1)			;reset serial ptr
+		move.l	(a1),d1
+		bset.l	#16,d1					;clear the parity error
+		move.l	d1,(a1)
+
+		RTS6							;return
+
+@notRPU
+
+@notParity
+		and.w	#$FF,d7						;clear high byte of low word of d7
+		or.w	#L7Code,d7					;Interrupt level 7 code
+		bset	#nmi,d7						;set NMI received bit
+		bra.s	ExceptionHandler
+
+
+FPCP#1
+		and.w	#$FF,d7						;clear high byte of low word of d7
+		or.w	#F1Code,d7					;FPCP bra or set on unordered cond
+		bra.s	ExceptionHandler
+FPCP#2
+		and.w	#$FF,d7						;clear high byte of low word of d7
+		or.w	#F2Code,d7					;FPCP inexact result
+		bra.s	ExceptionHandler
+FPCP#3
+		and.w	#$FF,d7						;clear high byte of low word of d7
+		or.w	#F3Code,d7					;FPCP divide by zero
+		bra.s	ExceptionHandler
+FPCP#4
+		and.w	#$FF,d7						;clear high byte of low word of d7
+		or.w	#F4Code,d7					;FPCP underflow
+		bra.s	ExceptionHandler
+FPCP#5
+		and.w	#$FF,d7						;clear high byte of low word of d7
+		or.w	#F5Code,d7					;FPCP operand error
+		bra.s	ExceptionHandler
+FPCP#6
+		and.w	#$FF,d7						;clear high byte of low word of d7
+		or.w	#F6Code,d7					;FPCP overflow
+		bra.s	ExceptionHandler
+FPCP#7
+		and.w	#$FF,d7						;clear high byte of low word of d7
+		or.w	#F7Code,d7					;FPCP signaling NAN
+		bra.s	ExceptionHandler
+PMMUConfig
+		and.w	#$FF,d7						;clear high byte of low word of d7
+		or.w	#PCCode,d7					;PMMU configuration
+		bra.s	ExceptionHandler
+PMMUillegal
+		and.w	#$FF,d7						;clear high byte of low word of d7
+		or.w	#PICode,d7					;PMMU illegal operation
+		bra.s	ExceptionHandler
+PMMUAccess
+		and.w	#$FF,d7						;clear high byte of low word of d7
+		or.w	#PACode,d7					;PMMU access level violation
+*		bra.s	ExceptionHandler			;
+
+ExceptionHandler
+		bset	#excp,d7					;set exception flag, why not?
+		move.l	sp,d6						;save sp in case needed for stack frame post mortum
+		move.l	#aStack,sp					;yes, init stack pointer
+		jmp		Error1Handler				;go directly to CritErr, then TM
+
+
+;=================================================================================================
+;  Reno ROM resident start up tests
+;=================================================================================================
+
+StartTest1
+		move.l	#aStack,a7				;set stack pointer value
+		clr.l	d7						;clear flags register
+		clr.l	d6						;clear minor error code reg
+
+;-------------------------------------------------------------------------------------------------
+;  Set up the exception vectors
+;-------------------------------------------------------------------------------------------------
+
+	IF NOT ROMinRAM THEN				; <SM13> rb
+	
+	IF	forRomulator	THEN			; 										<2.2>
+		TestInRam  A0					;check if running in RAM				<2.2>
+		beq.s	@noAdj					;if not, don't adjust vectors			<2.2>
+		BigLea	BaseOfRom,a0			;get base of ROM running in RAM			<2.2>
+		move.l	a0,d1					;use a data register					<2.2>
+		subi.l	#ROMStart,d1			;calculate conversion offset			<2.2>
+		lea		TMVectors+4,a0			;get address of vectors					<2.2>
+		move.w	#VTEntries-2,d0			;get number of entries to adjust		<2.2>
+@adj	add.l	d1,(a0)+				;convert a vector						<2.2>
+		dbra	d0,@adj					;do all of them							<2.2>
+@noAdj									;										<2.2>
+	  ENDIF								; {forRomulator}						<2.2>
+
+		lea		ElsieTMVectors,a1		;First see if we are on an Elsie		<10>
+		lea		StartTest1,a5			;Get the address of the start vector	<10>
+		cmpa.l	4(a1),a5				;Does this agree with where we are?		<10>
+		beq.s	@cont					;Continue if so							<10>
+		lea		TMVectors,a1			;Otherwise, load the default TM vectors	<10>
+		
+	  IF forRomulator THEN				; save certain ReAnimator except. vectors<33>
+		TestInRAM	A0					; only do the Vector Shuffle if in RAM	<33>
+		beq.s	@cont					; IF we are in RAM ...					<33>
+	  	movec	vbr,a0					;find out where our vector table currently is<33>
+		move.l	BusErrVct(a0),BusErrVct(a1)	; ... then do that Vector Shuffle Thang	<33>
+		move.l	AddrVector(a0),AddrVector(a1)
+		move.l	IlglVector(a0),IlglVector(a1)
+		move.l	ZeroVector(a0),ZeroVector(a1)
+		move.l	CheckVector(a0),CheckVector(a1)
+		move.l	TrapVVector(a0),TrapVVector(a1)
+		move.l	PrivlgVector(a0),PrivlgVector(a1)
+		move.l	TraceVector(a0),TraceVector(a1)
+		move.l	DebugVector(a0),DebugVector(a1)
+		move.l	FmtErrVect(a0),FmtErrVect(a1)
+		move.l	BadIntVector(a0),BadIntVector(a1)
+		move.l	BkptVector(a0),BkptVector(a1)
+	  ENDIF								; {forRomulator}						<33>
+
+@cont	movec	a1,VBR					;VBR points to our exception table		<10>
+
+	ENDIF								; <SM13> rb
+	
+		move.l	a7,a5					;copy sp for BusError handler
+
+		moveq.l	#0,d2
+		BSR6	JGetHardwareInfo		;get hardware info about this machine
+
+;-------------------------------------------------------------------------------------------------
+;  Check for diagnostic ROMs, jump to them if found, else return
+;-------------------------------------------------------------------------------------------------
+CheckDiagRoms
+	IF forRomulator THEN				; check if we are ReAnimatorªing					<33>
+		TestInRAM	A1					; are we running in ram?							<33>
+		bne.s	@noDiagRom				; dont check for diagnostic ROMs if running from RAM<33>
+		nop								; Why are we even doing TestInRAM?
+	ENDIF								; {forRomulator}									<33>
+@noDiagRom
+		bclr	#beok,d7				;clear the BusError is OK flag
+
+
+;-------------------------------------------------------------------------------------------------	<SM23> begin
+;  Check for factory loopback on VIA Sound Volume lines.  On Mac,MacPP,NuMac the
+;  jumper shorts SV2 to SV1.  On newer Macs, the jumper simply grounds
+;  the SV1 line (bit 0, VBufA), except on Normandy, where it grounds bit 2, VBufB.
+;  The VIA is assumed to be initialized to a normal state.  SV1 is changed here to
+;  be an input for Mac,MacPP,NuMac.  If loopback found, set test bit in d7 flags,
+;  run tests, and jump to Test Manager instead of returning to OS start code.
+;  For Mac,MacPP we rely on the fact that the VIA inputs read as
+;  [ZoneV jumpers the SCC WrReq pin of the OSS instead of the SV1 line on the VIA.]			<v2.6>
+;-------------------------------------------------------------------------------------------------
+CheckLoopBack
+		moveq.l	#0,d2					;get universal information
+		BSR6	JGetHardwareInfo		;
+		movea.l	VIA1Addr(a0),a2			;get VIA1 base address
+		
+		cmp.b	#NormandyDecoder,d2		;is this a Normandy decoder?
+		bne.s	@checkMDUorOSS			;no, check for other types of machines
+			
+										;Normandy decoder:  Jumper shows up on bit 2 of VIA1 port B
+		btst	#2,vBufB(a2)			;is the jumper installed?
+		bne		@checkROMs				;if not, continue startup as normal
+		bra		@HasJumper				;else, we're in burnin
+
+@checkMDUorOSS
+
+		cmp.b	#OSSFMCDecoder,d2	;OSS decoder has a jumper grounding SCC WrReq
+		bne.s	@DefaultJumper		;check the default jumper location if not OSS
+
+		move.l	OSSAddr(a0),a3		;point to OSS base								<v2.6>
+		btst	#1,OSSInpStat(a3)	;is the jumper installed?						<v2.6>
+		beq		@checkROMs			;go check ROMs if not (bit is inverted by OSS)	<v2.6>
+		bra		@HasJumper			;else, we're in burnin
+
+@DefaultJumper						;													<17><18>	
+;
+; OK - now's where we check the jumper.  This test should be done on all machines
+; prior to and including the MacLC.  However, for machines after that, we should
+; only perfrom this test if the box flag is contained in a list of post LC machines
+; that have a burnin edge connector.
+;
+
+		asr.w	#8,d2				;get the box flag into the lsb
+		cmp.b	#boxMacLC,d2		;are we an LC or before?
+		ble.s	@CheckJumper		;go ahead and check the jumper if so
+;		
+;else, we should only check the jumper if this machine's box flag is contained in
+;the table of post LC machines that still have a burnin connector
+;
+
+		lea		PostLC_BIJumper_boxes,a3	;get a pointer to the table
+		
+@JumperLookup
+		move.b	(a3)+,d3			;get the next box flag
+		cmp.b	#boxUnknown,d3		;is this the end of the table?
+		beq.s	@SCSICheck			;do the SCSI check anyway if so
+		cmp.b	d2,d3				;else, are we in the table?
+		bne.s	@JumperLookup		;keep looking if not
+									;OK - we're in the table, check for jumper
+
+@CheckJumper						;default jumper check:  bit 0 of port A of VIA1
+		bclr.b	#SV1,vDIRA(a2)		;make SV1 an input
+		bclr.b	#SV2,vBufA(a2)		;set SV2 bit to 0 volts (which will ground SV1 if jumpered)
+
+		btst	#SV1,vBufA(a2)		;is the jumper installed?
+		beq		@HasJumper			;branch if the jumper is installed
+									;else, jumper is not installed:  check for SCSI jumper
+@SCSICheck
+		move.l	#SCSIBILocs,d3		;get the location of the SCSI burnin bytes
+
+@CheckSCSISig
+		bsr6	ReadPramSig			;get the signature
+		cmp.l	#SCSIBIBytes,d4		;is this our location?
+		beq.s	@hasSCSISig			;branch if so
+		move.w	#$0000,d3			;else, clear out one signature location
+		swap	d3					;prepare the other location
+		bne.s	@CheckSCSISig		;and keep looking if we haven't checked both locs yet
+		bra		@checkROMs			;if we get here then we don't have any jumper
+
+@hasSCSISig							;we want to look for the SCSI jumper now
+		moveq.l	#0,d2				;get the universal information again
+		bsr6	jGetHardwareInfo	;make the call
+		movea.l	VIA1Addr(a0),a2		;prepare for possible PRAM access
+		
+		btst.l	#SCSIExists,d0		;do we have a 53C80?
+		beq.s	@hasC96				;branch if not
+		
+		movea.l	SCSIAddr(a0),a3		;get the base address of the 53C80 registers
+		move.b	sCSR(a3),d3			;get the current SCSI bus phase
+		and.b	#(aMSG|aCD|aIO),d3	;mask out the appropriate bits
+		cmp.b	#aMSG,d3			;does our phase match? (MSG asserted, CD and IO not)
+		bne.s	@ZeroPRAM			;go init PRAM if not
+		
+		bra.s	@HasJumper			;SCSI jumper installed
+
+@hasC96
+		movea.l	SCSI96Addr1(a0),a3	;assume SCSI1 is the external bus
+		btst.l	#SCSI96_2Exists,d0	;do we have a SCSI2 bus?
+		beq.s	@SCSI1Only			;branch if so (means SCSI1 is only bus
+		movea.l	SCSI96Addr2(a0),a3	;else, SCSI bus 2 is the external bus
+@SCSI1Only
+		move.b	rSTA(a3),d3			;get the bus control signals
+		and.b	#iPhaseMsk,d3		;mask out the bus phase information
+		cmp.b	#%100,d3			;look for our phase
+		beq.s	@HasJumper			;we have the jumper if this is a match
+
+@ZeroPRAM
+;
+;Factory escape! The SCSI signature was in PRAM, but there is no SCSI jumper!
+;Zero PRAM to remove any leftover RBI stuff and assure that the OS initializes it
+;from scratch.
+;
+		bsr6	ClkWpOff			;un-write protect the PRAM first
+		move.w	#$FF,d3				;start at the end of PRAM
+@ZeroPRAMLoop
+		moveq.l	#0,d2				;write zero to next location
+		move.w	d3,d1				;get the next address to write to
+		bsr6	WrXByte				;go zero out this byte
+		dbra.w	d3,@ZeroPRAMLoop	;keep going until it's all gone
+		bra.s	@CheckROMs			;and continue with normal bootup operation
+
+@HasJumper
+		bset	#test,d7				;jumper found, set flag bit for later
+
+;-------------------------------------------------------------------------------------------------
+; if here, then we are in board burn-in.													<v1.1><9>
+; See if the RBI signature bytes are valid.														<9>
+; There are 2 possible locations for these bytes.  The PRAM addresses of these 2 locations		<9>
+; are contained in the 2 halves of a long word.  Get this long word and look in both possible	<9>
+; locations.  If either location contains a valid signature, go to the RBI manager.				<9>
+;-------------------------------------------------------------------------------------------------
+
+		move.l	#SigLocs,d3		;Locations of signature bytes						<v1.1><7><9>
+		
+@CheckRBISig
+		bsr6	ReadPramSig 	;read the RBI signature from PRAM
+
+		cmp.l	#SigBytes,d4	;Compare result with the signature					<7><9>
+		beq		RBIMgr			;go to RBIMgr if all bytes correct					<v1.1><7><9>
+		
+		move.w	#$0000,d3		;No match here										<9>
+		swap	d3				;Have we tried both signature locations?			<9>
+		bne.s	@CheckRBISig	;Continue if not									<9>				<SM23> end
+
+@checkROMs
+; ¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+
+	IF NOT ROMinRAM THEN		; <SM13> rb
+	
+		movec	CACR,d0			; retrieve current CACR										<T2>
+		bset	#CACR_IE_040,d0	; set 040 "enable I-Cache" bit to see if we're on an 040	<T7>
+		movec	d0,CACR			; set the bit to see if it sticks	
+		movec	CACR,d0			; get the value back
+	if forRomulator THEN
+		bclr	#CACR_IE_040,d0	; leave inst. cache off for now								<T7>
+		movec	d0,cacr			; put it back in cache reg
+	else
+		btst	#CACR_IE_040,d0	; are we on an 040?											<T7>
+	endif
+		beq.s	@notAn040		; IF we're on an 040 THEN
+		MACHINE	MC68040			;	switch to 68040 instruction set
+		cinva	ic				;	invalidate the I-cache, leaving it enabled
+		bra.s	@go				;	continue
+		MACHINE	MC68030			;	switch back to 68030 instructions
+@notAn040						; ELSE
+		movec	CACR,d0			;	examine cache control register
+		ori.b	#((1<<CACR_EI_020_030)|\ ; enable ...										<T7>
+				(1<<CACR_CI_020_030)),d0 ; ... and flush I-Cache							<T7>
+		bclr.l	#CACR_ED_030,d0	;	disable data cache										<T7>
+		movec	d0,CACR			;	do it
+@go								; ENDIF														<T2>
+	ENDIF						; <SM13> rb
+	
+;
+; Next, initialize the DFAC (if present) by calling the machine dependant init routine.
+;
+		moveq.l	#0,d2
+		BSR6	JGetHardwareInfo		;first, recreate the universal information
+
+;	Potential chk needed here to determine if the DFAC HW needs to be initialized...
+;	Chk Hardware Type to see if DFAC INIT is required...
+;	1/31/92	gjs	<P5>
+	
+	WITH	ProductInfo
+		move.l	SndControlPtr(a1),d3		; get a pointer to the sound dispatch table
+		beq.s	@noDFAC						; we're done if there is none
+		lea		(a1,d3.l),a2				; dereference the pointer
+		move.l	(sndDFACInit<<2)(a2),d3		; and check for a DFAC init routine
+		beq.s	@noDFAC						; we're done if there is none
+		lea		@1,a6						; set the return address					<SM13> rb
+		jmp		(a2,d3.l)					; else, init the DFAC						<SM13> rb
+@1												;										<SM13> rb
+	ENDWITH
+@noDFAC											;DFAC initialization is done
+
+;-------------------------------------------------------------------------------------------------
+;  First get the ROMs checksummed to gain confidence in ourselves
+;-------------------------------------------------------------------------------------------------
+	
+;	If the machine has been started up by a 68k emulator, then the Native boot code has
+;	already checksumed the ROM (including the additional ROM space used by the emulator)
+
+	IF NOT ROMinRAM THEN				; skip ROM checksum code for RAM				<SM13> rb
+
+		btst	#ProductInfo.has68kEmulator//8,ProductInfo.ExtValid1+3(A1)
+		bne.s	@NoROMTest				; -> An emulator is responsible for starting up this machine.
+
+		move.w	#ErrROM,d7				; init major error code
+		BSR6	StartUpROMTest			;
+		tst.l	d6						; any error?
+		bne		Error1Handler			; yes, go handle fatal error
+
+@NoROMTest
+	ENDIF								;												<SM13> rb
+		clr.w	d7						; clear any residue error code
+
+;-------------------------------------------------------------------------------------------------
+; go ahead and make the call to bootbeep to inform the user that we're alive
+;-------------------------------------------------------------------------------------------------
+@Beep	moveq.l	#0,d2
+		BSR6	JGetHardwareInfo
+		BSR6	JGetExtHardwareInfo		;
+		
+	IF NOT forSTP601 THEN				;													<SM38>
+		BSR5	NuBusReset				; Send a Reset to BART (if we have one)
+		BSR5 	PDS_Reset				; Reset the PDS video cards (if present) for PowerPc machines <MC6>
+		BSR6	JGetHardwareInfo
+	ENDIF								;													<SM38>
+
+		btst.l	#(hwCbPwrMgr+16),d2		; do we have a pmgr?
+		beq.s	@noPmgr					; branch if not
+			
+		BSR6	USTPmgrTurnOn			; turn on a bunch of things
+@noPmgr
+
+	IF forSTP601 THEN					;													<SM38>
+		moveq.l	#0,d2					;get universal information
+		BSR6	JGetHardwareInfo		;
+		movea.l	DecoderInfo.VIA1Addr(a0),a2			;get VIA1 base address
+
+		move.w	#$B0,d1
+		BSR6	RdXByte
+		andi.b	#$01,d1
+		beq.s	@skip_040
+				_nkSwitchTo040
+@skip_040
+		BSR6	JGetHardwareInfo
+	ENDIF								;													<SM38>
+
+	IF NOT forTNTDebug THEN
+		BigBSR6	BootBeep6,a0			; call boot beep subroutine
+	ENDIF
+	
+		moveq.l	#0,d2					;													<30>
+		BSR6	JGetHardwareInfo		;													<30>
+		Btst.l	#ASCExists,D0			; Do we have an ASC									<LW2>
+		Beq.s	@NoASC					; if not, don't need to								<LW2>
+
+		BigLEA	BaseOfROM,A3			; Get ROMBase										<SM31> SAM
+		CMP.L	ASCAddr(A0),A3			; Is ASCAddr pointing into the ROM?
+		BEQ.S	@NoASC					; -> Yes, we don't really have an ASC. Dont whack	<SM31>
+		
+		movea.l	ASCAddr(a0),a3			; setup ASC address for BootBeep6					<SM25>
+		clr.b	$804(a3)				; clear pending interrupt from ASC
+@NoASC									;													<LW2>
+		BSR6	SizeV8VRAM				; and size video ram (changes memory decodeing)		<30>
+
+;-------------------------------------------------------------------------------------------------
+;  Need to size memory now
+;	On exit from SizeMemory,
+;		d6 		= 0 if sized ok and banks look good, otherwise, FF's in bad byte lanes
+;		(sp) 	= pointer to a memory chunk table with the following format:
+;					Start.L, Length.L, ..., $FFFFFFFF
+;-------------------------------------------------------------------------------------------------
+@SizeMem
+		move.w	#ErrSizeMem,d7			;just so we will know where we're at if fail
+		BSR6	SizeMemory				;(sp) points to memory table
+		bne		Error1Handler			;error, exit to test manager
+
+	IF forRomulator THEN				;													<2.2>
+		TestInRam  A1					;check to see if we're running in RAM				<2.2>
+		beq.s	@inROM					;if not, skip this 									<2.2>
+		movea.l	(sp),a0					;else, get pointer to bootglobs							<1.9>
+		move.l	#WmStConst,StartGlobals.sgWarmStart(a0) ; if in RAM, we want a warmstart 	<SM11> CSS 
+@inROM
+	ENDIF								;													<2.2>
+
+
+	IF 0 THEN
+;-------------------------------------------------------------------------------------------------
+; Before testing RAM, determine if we have parity, by testing the first long word of ram in
+; all banks, and setting parity flag in d7 to reflect this.  Parity is enabled/disabled here.
+;-------------------------------------------------------------------------------------------------
+	  	BSR6	checkForParity
+		tst.l	d6						;parity good (or no parity)?
+		bne.s	@checkRamDisk			;no, test memory like cold start					<v2.6>
+	ENDIF
+
+
+;	On machine who's start up process is being emulated by a "V0" style emulator/nanokernel, the native	<SM31>
+;	startup code is responsible for doing the RAM test and boot beep on a cold start.  On a warm start
+;	the native code is not run; we therefore need to determine if the native code has just run, and if
+;	so, play the boot beep.
+
+		moveq	#0,D2
+		bsr6	JGetHardwareInfo		; Get the universal info for the 99e99'th time this boot...
+	
+		move.l	(SP),A6					; Put the chunk table pointer into A6 for later
+
+	; Does the universal info say we're running with an emulator?
+	
+		btst	#ProductInfo.has68kEmulator//8,ProductInfo.ExtValid1+3(A1)
+		beq		@NonEmulatedMachine		; -> An emulator is *not* responsible for starting up this machine.
+
+	; Check the "has the native cold-start code just run?" flags
+		
+		WITH	nkDiagInfo	
+		move.l	(nkDiagInfoPtr),A0						; Get the address of the nanokernal diag page
+		cmpi.l	#emuWarmStartConst,DiagWarmStartLow(A0)	; Does the upper long match?
+		bne.s	@EmuColdStart							; -> Nope, this is a cold start
+		cmpi.l	#WmStConst,DiagWarmStartHigh(A0)		; Lower long?
+		bne.s	@EmuColdStart							; -> Cold start		
+
+	; We are doing a WarmStart.  We need to run the emulated boot beep code & return to StartInit
+
+@EmuWarmStart
+
+
+		cmp.b	#HMCDecoder,ProductInfo.DecoderKind(a1)	; are we a PDM?
+		bne.l	@NotPDM									; no, try tnt
+
+ 	 	bsr.l	PDMBeep
+
+@NotPDM
+		cmp.b	#HHeadDecoder,ProductInfo.DecoderKind(a1); are we a TNT?  
+		bne.l	@NotTNT									; no, must be stp
+
+		bsr6	TNTBootBeep								; <SM41>
+
+@NotTNT
+		move.l	(SP),A6					; Put the chunk table pointer into A6 for later
+
+		bra		ReturnToStartInit						; -> Emu machines are done
+		
+	; We have just come from the Native Hard/Cold Reset code.  It has already played the boot beep so
+	; we don't have to.  Now comes the fun part.  We need to set the "emu" warmstart flag (the only
+	; thing that we check to determine if the current boot is cold or warm).  This flag lives in the
+	; writeprotected diagnostic info block in the Nanokernel's data page.  We need to "map" the diag
+	; page to a normally mapped page of RAM, write the warmstart constant, and remap the memory back
+	; the way it was.  Oh, I'm using logical page number 1 (i.e. $1000 - 4k pages). Oh, yeah, the RAM
+	; at $1000 never actually gets modified... 		<SAM>
+
+@EmuColdStart
+
+		move.w	#12,D2									; Shift Count (12 bits in 4k)
+		
+		lea		1,A0									; Logical page #1 ($1000)
+		_nkGetPTEntryGivenPage							; Get its Pte
+		move.l	D0,D3									; Save the Pte in D3
+		
+		move.l	(nkDiagInfoPtr),D0						; Get the DiagPage Logical Address
+		move.l	D0,D5									; Make a copy
+		and.l	#4096-1,D5								; Get the offset into the page
+		
+		lsr.l	D2,D0									; Make it a page number
+
+		move.l	D0,A0									; Page into A0
+		_nkGetPTEntryGivenPage							; Get the Diag Pte
+		move.l	D0,D4									; Save it
+		
+		lea		1,A0									; Get the buffer page number in A0
+		lea		1,A1									; Say page is inited (#1)
+		_nkMMUMarkBacking								; Mark this page as outta here
+
+		lea		1,A0									; Logical Page number of the buffer
+		move.l	D4,D0									; Get the Diag Pte
+		lsr.l	D2,D0									; Get its Physical Page number
+		move.l	D0,A1									; Set Physical Page
+		_nkMMUMarkResidentGlue							; Map the diag's physical address to the buffer's logical addr
+
+		lea		$1000,A0								; Get our logical starting point
+		add.l	D5,A0									; Add in the offset from the start of the diag page
+		move.l	#'SamB',DiagWarmStartLow(A0)			; Write a great constant to the diag page
+		move.l	#'WLSC',DiagWarmStartHigh(A0)			; This one too....
+
+		lea		1,A0									; Get the lo Page number in A0
+		lea		1,A1									; Say page is inited (#1)
+		_nkMMUMarkBacking								; Mark this page as outta here
+
+		lea		1,A0									; Get the lo Page number in A0
+		move.l	D3,D0									; Get the LoPage's Pte
+		lsr.l	D2,D0									; Get its Physical Page number
+		move.l	D0,A1									; Set Physical Page
+		_nkMMUMarkResidentGlue							; Move the HiPage to the loPage's logical addr
+
+		ENDWITH
+
+		
+		move.l	#WmStConst,StartGlobals.sgWarmStart(a6)	; Set the traditional warmstart flag in startglobals
+		bra		ReturnToStartInit						; Skip all the CTE garbage.  Emu machines have native garbage.	<SM31>
+
+@NonEmulatedMachine
+
+		cmpi.l	#WmStConst,StartGlobals.sgWarmStart(a6)	; Check for warm start				<SM11> CSS 		
+		bne.s	@checkRamDisk							; -> Cold start. Test RAM (avoiding RAM disk)
+
+@NoRAMTest
+		clr.w	d7										; Done with warm start testing
+		bra.w	testchk									; Do warm start
+
+@checkRamDisk
+		movea.l	#-1,a3									; No RAM disk here
+
+
+;-------------------------------------------------------------------------
+; Test ALL banks of RAM now.  Keep index into table in a4.
+; Enter with a3=base of RAM disk, if any, else a3=ffffffff
+;-------------------------------------------------------------------------
+@testRam
+	IF ROMinRAM | BlackBirdDebug THEN	;¥¥Fix this													<SM13> rb
+		move.l	#WmStConst,StartGlobals.sgWarmStart(a6)	; force warm start					<SM13> rb
+	ELSE								; 													<SM13> rb
+		move.w	#ErrRAMA,d7				;init error to Bank A error code
+		movea.l (sp),a4					;get ptr to chunk table
+		movea.l	a4,a5					;preserve in a5										<1.9>
+@memLoop
+		move.l	(a4)+,a0				;get start of bank
+		cmpa.l	#-1,a0					;at end of table?
+		beq.s	@RamPassed				;(-1) means end of table
+		move.l	(a4)+,d0				;get length
+		move.l	a0,a1
+		adda.l	d0,a1					;calculate end of bank
+		cmpa.l	a1,a5					;above memory chunk table?							<1.9>
+		bhi.s	@atRAMdsk				;no, test complete chunk
+		move.l	(sp),a1					;yes, set top to base of chunk table				<1.9>
+@atRAMdsk
+		cmpa.l	a1,a3					;above RAM disk
+		bhi.s	@testChunk				;no, test it
+		move.l	a3,a1					;yes, set top to base of RAM disk
+@testChunk
+		BSR6	Mod3Test				;test this bank										<1.7>
+		move.l	a5,(sp)					;restore pointer in case blown away					<1.9>
+		tst.l	d6
+		bne		Error1Handler			;failed, go to test manager
+		addq.w	#1,d7					;bump to next bank code
+		bra.s	@memLoop				;passed, test next bank
+	ENDIF								; 													<SM13> rb
+
+@RamPassed
+
+;-------------------------------------------------------------------------------------------------
+; Finally, test the bus sizing feature of the 020/030
+;-------------------------------------------------------------------------------------------------
+		move.w	#ErrDynBus,d7			;preset failed code
+		movea.l	(sp),a0					;get ptr to chunk table								<1.9>
+		movea.l	(a0),a0					;test at base of first bank							<1.9>
+		bsr6	dynamic_bussize_test	;do this test
+		tst.l	d6						;any error here?
+		bne		Error1Handler			;failed, go to test manager
+
+
+; From here to the next <HAL> below was changed to support machine dependant test tables
+; and CTE kernel v2.1.
+;/////////////////////////////////////////////////////////////////////////////////////////////////
+;----------------------Non-Critical Diagnostic Tests------------------
+;
+; This section of code executes the RAM based tests.  These tests require RAM in
+; order to execute, as apposed to the RAM less tests such as the ROM checksum
+; and the RAM tests above.  Because RAM has already been tested before this point,
+; it is assumed that RAM is good enough to rely on.
+;
+;----------------------------------------------------------------------
+testchk
+	WITH	USTGlobals, RunBits, CPUTestList, USTSubtest
+	
+		moveq	#1,D2					; set the flag telling UST to NOT call SizeMem again!	<SM32>
+		BSR6	USTInit					; initialize the universal environment
+
+	IF NOT ROMinRAM THEN				;											<SM13> rb
+
+		move.l	PrdctInfPtr(a5),a1		; set this for NCErrorHandler (trashed by USTInit)
+
+		suba.l	#SizeOfCTEGlobals,sp	; allocate our CTE global area on the stack
+		move.l	sp,CTEGlobals(a5)		; save the global area pointer
+		move.l	a5,-(sp)				; save our UST globals pointer		
+		movea.l	CTEGlobals(a5),a0		; get the CTE globs pointer
+		
+		CASE ON
+			GIM_InitInterface	(a0),#SIZEOFCTEGLOBALS	;init the CTE interface
+		CASE OFF
+		
+		movea.l	(sp)+,a5				; restore the USTGlobals pointer
+		moveq.l	#Restart,d0				; init it for restart (at least)
+		cmp.l	#WmStConst,WarmStartConst(a5)	; is this a warm start?
+		beq.s	@warmStart				; branch if so
+		bset.l	#StartupBit,d0			; else, also set the startup condition		<H16>
+		
+@warmStart
+		move.w	d0,RunMode(a5)			; store the run mode
+		movea.l	GlobCPUTestList(a5),a2	; get the CPU specific test list in a2		<36>
+		
+		movea.l	DcdrInfPtr(a5),a0		; set this for the NCErrorHandler also		<H16>
+		
+@NextTest
+		moveq.l	#0,d5					; zero out the test ID register
+		move.w	TLTest_ID(a2),d5		; get the next test ID
+		cmp.w	#-1,d5					; are we at the end of the table?
+		beq.l	@done					; all finished with non-critical startups if so
+		moveq.l	#0,d4					; zero out the test ID register				<H16>
+		move.w	TLSubTest_ID(a2),d4		; get the subtest ID (word)					<H16>
+		movem.l	a0-a3/a5,-(sp)			; save some registers
+		BigBSR6	SetupForExecuteDTM,a0	; set up the GI_ExecuteDTM parameters
+
+	; Check for errors in setting up for the ExecuteDTM and don't try to execute the DTM
+	; if any were found (just skip it and move to the next one). At this stage, the only
+	; possible error would be if the requested DTM does not apply to a warmstart condition.
+	; At this time, the only test I can think of that does apply is the VRAM test:
+	
+		move.l	tInfoFunctionEntry(a5),d6
+		cmp.l	#-1,d6					; -1 means test not found or does not apply
+		beq.s	@TestFailure
+		move.l	sInfoFunctionEntry(a5),d6
+		cmp.l	#-1,d6					; -1 means subtest not found or does not apply
+		beq.s	@TestFailure
+
+	; No errors setting up for the test, so do it:
+
+		movea.l	CTEGlobals(a5),a0		; get the globs pointer again - a0 was trashed
+										;	by SetupForExecuteDTM
+		moveq.l	#0,d6					; Zero out the DTM result register. The ROM-based
+										;	test routines traditionally use d6 as the result
+										;	register, but the ROM-based test used with CTE
+										;	will transfer d6 to d0 before returning to the
+										;	ExecuteDTM routine - from there it's all C code
+										;	back to here after GIM_ExecuteDTM. So, the rule
+										;	of thumb here is: clear d6 going in, check
+										;	d0 coming out.
+			
+		CASE ON
+			GIM_ExecuteDTM		(a0), EXOPUSERINFO(a5), TINFOUSERINFO(a5), SINFOUSERINFO(a5), EXRESERR(a5)
+		CASE OFF
+
+		tst.l	d0						; any errors? (C functions return result in D0)
+		beq.s	@testPassed				; continue if not
+		move.l	d0,d6					; store the error from the C function where the NCErrorHandler
+										;	routine expects it to be
+@TestFailure
+		movem.l	(sp),a0-a3/a5			; restore them registers (leave stack where it is)
+		move.w	RunMode(a5),d0			; get the run mode
+		btst.l	#StartupBit,d0			; is this a startup (cold start) condition?						 <H16>
+		beq.s	@testPassed				; no, so skip logging results (only store results on cold start) <H16>
+		bsr		NCErrorHandler			; else, execute the error handler			<37>
+		btst.l	#test,d7				; are we in test mode?
+		bne		goTM					; go to test manager if so
+		
+@testPassed
+		movem.l	(sp)+,a0-a3/a5			; restore registers (and adjust the stack appropriately)
+		adda.l	#sizeofCPUTestList,a2	; index to next DTM							<H16>
+		bra.s	@NextTest				; go on to next DTM in the list
+		
+@done									; finished with tests - continue with bootup
+		adda.l	#SizeOfCTEGlobals,sp	; clean up the stack - remove all traces of CTE, but leave the
+										;	USTGlobals in place because we have to set a6 to point to the
+										;	memory chunk table before handing things over to the OS guys
+	
+	ENDWITH
+
+;From here to the next <HAL> above was changed to support CTE v2.1.					<SM19>end
+
+;-------------------------------------------------------------------------
+;  Now check the flag bit that might send us to the Test Manager instead
+;  of returning to OS start code.  This would be that we found a VIA
+;  loopback on the SV1 and SV2 lines.
+;-------------------------------------------------------------------------
+
+		clr.w	d7						;clear out any error code					<34>
+		btst.l	#test,d7				;any loopback?
+		bne		goTM					;yes, go directly to Test Manager
+
+;
+; Any test failure will have already been logged previously when the test			<29>
+; was run at power on.
+;
+	ENDIF										;									<SM13> rb
+	
+		movea.l	USTGlobals.ChunkTable(a5),a6	;and return with a6 pointing to RAM table<34>
+ReturnToStartInit
+		bra.l	StartInit1						;									<SM13> rb
+
+
+;===============================================================================
+; Misc subroutines...
+;===============================================================================
+
+;-------------------------------------------------------------------------------
+;  Routine:	checkForParity
+;
+;  Inputs:		a6		- return address
+;				(sp)	- memory chunk table pointer
+;
+;  Outputs:		d7		- parity bit set on parity
+;
+;  Destroys:	d0-d2,d4,a0-a5
+;
+; RBV Type Parity:	This routine checks each bank for parity RAM, and sets the parity
+; bit in d7 if all banks seem to have parity.  If any bank does not have parity, it
+; clears the parity bit.  It checks for parity by writing a single 1 to every SIMM, then
+; reading.  If no parity chip exists, the parity bit will = 1 (floats) and cause
+; a parity NMI.  Parity is enabled/disabled on exit from this routine, if parity
+; was detected/not detected.
+;
+; RPU Type Parity:  This routine checks to see if the RPU chip exists, and if so,
+; enables parity interrupts and sets the parity bit in d7.  The RPU operates correctly
+; even if no SIMM's installed are parity SIMMs (parity is detected on the SIMM).
+;-------------------------------------------------------------------------------
+checkForParity
+		move.l	a6,d4					;save return address in d4
+		moveq.l	#0,d2					;prep d2 for universal call
+		BSR6	JGetHardwareInfo		;get info on this machine
+
+		bset	#parity,d7				;assume we have parity
+		bset	#beok,d7				;tell the bus error handler it's ok
+		movea.l	sp,a5					;copy sp for NMI handler
+
+		btst	#ProductInfo.PGCInstalled,d1	;see if we have a PGC chip	<7>
+		beq.s	@noPGC				;no, see if RPU type parity
+		
+		move.l	#PGCParity,d0			;tell the NMI handler to expect PGC parity errors
+		movea.l	VIA1Addr(a0),a2			;get VIA1 base
+		bclr	#vPGCEnb,VBufB(a2)		;enable PGC parity interrupts
+		tst.b	VBufB(a2)				;access VIA to delay a little
+
+		lea		@noPGCparity,a6			;load up return address	 for NMI
+		movea.l	(sp),a4					;get base of chunk table							<1.9>
+@next	movea.l	(a4)+,a3				;check at base of each bank							<1.8>
+		cmpa.l	#-1,a3					;at end of table?
+		beq.s	@scanParityRam			;(-1) means end of table
+
+		addq.l	#4,a4					;skip past size
+		move.l	#$01010101,(a3)			;put one 1 on every SIMM (parity bit = 0)
+		tst.l	(a3)					;parity error if no parity bit exists (floats to 1)
+		move.l	#0,(a3)					;put zeros on all bits (parity bit = 1)				<2.0>
+		tst.l	(a3)					;parity error if no parity bit exists				<2.0>
+		bra.s	@next					;check next bank
+
+@noPGCparity
+		bset	#vPGCEnb,VBufB(a1)		;disable parity checking
+		bra.s	@noParity
+
+@noPGC
+
+
+		btst	#RPUExists,d0		;do we support RPU (F-19) parity?
+		beq.s	@noParity			;no, then we don't support parity
+
+		move.l	#RPUParity,d0			;tell the NMI handler to expect RPU parity errors
+		movea.l	RPUAddr(a0),a2			;get OSS base
+		st.b	rpuReset(a2)			;reset serial pointer
+		clr.b	(a2)					;write good parity mode
+		st.b	(a2)					;clear any parity errors caused by SizeMemory
+		movea.l	OSSAddr(a0),a1			;get OSS base
+		move.b	#7,OSSMskRPU(a1)		;enable RPU parity interrupts (level 7)
+
+@scanParityRam
+		lea		@parityError,a6			;an NMI will send us here
+		move.l	(sp),a4					;get base of chunk table
+
+@nextBank
+		move.l	(a4)+,a2				;get start of bank
+		cmpa.l	#-1,a2					;no more banks?
+		beq.s	@scandone				;yes, exit
+		move.l	(a4)+,d5				;get length
+
+@check	movem.l	(a2)+,d1-d3/d6			;test 16 bytes at a time							<1.5>
+		subq.l	#4,d5
+		bgt.s	@check					;finish testing bank
+		bra.s	@nextBank				;do next bank
+
+@parityError
+		moveq.l	#1,d6					;indicate a parity error
+		bra.s	@exit					;and exit
+
+@noParity
+		bclr.l	#parity,d7				;clear parity ram installed bit
+
+@scandone
+		moveq.l	#0,d6					;clear return status (no parity)
+		
+@exit	bclr.l	#beok,d7				;normal operation again
+		moveq.l	#0,d0					;clear parity signature
+		movea.l	d4,a6					;restore return address
+		RTS6							;return
+
+
+;------------------------------------------------------------------------
+
+JGetHardwareInfo
+	ori.w	#hiIntMask,sr			;turn off interrupts							<2.1>
+
+	IF forRomulator THEN				;											<T9>
+		TestInRAM	a0					;are we in RAM								<T9>
+		beq.s	@inROM					;branch if we're in ROM						<T9>
+		
+		move.l	a6,-(sp)				;save return address						<T9>
+		
+		movec	vbr,a6					;get the VBR								<T9>
+		move.l	BusErrVct(a6),-(sp)		;and save the bus error vector in our local space<T9>
+
+		lea		@GotBusError,a0			;get the address of our local bus error handler<T9>
+		move.l	a0,BusErrVct(a6)		;move it on in there						<T9>
+
+		bigbsr6	GetHardwareInfo,a0		;call gethardware info						<T9>
+
+		movec	vbr,a6					;get the vbr again							<T9>
+		move.l	(sp)+,BusErrVct(a6)		;restore the bus error handler				<T9>
+
+		rts								;and return to caller						<T9>
+	
+@GotBusError							;											<T9>
+		btst.l	#beok,d7				; indicate that bus error occured			<T9>
+		move.l	a5,a7					; restore stack								<T9>
+		rts6							; return									<T9>
+
+@inROM									;											<T9>
+	ENDIF								;											<T9>
+
+	BigJMP	GetHardwareInfo,a0		;make long bsr6 to actual routine
+
+;------------------------------------------------------------------------
+
+JGetExtHardwareInfo						;											<MC3> SAM
+	ori.w	#hiIntMask,sr			;turn off interrupts
+
+	IF forRomulator THEN				;
+		TestInRAM	a0					;are we in RAM			
+		beq.s	@inROM					;branch if we're in ROM	
+		
+		move.l	a6,-(sp)				;save return address	
+		
+		movec	vbr,a6					;get the VBR			
+		move.l	BusErrVct(a6),-(sp)		;and save the bus error vector in our local space
+
+		lea		@GotBusError,a0			;get the address of our local bus error handler
+		move.l	a0,BusErrVct(a6)		;move it on in there	
+
+		bigbsr6	GetExtHardwareInfo,a0	;call gethardware info	
+
+		movec	vbr,a6					;get the vbr again		
+		move.l	(sp)+,BusErrVct(a6)		;restore the bus error handler
+
+		rts								;and return to caller	
+	
+@GotBusError							;						
+		btst.l	#beok,d7				; indicate that bus error occured
+		move.l	a5,a7					; restore stack			
+		rts6							; return				
+
+@inROM									;
+	ENDIF								;
+
+	BigJMP	GetExtHardwareInfo,a0		;make long bsr6 to actual routine
+
+;------------------------------------------------------------------------
+
+
+;
+; The following routine sizes VRAM on V8 equiped Elsie machines.  This routine must
+; be called before using memory (even before sizing it and testing it).  This is
+; because the setting of the VRAM size bits affect how the RAM is ordered in the
+; address space.
+;
+SizeV8VRAM
+
+	WITH	ProductInfo, DecoderInfo
+		move.l	ExtValid(a1),d0		;get external features flag							<SM17>
+		btst.l	#V8ChipBit,d0		;Is this a V8 machine (LC/LCII)?					<SM17>
+		beq.s	@Done				;If not V8 machine then we're finished				<SM17>
+
+		movea.l	RBVAddr(a0),a2		;Get the RBV address								<30>
+		move.l	VideoInfoPtr(a1),d0	;Get the video info pointer address offset			<30>
+		movea.l	(a1,d0.l),a0		;and offset to the actual pointer					<30>
+	ENDWITH							;ProductInfo, DecoderInfo
+		
+		move.l	#'Shel',d0			;Get a signature									<30>
+		moveq.l	#-1,d1				;and a bus discharger								<30>
+		move.l	#1<<18,d2			;Store 256K into a register							<30>
+
+		bset.b	#V8vRAMIn,V8Exp(a2)	;Set the VRAM installed bit							<30>
+		bset.b	#V8512Row,V8Exp(a2)	;and set the 512 rowbytes (selects 256K of VRAM)	<30>
+				
+		move.l	d0,(a0)				;store the signature into VRAM						<30>
+		move.l	d1,4(a0)			;now eliminate any stray bus charges				<30>
+		cmp.l	(a0,d2.l),d0		;Look at offset 256K								<30>
+		beq.s	@Done				;If this is equal we have 256K of VRAM				<30>
+		cmp.l	(a0),d0				;else see if there's any VRAM at all				<30>
+		beq.s	@512KVRAM			;Yes - we must have 512K of it						<30>
+		bclr.b	#V8vRAMIn,V8Exp(a2)	;Else, No VRAM installed, clear the appropriate bit	<30>
+		bra.s	@Done
+
+@512KVRAM
+		bclr.b	#V8512row,V8Exp(a2)	;512K of VRAM:  clr the 512 rowbytes				<30>
+@Done
+	RTS6
+
+;From here to the next <34> below was added to support the machine dependant test tables.
+USTInit
+;-------------------------------------------------------------------------------------
+; This routine initializes all the information needed by the subtests.  It returns in a5
+; a pointer to a data structure with the following format (increasing addresses down):
+;
+;		a5 ->	WarmStartConstant
+;		+4h		Product info pointer (long)
+;		+8h		Bases valid flags (long)
+;		+Ch		Chunk table	(1 or more 2 long word entries)
+;		+Ch+8n	FFFF FFFF
+;				where n = number of chunk table entries
+;
+; The format of this data structure is defined in the USTGlobals record.
+;
+
+; This routine initializes MOST OF the information needed by the subtests for the various ROM-based
+; diagnostics environments (Startup/Restart, ROM BurnIn, In House Testers (board testers), Serial
+; Test Manager, Test Manager ATrap). Specifically, it does set up everything needed by the RBI
+; environment. Some of the others fill in the fields as necessary.
+;
+; The data structure that is created and initialized here is known as the USTGlobals. It contains
+; information that the diagnostics environments need to keep around as they are executing DTMs and
+; stuff.
+;
+; It returns in a5 a pointer to the data structure with the following format (increasing
+; addresses up):
+;
+;	NOTE: the fields marked with "*" indicate that they are initialized by this routine
+;	(some fields are used by other environments - IHT, STM, etc. - and are not needed
+;	by RBI, so they are left uninitialized, to be managed by the routine(s) that need them).
+;
+;	NOTE 2: The USTGlobals structure has been enhanced for the Horror ROM (and all of its
+;	kin) to support the paramters to the GI_ExecuteDTM call, new for CTE v2.1.
+;
+;
+;		+92h+8n	FFFF FFFF
+;				where n = number of chunk table entries
+; *		+8Eh	Chunk table	(1 or more 2 long word entries)
+;
+;					; These are the executionResults structure fields:
+;
+;		+8Ah	exResSubtestResults
+;		+86h	exResSubtestParams
+;		+82h	exResTestResults
+;		+7Eh	exResTestParams
+;		+7Ah	exResErr
+;
+;
+;					; These are the subtestInfo structure fields:
+;
+;		+76h	sInfoResultsSize
+;		+72h	sInfoParamsSize
+;		+6Eh	sInfoFunctionEntry
+;		+6Ah	sInfoID
+;		+66h	sInfoUserInfo
+;
+;
+;					; These are the testInfo structure fields:
+;
+;		+62h	tInfoResultsSize
+;		+5Eh	tInfoParamsSize
+;		+5Ah	tInfoFunctionEntry
+;		+56h	tInfoID
+;		+52h	tInfoUserInfo
+;
+;
+;					; These are the executionOptions structure fields:
+;
+;		+4Eh	exOpIdleMethodArg
+;		+4Ah	exOpIdleMethod
+;		+46h	exOpSubtestResultsOverride
+;		+42h	exOpSubtestParamsOverride
+;		+3Eh	exOpTestResultsOverride
+;		+3Ah	exOpTestParams
+;		+36h	exOpExecutionMode
+;		+32h	exOpProcessorType
+;		+2Eh	exOpUserInfo
+;
+;
+;					; These are the original USTGlobals from Terror (the Chunk Table has
+;					;	been moved to the end of the record, where it should stay):
+;
+; *		+2Ah	Bases valid flags (long)
+; *		+26h	Product info pointer (long)
+; *		+22h	Decoder info pointer
+; *		+1Eh	WarmStartConstant
+;		+1Ah	Pointer to an error handler (if any)
+;		+16h	Pointer to the CTE globals
+; *		+12h	Pointer to the CPU-specific test list in ROM
+;		+Eh		Pointer to a list of subtests to execute (for CTE also)
+;		+Ah		Pointer to a list of tests to execute (for CTE)
+;		+8h		Run mode flags (startup, restart, etc.)
+;		+4h		Size of the CTE command stack frame
+; 	a5 ---->	Current command number
+;				Vector table (copied into RAM by the SetVectorTable routine after the above
+;					structure is filled out). The vector table is copied from the ROM-based
+;					table declared at the beginning of this file. The VBR and SP point to the
+; * VBR & SP -->	base of this table.
+;
+;
+;
+; The format of this data structure (the one pointed to by a5, vector table not included)
+;	is defined in the USTGlobals record.
+;
+;
+;
+;	Input:
+;		d2 - Flag. Clear: Call SizeMem at init.  Set: Do NOT call SizeMem.								<SM32>
+;
+;	output:
+;		a5 - points to the standard environment data structure
+;		sp - initialized
+;
+;	destroys most, if not all registers
+;
+; Called by:  BSR6
+;
+;-------------------------------------------------------------------------------------
+
+	WITH	USTGlobals, StartGlobals, CPUList, ProductInfo	;						<36> <SM11> CSS
+	
+		movea.l	a6,a4					;save the return address					<SM3> rb, start
+		tst.b	d2						;is this a normal boot? (ie no diag ROM, serial test, etc.)?	<SM32>
+		bne.s	@noSize					;-> Yes. Do NOT call sizemem *again*!							<SM32>
+		BSR6	SizeMemory				;Create the chunk table (relocates the stack)
+@noSize	moveq.l	#0,d2					;then get hardware information for this machine
+		BSR6	JGetHardwareInfo		;assume we know nothing
+
+		movea.l	(sp),a2					;get a pointer to the chunk table
+
+		movea.l	(a2),a5					;get a pointer to the base of a chunk			<T14>
+		adda.l	#(1<<16),a5				;offset to end of second 32K					<T14>
+		suba.w	#sizeofUSTGlobals,a5	;allocate space for our globals					<T14>
+		move.l	a2,ChunkTable(a5)		;put the pointer to the chunk table there		<T14>
+		movea.l	a5,sp					;and put the stack there						<T14>
+		
+		move.l	sgWarmStart(a2),WarmStartConst(a5)	;remember the warm start constant	<T14> <SM11> CSS 
+				
+		move.l	d0,BasesValidFlags(a5)	;save the bases valid flags
+		move.l	a1,PrdctInfPtr(a5)		;and a pointer to the product info record
+		move.l	a0,DcdrInfPtr(a5)		;and a pointer to the decoder info record
+		
+		move.b	ProductKind(a1),d0		;and get the box flag							<36>
+		lea.l	USTCPUList,a0			;start at the beginning of the list of tables	<36>
+		move.l	a0,d2					;save this for later							<36>
+	
+@itemloop
+		move.w	cpuBoxFlag(a0),d1		;Get the box flag for this test table			<36>
+		cmp.b	#boxUnknown,d1			;Is this the end of the table?					<36>
+		beq.s	@found					;quit if so - we'll use the default tests		<36>
+		cmp.b	d1,d0					;is this the table entry for this machine?		<36>
+		beq.s	@found					;quit if so										<36>
+		addq.l	#sizeofCPUList,a0		;else, go to the next table entry				<36>
+		bra.s	@itemloop				;and keep looking								<36>
+	
+@found
+		movea.l	CPUTestListPtr(a0),a0	;get a pointer to the test table for this CPU	<36>
+		lea.l	(a0,d2.l),a0			;and dereference it								<36>
+		move.l	a0,GlobCPUTestList(a5)	;and store it in the globals area.				<36>
+
+		suba.l	#VTEntries*4,sp			;get a vector table space in RAM
+		movea.l	sp,a1					;point a1 at it
+		BSR6	SetVectorTable			;then, set up our exception table in RAM
+		
+		jmp		(a4)					;and return to caller
+
+	ENDWITH
+
+
+	EXPORT	USTGetSubtest
+USTGetSubtest
+;-------------------------------------------------------------------------------------
+;
+; This routine looks up a subtest ID in the master list of subtests and relocates the
+; CTE information about the test into RAM.
+;
+;	Input:  The following information on the stack:
+
+StackFrame1		RECORD	4, Increment	;start with offset for a saved register
+
+return			ds.l	1				;Return address
+ID				ds.l	1				;subtest ID
+infoPtr			ds.l	1				;place to put the subtest info
+
+	ENDR
+
+;
+;	Output:
+;		a0 - pointer to the subtest table for this CPU
+;
+;	Destroys:
+;		d0, d1
+;
+;
+; Called by:  bsr
+;
+;-------------------------------------------------------------------------------------
+	
+	WITH	StackFrame1, USTSubtest
+	
+		link	a0,#0					;save a0 and point it to the stack frame
+		movem.l	a1/a2/d0/d1,-(sp)		;save some regs
+		
+		lea.l	USTSubtests,a1			;get a pointer to the subtest table in ROM
+		move.l	a1,d1					;save it for later
+		move.l	ID(a0),d0				;get the test ID
+@searchLoop
+		cmp.l	STSubtest_ID(a1),d0		;is this our test?							<T12>
+		beq.s	@load					;go load it if so
+		adda.w	#sizeofUSTSubtest,a1	;else get next test
+		bra.s	@searchLoop				;and continue
+@load
+		moveq.l	#(sizeofUSTSubtest>>2)-1,d0	;get size of subtest in long words
+		movea.l	infoPtr(a0),a2				;get the pointer to the storage area
+@loadLoop
+		move.l	(a1)+,(a2)+					;move the data into the RAM area
+		dbra.w	d0,@loadLoop
+		
+		movea.l	infoPtr(a0),a2				;get the pointer to the storage area again
+		add.l	d1,STEntryPtr(a2)			;dereference the entry pointer			<T12>
+		add.l	d1,STNamePtr(a2)			;and the name pointer					<T12>
+	ENDWITH
+
+	movem.l	(sp)+,a1/a2/d0/d1		;restore some regs
+	unlk	a0						;get rid of our local storage					<SM3> rb, end
+	rts
+
+
+
+;_______________________________________________________________________
+;	USTPmgrTurnOn
+;
+;	Written by:  Scott Smyers	11/90
+;
+;	This routine sends a command to the power manager.  It requires the
+;	following information:
+;
+;		a0-	Decoder info pointer
+;		a6-	return address
+;
+;	register usage:
+;
+;		a2-	destroyed
+;		a3-	destroyed
+;		a5-	destroyed
+;		d3-	destroyed
+;		d4-	destroyed
+;
+;		d6-	status:
+;			0 - success
+;			1 - PMGR not ready
+;			2 - PMGR timeout during handshake
+;
+;_______________________________________________________________________
+
+USTPmgrTurnOn
+		MOVE.L	DefExtFeatures(A0),D3			; get the external features flags	<H6>
+		BTST	#ProductInfo.MSCChipBit,D3		; are we on an MSC-based system?	<H6>
+		BEQ.S	@NoMSC							; -> nope, continue					<H6>
+		MOVEA.L	RBVAddr(A0),A2					; point to the base of the MSC		<H6>
+		BSET	#MSCSCCClk,MSCClkCntl(A2)		; turn on SCC clock (PMGR doesn't	<H6>
+@NoMSC											;  control SCC in our case)			<H6>
+
+		MOVE.L	#((iwmOn|sccOn|serOn|ascOn)<<16)+\	;  data = what to turn on			<H2>
+				 (1<<8)+\							;  length = 1						<H2>
+				 (powerCntl<<0),D3					;  command = power control			<H2>
+;		BRA		USTPMgrSendCommand					; send the command					<H2>
+	
+
+;_______________________________________________________________________			<H2>
+;
+;	USTPMGRSendCommand - sends a command and 0-2 data bytes to the PMGR.
+;
+;	This routine is generally used for fixed-length commands, however
+;	by passing in a negative number for the length, it will exit after
+;	sending the command byte, permitting the true length byte to be sent.
+;
+;	Inputs:
+;
+;		D3- [data2] [data1] [length] [command]
+;		A0- pointer to DecoderInfo
+;		A6- return address
+;
+;	Outputs:
+;
+;		D6-	result:
+;			0 - success
+;			1 - PMGR not ready
+;			2 - PMGR timeout during handshake
+;
+;	Uses:
+;
+;		D3- gets trashed
+;		D4- timeout counter from USTPMGRSendByte; bit 31=1 if serial interface,new protocol
+;		A2- base address of VIA1
+;		A3- base address of VIA2
+;		A5- return address
+;_______________________________________________________________________
+
+PMack		EQU		v2PMack
+PMreq		EQU		v2PMreq
+PMbuf		EQU		vBufAH
+PMbufDir	EQU		vDirA
+
+USTPMGRSendCommand
+		WITH DecoderInfo,ProductInfo
+			MOVEA.L	VIA1Addr(A0),A2		; point to the base of VIA1
+			MOVE.L	VIA2Addr(A0),D6		;  and VIA2										<H8>
+			BNE.S	@HaveVIA2			; -> VIA2 exists
+			MOVE.L	RBVAddr(A0),D6		; otherwise use the RBV look-alike				<H8>
+@HaveVIA2	MOVEA.L	D6,A3				;												<H8>
+		ENDWITH
+
+			MOVEQ	#1,D6				; assume pmgr not ready
+			MOVE.W	#32*nTicks,D4		; use 32ms timeout (based on VIA access)
+@WaitAckHi	TST.B	(A2)				; (throttle execution speed with a VIA access)	<H3>
+			BTST.B	#PMack,(A3)			; wait for /ack to go high
+			DBNE	D4,@WaitAckHi		; -> keep waiting
+			BEQ.S	@Done				; -> timed out
+
+			BSR5	USTPMGRSendByte		; send the command byte
+			BNE.S	@Done				; -> timed out									<H3>
+
+			ASR.W	#8,D3				; shift the length into the next position		<H8>
+			BMI.S	@Done				; -> variable length command: bail now			<H8>
+			TST.L	D4					; do we need to send the length?
+			BMI.S	@NoLength
+			BSR5	USTPMGRSendByte		; yes, send it
+			BNE.S	@Done				; -> timed out									<H3>
+
+@NoLength	SUBQ.B	#1,D3				; any data?
+			BMI.S	@Done				; -> no, done
+			SWAP	D3					; get the first data byte
+			BSR5	USTPMGRSendByte		;  and send it
+			BNE.S	@Done				; -> timed out									<H3>
+			SWAP	D3					; get the count back
+
+			SUBQ.B	#1,D3				; any data?
+			BMI.S	@Done				; -> no, done
+			SWAP	D3					; get the second data byte,
+			LSR.W	#8,D3				;  shift it into position,
+			BSR5	USTPMGRSendByte		;  and send it
+
+@Done		TST.L	D6					; set up the CCR								<H3>
+			RTS6
+
+
+ReadPramSig
+;_______________________________________________________________________
+;
+; ReadPramSig - Universal Start Test read 4 byte signature from parameter RAM
+;
+;	Written by:  Scott Smyers	2/91
+;
+;	This routine reads a 4 byte signature from parameter RAM.  It requires the
+;	following information:
+;
+;		a1- base address of ProductInfo record
+;		a2- VIA1 base address
+;		a6- return address
+;
+;		d3.w- PRAM start address of 4 byte signature - must be on a long word boundary
+;				(i.e., low order 2 bits must be zero)
+;
+;	registers destroyed:
+;		d0-2/d5, a3-6 and the low word of d3
+;
+;	Output:
+;		d4 - contains the long word signature
+;
+;_______________________________________________________________________
+
+
+		move.l	a6,d5			;save the return address
+		
+@next	move.w	d3,d1			;d1 = address to read from Pram						<v1.1><7><9>
+		BSR6	RdXByte 		;go read the byte									<v1.1><7><9>
+		rol.l	#8,d4			;Accumulate signature bytes in D4					<7><9>
+		move.b	d1,d4			;													<7><9>
+		addq.w	#1,d3			;increase by one									<v1.1><7><9>
+		move.w	d3,d1			;See if we've read all the signature bytes			<9>
+		and.w	#$03,d1			;low nibble will wrap if so							<9>
+		bne.s	@next			;Continue if not									<7><9>
+
+		movea.l	d5,a6
+	RTS6
+
+USTPMGRSendByte
+;_______________________________________________________________________
+;
+; USTPMGRSendByte - Universal Start Test Power Manager Send Byte
+;
+;	Written by:  Scott Smyers	11/90
+;
+;	This routine sends a single byte to the power manager.  It requires the
+;	following information:
+;
+;		a0- pointer to decoder info													<H2>
+;		a2- base address of VIA1													<H2>
+;		a3-	base address of VIA2
+;		a5-	return address
+;		d3-	byte to send to the pmgr
+;
+;	register usage:
+;
+;		d4-	destroyed, but bit 31=1 if new (serial) interface, else bit 31=0
+;
+;		d6-	status:
+;			0 - success
+;			2 - PMGR timeout during handshake
+;
+;_______________________________________________________________________
+
+	move.w	#32*nTicks,d4		; 32ms timeout										<H8>
+	BCLR	#31,D4				; clear the serial flag								<H8>
+	WITH ProductInfo			;													<H2>
+	BTST	#PMgrNewIntf//8,DefExtFeatures+3-(PMgrNewIntf/8)(A0)
+								; parallel interface?								<H2>
+	ENDWITH						;													<H2>
+	BEQ.S	@IsParallel			; -> yes											<H2>
+	MOVEA.L	RBVAddr(A0),A3		; serial interface is in a RBV look-alike			<H2>
+	BSET	#31,D4				; mark this as a serial interface					<H2>
+	BSET	#4,vACR(A2)			; set shift register to shift out under ext clock	<H2>
+	MOVE.B	D3,vSR(A2)			; write out the byte to the shift register			<H2>
+	BRA.S	@DropReq			;													<H2>
+
+@IsParallel						;													<H2>
+	move.b	#$FF,PMbufDir(a3)	;Make VIA port an output
+	move.b	d3,PMbuf(a3)		;put the data byte on the bus
+
+@DropReq						;													<H2>
+	moveq.l	#2,d6				;assume pmgr timeout error
+
+	bclr.b	#PMreq,(a3)			;lower the request line
+	
+@ackOn
+	TST.B	(A2)				; (throttle execution speed with a VIA access)		<H2>
+	btst.b	#PMack,(a3)			;wait for ack to go low
+	dbeq.w	d4,@ackOn			;loop until timeout or ack
+	bne.s	@Error				;error out if timeout
+	
+	move.w	#nTicks/8,d4		; use 125usec timeout								<H2>
+	bset.b	#PMreq,(a3)			;turn off request line
+	
+@ackOff
+	TST.B	(A2)				; (throttle execution speed with a VIA access)		<H2>
+	btst.b	#PMack,(a3)			;wait for ack to go high
+	dbne.w	d4,@ackOff			;keep going until high or timeout
+	beq.s	@Error				;error out if timeout (ack still low)
+	
+	moveq.l	#0,d6				;all's well
+@Error
+	bset	#PMreq,(a3)			;turn off request line
+
+	TST.L	D4					; serial interface?									<H2>
+	BMI.S	@IsSerial			; -> yes, don't touch port A stuff					<H2>
+	move.b	#0,PMBufDir(a3)		;make port an input
+@IsSerial						;													<H2>
+	tst.l	d6					;return with state of d6 in the Z bit
+	RTS5						;and return
+
+
+;_______________________________________________________________________			<H3>
+;
+; USTPMGRRecvByte - Universal Start Test Power Manager Receive Byte
+;
+;	This routine receives a single byte from the power manager.
+;	It requires the following information:
+;
+;		A0- pointer to decoder info
+;		A2- base address of VIA1
+;		A3-	base address of VIA2
+;		A5-	return address
+;		D3-	byte to send to the pmgr
+;
+;	register usage:
+;
+;		D4-	destroyed, but bit 31=1 if new (serial) interface, else bit 31=0
+;
+;		D6-	status:
+;			0 - success
+;			2 - PMGR timeout during handshake
+;
+;_______________________________________________________________________
+
+USTPMGRRecvByte
+			MOVEQ	#2,D6				; assume PMGR timeout
+			move.w	#32*nTicks,d4		; 32ms timeout								<H8>
+			BCLR	#31,D4				; clear serial flag (bit 31)				<H8>
+			WITH ProductInfo
+			BTST	#PMgrNewIntf//8,DefExtFeatures+3-(PMgrNewIntf/8)(A0)
+										; parallel interface?
+			ENDWITH
+			BEQ.S	@IsParallel			; -> yes
+			MOVE.L	VIA2Addr(A0),D6		;  and VIA2									<K5>
+			BNE.S	@HaveVIA2			; -> VIA2 exists
+			MOVE.L	RBVAddr(A0),D6		; otherwise use the RBV look-alike			<K5>
+@HaveVIA2	
+			MOVEA.L	D6,A3				;											<K5>
+			BSET	#31,D4				; mark this as a serial interface
+
+			MOVE.B	vACR(A2),D4			; set shift register to shift in under external clock
+			AND.B	#$EF,D4
+			ORI.B	#%00001100,D4		; set up shift register		
+			MOVE.B	D4,vACR(A2)			; set up shift register		
+
+			TST.B	vSR(A2)				; read a byte to reset the shifter
+
+			BCLR	#PMreq,(A3)			; assert /req to start the handshake
+
+@Wait4AckLo	TST.B	(A2)				; (throttle execution speed with a VIA access)
+			BTST	#PMack,(A3)			; wait for /ack to go low
+			DBEQ	D4,@Wait4AckLo		; -> loop until timeout or ack
+			BNE.S	@Error				; -> timed out
+
+			BSET	#PMreq,(A3)			; de-assert /req since we've seen /ack asserted
+
+			MOVE.W	#nTicks/8,D4		; use 125usec timeout
+@Wait4AckHi	TST.B	(A2)				; (throttle execution speed with a VIA access)
+			BTST	#PMack,(A3)			; wait for /ack to go high
+			DBNE	D4,@Wait4AckHi		; -> loop until timeout or ack
+			BEQ.S	@Error				; -> timed out
+
+			MOVE.B	vSR(A2),D3			; read in the byte
+			BRA.S	@Success
+
+
+@IsParallel	MOVE.B	#$00,PMBufDir(A3)	; make the data port an input
+
+@AckOn		TST.B	(A2)				; (throttle execution speed with a VIA access)
+			BTST	#PMack,(A3)			; wait for /ack to go low
+			DBEQ	D4,@AckOn			; -> loop until timeout or ack
+			BNE.S	@Error				; -> timed out
+
+			BCLR	#PMreq,(A3)			; assert the /req line
+
+			MOVE.B	PMbuf(A3),D3		; read in the byte
+
+			MOVE.W	#nTicks/8,D4		; use 125usec timeout
+@AckOff		TST.B	(A2)				; (throttle execution speed with a VIA access)
+			BTST	#PMack,(A3)			; wait for /ack to go high
+			DBNE	D4,@AckOff			; -> loop until timeout or ack
+			BEQ.S	@Error				; -> timed out
+
+@Success	MOVEQ	#0,D6				; success!
+
+@Error		BSET	#PMreq,(A3)			; be sure /req is not asserted
+			TST.L	D4					; serial or parallel interface?
+			BMI.S	@IsSerial
+			MOVE.B	#0,PMBufDir(A2)		; switch the data port back to an input
+			BRA.S	@Done
+
+@IsSerial	ORI.B	#%00011100,vACR(A1)	; make the shift register shift out					<K5>
+@Done		TST.L	D6					; return with BEQ for no error, BNE for error
+			RTS5
+
+	
+;
+; This is the list of machines which were introduced after the macLC
+; which have a factory edge connector.  For these machines, the test
+; of the burnin jumper is still performed.
+;
+
+PostLC_BIJumper_boxes
+	dc.b	boxQuadra900
+	dc.b	boxQuadra700
+	dc.b	boxClassicII	; <SM9> CSS
+	dc.b	boxQuadra950	;																<Z15><H5>
+	dc.b	boxMacLCII		; <SM17>
+	dc.b	boxUnknown		;table terminator
+
+;________________________________________________________________________________________	<MC3>
+;
+; Routine:	NuBusReset
+;
+; Inputs:	a0		Pointer to DecoderInfo record for this machine
+;			d0 		Flags indicating which base addresses are valid #32-63
+; Outputs:	...
+;
+; Trashes:	Tons of stuff.
+;
+; Function:	If we have a BART NuBus controller, tell it to pulse the NuBus reset (1ms).
+;			This is needed because on a soft restart, the NuBus reset line doesn't get
+;			asserted.
+;________________________________________________________________________________________
+
+NuBusReset	
+		WITH	DecoderInfo
+
+			btst	#BARTExists-32,d0				; do we have BART?
+			beq.s	@exit
+			
+			move.l	BARTAddr(a0),a0					; get address of BART
+			move.b	#$80,(a0)						; drive reset
+			
+			BigBSR6	GetCPUIDReg						; Get the CPU id
+			cmpi.w	#$3011,D0						; Is this a single slot PDM-style machine w/bart?
+			beq.s	@exit							; -> Yes, do not disable the only real slot we have!
+			
+			move.b	#$80,$11(a0)					; Disable slot E irqs from BART
+						
+@exit		RTS5									; and return
+
+
+
+;________________________________________________________________________________________	<MC6>
+;
+; Routine:	BSR5 PDS_Reset
+;
+; Inputs:	vbr		setup for bus-error
+; Outputs:	none
+;
+; Trashes:	d0-d1,a0-a1,a6
+;
+; Function:	This code will check the DECL ROM for a signature indicating an HPV or Planaria
+;			card (or even a third party card).  If one exists, it will hit the hardware to 
+;			simulate a card reset, so we don't leave video hanging around until PrimaryInit 
+;			time.  The routine is hard coded for Slot E, and assumes 1 byte lane cards.
+;
+;			This signature is located 64 bytes from the end of the ROM, and is followed by
+;			an 8 byte address (the register to hit), then by a single byte to write to that
+;			address:
+;
+;			For example, suppose that the 'reset' address is $fec00043, and we want to write
+;			a $07 there.  Then starting at address $1ffc0 of a 128k byte config ROM, we would
+;			place the following data:
+;		
+;			$1ffc0: dc.l	$56696452
+;					dc.l	$65736574
+;					dc.l	$fec00043
+;					dc.b	$07
+;________________________________________________________________________________________
+DeclSigAddr	EQU		$feffff00						; location of the signature (assumes 1 byte lane, lane 3)
+		
+		WITH	ProductInfo
+
+PDS_Reset	
+			cmp.b	#HMCDecoder, DecoderKind(a1)	; are we a PDM?  
+			bne.s	@exit							; no, do nothing	
+			
+			move.l	a5,d0							; save return address
+			bset	#beok,d7						; we're expecting a bus error potentially
+			move.l	sp,a5							; save stack pointer
+			lea		@busErr,a6						; load return address (in case we take the bus error)
+			tst.l	DeclSigAddr						; first, see if we can access the PDS slot (slot E)?
+			move.l	d0,a5							; restore return address
+			
+			lea		DeclSigAddr,a0					; get address at end of DeclROM where signature lives
+			lea		ResetSignature,a1				; second, check for the signature
+			moveq	#8-1,d1
+@loop		move.b	(a0),d0							; get next byte from DECL ROM
+			addq.l	#4,a0
+			cmp.b	(a1)+,d0						; does it match?
+			dbne	d1,@loop						; yes, check rest of signature
+			bne.s	@exit							; no, exit
+			moveq	#4-1,d1							; signature matched, get next 4 bytes to form address
+@addrLoop	lsl.l	#8,d0							; make room for next byte of address
+			move.b	(a0),d0							; get next byte
+			addq.l	#4,a0							; bump to next position in DECL ROM
+			dbra	d1,@addrLoop
+			move.l	d0,a1							; get complete address
+			
+			move.b	(a0),(a1)						; write the following byte to that address (to reset the card)
+			bra.s	@exit							; and we're done
+			
+@busErr		movea.l	d0,a5							; restore return address			
+@exit		RTS5
+
+	ENDWITH
+	
+ResetSignature
+			dc.l	$56696452
+			dc.l	$65736574
+
+
+
+
+
+	ENDPROC

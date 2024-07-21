@@ -1,0 +1,979 @@
+;
+;	File:		Graf3DAsm.a
+;
+;	Copyright:	© 1984-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	10/28/92	SWC		Changed INCLUDEs to a LOAD of StandardEqu.d.
+;
+
+		LOAD	'StandardEqu.d'
+		INCLUDE 'FixMath.a'
+        
+	
+FixRad		EQU	3754936		;radConst = 57.29578
+FracRad		EQU	1073741824
+
+;offsets
+
+;Point3D and Point2D
+x			EQU	0			;Fixed
+y			EQU	4			;Fixed
+z			EQU	8			;Fixed
+
+
+;XfMatrix  = ARRAY[0..3,0..3] OF fixed
+xf00		EQU	0
+xf01		EQU	4
+xf02		EQU	8
+xf03		EQU	12
+xf10		EQU	16
+xf11		EQU	20
+xf12		EQU	24
+xf13		EQU	28
+xf20		EQU	32
+xf21		EQU	36
+xf22		EQU	40
+xf23		EQU	44
+xf30		EQU	48
+xf31		EQU	52
+xf32		EQU	56
+xf33		EQU	60
+
+;Port3D
+GrPort		EQU	0		;GrafPtr
+viewRect	EQU	4		;Rect
+xLeft		EQU	12		;Fixed
+yTop		EQU	16		;Fixed
+xRight		EQU	20		;Fixed
+yBottom		EQU	24		;Fixed
+pen			EQU	28		;Point3D
+penPrime	EQU	40		;Point3D
+eye			EQU	52		;Point3D
+hSize		EQU	64		;Fixed
+vSize		EQU	68		;Fixed
+hCenter		EQU	72		;Fixed
+vCenter		EQU	76		;Fixed
+xCotan		EQU	80		;Fixed
+yCotan		EQU	84		;Fixed
+ident		EQU	88		;BOOLEAN
+xForm		EQU	90		;XfMatrix
+szPort3D	EQU	154		;size of Port3D
+
+GRAF3D	PROC       EXPORT
+
+;GRAF3DIMPL translated into assembly, a little at a time
+		
+		EXPORT	InitGrf3D
+
+InitGrf3D							;PROCEDURE InitGrf3D(globalPtr: Ptr);
+       
+		MOVE.L  (SP)+,A0
+        MOVE.L  (SP)+,4(A5)
+        JMP     (A0)
+
+
+        EXPORT   SetPort3D			;PROCEDURE SetPort3D(port: Port3DPtr);
+        EXPORT   GetPort3D
+
+;change to another Port3D
+
+SetPort3D
+		
+		MOVE.L  4(SP),A0			;port
+        MOVE.L  4(A5),A1
+        MOVE.L  A0,(A1)				;thePort3D := port;
+        MOVE.L  GrPort(A0),-(SP)	;port^.GPort
+        _SetPort					;SetPort(port^.GPort);
+popRet  MOVE.L  (SP)+,(SP)			;pop param off stack
+        RTS			        		;END;
+
+
+GetPort3D							;PROCEDURE GetPort3D(VAR port: Port3DPtr);
+
+;inquire the current Port3D
+									;BEGIN
+        MOVE.L  4(A5),A0			;VAR port
+        MOVE.L  4(SP),A1
+        MOVE.L  (A0),(A1)			;port := thePort3D;
+        BRA.S   popRet				;pop param off stack
+
+		;PROCEDURE Open3DPort(port:Port3DPtr); 
+		
+		EXPORT	Open3DPort			
+        EXPORT	MoveTo2D, MoveTo3D, LineTo2D, LineTo3D
+        EXPORT	Move2D, Move3D, Line2D, Line3D
+        EXPORT	ViewAngle, Identity, TransForm, Clip3D
+        EXPORT	ViewPort, LookAt
+
+;initialize all values in port^ to their defaults
+
+Open3DPort
+		MOVE.L  A2,-(SP)	        ;BEGIN
+        MOVE.L  8(SP),A1	        ;port
+        MOVE.L  4(A5),A0
+        MOVE.L  A1,(A0)		        ;thePort3D := port;
+        MOVE.L  (A5),A0		        ;get globals
+        MOVE.L  (A0),GrPort(A1)	    ;port^.GPort := thePort;
+        MOVE.L  (A0),A0		        ;thePort^
+        LEA     portRect(A0),A2	    ;WITH thePort^.portRect DO
+        MOVE.L  A2,-(SP)	        ;thePort^.portRect
+        BSR     ViewPort	        ;ViewPort(thePort^.portRect);
+        MOVEQ   #7,D0
+@1      CLR.L   -(SP)
+        DBRA    D0,@1		        ;clear 8 longs on the stack for later operations
+        MOVE    (A2)+,12(SP)	    ;put left, right, top, bottom in high words as fixed #s
+        MOVE    (A2)+,8(SP)
+        MOVE    (A2)+,4(SP)
+        MOVE    (A2),(SP)
+        BSR     LookAt		        ;LookAt(FixRatio(left,1), FixRatio(top,1), FixRatio(right,1), FixRatio(bottom,1));
+        BSR     ViewAngle	        ;ViewAngle(0)
+        BSR     Identity	        ;Identity
+        BSR.S	MoveTo3D	        ;MoveTo3D(0, 0, 0)
+        MOVE.L  (SP)+,A2	        ;preserved reg.
+        MOVE.L  (SP)+,(SP)	        ;return address
+        RTS			        		;END
+
+
+MoveTo3D							;PROCEDURE MoveTo3D(x, y, z: fixed);
+
+;Move from current position to x,y,z without drawing
+
+pt1		 EQU	 -4					;POINT
+pt2	 	 EQU	 -8					;POINT
+oldPrime EQU	 -20		        ;Point3D
+local	 EQU	 -24		        ;local return address
+
+          BSR.S	 CmnTo3D
+          BEQ.S	 dontMove
+          MOVE.L pt2(A6),-(SP)
+          _MoveTo					;THEN MoveTo(pt2.H, pt2.V);
+dontMove  MOVE.L (SP)+,A2
+          UNLK	 A6
+          MOVE.L (SP),A0
+          ADD	 #16,SP
+          JMP	 (A0)		        ;END
+
+CmnTo3D	  MOVE.L (SP)+,D0	        ;local return address
+          LINK	 A6,#local	        ;BEGIN
+          MOVE.L D0,local(A6)	    ;save local return
+          MOVE.L A2,-(SP)
+          MOVE.L 4(A5),A2	        ;WITH thePort3D^ DO
+          MOVE.L (A2),A2
+          LEA	 penPrime(A2),A0    ;BEGIN
+          LEA	 oldPrime(A6),A1    ;oldPrime := penPrime
+          MOVE.L (A0)+,(A1)+
+          MOVE.L (A0)+,(A1)+
+          MOVE.L (A0),(A1)
+          LEA	 20(A6),A0			;x
+          LEA	 pen+x(A2),A1		;pen + x
+          MOVE.L -(A0),(A1)+		;pen.x := x;
+          MOVE.L -(A0),(A1)+		;pen.y := y;
+          MOVE.L -(A0),(A1)			;pen.z := z;
+          PEA	 pen(A2)
+          PEA	 penPrime(A2)	    ;
+          BSR	 TransForm	        ;TransForm(pen, penPrime);
+          SUBQ	 #2,SP		        ;room for result
+          PEA	 oldPrime(A6)
+          PEA	 penPrime(A2)
+          PEA	 pt1(A6)
+          PEA	 pt2(A6)
+          BSR	 Clip3D		        ;IF Clip3D(oldPrime, penPrime, pt1, pt2)
+          MOVE.B (SP)+,D0
+          MOVE.L local(A6),A0	    ;retrieve local return
+          JMP	 (A0)
+
+
+LineTo3D			        		;PROCEDURE LineTo3D(x, y, z: fixed);
+
+;nearly the same as MoveTo3D, just moveTo pt1, LineTo pt2
+          
+		  BSR.S	 CmnTo3D
+          BEQ.S	 dontMove
+	  	  _HidePen					;changed to support Polygons
+          MOVE.L pt1(A6),-(SP)
+          _LineTo		        	;THEN MoveTo(pt1.h, pt1.v);
+	  	  _ShowPen
+          MOVE.L pt2(A6),-(SP)	    ;LineTo(pt2.h, pt2.v);
+          _LineTo
+          BRA.S	 dontMove
+
+Move3D				        		;PROCEDURE Move3D(dx, dy, dz: fixed);
+          BSR.S	 Cmn3D
+          BRA.S  MoveTo3D	        ;MoveTo3D(pen.x + dx, pen.y + dy, pen.z + dz)
+
+Cmn3D	  MOVE.L (SP)+,D2	        ;save ret. address
+          MOVE.L 4(A5),A0	        ;thePort3D
+          MOVE.L (A0),A0
+          LEA	 pen(A0),A0	        ;thePort3D^.pen
+          LEA	 16(SP),A1	        ;add 4 for the predecrement
+          MOVEQ	 #2,D1		        ;3 times, for x, y and z
+@0	  	  MOVE.L (A0)+,D0
+          ADD.L	 D0,-(A1)	        ;pen.? + d?
+          DBRA	 D1,@0		        ;WITH thePort3D^ DO
+          MOVE.L D2,A0		        ;get ret. addr.
+          JMP	 (A0)
+
+Line3D				        		;PROCEDURE Line3D(dx, dy, dz: fixed);
+          BSR.S	 Cmn3D
+          BRA.S	 LineTo3D	        ;LineTo3D(pen.x + dx, pen.y + dy, pen.z + dz)
+
+MoveTo2D			        		;PROCEDURE MoveTo2D(x, y: fixed);
+          BSR.S	 CmnTo2D
+          BRA.S	 MoveTo3D	        ;MoveTo3D(x, y, thePort3D^.pen.z);
+
+CmnTo2D	  MOVE.L (SP)+,A1	        ;save return address
+          MOVE.L (SP),-(SP)	        ;get prior return address
+          MOVE.L 4(A5),A0	        ;thePort3D
+          MOVE.L (A0),A0
+          MOVE.L pen+z(A0),4(SP)
+          JMP	 (A1)
+
+Move2D				        		;PROCEDURE Move2D(dx, dy: fixed);
+          BSR.S	 Cmd2D
+          BRA.S	 Move3D		        ;Move3D(dx, dy, 0);
+
+Cmd2D	  MOVE.L (SP)+,A0	        ;save local return address
+          MOVE.L (SP),-(SP)	        ;move Move2D return address
+          CLR.L  4(SP)	        	; to make room for '0'
+          JMP	 (A0)
+
+LineTo2D			        		;PROCEDURE LineTo2D(x, y: fixed);
+          BSR.S	 CmnTo2D
+          BRA.S	 LineTo3D	        ;LineTo3D(x, y, thePort3D^.pen.z);
+
+
+Line2D				        		;PROCEDURE Line2D(dx, dy: fixed);
+          BSR.S	 Cmd2D
+          BRA.S	 Line3D		        ;Line3D(dx, dy, 0);
+
+
+ViewLook			        		;PROCEDURE ViewLook
+
+;re-calculate offsets and scales after LookAt or ViewPort
+          
+		  MOVE.L 4(A5),A0	        ;WITH thePort3D^, viewRect DO
+          MOVE.L (A0),A0
+          MOVE	 viewRect+right(A0),D0
+          MOVE	 viewRect+left(A0),D2
+          SUB	 D2,D0
+          SWAP	 D0
+          CLR.W	 D0
+          ASR.L	 #1,D0
+          MOVE.L D0,hsize(A0)	   	;hSize:=(right-left)/2.0
+          SWAP	 D2
+          CLR.W	 D2
+          ADD.L	 D2,D0
+          MOVE.L D0,hCenter(A0)	    ;hCenter:=left + hSize;
+          MOVE	 viewRect+bottom(A0),D0
+          MOVE	 viewRect+top(A0),D2
+          SUB	 D2,D0
+          SWAP	 D0
+          CLR.W	 D0
+          ASR.L	 #1,D0
+          NEG.L	 D0
+          MOVE.L D0,vsize(A0)	  	;vSize:=(bottom-top)/(-2.0)
+          SWAP	 D2
+          CLR.W	 D2
+          SUB.L	 D0,D2
+          MOVE.L D2,vCenter(A0)	    ;vCenter:=top  - vSize
+          RTS
+
+
+ViewPort			        		;PROCEDURE ViewPort(r: Rect);
+
+;specify what portion of the folder to map onto
+         
+		  MOVE.L 4(A5),A0	        ;thePort3D
+          MOVE.L (A0),A0
+          LEA	 viewRect(A0),A0
+          MOVE.L (SP)+,D0	        ;save return address
+          MOVE.L (SP)+,A1	        ;thePort3D^.viewRect := r;
+          MOVE.L (A1)+,(A0)+
+          MOVE.L (A1),(A0)
+          MOVE.L D0,-(SP)	        ;restore return address
+          BRA.S	 ViewLook	        ;ViewLook;  { re-calculate scales and offsets }
+
+
+LookAt				        		;PROCEDURE LookAt(left, top, right, bottom: fixed);
+
+;specify the fixed number coordinates of the portRect
+         
+		  MOVE.L 4(A5),A0	        ;  WITH thePort3D^ DO
+          MOVE.L (A0),A0
+          MOVEQ	 #3,D0
+          LEA	 xLeft(A0),A0	    ; xLeft:= left;
+          LEA	 20(SP),A1	        ; add 4 for predecrement
+@0	  	  MOVE.L -(A1),(A0)+	    ;xRight := right;
+          DBRA	 D0,@0		        ;yBottom := bottom;
+                                    ;yTop := top;
+          MOVE.L 4(A5),A0
+          MOVE.L (A0),A0
+          MOVE.L 16(SP),D0
+          ADD.L	 8(SP),D0
+          ASR.L	 #1,D0
+          MOVE.L D0,eye+x(A0)	    ;eye.x:=(left+right)/2.0
+          MOVE.L 12(SP),D0
+          ADD.L	 4(SP),D0
+          ASR.L	 #1,D0
+          MOVE.L D0,eye+y(A0)	    ;eye.y:=(top+bottom)/2.0
+          MOVE.L (SP)+,A0	        ;save return address
+          ADD   #16,SP		        ;pop parameters
+          MOVE.L A0,-(SP)	        ;restore return address
+          BRA.S ViewLook	        ;re-calculate scales and offsets
+
+
+
+ViewAngle			        		;PROCEDURE ViewAngle(angle: fixed);
+
+;specify the horizontal angle subtended by the viewing pyramid }
+          
+		  MOVE.L A2,-(SP)
+          MOVE.L 8(SP),D0
+          MOVE.L #6553,D1
+          CMP.L	 D1,D0		        ;IF angle < 0.1 THEN angle:=0.1
+          BGE.S	 @0
+          MOVE.L D1,D0
+@0	  	  MOVE.L #117899236,D1
+          CMP.L	 D1,D0
+          BLE.S	 @1
+          MOVE.L D1,D0		        ;IF angle > 179.9 THEN angle := 179.9
+@1	  	  SUB	 #36,SP		        ;room for _FixDiv, _FracCos, _FracSin, (_FracRatio), 2 _FixMul, _FixDiv
+          MOVE.L D0,-(SP)
+          MOVE.L #7509872,-(SP)
+          
+	  	  _FixDiv		        	;angle:=angle/(2.0*radConst); } { halve angle & convert to rad }
+	      MOVE.L (SP),8(SP)	        	;put a copy on stack for Sin
+          
+	      _FracCos
+	      MOVE.L (SP)+,8(SP)	        ;save result for FracRatio
+          
+	      _FracSin
+	      _FixDiv
+	      MOVE.L 4(A5),A2
+          MOVE.L (A2),A2
+          MOVE.L (SP)+,xCotan(A2)       ;xCotan := FracRatio(FracCos(angle), FracSin(angle));   { remember for perspective calc }
+          MOVE.L xRight(A2),D0
+          SUB.L	 xLeft(A2),D0
+          MOVE.L D0,-(SP)	        	;one for FixDiv, below
+          MOVE.L yTop(A2),D0
+          SUB.L	 yBottom(A2),D0
+          MOVE.L D0,-(SP)
+          
+	      _FixDiv
+	      MOVE.L xCotan(A2),-(SP)       ;note: must divide first or overflow will occur for small angles
+          _FixMul
+          MOVE.L (SP)+,yCotan(A2)       ;yCotan:=xCotan * (xRight-xLeft)/(yTop-yBottom)
+          MOVE.L xRight(A2),D0
+          SUB.L	 xLeft(A2),D0
+          ASR.L	 #1,D0
+          MOVE.L D0,-(SP)
+          MOVE.L xCotan(A2),-(SP)
+          _FixMul
+          MOVE.L (SP)+,eye+z(A2)        ;eye.z:=xCotan * (xRight-xLeft)/2;
+          MOVE.L (SP)+,A2
+          MOVE.L (SP)+,(SP)
+          RTS
+
+
+TransForm			        			;PROCEDURE TransForm(src: Point3D; VAR dst: Point3D);
+
+;use the current xForm matrix to transform
+;a 3D source point into a 3D destination point.
+          
+		  LINK	 A6,#-12				;12 bytes off the stack, thank you
+          MOVEM.L D3/D4/A2-A4,-(SP)
+          MOVE.L 12(A6),A0
+		  LEA    -12(A6),A1
+	      MOVE.L (A0)+, (A1)+
+	      MOVE.L (A0)+, (A1)+
+	      MOVE.L (A0), (A1)
+	      MOVE.L 4(A5),A2	        	;BEGIN
+          MOVE.L (A2),A2
+          MOVE.L 8(A6),A3
+          LEA    -12(A6),A4				; oops Wargo bugo -- fixed 5/8/86
+          TST.B	 ident(A2)	        	;IF thePort3D^.ident
+          BEQ.S	 trans1
+          MOVE.L (A4)+,(A3)+
+          MOVE.L (A4)+,(A3)+
+          MOVE.L (A4),(A3)	        	;THEN dst := src
+          BRA.S	 leave
+trans1	  MOVEQ	 #8,D3		        	;do all three evaluations in this loop
+@0	  	  SUB	 #12,SP		        	;for 3 _FixMuls
+          MOVE.L x(A4),-(SP)
+          MOVE.L xForm+xF00(A2,D3),-(SP)
+          _FixMul		        		;dst.x:=src.x * xForm[0,0] +
+          MOVE.L (SP)+,D4
+          MOVE.L y(A4),-(SP)
+          MOVE.L xForm+xF10(A2,D3),-(SP)
+          _FixMul		        		; src.y * xForm[1,0] +
+          ADD.L	 (SP)+,D4
+          MOVE.L z(A4),-(SP)
+          MOVE.L xForm+xF20(A2,D3),-(SP)
+          _FixMul		        		; src.z * xForm[2,0]
+          ADD.L	 (SP)+,D4
+	  	  LEA	 xForm+xF30(A2),A0		;changed 'cause xForm+xF30(A2,D3) too big
+          ADD.L	 0(A0,D3),D4   			; + xForm[3,0];
+          MOVE.L D4,x(A3,D3)
+          SUBQ	 #4,D3	    			;dst.y := src.x * xForm[0,1] + src.y * xForm[1,1] + src.z * xForm[2,1] + xForm[3,1]
+          BPL.S	 @0	    				;dst.z := src.x * xForm[0,2] + src.y * xForm[1,2] + src.z * xForm[2,2] + xForm[3,2]
+leave	  MOVEM.L (SP)+,D3/D4/A2-A4
+          UNLK	 A6
+          MOVE.L (SP)+,A0
+          ADDQ	 #8,SP
+          JMP	 (A0)
+
+bTop	  EQU	 0
+bLeft	  EQU	 1
+bBottom	  EQU	 2
+bRight	  EQU	 3
+
+Code				        		;FUNCTION Code(pt3D: Point3D) : OutCode;
+          MOVE.L 4(SP),A0	        ;pt3D
+          MOVEQ	 #0,D1		        ;c := []
+          MOVE.L z(A0),D0
+          MOVE.L x(A0),D2
+          CMP.L	 D2,D0		        ;IF pt3D.x > pt3D.z
+          BGE.S	 @0
+          BSET	 #bRight,D1	        ;THEN c := [right]
+          BRA.S	 @1
+@0	  	  NEG.L	 D0
+          CMP.L	 D2,D0		        ;ELSE IF pt3D.x < -pt3D.z
+          BLE.S	 @1
+          BSET	 #bLeft,D1	        ;THEN c := [left];
+@1	  	  MOVE.L z(A0),D0
+          MOVE.L y(A0),D2
+          CMP.L	 D2,D0		        ;ELSE IF pt3D.y > pt3D.z
+          BGE.S	 @2
+          BSET	 #bTop,D1	        ;THEN c := c + [top]
+          BRA.S	 @3
+@2	  	  NEG.L	 D0
+          CMP.L	 D2,D0		        ;IF pt3D.y < -pt3D.z
+          BLE.S	 @3
+          BSET	 #bBottom,D1	    ;THEN c := c + [bottom]
+@3	  	  MOVE.L (SP)+,A0
+          ADDQ.L #6,SP		        ;remove parameter & function result space
+          MOVE.B D1,-(SP)	        ;return byte sized result
+          JMP	 (A0)
+
+convert	  MOVEQ	 #4,D3		        ;do 'y' first
+@0	  	  MOVE.L x(A2,D3),D0
+          SUB.L	 eye+x(A3,D3),D0
+          SUBQ	 #4,SP
+          MOVE.L D0,-(SP)
+          MOVE.L xCotan(A3,D3),-(SP)
+          _FixMul
+          MOVE.L (SP)+,x(A2,D3)	    ;src1.y := (src1.y - eye.y) * yCotan
+          SUBQ	 #4,D3		        ;src1.x := (src1.x - eye.x) * xCotan;
+          BPL.S	 @0
+
+          MOVE.L eye+z(A3),D0
+          SUB.L	 z(A2),D0
+          MOVE.L D0,z(A2)	        ;src1.z := eye.z - src1.z
+          RTS
+
+Clip3D			      				;FUNCTION	 Clip3D(src1, src2: Point3D; VAR dst1, dst2: POINT) : BOOLEAN;
+
+;do full 3D clipping to viewing pyramid and return 2D
+;screen coords in dst.  Function value true if visible.
+;	  D3 = c		        A2 = src1, scratch across ROM calls
+;	  D4 = c * [left, right]        A3 = thePort3D^
+;	  D5 = _FixMul, _FFixMul flag   A4 = src2, scratch
+;	  D6 = t*(src2.z-src1.z),etc.
+;	  D7 = Clip3D result flag
+
+dst2		EQU  8
+dst1		EQU  12
+src2		EQU  16
+src1		EQU  20
+
+c1			EQU  -1		        ;SET OF (left,top,right,bottom)
+c2			EQU  -2		        ;SET OF (left,top,right,bottom)
+pt3D		EQU  -14		    ;Point3D
+src1copy	EQU  -26
+src2copy	EQU  -38
+
+          LINK	 A6,#src2copy
+          MOVEM.L D3-D7/A2-A4,-(SP)	 ;BEGIN
+          MOVE.L src1(A6),A0
+          LEA	 src1copy(A6),A1
+          MOVE.L (A0)+,(A1)+
+          MOVE.L (A0)+,(A1)+
+          MOVE.L (A0),(A1)
+          MOVE.L src2(A6),A0
+          LEA	 src2copy(A6),A1
+          MOVE.L (A0)+,(A1)+
+          MOVE.L (A0)+,(A1)+
+          MOVE.L (A0),(A1)
+          MOVEQ	 #0,D7			 	;Clip3D:=FALSE
+          MOVE.L 4(A5),A3		 	;WITH thePort3D^ DO
+          MOVE.L (A3),A3
+          LEA	 src1Copy(A6),A2
+          BSR.S	 convert
+          SUBQ	 #4,SP			 	;reserve room for 2 calls to Code
+          MOVE.L A2,-(SP)
+          BSR.S	 Code			 	;c1 := Code(src1)
+          MOVE.B (SP)+,c1(A6)
+
+          LEA	 src2Copy(A6),A2	;src2.x := (src2.x - eye.x) * xCotan
+          BSR.S	 convert		 	;src2.y := (src2.y - eye.y) * yCotan
+                                    ;src2.z := eye.z - src2.z;
+          MOVE.L A2,-(SP)
+          BSR	 Code			 	;c2 := Code(src2)
+          MOVE.B (SP)+,c2(A6)
+
+while					 			;WHILE c1 + c2 <> [] DO
+          MOVE.B c2(A6),D0
+          MOVE.B c1(A6),D3
+          MOVE.B D0,D2
+          OR.B	 D3,D2
+          BEQ	 endWhile
+
+          MOVE.B D0,D2
+          AND.B	 D3,D2			 	;IF c1 * c2 <> [] THEN GOTO 0; { both out on same side }
+          BNE	 endItAll
+
+          TST.B	 D3
+          BNE.S	 @0
+          MOVE.B D0,D3			 	;c := c1; IF c = [] THEN c := c2
+@0	  	  LEA	 src1Copy(A6),A2
+          LEA	 src2Copy(A6),A4
+
+          MOVE.L z(A2),D0
+          BTST	 #bLeft,D3		  	;IF left IN c THEN
+          BEQ.S	 @1
+          ADD.L	 x(A2),D0		 	;calc intersect with left edge
+          MOVE.L D0,D1			 	;num := src1.z + src1.x
+          SUB.L	 x(A4),D1		 	;denom := (src1.x-src2.x) - (src2.z-src1.z)
+          BRA.S	 @4
+@1	  	  BTST	 #bRight,D3		  	;ELSE IF right IN c THEN
+          BEQ.S	 @2
+          SUB.L	 x(A2),D0		 	;calc intersect with right edge
+          MOVE.L D0,D1			 	;num := src1.z-src1.x
+          ADD.L	 x(A4),D1		 	;denom := (src2.x-src1.x) - (src2.z-src1.z)
+          BRA.S	 @4
+@2	  	  BTST	 #bBottom,D3		;ELSE IF bottom IN c THEN
+          BEQ.S	 @3
+          ADD.L	 y(A2),D0		 	;calc intersect with bottom edge
+          MOVE.L D0,D1			 	;num := src1.z + src1.y
+          SUB.L	 y(A4),D1		 	;denom := (src1.y-src2.y) - (src2.z-src1.z)
+          BRA.S	 @4
+@3	  	  BTST	 #bTop,D3		  	;ELSE IF top IN c THEN
+          BEQ.S	 @4
+          SUB.L	 y(A2),D0		 	;calc intersect with bottom edge
+          MOVE.L D0,D1			 	;num := src1.z - src1.y
+          ADD.L	 y(A4),D1
+@4	  	  SUB.L	 z(A4),D1		 	;denom := (src2.y-src1.y) - (src2.z-src1.z)
+
+          SUBQ.L #4,SP
+          MOVE.L D0,-(SP)		 	;num   (for FFixRatio later, if needed)
+          MOVE.L D1,-(SP)		 	;denom
+          SUBQ.L #4,SP
+          MOVE.L D0,-(SP)		 	;num
+          MOVE.L D1,-(SP)		 	;denom
+          
+	  
+	  	  _FixDiv
+	  	  MOVE.L (SP),D0		 	;t := FixDiv(num, denom);
+          BPL.S	 @5
+          NEG.L	 D0
+@5	  	  CMP.L	 #$00020000,D0		;IF ABS(t) < 131072 { < 2} THEN
+          BGE.S	 @9
+          MOVEQ	 #1,D5			 	;set _FFixMul flag
+          ADDQ	 #4,SP			 	;throw away _FixDiv result
+          
+	  	  _FracDiv
+	  	  MOVE.L (SP),-(SP)		;room for 2nd FixMul result, copy t for 2nd FixMul
+          SUBQ	 #8,SP			;room for 1st FixMul result, t for 1st FixMul
+          MOVE.L 8(SP),(SP)		;copy t for 1st FixMul
+@55	  	  MOVE.L z(A4),D0
+          SUB.L	 z(A2),D0
+          BSR.S	 @8			 	;_FFixMul
+          MOVE.L (SP)+,D6		;num := FFixMul(t, src2.z - src1.z);
+
+          MOVE.L D3,D4
+          AND.B	 #$A,D4			;IF c * [left, right] <> []
+          BEQ.S	 @6
+
+          MOVE.L y(A4),D0
+          SUB.L	 y(A2),D0		;THEN t := FFixMul(t, src2.y - src1.y)
+          BRA.S	 @7
+@6	  	  MOVE.L x(A4),D0
+          SUB.L	 x(A2),D0		;ELSE t := FFixMul(t, src2.x - src1.x);
+
+@7	  	  BSR.S	 @8			 	;_FFixMul
+          BRA.S	 @10
+
+@8	  	  MOVE.L (SP)+,D7		;save return address
+          MOVE.L D0,-(SP)
+          TST	 D5
+          BNE.S	 @85
+          _FixMul
+          BRA.S	 @87
+
+@85	  	  _FracMul
+
+@87	 	  MOVE.L D7,A0
+          MOVEQ	 #0,D7
+          JMP	 (A0)
+
+@9	  	  MOVE.L (SP),8(SP)	        ;put 2nd copy on for 2nd _FixMul
+          MOVEQ	 #0,D5		        ;flag for _FixMul
+          BRA.S	 @55
+                                    ;ELSE
+                                    ;num := FixMul(t, src2.z - src1.z);
+                                    ;IF c * [left, right] <> []
+                                    ;THEN t := FixMul(t, src2.y - src1.y)
+                                    ;ELSE t := FixMul(t, src2.x - src1.x);
+
+@10	  	  ADD.L	 z(A2),D6	        ;pt3D.z:=t*(src2.z-src1.z) + src1.z;
+          MOVE.L D6,pt3D+z(A6)
+
+          MOVE.L (SP)+,D0	        ;get t*(src2.y-src1.y) from above
+          TST.B	 D4		        	;IF c * [left, right] <> []
+          BEQ.S	 @11
+          ADD.L	 y(A2),D0
+          MOVE.L D0,pt3D+y(A6)	    ;pt3D.y:=t*(src2.y-src1.y) + src1.y;
+          BRA.S	 @12
+@11	  	  ADD.L	 x(A2),D0
+          MOVE.L D0,pt3D+x(A6)	    ;pt3D.x:=t*(src2.x-src1.x) + src1.x
+@12	  	  MOVE.L pt3D+z(A6),D0
+          MOVE.L D3,D1
+          AND.B	 #6,D1		        ;left or bottom,
+          BEQ.S	 @13
+          NEG.L	 D0		        	;-pt3D.z
+@13	  	  TST.B	 D4		        	;left or right,
+          BEQ.S	 @14
+          MOVE.L D0,pt3D+x(A6)	    ;IF left IN c THEN pt3D.x := -pt3D.z ELSE
+          BRA.S	 @15		        ;IF right IN c THEN pt3D.x := pt3D.z ELSE
+@14	  	  MOVE.L D0,pt3D+y(A6)	    ;IF bottom IN c THEN pt3D.y := -pt3D.z ELSE
+                                    ;IF top IN c THEN pt3D.y := pt3D.z;
+@15	  	  LEA	 pt3D(A6),A0
+          CMP.B	 c1(A6),D3	        ;IF c = c1 THEN
+          BNE.S	 @16
+          LEA	 c1(A6),A4	        ;** note:  A4 no longer means src2
+          LEA	 src1Copy(A6),A1    ;src1 := pt3D
+          BRA.S	 @17		        ;ELSE
+@16	  	  LEA	 c2(A6),A4
+          LEA	 src2Copy(A6),A1    ;src2 := pt3D
+@17	  	  MOVE.L A1,A2		        ;** note:  A2 no longer means src1
+          MOVE.L (A0)+,(A1)+
+          MOVE.L (A0)+,(A1)+
+          MOVE.L (A0),(A1)
+          SUBQ	 #2,SP		        ;IF c = c1 THEN
+          MOVE.L A2,-(SP)	        ;c1 := Code(src1)
+                                        ;ELSE
+          BSR	 Code		        ;c2 := Code(src2)
+          MOVE.B (SP)+,(A4)
+          BRA	 while
+EndWhile
+
+;if we reach here, the line from src1 to src2 is visible
+          MOVEQ	 #1,D7		        ;Clip3D := TRUE;
+;convert clip coords to screen coords
+          LEA	 src1Copy(A6),A2
+          MOVE.L dst1(A6),A4
+          BSR.S	 figDst
+          LEA	 src2Copy(A6),A2    ;dst2.H:=ROUND(hCenter + hSize * src2.x / src2.z)
+          MOVE.L dst2(A6),A4	    ;dst2.V:=ROUND(vCenter + vSize * src2.y / src2.z)
+          BSR.S	 figDst
+
+endItAll  MOVE.B D7,24(A6)
+          MOVEM.L (SP)+,D3-D7/A2-A4
+          UNLK	 A6
+Exit20	  MOVE.L (SP),A0
+          ADD	 #20,SP
+          JMP	 (A0)
+
+figDst	  SUB   #20,SP		        ;(4 for _FixDiv, 4 for _FixMul, 2 for _FixRound) * 2
+          MOVEQ	 #4,D3		        ;do 'v', 'y' first
+@0	  	  MOVE.L hSize(A3,D3),-(SP) ;h or v = 0, 4
+          MOVE.L z(A2),-(SP)	    ;src1 or src2
+          
+	  
+	  	  _FixDiv
+	  	  MOVE.L x(A2,D3),-(SP)	    ;D3; x or y = 0, 4   {src1 or src2}
+          _FixMul
+          MOVE.L hCenter(A3,D3),D0  ;D3; h or v = 0, 4
+          ADD.L	 D0,(SP)
+          _FixRound
+          ASR	 #1,D3		        ;make 4 into 2 (or 0 into 0)
+          EOR	 #2,D3		        ;make 2 into 0 (0 into 2)
+          MOVE.W (SP)+,v(A4,D3)	    ;dst1.V:=ROUND(vCenter + vSize * src1.y / src1.z)
+          EOR	 #2,D3		        ;fix D3 back
+          SUBQ	 #2,D3		        ;dst1.H:=ROUND(hCenter + hSize * src1.x / src1.z)
+          BPL.S	 @0
+          RTS
+
+
+Identity			        		;PROCEDURE Identity;
+
+;reset the transform matrix to identity
+
+          MOVE.L 4(A5),A0	        ;WITH thePort3D^ DO
+          MOVE.L (A0),A0
+          MOVEQ	 #1,D0
+          MOVE.B D0,ident(A0)	    ;ident:=TRUE; { SET FLAG SO xForm CAN BE SKIPPED }
+          LEA	 xForm(A0),A0
+          SWAP	 D0
+          MOVEQ	 #3,D1		        ;FOR ROW:=0 TO 3 DO
+@0	  	  MOVEQ	 #3,D2		        ;FOR COL:=0 TO 3 DO
+@1	  	  CMP	 D1,D2		        ;IF ROW=COL
+          BNE.S	 @2
+          MOVE.L D0,(A0)+	        ;THEN xForm[ROW,COL]:=65536
+          BRA.S	 @3
+@2	  	  CLR.L	 (A0)+		        ;ELSE xForm[ROW,COL]:=0
+@3	  	  DBRA	 D2,@1
+          DBRA	 D1,@0
+          RTS			        	;END;
+
+
+          EXPORT	    Scale	    ;PROCEDURE Scale(xFactor, yFactor, zFactor: fixed);
+
+;change xForm matrix to provide scaling
+
+Scale     
+	  	  MOVEM.L D3-D4/A2-A3,-(SP)     ;BEGIN
+          MOVE.L 4(A5),A0	        	;WITH thePort3D^ DO
+          MOVE.L (A0),A0
+          CLR.B	 ident(A0)	        	;ident:=FALSE;
+          MOVEQ	 #3,D3		        	;FOR ROW:=0 TO 3 DO (four rows)
+          LEA	 xForm(A0),A2
+@0        LEA	 32(SP),A3	        	;xFactor + 4
+	  	  MOVEQ	 #2,D4					;three multiplies for a row
+@1	  	  SUBQ.L #4,SP
+          MOVE.L (A2),-(SP)				;xForm plus offset for each prior *
+          MOVE.L -(A3),-(SP)			;xFactor, then yFactor, then zFactor
+          _FixMul
+          MOVE.L (SP)+,(A2)+	        ;xForm[ROW,0]:=xForm[ROW,0]*xFactor;
+          DBRA	 D4,@1					;xForm[ROW,1]:=xForm[ROW,1]*yFactor
+          DBRA	 D3,@0		        	;xForm[ROW,2]:=xForm[ROW,2]*zFactor
+          MOVEM.L (SP)+,D3-D4/A2-A3
+          MOVE.L (SP),A0
+          ADD	 #16,SP
+          JMP	 (A0)		        	;END
+
+          EXPORT   Translate	        ;PROCEDURE Translate(dx, dy, dz: fixed);
+
+;change xForm matrix to translate
+
+Translate
+	  	  MOVE.L 4(A5),A0	        	;WITH thePort3D^ DO
+          MOVE.L (A0),A0
+          CLR.B	 ident(A0)	        	;ident:=FALSE;
+          LEA	 xForm+xf30(A0),A0
+          LEA	 16(SP),A1
+          MOVEQ	 #2,D1
+@0	  	  MOVE.L (A0),D0
+          ADD.L	 -(A1),D0
+          MOVE.L D0,(A0)+	        	;xForm[3,0]:=xForm[3,0]+dx;
+          DBRA	 D1,@0		        	;xForm[3,1]:=xForm[3,1]+dy;
+          MOVE.L (SP),A0
+          ADD	 #16,SP
+          JMP	 (A0)		        	;END
+
+
+          EXPORT  Yaw, Roll, Pitch
+
+RotEntry  MOVE.L (SP)+,A1	        	;return address
+          LINK	 A6,#0
+          MOVEM.L A2-A4/D3-D7,-(SP)     ;BEGIN
+          SUB	 #16,SP		        	;reserve space for FixDiv, FracSin & FracCos
+          MOVE.L 8(A6),-(SP)
+          MOVE.L #fixRad,-(SP)
+          
+	  	  _FixDiv
+
+	      MOVE.L (SP),8(SP)	        	;save result for FracCos       
+	  
+	  	   _FracSin
+
+	  	  MOVE.L (SP)+,D3	        	;si          
+	  
+	  	  _FracCos
+
+	  	  MOVE.L (SP)+,D4	        	;co
+          MOVE.L 4(A5),A4	        	;WITH thePort3D^ DO
+          MOVE.L (A4),A4
+          CLR.B	 ident(A4)	        	;ident := FALSE
+          MOVEQ	 #3,D5
+          JMP	 (A1)
+
+Yaw				        				;PROCEDURE Yaw(yAngle: fixed);
+
+;change xForm matrix to rotate yAngle degrees around y-Axis
+          
+		  BSR.S RotEntry	        	;yAngle := yAngle/radConst { convert degrees to rads }
+                                        ;si:=SIN(yAngle)
+                                        ;co:=COS(yAngle)
+                                        ;WITH thePort3D^ DO ident := FALSE;
+          LEA   xForm+xf02+48(A4),A2    ;TEMP := xForm[0,0]*co-xForm[0,2]*si (do row 3 first)
+          LEA   xForm+xf00+48(A4),A3    ;xForm[0,2] := xForm[0,0]*si+xForm[0,2]*co
+          BRA.S CmnRot		        	;xForm[0,0] := TEMP
+
+
+                                        ;TEMP := xForm[1,0]*co-xForm[1,2]*si
+                                        ;xForm[1,2] := xForm[1,0]*si+xForm[1,2]*co
+                                        ;xForm[1,0] := TEMP
+
+                                        ;TEMP := xForm[2,0]*co-xForm[2,2]*si
+                                        ;xForm[2,2] := xForm[2,0]*si+xForm[2,2]*co
+                                        ;xForm[2,0] := TEMP
+
+                                        ;TEMP := xForm[3,0]*co-xForm[3,2]*si
+                                        ;xForm[3,2] := xForm[3,0]*si+xForm[3,2]*co
+                                        ;xForm[3,0] := TEMP
+
+Roll				        			;PROCEDURE Roll(zAngle: fixed);
+
+;change xForm matrix to rotate zAngle degrees around z-Axis
+          
+		  BSR.S RotEntry	        	;zAngle := zAngle/radConst { convert degrees to rads }
+                                        ;si:=SIN(zAngle)
+                                        ;co:=COS(zAngle)
+                                        ;WITH thePort3D^ DO ident := FALSE;
+          LEA   xForm+xf00+48(A4),A2    ;TEMP := xForm[0,0]*co+xForm[0,1]*si (row 3 first)
+          LEA   xForm+xf01+48(A4),A3    ;xForm[0,1] := xForm[0,1]*co-xForm[0,0]*si
+          BRA.S CmnRot		        	;xForm[0,0] := TEMP
+
+                                        ;TEMP := xForm[1,0]*co+xForm[1,1]*si
+                                        ;xForm[1,1] := xForm[1,1]*co-xForm[1,0]*si
+                                        ;xForm[1,0] := TEMP;
+
+                                        ;TEMP := xForm[2,0]*co+xForm[2,1]*si
+                                        ;xForm[2,1] := xForm[2,1]*co-xForm[2,0]*si
+                                        ;xForm[2,0] := TEMP;
+
+                                        ;TEMP := xForm[3,0]*co+xForm[3,1]*si
+                                        ;xForm[3,1] := xForm[3,1]*co-xForm[3,0]*si
+                                        ;xForm[3,0] := TEMP
+
+
+Pitch				        			;PROCEDURE Pitch(xAngle: fixed);
+
+;change xForm matrix to rotate xAngle degrees around x-Axis
+;	  D3 = si	      A2 = xForm + xf01
+;	  D4 = co	      A3 = xForm + xf02
+;			      A4 = thePort3D^
+;	  D6 = xForm[0,1]
+;	  D7 = xForm[0,2]
+
+          BSR.S	 RotEntry
+          LEA	 xForm+xf01+48(A4),A2   ;xForm[3,1]
+          LEA	 xForm+xf02+48(A4),A3   ;xForm[3,2]
+CmnRot	  MOVE.L (A2),D6
+          MOVE.L (A3),D7
+          SUB	 #16,SP		        	;4 _FFixMuls
+          MOVE.L D6,-(SP)
+          MOVE.L D4,-(SP)
+          
+	  
+	  	  _FracMul
+
+	  	  MOVE.L (SP),4(SP)
+          MOVE.L D7,-(SP)
+          MOVE.L D3,-(SP)
+	  
+	  	  _FracMul
+
+	  	  MOVE.L (SP)+,D0
+          ADD.L	 (SP)+,D0
+          MOVE.L D0,(A2)	        ;TEMP := xForm[0,1]*co+xForm[0,2]*si;
+          MOVE.L D6,-(SP)
+          MOVE.L D3,-(SP)
+          
+	  
+	  	  _FracMul
+
+	  	  MOVE.L (SP),4(SP)
+          MOVE.L D7,-(SP)
+          MOVE.L D4,-(SP)       
+	  
+	  	  _FracMul
+
+	  	  MOVE.L (SP)+,D0
+          SUB.L	 (SP)+,D0
+          MOVE.L D0,(A3)	        	;xForm[0,2] := xForm[0,2]*co-xForm[0,1]*si
+                                        ;xForm[0,1] := TEMP
+          MOVEQ	 #16,D0		        	;TEMP:=xForm[1,1]*co+xForm[1,2]*si
+          SUB.L	 D0,A2		        	;xForm[1,2]:=xForm[1,2]*co-xForm[1,1]*si
+          SUB.L	 D0,A3
+          DBRA	 D5,CmnRot	        	;xForm[1,1] := TEMP
+          MOVEM.L (SP)+,D3-D7/A2-A4     ;TEMP:=xForm[2,1]*co+xForm[2,2]*si
+          UNLK	 A6		        		;xForm[2,2]:=xForm[2,2]*co-xForm[2,1]*si
+          MOVE.L (SP)+,(SP)	        	;xForm[2,1] := TEMP
+          RTS			        		;TEMP:=xForm[3,1]*co+xForm[3,2]*si
+                                        ;xForm[3,2]:=xForm[3,2]*co-xForm[3,1]*si
+                                        ;xForm[3,1] := TEMP
+
+
+          EXPORT	    Skew	        ;PROCEDURE Skew(zAngle: fixed);
+
+;change xForm matrix to skew zAngle degrees around z-Axis
+;x  :=  (x + y*TAN(zAngle))  zAngle limited to +-90 degrees
+
+Skew      LINK	 A6,#0
+          MOVEM.L D3/D5/A3-A4,-(SP)
+          SUB	 #16,SP			  		;space for FixDiv, FracSin, FracCos, FracRatio
+          MOVE.L 8(A6),-(SP)
+          MOVE.L #fixRad,-(SP)
+          
+	  
+	  	  _FixDiv						;{ co := COS(zAngle); }
+                                        ;{IF ABS(co) > 1.0E-5 THEN BEGIN}
+	   	  MOVE.L (SP),8(SP)	        	;copy for FracCos
+          	  
+	  	  _FracSin
+
+	  	  MOVE.L (SP)+,4(SP)	        ;move for FracRatio
+            
+	  	  _FracCos	  
+	  
+	  	  _FixDiv
+
+	  	  MOVE.L (SP)+,D3	        ;TA :=  SIN(zAngle)/co;
+
+          MOVE.L 4(A5),A4	        ;WITH thePort3D^ DO
+          MOVE.L (A4),A4
+          CLR.B	 ident(A4)	        ;ident := FALSE
+          MOVEQ	 #8,D5		        ;FOR COL := 0 TO 2
+@0	  	  LEA	 xForm+xf10(A4,D5),A3
+          MOVE.L xForm+xf00(A4,D5),-(SP)
+          MOVE.L D3,-(SP)
+          _FixMul
+          MOVE.L (SP)+,D0
+          ADD.L	 (A3),D0
+          MOVE.L D0,(A3)	        ;xForm[1,COL] := xForm[1,COL]+xForm[0,COL]*TA
+          SUBQ	 #4,D5
+          BNE.S	 @0
+          MOVEM.L (SP)+,D3/D5/A3-A4
+          UNLK	 A6
+          MOVE.L (SP)+,(SP)
+          RTS			        	;END
+
+          EXPORT   SetPt3D	        	;PROCEDURE SetPt3D(VAR pt3D: Point3D; x,y,z: fixed);
+
+SetPt3D   LEA	 20(SP),A1
+          MOVE.L -(A1),A0
+          MOVE.L -(A1),(A0)+	        ;pt3D.x := x;
+          MOVE.L -(A1),(A0)+	        ;pt3D.y := y;
+          MOVE.L -(A1),(A0)	        	;pt3D.z := z;
+          MOVE.L (SP),A0
+          ADD	 #20,SP
+          JMP	 (A0)		        	;END
+
+          EXPORT	 SetPt2D	        ;PROCEDURE SetPt2D(VAR pt2D: Point2D; x,y: fixed);
+
+SetPt2D   LEA	 16(SP),A1
+          MOVE.L -(A1),A0
+          MOVE.L -(A1),(A0)+	        ;pt2D.x := x;
+          MOVE.L -(A1),(A0)	        	;pt2D.y := y;
+          MOVE.L (SP),A0
+          ADD	 #16,SP
+          JMP	 (A0)		        	;END
+
+         END			        		;of Unit
+
+
+

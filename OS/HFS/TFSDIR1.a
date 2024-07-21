@@ -1,0 +1,787 @@
+;
+;	File:		TFSDIR1.a
+;
+;	Contains:	This file contains mostly volume-level routines.
+;
+;	Copyright:	© 1982-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM4>	 8/27/93	BH		Removed <SM3>. The flushing stuff is now in CmdDone.
+;	   <SM3>	  8/3/93	BH		Flushing critical volume info when changed for a volume in a
+;									manual-eject drive.
+;	   <SM2>	 5/21/92	kc		Append "Trap" to the names of OpenDF and OpenRF to avoid name
+;									conflict with the glue.
+;	   <SM1>	 4/1/92		kc		Roll in PreflightOpenRF, PreflightFileOpen, ParallelWDCBFromRefnum,
+;									GetParallelFCBFromRefnum ParallelFCBFromRefnum and OpenDF from
+;									FileManagerPatches.a.
+;									¥ Pre-SuperMario comments follow ¥
+;		 <3>	 9/12/91	JSM		Cleanup header.
+;		 <2>	 4/24/91	dba		get rid of bogus branch that was causing a warning
+;	   <1.4>	 6/15/89	JB		preserve IOParamBlock address during additions to _Open
+;	   <1.3>	 6/12/89	JB		Fixed file _Open to load the actual file name from the catalog
+;									record into the FCB rather than from the IOParamBlock. File name
+;									case will always be that of the name stored in the catalog.
+;	   <1.2>	  3/2/89	DNF		removed references to forROM; HFS now builds identically for ram
+;									or rom
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				  2/3/87	BB		Replaced use of "FCBEntLen" equate with the use of low memory
+;									variable "FSFCBLen".
+;				  2/3/87	BB		Removed set up of users own buffer in open. This MFS feature is
+;									no longer supported.
+;				 1/14/86	LAK		Check volume for writability after FndFilName (ROM75Fix patch).
+;									The check in MFSCreate was no longer necessary and was deleted.
+;				10/29/85	LAK		Vectored FileOpen, PermssnChk.
+;				10/28/85	PWD		Implemented new shared-write access mode on _Open.
+;				10/25/85	PWD		Fixed PushCName/PopCName to not rely on length to be a longword.
+;				10/23/85	LAK		Initialize Ownbuf buffer for cache use.
+;				10/21/85	PWD		Changed Open to save file-locked state in FCB flags [FCBFilLck
+;									bit]
+;				10/20/85	LAK		Added back code to store OwnBuf in FCB in case we want to use it
+;									someday.
+;				10/16/85	PWD		Changed PermssnChk to separate out FCBScan for _LockRng use.
+;				 10/1/85	LAK		Removed convert of internal errors to TFDSIntErr.
+;				 8/31/85	LAK		Removed support of OwnBuf for TFS.
+;				 8/28/85	LAK		Cleaned up permission check code.
+;				 8/22/85	PWD		Added support for file-specific clump sizes.
+;				 6/20/85	PWD		Changed to use new system CNode equates
+;				 6/19/85	PWD		Changed misleading IOErr returns to FSDSIntErr.
+;				  6/4/85	PWD		Changed CreateDir to return the DirID of the new directory.
+;				  5/1/85	PWD		Added separate CreateDir entry point.
+;				 4/26/85	PWD		Changed Open to copy Finder type bytes for use in tags (to
+;									improve volume scavengibility).
+;				 4/25/85	PWD		Changed to convert internal errors to IOErr.
+;				 3/10/85	PWD		Added PushCName and PopCName.
+;				 2/27/85	PWD		Moved FndFilSpc to MFSDir1.
+;				 2/25/85	GJC		Created TFSDir1 from FSDir1; modified Create to pass control to
+;									MFSCreate for MFS volume creations, changed Create to handle
+;									creations of files and directories on TFS volumes.
+;				 9/29/84	GSS		Bug fix in FileOpen to the 7 Aug 84 mod (created label @8)
+;				  8/7/84	GSS		Modified FileOpen to adjust EOF for the just opened file if to
+;									match other already opened forks of the same file. (This was
+;									part of the OpenFix in MSFileFix).
+;				  8/6/84	GSS		Fixed FileOpen to allow Open, OpenRF calls to open locked files
+;									with read/only permission if IOPermmsn=0
+;				 7/12/83	LAK		Fixed bug in open (see open).
+;				 5/25/83	LAK		Create no longer needs to incr A4 after FndFilName.
+;				 4/23/83	LAK		added minor change to open to simplify resources.
+;				  2/7/83	LAK		fixed create bug (incr.b of vcb num files -> incr.w)
+;				 1/13/83	LAK		broke out from Open code.
+;				 12/8/82	LAK		Reworked all files for new file system data structures.
+;				 1/14/82	LAK		Scan-thru changes prior to machine debug: added OpenRF, changed
+;									for physical length byte count in directory blocks,
+;
+
+;_______________________________________________________________________
+;
+; External Routines:	GetParallelFCBFromRefnum,ParallelFCBFromRefnum,
+;						ParallelWDCBFromRefnum,FileOpen,FileCreate,CreateDir
+;						
+; Internal Routines:	Gt1stFCB,GtNxtFCB,Gt1stMatch,GtNxtMatch
+;
+;_______________________________________________________________________
+
+			BLANKS		ON
+			STRING		ASIS
+
+;________________________________________________________________________________
+; <55>
+; Routine:	GetParallelFCBFromRefnum
+; Function:	Return a pointer to the parallel FCB entry for a given
+;			file RefNum.
+;
+; Input:	ioRefNum(a0)	- File reference number
+;
+; Output:	ioMisc(a0)		- Pointer to parallel FCB entry
+;________________________________________________________________________________
+
+			entry	GetParallelFCBFromRefnum
+GetParallelFCBFromRefnum
+			import	ParallelFCBFromRefnum
+			
+			jsr 	FSQueue 			; wait our turn
+			
+			move.w	ioRefNum(a0),d0		; Get the file reference number
+			move.w	d0,d1				; Keep a copy in another register
+			bsr		RefNumCheck			; Make sure the reference number is valid
+			bmi.s	@exitGetParallelFCB	; Bad reference number
+			
+			move.w	d1,d0				; Get the copy
+			bsr		ParallelFCBFromRefnum	; Get the pointer to the parallel structure
+			move.l	a1,ioFDirIndex(a0)	; Return the pointer in ioMisc
+			moveq	#noErr,d0			; No error
+@exitGetParallelFCB
+			jmp		CmdDone				; outa here
+
+;________________________________________________________________________________
+;
+; Routine:	ParallelFCBFromRefnum
+; Function:	Return a pointer to the parallel FCB entry for a given
+;			file RefNum.
+;
+; Input:	d0.w	- file refNum
+;
+; Output:	d0.l	- trash
+;			a1.l	- pointer to parallel FCB entry
+;
+; Note: This routine assumes that d0 is really a decent, law-abiding
+; refnum.  RefNumCheck is a fine way to assure this.
+;________________________________________________________________________________
+
+			entry	ParallelFCBFromRefnum
+ParallelFCBFromRefnum
+			andi.l	#$FFFF, d0					; only the low word is passed.				<11>
+			divu.w	FSFCBLen,d0					; convert refnum to an index
+			movea.l	FSVarsPtr,a1				; get address of HFS variable area
+			movea.l	FSVars.fcbPBuf(a1),a1		; get address of parallel array
+			mulu.w	cbPBufULen(a1),d0			; convert file index to parallel array offset
+			lea		fcbPBufData(a1,d0.l),a1		; a1 -> parallel array element for file		<20>
+			rts
+
+;________________________________________________________________________________
+; <20>
+; Routine:	ParallelWDCBFromRefnum
+; Function:	Return a pointer to the parallel FCB entry for a given
+;			working directory RefNum.
+;
+; Input:	d0.w	- working directory refNum
+;
+; Output:	d0.l	- trash
+;			a1.l	- pointer to parallel WDCB entry
+;
+; Note: This routine assumes that d0 is really a decent, law-abiding
+; refnum.  RefNumCheck is a fine way to assure this.
+;________________________________________________________________________________
+			
+			entry	ParallelWDCBFromRefnum
+ParallelWDCBFromRefnum
+	subi.w	#WDRfnMin,d0				; Change WDRefNum to WDCB table offset
+	assert	WDCBLen = 1<<4				; ensure that this shift is still legal
+	lsr.w	#4,d0						; convert WDCB table offset to an index
+	movea.l	FSVarsPtr,a1				; get address of HFS variable area
+	movea.l	FSVars.wdcbPBuf(a1),a1		; get address of parallel array
+	mulu.w	cbPBufULen(a1),d0			; convert WDCB index to parallel array offset
+	lea		wdcbPBufData(a1,d0.l),a1	; a1 -> parallel array element for file
+	rts
+
+;_______________________________________________________________________
+;
+; Routine:		Gt1stFCB,GtNxtFCB
+;
+; (c) 1982 Apple Computer, Inc.
+;
+; Arguments:	  A1.L (input)	-- FCB start pointer (GtNxtFCB)
+;				  D1.W (input)	-- offset to current FCB (GtNxtFCB)
+;				  A1.L (output) -- unchanged
+;				  D1.W (output) -- offset to next FCB
+;				  CCR set so that BCS will not br when past last FCB
+; Called By:	FlushVolume,FileOpen,CkFileBusy,AdjEOF
+; Function: 	Scan through the FCBs.
+;
+; Routine:		Gt1stMatch,GtNxtMatch
+;
+; Arguments:	  A1.L (input)	-- FCB start pointer (GtNxtFCB)
+;				  D1.W (input)	-- offset to current FCB (GtNxtFCB)
+;				  A2.L (input)	-- VCB pointer to match against
+;				  D2.L (input)	-- file number to match against
+;				  A1.L (output) -- unchanged
+;				  D1.W (output) -- offset to next FCB which matches
+;				  CCR set so that BNE will not br when past last FCB
+; Called By:	FlushVolume,FileOpen,CkFileBusy,AdjEOF,ReName
+; Function: 	Scan through the FCBs.
+;
+; Modification History:
+;  13 Jan 83  LAK  broke out from Open code.
+;_______________________________________________________________________
+
+
+Gt1stFCB	MOVE.L	FCBSPtr,A1			; get FCB ptr
+			MOVEQ	#2,D1				; index to first FCB
+			RTS
+
+GtNxtFCB	ADD.W	FSFCBLen,D1			; go to next FCB				<03Feb87>
+			CMP.W	(A1),D1 			; reached the end yet?
+			RTS 						; let the caller test (BCS if not)
+
+Gt1stMatch	BSR.S	Gt1stFCB
+GNMLoop 	CMP.L	FCBFlNm(A1,D1),D2	; file numbers match?
+			BNE.S	GtNxtMatch
+			CMP.L	FCBVPtr(A1,D1),A2	; on the same volume?
+			BEQ.S	GNMRTS
+GtNxtMatch	BSR.S	GtNxtFCB
+			BCS.S	GNMLoop 			; loop thru them all
+			MOVE	#0,CCR				; clear Z bit
+GNMRTS		RTS 						; BEQ for match, BNE at end . . .
+
+;________________________________________________________________________________
+;
+; Routine:		OpenDF
+;
+; Function: 	Opens a data fork.  Identical to Open, except that no checking
+;				for drivers is done.
+;
+;				Changes the trap word to _Open (from _HFSDispatch) so that external
+;				file systems will work properly.  Preserves hfs and async bits
+;________________________________________________________________________________
+; This routine was rolled in from the file FileMgrPatches.a.						<SM1>
+
+OpenDFTrap:		
+
+			MOVE.B	#0, d1				; clear low byte $Ax60 -> $Ax00
+			MOVE.W	d1, ioTrap(a0)		; clean up the pb, too
+			BSR 	FSQueue 			; queue up the call, wait for it's turn
+			ST		RegRsrc 			; open regular part of file
+			BRA.S	FOpen1				; share code with FileOpen
+
+;_______________________________________________________________________
+;
+; Routine:		OpenRF
+; (c) 1983 Apple Computer, Inc.
+;
+; Arguments:	  A0.L (input)	-- pointer to I/O parameter block: uses
+;									IOFileName,IOPermssn
+;				  D0.W (output) -- 0 if file successfully opened, errcode otherwise
+;				  This call may be executed asynchronously.
+;				  Note that open does not use equates when transferring data from
+;				   the directory entry to the FCB (to save code).
+; Calls:		FileOpen
+; Function: 	Prepare a file for action.
+;_______________________________________________________________________
+
+OpenRFTrap
+			BSR 	FSQueue
+			CLR.B	RegRsrc 			; open for resource fork
+			BRA.S	FOpen1				; share code with FileOpen
+
+;_______________________________________________________________________
+;
+; Routine:		FileOpen
+;
+; (c) 1983 Apple Computer, Inc.
+;
+; Arguments:	  A0.L (input)	-- pointer to I/O parameter block: uses IODrvNum,
+;									IOFileType,IOFileName,IOPermssn
+;				  D0.W (output) -- 0 if file successfully opened, errcode otherwise
+;				  This call may be executed asynchronously.
+;				  Note that open does not use equates when transferring data from
+;				   the directory entry to the FCB (to save code).
+; Calls:		FSQueue,DtrmVol,Gt1stFCB,GtNxtFCB,FndFilName,CmdDone
+; Function: 	Prepare a file for action.
+;
+;
+;  Modification History:
+;  02 Dec 82  LAK  Got rid of alternate entry point Open2: just don't advertise
+;					as many FCB's so system level stuff can always get one.
+;					Removed the code for ALO's 20-Apr 'fix' to set up A1 (it's
+;					already set up by FndFil). Only put file num in FCB once
+;					(did it twice . . .).  Now checks for write permission
+;					before opening a file for writing.
+;  07 Dec 82  LAK  Changed for new file system data structures. Added support
+;				   for resource fork of the file. Own buffer is now passed by
+;				   application.
+;  21 Dec 82  LAK  Added equates for resource bit in FCB; tag field support.
+;				   Added Gt1stFCB and GtNxtFCB to save code; if opening file
+;				   with write permission, makes sure it's not already open
+;				   with write (checks for fork)
+;  14 Jan 83  LAK  Integrated with OpenRF; changes for phys length change in Dir.
+;  11 Feb 83  LAK  If Open fails, refnum field is invalidated for stronger
+;					checking.
+;  20 Apr 83  LAK  Changed to return refnum of fcb entry for files which
+;					are already open with write permissions.
+;  02 Jun 83  LAK  FCBBfAdr=0 now means use system buffer (adr will change on
+;					remounts).
+;  08 Jun 83  LAK  Fixed Open to return conflicting refnum on open error (was
+;					branching to wrong exit).
+;  12 Jul 83  LAK  Fixed check for file already open to also compare volume
+;					pointers.
+;  29 Aug 83  LAK  Changed to use Gt1stMatch, GtNxtMatch when searching for
+;					matching FCBs.
+;  06 Aug 84  GSS  modified to allow Open and OpenRf calls to open a locked file
+;					with read only access if the caller sets IOPermssn = 0.
+;  07 Aug 84  GSS  changed OKToOpen to adjust EOF if another identical fork is
+;					already open (this was part of OpenFix in MSFileFix).
+;  29 Sep 84  GSS  fixed a bug in the 7 Aug 84 mod (created label @8)
+;  27-Feb-85  PWD  Moved MFS-specific code into MFSDir1; added call to DtrmVol and
+;				   pass control to MFSOpen for MFS volumes.
+;  26-Apr-85  PWD  Modified to copy finder type bytes into FCB.  Separated out
+;				   PrmssnChk code in anticipation of a complete split by MFS code.
+;  15-Jul-85  PWD  Patched out ioPermssn=0 code to make 0 into 3 (read AND write)
+;	9-Aug-85  PWD  Changed to use clump size in catalog entry for file, default
+;				   to current volume clump size
+;  13-Aug-85  PWD  Fixed bug in locked-file check.
+;  22-Aug-85  PWD  Added code to set FCBOwnClp on open as appropriate.
+;  <21Oct85>  PWD  Changed to save file-locked state in FCB flags [FCBFilLck bit]
+;  <28Oct85>  PWD  Implemented new shared-write access mode on _Open
+;
+; The following sequences should suffice for file opening:
+;
+;	Delete,Create,Open	- when you want a fresh start
+;	Open				- when you want to continue working with a file
+;	Create				- when you want a new file which shouldn't be there
+;
+; - a file may be opened with write permission even if the volume is
+;	write protected; an error is not reported until a write, seteof, or
+;	allocate call for that file is actually made . . . this makes sense
+;	since the application which requests the permission does not want to
+;	change code depending upon the write-protect status of the volume (the
+;	user may insert it just to use the write functions . . .).
+; - (GSS 8/6/84) also a locked file is opened with read permission,
+;	provided the caller specifies IOPermssn = 0.
+;_______________________________________________________________________
+
+FileOpen:
+			MOVE.L	jFileOpen,-(SP) 	; jumptable entry for vFileOpen 		<29Oct85>
+			RTS 						; go there								<29Oct85>
+vFileOpen								; 'vectored' FileOpen routine			<29Oct85>
+
+			BSR 	FSQueue 			; queue up the call, wait for it's turn
+			ST		RegRsrc 			; open regular part of file
+
+FOpen1
+
+; make sure we allocate more FCB's next chance we get (if we need to)			<SM1>
+; (from PreflightOpenRF and PreflightFileOpen patches in FileMgrPatches.a)		<SM1>
+			BSR		OpenAttemptHook		;										<SM1>	
+
+; first, make sure we have an open FCB
+
+			BSR.S	Gt1stFCB			; get (A1,D1) pointing to first FCB
+@1			TST.L	FCBFlNm(A1,D1)		; FCB unused
+			BEQ.S	ChkVol				; br if so
+			BSR.S	GtNxtFCB			; get next one until we run out
+			BCS.S	@1
+
+			MOVEQ	#TMFOErr,D0 		; too many files open
+OpnErrExit	CLR.W	IORefNum(A0)		; make refnum invalid
+OpnExit 	BRA 	CmdDone 			; until we have looked at them all
+
+; now, search the directory by filename for the file we want to open
+
+ChkVol		MOVE.W	D1,IORefNum(A0) 	; refnum is the FCB index!
+			ADD.L	A1,D1				; save FCB ptr in D1
+			BSR 	FndFilName			; Look for the affected file & volume
+			BNE.S 	OpnErrExit			; Punt if this causes a problem
+
+; OK, we're really going to do it!  First, though, just to be safe, zero the
+; newly found FCB before use (external file systems may not have known how to
+; zero it properly):
+
+			MOVE.L	A0,-(SP)
+			MOVEA.L D1,A0				; Point to FCB entry
+			MOVEQ	#0,D0				;									<03Feb87>
+			MOVE.W	FSFCBLen,D0			; (FCB length / 2) - 1				<03Feb87>
+			LSR.W	#1,D0				;									<03Feb87>
+			SUBQ.W	#1,D0				;    = number of words to clear		<03Feb87>
+@1			CLR.W	(A0)+				; Clear a word in the FCB
+			DBRA	D0,@1				; Until all done
+			MOVE.L	(SP)+,A0			; Restore parameter block pointer
+
+			BSR 	TFSVCBTst			; Are we dealing with a TFS volume? 	<01Oct85>
+			BNE 	MFSOpen 			; If not, give up.
+;
+; Handle an open for a TFS volume:
+;
+			MOVEQ	#FNFErr,D0			; Let's be pessimistic for a moment
+			CMP.B	#CDRFilRec,CDRType(A5) ; Is all this just a cruel hoax?
+			BNE.S 	OpnErrExit			; Crash and burn on directory specs
+			MOVEA.L D1,A3				; Retrieve the file's FCB pointer
+			MOVE.L	D7,FCBCatPos(A3)	; Store catalog hint for use on Close
+			MOVE.L	FilUsrWds+FdType(A5),D0 ; Get a hold of the file type string
+			MOVE.L	D0,FCBFType(A3) 	; Copy it into the FCB
+			MOVE.L	D6,FCBDirID(A3) 	; Copy parental DirID into FCB for Close
+
+			MOVEQ	#0,D0				; Clear top word
+			MOVE.W	FilClpSize(A5),D0	; Pick up the file's clump size
+			BEQ.S	@3					; If none set, default to volume's
+			MULU	VCBAlBlkSiz+2(A2),D0; Multiply by allocation block size
+			BSET	#FCBOwnClp,FCBMdRByt(A3) ; Set flag indicating own clump size <22Aug85>
+			BRA.S	@4					; Go set it up
+
+@3			MOVE.L	VCBClpSiz(A2),D0	; Pick up volume's clump size
+			BCLR	#FCBOwnClp,FCBMdRByt(A3) ; Clear 'own clump-size spec'd flag) <22Aug85>
+@4			MOVE.L	D0,FCBClmpSize(A3)	; volume's default clump size
+
+			MOVEM.L A0-A1,-(SP) 		; Free up two scratch register
+			MOVEQ	#lenXDR,D0			; Length of an extent record
+			LEA 	FilExtRec(A5),A0	; Data fork's extents
+			TST.B	RegRsrc 			; Was this the fork desired?
+			BNE.S	@5					; If set, that's what we wanted
+			LEA 	FilRExtRec(A5),A0	; Point to resource fork's extents instead
+@5			LEA 	FCBExtRec(A3),A1	; Point to extent record in FCB
+			_BlockMove					; Copy the extent record
+
+			MOVEQ	#0,D0				; Clear top half of D0
+			MOVE.W	D2,D0				; Get name length
+			MOVEA.L A4,A0				; Point to filename in pathname
+			LEA 	FCBCName(A3),A1 	; Point to name field in FCB
+			MOVE.B	D0,(A1)+			; Copy in CName length
+			_BlockMove					; Make a copy of the name string
+			MOVEM.L (SP)+,A0-A1 		; Restore the scratch registers
+
+;	Fetch the catalog record for the file so the file's real name can be 				<1.3>
+;	loaded into the FCB. This is so GetFCBInfo will return the *real* file name.		<1.3>
+;																						<1.3>
+;	NOTE: it is assumed that we are fetching the same catalog record that was			<1.3>
+;	located in the call to FndFilName. Hence, the cache buffer pointed to by			<1.3>
+;	register A5 should not become invalid as a result of calling CMGetCN...				<1.3>
+;																						<1.3>
+;	Assumed registers:																	<1.3>
+;			D6		dirID																<1.3>
+;			D7		hint																<1.3>
+;			A2		VCB address															<1.3>
+;			A3		FCB address															<1.3>
+
+			move.l	a0,-(a6)			; save param block ptr							<1.4>
+			move.l	d6,d0				; parent DirID									<1.3>
+			move.l	d7,d2				; catalog hint									<1.3>
+			lea		FCBCName(a3),a0		; pointer to CName in the FCB					<1.3>
+			jsr		CMGetCN				; get the catalog record						<1.3>
+			beq		@getCatRecord		; xfer if got it (should...)					<1.3>
+			move.l	(a6)+,a0			; restore param block ptr						<1.4>
+			bmi.s	OpnErrExit			; xfer if I/O error								<1.3>
+			moveq	#FNFErr,d0			; some catalog manager error...					<1.3>
+			bra.s	OpnErrExit			; so, return "file not found"					<1.3>
+
+@getCatRecord							;												<1.3>
+			move.l	a1,a5				; get cat rec ptr again in case I/O moved it...	<1.3>
+			lea		ckrCName(a0),a0		; source for block move							<1.3>
+			lea		FCBCName(a3),a1		; pointer to CName in the FCB					<1.3>
+			moveq	#0,d0				;												<1.3>
+			move.b	(a0),d0				; get length of name string						<1.3>
+			addq.l	#1,d0				; take length byte into account					<1.3>
+			_BlockMove					; move case-correct name into FCB				<1.3>
+			move.l	(a6)+,a0			; restore param block ptr						<1.4>
+
+			CLR.W	D7					; Clear directory block number
+			MOVE.W	FilFlags(A5),D3 	; Copy version number and flags byte
+			AND.W	#$100,D3			; Clear resource, dirty bits, type byte for TFS <PWD 21Oct85>
+			BEQ.S	@10 				; If clear, it's not locked.                    <PWD 21Oct85>
+			BSET	#FCBFlgPBit,D3		; Otherwise, duplicate the bit for later use.	<PWD 21Oct85>
+										; [bit 0 is also write-allowed bit] 			<PWD 21Oct85>
+
+@10 		LEA 	FilFLNum(A5),A5 	; Point beyond user bytes in catalog entry
+			MOVE.L	(A5)+,D2			; FilFlNum
+			MOVE.W	(A5)+,D4			; FilStBlk
+			MOVE.L	(A5)+,D5			; FilLgLen
+			MOVE.L	(A5)+,D6			; FilPyLen
+
+; Oops, were we supposed to open the resource fork?
+
+			TST.B	RegRsrc 			; Check flag that OpenRF would set
+			BNE.S	@30 				; If set, it's the regular part
+			BSET	#FCBFlgRBit,D3		; Mark this FCB as a resource FCB
+
+			MOVE.W	(A5)+,D4			; FilRStBlk
+			MOVE.L	(A5)+,D5			; FilRLgLen
+			MOVE.L	(A5)+,D6			; FilRPyLen
+@30 		BSR.S	PermssnChk			; Check if the requested file access is OK
+			BEQ.S	SetupFCB			; Continue if all was well
+;
+; We're going to exit with an error, but some FCB fields have already been set
+; up.  Zero the FCB here just to be neat (especially since the MFS code doesn't
+; clear these fields on open)...
+;
+			MOVEQ	#0,D1				;									<03Feb87>
+			MOVE.W	FSFCBLen,D1			; (FCB length / 2) - 1				<03Feb87>
+			LSR.W	#1,D1				;									<03Feb87>
+			SUBQ.W	#1,D1				;    = number of words to clear		<03Feb87>
+@50 		CLR.W	(A3)+				; Clear a word
+			DBRA	D1,@50				; And continue until they're all done
+			BRA 	OpnExit 			; Give up when we're good 'n ready.
+
+
+; NOTE: The MFS branch of the code re-joins this thread at SetUpFCB:
+
+SetupFCB	MOVE.L	D2,(A3)+			; file number
+			MOVE.W	D3,(A3)+			; file flags (FCB undirty, res/reg, write)
+			MOVE.W	D4,(A3)+			; start block
+			MOVE.L	D5,(A3)+			; logical length
+			MOVE.L	D6,(A3)+			; physical length
+			CLR.L	(A3)+				; reset current file position to 0
+			MOVE.L	A2,(A3)+			; ptr to associated VCB.
+
+;			MOVE.L	IOOwnBuf(A0),A4 	; see if user supplied a buffer 		<03Feb87>
+			SUBA.L	A4,A4				; we no longer support a user buffer	<03Feb87>
+			MOVE.L	A4,D0				; is it zero?							<20Oct85>
+;			BEQ.S	@1					; br if so								<20Oct85>
+;			CLR.L	(A4)+				; initialize the 10 byte header 		<03Feb87>
+;			CLR.L	(A4)+				;  of the 522-byte buffer				<03Feb87>
+;			CLR.W	(A4)				;  to empty state.						<03Feb87>
+;			BSET	#CBHEmpty,(A4)		;										<03Feb87>
+;			ADDQ	#2,A4				; point to data part of buffer			<03Feb87>
+;@1
+			MOVE.L	A4,(A3)+			;  use it . . . 						<20Oct85>
+
+			MOVE.W	D7,(A3)+			; disk block directory entry is in
+			ADDQ.L	#4,A3				; Skip Clump Size (already set up)
+			CLR.L	(A3)+				; Clear BTCB pointer
+
+;  At this point:
+;		 A1,D1 --> FCB
+;		 A2 --> VCB
+;		 D2 = this files file number
+;		 D3 = fcbMdRByte of this file
+;
+			BSET	#7,5(A2)			; Do we really need this and where used??
+										;	note that a file was once open here
+			MOVE.W	IORefNum(A0),D4 	; get refnum of just opened file
+			BSR 	Gt1stMatch			; get an FCB match on D2, A2 (there is
+										; always a match with the just opened file)
+@5
+;	Now A1 --> FCBs, D1 = refnum of the matching fcb
+			CMP.W	D1,D4				; this one?
+			BEQ.S	@6					; br if so
+			MOVE.B	FCBMdRByt(A1,D1),D5 ; check for same fork (and save)
+			MOVE.B	D5,D6
+			EOR.B	D3,D6				; bit 1 (set if res fork) must match
+			LSR.B	#2,D6
+			BCC.S	@7					; Adjust EOF if the forks match
+@6			BSR 	GtNxtMatch			; look for another matching fcb
+			BEQ.S	@5					; br if match
+			BRA.S	@8					; return if no FCB matches . . .
+
+@7			JSR 	AdjEOF				; otherwise, make sure we are the same
+			MOVE.B	D5,FCBMdRByt(A1,D1)	; don't let AdjEOF change dirty bit
+
+@8			MOVEQ	#0,D0				; no error.
+			BRA 	CmdDone 			; Return to user.
+
+;_______________________________________________________________________
+;
+; Routine:		PermssnChk
+; Arguments:	  A0.L (input)	-- pointer to I/O parameter block
+;				  D3.L (input)	-- planned FCBMdRByt for file.
+;
+;				  D0.W (output) -- error code
+;				  D3.B (output) -- Corrected FCBMdRByt
+;
+; Calls:		Gt1stMatch, GtNxtMatch
+; Function: 	Check requested file access on Open
+;
+; Modification History:
+;
+;  25-Apr-85  PWD  Separated out from FileOpen call to allow sharing with
+;					MFSOpen code.
+;  16-Oct-85  PWD  Changed to separate out FCBScan for _LockRng use.
+;  <28Oct85>  PWD  Implemented new shared-write access mode on _Open
+;
+; NOTE: The following routine is called from the MFS side of OpenFile as well.
+;_______________________________________________________________________
+
+PermssnChk:
+			MOVE.L	jPermssnChk,-(SP)	; jumptable entry for vPermssnChk		<29Oct85>
+			RTS 						; go there								<29Oct85>
+vPermssnChk 							; 'vectored' PermssnChk routine 		<29Oct85>
+
+; If asking for read permission, it's always ok . . .
+
+			CMP.B	#1,IOPermssn(A0)	; Requesting read-only permission
+			BEQ.S	okToRead			; Branch if so							<28Aug85>
+
+; Else, if the file is locked: give read-only if asking for whatever permissions
+;							   give PermErr otherwise
+
+@1			BSET	#FCBFlgWBit,D3		; Test Lock bit and set write allowed	<28Aug85>
+			BEQ.S	@2					; Not locked: all writes OK (so far)	<28Aug85>
+			TST.B	IOPermssn(A0)		; was IOPermssn 0 in the call?			<28Aug85>
+			BEQ.S	OKToRead			; Yes, it's OK to give read access      <28Aug85>
+			CLR.W	IORefNum(A0)		; Invalidate the refnum 				<28Aug85>
+			MOVEQ	#PermErr,D0 		; Asked for write permission but file	<28Aug85>
+			BRA.S	pcheckRTS			;  was locked . . . 					<28Aug85>
+
+; Scan the FCB's to see whether this file is already open with write permission
+
+@2			BTST	#2,ioPermssn(A0)	; Shared-write requested?				<28Oct85>
+			BEQ.S	@3					; Nope - go for exclusive write 		<28Oct85>
+			BSET	#FCBFlgSBit,D3		; Yes - indicate for scan				<28Oct85>
+@3			BRA.S	FCBScan 			; Check for other FCB's with file open  <16Oct85>
+
+okToRead	BCLR	#FCBFlgWBit,D3		; Read-only access: clear write allowed <28Aug85>
+okToOpen	MOVEQ	#0,D0				; It's all right...                     <28Aug85>
+pcheckRTS	RTS 						;										<28Aug85>
+
+FCBScan 	BSR 	Gt1stMatch			; find VCB ptr, FileNum match			<28Aug85>
+@1			BNE.S	FCBScnOK			; br if none open (ok to write) 		<28Aug85>
+			MOVE.W	FCBFlags(A1,D1),D0	; if write perm and rsrc/reg are the same,
+			EOR.W	D3,D0				;  it's an error (2 files open with write
+			AND.W	#WrRSMask,D0		; look at 2 bits
+			BNE.S	@3					; br if no conflict 					<28Oct85>
+			BTST	#FCBFlgSBit,D3		; Check - requesting shared access? 	<28Oct85>
+			BEQ.S	@5					; If 0, no - bomb, then.				<28Oct85>
+			BTST	#FCBShrWrt,FCBMdRByt(A1,D1) ; If so, is this shared-write?	<28Oct85>
+			BEQ.S	@5					; Nope - they won't play together       <28Oct85>
+@3			BSR 	GtNxtMatch			; go for the next one
+			BRA.S	@1					; loop until we've looked at them all   <28Aug85>
+
+; File is open for write:	give read-only if asking for whatever permissions
+;							give OpWrErr otherwise and return refnum of that file
+
+@5			MOVE.W	D1,IORefNum(A0) 	; return refnum of already opened entry
+			MOVEQ	#OpWrErr,D0 		; open with write perm already error
+			BRA.S	FCBScnExit			;										<28Aug85>
+
+FCBScnOK	MOVEQ	#0,D0				; All is well							<16Oct85>
+FCBScnExit	RTS 						;										<16Oct85>
+;_______________________________________________________________________
+;
+; Routine:		FileCreate
+; Arguments:	  A0.L (input)	-- pointer to I/O parameter block: uses
+;									IOFileName
+;				  D0 (output) -- error code
+;				  This call may be executed asynchronously.
+; Calls:		FSQueue,FndFilName,CVFlgs,CmdDone
+; Function: 	Create a new file . . .
+;
+; Modification History:
+;
+;	30-Nov-82  LAK	removed file type determination; gets time from lomem var
+;	01-Dec-82  LAK	changed Scn4Spc call to start from beginning of directory,
+;					  instead of where FndFil left off; included this proc in-line
+;	08 Dec 82  LAK	changed for new file system data structures.
+;	29 Aug 83  LAK	changed to specifically disallow file names of 0 length.
+;	25 Feb 85  GJC	added support for Turbo File System
+;	 1 Mar 85  PWD	Changed to use full Turbo pathname parsing
+;	 9-Aug-85  PWD	Changed to leave VCB file/directory count update to CMCreateCN
+;	<14Jan86>  LAK	Check volume for writability after FndFilName (ROM75Fix patch).
+;					  The check in MFSCreate was no longer necessary and was deleted.
+;_______________________________________________________________________
+
+CreateDir:
+			BSR 	FSQueue 			; queue up and wait our turn
+			BSET	#DirCN,HFSFlags 	; Indicate that we want to create a directory
+			BRA.S	CreateCN			; Join common code
+
+FileCreate:
+			BSR 	FSQueue 			; queue up the call.
+			BCLR	#DirCN,HFSFlags 	; Indicate we're only after a new file
+
+CreateCN	BSR 	FndFilName			; Check to see if the file exists already
+			BNE.S	@0					; Errors are expected (FNFErr).
+			MOVEQ	#DupFNErr,D0		; duplicate filename if found already
+			BRA.S	CrExit				; Punt.
+
+@0			CMP.W	#FNFErr,D0			; Was it actually the expected error?
+			BNE.S	CrExit				; If not, that's serious
+
+			BSR 	CVFlgs				; check the volume flags for writability		<14Jan86>
+			BNE.S	CrExit				;  (requires A2=VCB ptr) - br if an error		<14Jan86>
+
+			BSR 	TFSVCBTst			; Are we dealing with a TFS volume?
+			BEQ.S	@1					; If so, go for it
+			BTST	#DirCN,HFSFlags 	; Are we creating a directory?
+			BEQ 	MFSCreate			; If not, we are just creating a file
+			MOVEQ	#WrgVolTypErr,D0	; No directories on MFS disks
+			BRA.S	CrExit				; Give up.
+
+@1			MOVE.B	ioFileType(A0),D1	; Get file type (version number) in D1
+			SWAP	D1					; Switch it into the upper half
+			MOVE.B	#CMFilCN,D1 		; Set up to create a file
+			BTST	#DirCN,HFSFlags 	; Are we creating a directory?
+			BEQ.S	CrFile				; If so, we're set.
+			MOVE.B	#CMDirCN,D1 		; Switch to create a directory
+;
+;  file did not already exist.	See FndFil to see what regs hold now. Basically:
+;	A2=ptr to correct VCB, A4=ptr to name, D2=name len
+
+CrFile		MOVE.L	A0,-(A6)			; Save IOPB pointer
+			BSR.S	PushCName			; Copy the element name onto the A6 stack
+			MOVE.W	D2,-(A6)			; Store rounded up CName length
+			MOVE.L	D6,D0				; Set up parent directory ID
+			JSR 	CMCreateCN			; create the CNode
+
+; Now to remove this junk from the A6 stack again:
+
+			MOVE.W	(A6)+,D2			; Restore the CName length
+			BSR.S	PopCName			; Remove the string copy from the stack
+			MOVEA.L (A6)+,A0			; Restore IOPB pointer
+			TST.W	D0					; Now then, were there any errors on create?
+			BEQ.S	@5					; Continue if all was well
+			CMP.W	#CMNotFound,D0		; Was a directory missing?
+			BNE.S	CrExit				; If not, exit with possible internal err
+			MOVEQ	#DirNFErr,D0		; Change the error to 'Directory Not Found'
+			BRA.S	CrExit				; ...and Punt.
+
+@5			BTST	#DirCN,HFSFlags 	; Creating a directory?
+			BEQ.S	@10 				; Nope - count it as a file
+			MOVE.L	D1,ioDirID(A0)		; Return the new directory's DirID
+@10 		MOVEQ	#0,D0				; flawless
+
+CrExit		BRA 	CmdDone 			; that's all folks.
+
+;_______________________________________________________________________
+;
+; Routine:		PushCName
+; Arguments:	  A4.L (input)	-- pointer to name string
+;				  D2.W (input)	-- length of name string
+;
+;				  A0.L (output) -- pointed to copied string length byte
+;				  D2.W (output) -- rounded up string length
+;
+;				This call may be executed asynchronously.
+; Calls:
+; Called from:	FileCreate, FileDelete
+; Function: 	Copy a pathname element substring onto the A6 stack for use.
+;				Pre-pends a length byte onto the string
+;
+; Modification History:
+;
+;	10-Mar-85  PWD	New today.
+;	25-Oct-85  PWD	Fixed to not rely on D2 being long on input
+;_______________________________________________________________________
+
+PushCName	MOVEM.L D0/A1,-(SP) 		; Save 'em through this little manouver
+
+; Compute the number of bytes to allocate by rouding the string length up:
+
+			SUBA.L	A0,A0				; Assume D2.W is zero - make string ptr NIL 		<25Oct85>
+			TST.W	D2					; Check string length
+			BEQ.S	@90 				; If NIL, we're set as is
+			MOVEA.W D2,A0				; Save string length
+			ADDQ.W	#1,D2				; Prepare to round length up: add one
+			BCLR	#0,D2				; Truncate to next lower even length
+			SUBA.W	D2,A6				; Allocate room for string on TFS stack
+			MOVE.W	D2,-(SP)			; Stash 'fixed' length on stack
+			MOVE.W	A0,D2
+
+; Copy in the actual string contents:
+
+			MOVEA.L A4,A0				; Point to source string start
+			MOVEA.L A6,A1				; Point to target string start
+			MOVEQ	#0,D0				; Clear top word of D0								<25Oct85>
+			MOVE.W	D2,D0				; String length for _BlockMove
+			_BlockMove
+			MOVE.W	D2,-(A6)			; Push length in front of new string
+			MOVE.W	(SP)+,D2			; Set D2 to 'fixed' length
+			MOVEA.L A6,A0				; Point to element name
+			ADDQ.L	#1,A0				; Length actually starts in low byte
+@90 		MOVEM.L (SP)+,D0/A1 		; Restore scratch registers
+			RTS 						;
+
+;_______________________________________________________________________
+;
+; Routine:		PopCName
+; Arguments:	  A6.L (input)	-- pointer to copied string
+;				  D2.W (input)	-- rounded up length of name string
+;
+;				  D2.W (output) -- original string length
+;
+;				This call may be executed asynchronously.
+; Calls:
+; Called from:	FileCreate, FileDelete
+; Function: 	Remove a string from the A6 stack.	Undoes the effects of PushCName
+;
+; Modification History:
+;
+;	10-Mar-85  PWD	New today.
+;	25-Oct-85  PWD	Fixed to not rely on top word of D2 long: ADDA.W instead of ADDA.L D2
+;_______________________________________________________________________
+
+PopCName	TST.W	D2					; Zero length string?
+			BEQ.S	@90 				; If so, don't do anything strenuous
+			MOVE.W	(A6)+,-(SP) 		; Stash real length word
+			ADDA.W	D2,A6				; Adjust for string contents+length word		<25Oct85>
+			MOVE.W	(SP)+,D2			; Retrieve the true string length
+@90 		RTS 						;
+

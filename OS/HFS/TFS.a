@@ -1,0 +1,1992 @@
+;
+;	File:		TFS.a
+;
+;	Contains:	This file is the controlling file for the Macintosh Turbo file
+;				system.  It contains initialization code and the file system's
+;				queueing and dispatch routines.
+;
+;	Roots:		This system exploits the dispatching mechanism used by the earlier
+;				Macintosh file system written by Larry Kenyon et al.  Relevant
+;				code was taken from that system and modified as appropriate.
+;
+;	Copyright:	© 1982-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM9>	 8/27/93	BH		Made DSAlertRect bigger for the disk-switch alert in
+;									manual-eject systems to keep it the same size as the various
+;									manual-eject alerts, which have also been enlarged.
+;	   <SM8>	  8/3/93	BH		Rewrote DSHook for manual-eject drive support.
+;	   <SM7>	  6/7/93	kc		Roll in missing part of DSHookPatch from reality that sets the fsNoAllocate bits.
+;	   <SM6>	11/12/92	PN		Get rid of ≥ 020 conditionals
+;	   <SM5>	10/29/92	SWC		Changed SCSIEqu.a->SCSI.a.
+;	   <SM4>	 9/15/92	RB		#1042050,#1042640,#Fixed a bug in DSHook where the PostUpdate
+;									routine was not duplicating a rectangle pointer in the stack
+;									correctly. This caused a bomb after a disk had been asked for
+;									and it got inserted in the drive. The satck was trashed 4 bytes.
+;	   <SM3>	 5/21/92	kc		Append "Trap" to the names of
+;									OpenWD,CloseWD,GetWDInfo,OpenDF,UnMountVol,FlushVol,OpenWD,Close
+;									WD,GetWDInfo,ReName,OpenRF,OpenDF,GetFPos,SetFPos,GetEOF,SetEOF,
+;									Eject,SetVol,GetVolTrap,Enqueue and Dequeue to avoid name
+;									conflict with the glue.
+;	   <SM2>	 5/18/92	CS		Fix bug in OpenCall that I (kc) introduced in the patch roll in.
+;	   <SM1>	 4/1/92		kc		Rolled in HFSDispHook from FileMgrPatches.a.
+;									Moved the stub dispatch handlers (VolumeCall,
+;									RefNumCall,OpenCall and UnknownCall) and copied the 
+;									routines InstallVectors, FSGrowPatchInit,
+;									QMInit, CountFCBs, OpenAttemptHook, AllocateFCBs, DoFSCleanUp
+;									Rolled in patches to DSHook.
+;									include FileMgrHooks.a till someone rolls it in.
+;									• Pre-SuperMario comments follow •
+;		 <4>	 9/27/91	JSM		Don’t use hasCQD conditional, all future ROMs will have color
+;									QuickDraw.
+;		 <3>	 9/12/91	JSM		Cleanup header.
+;		 <2>	 6/12/91	LN		Changed #include 'HardwareEqu.a' to 'HardwarePrivateEqu.a'
+;	   <2.6>	 6/12/89	GGD		Fixed bugs in <C150 09sep86> which intended to allow
+;									cmd-shift-0/1/2 to eject disks during a disk switch dialog, but
+;									never worked. (ESPRIT SHOULD ALSO GET THIS FIX)
+;	   <2.5>	 5/25/89	GGD		Deleted 4 extra lines of code that were accidently pasted in the
+;									wrong place, in the Switcher Table initialization code. This
+;									would cause a random long word (whose address is a function of
+;									the number of FCBs from the boot blocks) in the system heap to
+;									get trashed. This fixes problems noticed in Aurora B1 ROMs, and
+;									needs to be fixed in Esprit also.
+;	   <2.4>	 5/23/89	DAF		Corrected color updates in DSHook
+;	   <2.3>	 4/13/89	dnf		Completed export
+;	   <2.2>	 4/13/89	DNF		Exported vFileRead, vFileWrite, and vFileClose
+;	   <2.0>	 3/27/89	DNF		=
+;	   <2.1>	 3/27/89	DNF		This comment documents the change from V1.7 to V1.8/V1.9/V2.0.
+;									There have been node real code changes since V1.7. V1.8 Added
+;									forROM conditionals around the disk-switch code, since it jumps
+;									to other spots in the ROM. Note that the comment in V1.6 is no
+;									longer true; RAM versions use the ROM's disk switch code. The
+;									overridden V1.8, V1.9, the accidentally commentless V2.0 and
+;									this file all contain the same code.
+;	  <•1.9>	 3/27/89	DNF		whoops. v1.8 was checked in from the wrong directory. Here's the
+;									right one.
+;	  <•1.7>	 3/20/89	CCH		Added Export of FSQueueSync and CmdDone for CacheControl.a.
+;	   <1.6>	  3/2/89	DNF		removed references to forROM; HFS now builds identically for ram
+;									or rom
+;	   <1.5>	 2/20/89	rwh		changed from CPU-based to feature-based conditionals.
+;	   <1.4>	 1/16/89	GGD		Added a scratch register parameter to the BigJSR macro calls
+;									since it will be needed when they change to use PC relative
+;									addressing.
+;	   <1.3>	11/21/88	CCH		Replaced references to forRAM with “NOT forROM.”
+;	   <1.2>	11/17/88	GGD		Moved file system initialization code from StartBoot into TFS.a,
+;									Changed BigJsr's into Jsr, since they now reach.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	  <•1.1>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASE…
+;				11/10/87	JB		(C957) Rolled in changes from patches S084, PM120, PP227, &
+;									PM289. Fixed CmdDone logic for "NoMacDskErr". Instead of special
+;									casing here, disk format package (PACK 2) will be modified to
+;									accept "ExtFSErr" as a legitimate format request.
+;	  <C914>	10/19/87	rwh		Port to Modern Victorian
+;				10/16/87	MSH		Added nHardwareEqu.a to INCLUDES for Laguna support.
+;				 6/10/87	EHB		Added INCLUDEs for colorEqu.a and nsysequ.a again.
+;				  6/2/87	DAF		Added INCLUDEs for colorEqu.a and nsysequ.a. Added 020 asm
+;									directive if on numac.
+;				 5/12/87	DAF		Rolled in DSHook patch to not save bits behind dialog when on
+;									CQD-equipped system and in >1-bit mode.
+;				  3/3/87	BB		Modified CmdDone to call external file systems if "NoMacDskErr"
+;									is returned from MountVol.
+;				 2/19/87	BB		Added EXPORTs for vectored MtCheck, CheckReMount, FindDrive,
+;									DtrmV2, FClose, and FlushMDB.
+;				10/27/86	BB		Added EXPORTs for vectored CkExtFS, DtrmV3, TstMod, and BMChk
+;									routines.
+;				 9/25/86	BB		Updated to use new MPW equate files.
+;	  <C150>	  9/9/86	TJ		Added vDoEject vector for access by other system routines that
+;									need to handle manual diskette ejection. Extended to accept
+;									Command-Shift-0 for drive #3.
+;				 1/20/86	LAK		Added .DEF of FindDrive for BTAlloc usage in updating alternate
+;									MDB.
+;				 11/3/85	LAK		One more tweak to disk-switch: if we get a non-memfull error on
+;									our mount (e.g., IOErr because double-sided disk was inserted
+;									into 1-sided drive), we eject that disk and reenter our wait
+;									loop. Also fixed bug when remounting an offline volume (D3 not
+;									set up).
+;				 11/2/85	LAK		Call DoEject for cmd-shift-1 or 2 during disk switch DIP wait.
+;									In case user has inserted needed 2-sided disk into his old
+;									external 1-sided drive (removes need for paper clip eject).
+;				10/29/85	LAK		Added Defs for vectored routines.
+;				10/22/85	PWD		Fixed CmdDone to check PMSP for traps w. TFS bit set but
+;									DirID=0.
+;				10/16/85	PWD		Added _LockRng and _UnlockRng dispatches
+;				10/14/85	PWD		Added _ReadWDCB dispatch (trap 15)
+;				 10/8/85	LAK		Added .Def of vLg2Phys (for ROM vector).
+;				 10/2/85	LAK		Added debug code at CmdDone to check for a non-released buffer.
+;									(may want to take this out since it is time-consuming).
+;				 10/1/85	LAK		Added .Ref of MarkA5Block. Add .Def of Lg2Phys for Cache.
+;									Convert positive internal errors to FSDSIntErr at CmdDone. Cut
+;									out Queue code convert drive numbers to VRefNums (this is now
+;									handled by GetVCBDrv in TFSCommon). Added Refs of
+;									CacheWrIP,CacheRdIP. Added Def of TFSVCBTst. Set up global
+;									asynchronicity flag, FSCallAsync, at FSDispatch. Patched
+;									disk-switch hook for ROM to look for cmd-. abort and return
+;									VolOffLinErr for that case (let's see how it goes).
+;				 9/26/85	PWD		Added SetupDef entry point dispatch for external FS support.
+;				 9/25/85	PWD		Changed to allow SkipPMSP to come on in mid-parse in CmdDone
+;									path
+;				 9/20/85	LAK		Added .Ref of TrashFBlocks.
+;				  9/8/85	LAK		Added Def of MarkVCBTime. Added Ref of UpdateFree.
+;				  9/5/85	LAK		Clear CacheFlag on exit.
+;				  9/5/85	LAK		ParamErr instead of IOErr if D0 parameter to $Ax60 trap is out
+;									of range.
+;				  9/2/85	LAK		Added .Ref of MarkBlock.
+;				 8/30/85	LAK		Added .Ref of TrashVBlks. Removed .Ref of RelCache.
+;				 8/27/85	LAK		Why waste a word in _FSControl? Remunged dispatch a bit, too.
+;				 8/22/85	PWD		Added _SetUpWDCB trap dispatch
+;				 7/31/85	PWD		Added _FSControl trap
+;				 7/27/85	PWD		Added Poor Man's Search Path mechanism
+;				 7/17/85	PWD		Changed TFSDispatch to store trap index in ioTrap for use by
+;									ext. FS and volume switch re-trap (TrapAgain)
+;				 6/14/85	PWD		Added EXT.L to make error codes into longs at CmdDone
+;				  5/1/85	PWD		Expanded dispatch table to accomodate new TFS traps
+;				 4/22/85	PWD		Fixed dispatcher table indexing to use word offsets
+;									consistently.
+;				 3/13/85	PWD		Added TFS trap dispatcher
+;				  2/8/85	PWD		Added .Include of ToolEqu for TIOCore use.
+;				  2/5/85	PWD		Changed to use Tlasm- equates (including TFSEqu)
+;				 9/24/84	GSS		Added include of RAM version trap install code, and def for
+;									Offline call
+;				  8/5/84	GSS		New today. (taken from Larry Kenyon's Mac File System)
+;
+
+;_______________________________________________________________________
+;
+; External Routines:	Enqueue,Dequeue,InitQueue
+;
+; Internal Routines:	FSQueue,FSQueueSync
+;
+;_______________________________________________________________________
+
+
+			BLANKS		ON
+			STRING		ASIS
+			
+			MACHINE		MC68020
+			
+SonyNonPortable EQU 	1
+
+			PRINT		OFF
+			LOAD		'StandardEqu.d'
+			INCLUDE		'HardwarePrivateEqu.a'
+			INCLUDE		'SonyEqu.a'
+			INCLUDE		'Processes.a'
+			INCLUDE		'MFPrivate.a'
+			INCLUDE		'FileMgrPrivate.a'
+			INCLUDE		'SCSI.a'
+			INCLUDE		'SCSIPriv.a'
+			INCLUDE		'GestaltEqu.a'
+			INCLUDE		'InternalMacros.a'
+			INCLUDE		'SysPrivateEqu.a'
+			INCLUDE		'BTreeEqu.a'
+			PRINT		ON
+
+			PRINT		NOGEN
+
+
+;_______________________________________________________________________
+;
+; Routine:			TFSDispatch
+;
+; Arguments:		D0.W = TFS trap index
+;					D1.W = Trap ($Ax60)
+;					A0.L = Parameter Block Pointer
+;
+; Called by:		EMT1010
+;
+; Function: 		Dispatch routine for the _HFSDispatch trap.
+;
+; The deal with $A060 trap numbers:
+;		$00-$1f		HFS calls
+;		$20-$2f		Desktop Manager Calls
+;		$30-$3f		AppleShare calls (owned by AppleShare group)
+;		$40-$4f		More appleshare calls
+;		$60-$7f		More HFS calls
+;
+;  Modification History:
+;
+;	13-Mar-85  PWD	New today.
+;	<25Sep85>  PWD	Added SetPMSP (trap 12): bumped _SetupWDCB to index 13.
+;	<14Oct85>  PWD	Added _ReadWDCB dispatch (trap 15)
+;_______________________________________________________________________
+
+MaxTrapNum 			Equ			$70	
+
+
+TFSDispatch	Proc	Export
+			Import	UnknownCall
+			
+			tst.w	d0						; check lower bound of selector
+			blt.l	UnknownCall				;  negative traps are no good
+			cmp.w	#MaxTrapNum,d0			; check upper bound of selector
+			bge.l	UnknownCall				;  off the deep end
+		
+			move.w	d1,ioTrap(a0)			; save the unmunged trap
+			andi.w	#$0F00,ioTrap(a0)		; leave only modifiers (Async etc.)
+			move.b	d0,ioTrap+1(a0)			; save the trap selector
+
+			lea		TFSTrpTbl,a2			; address of the dispatch table
+			adda.l	(a2,d0.w*4),a2			; add the routine offset
+			jmp		(a2)					; jump to the routine
+			
+			macro						
+			DispatchEntry	&where
+			import			&where
+			dc.l			&where-TFSTrpTbl
+			endm
+
+TFSTrpTbl									; pc relative data
+
+			DispatchEntry FSControl			; $00 Special control entry point
+			DispatchEntry OpenWDTrap		; $01 Open a working directory
+			DispatchEntry CloseWDTrap		; $02 Close a working directory
+			DispatchEntry SetDir			; $03 Set a default directory
+			DispatchEntry GetDir			; $04 Get default directory information
+			DispatchEntry TFMove			; $05 Move a CNode into another directory
+			DispatchEntry CreateDir			; $06 Create a directory CNode
+			DispatchEntry GetWDInfoTrap		; $07 Get WDCB infomation
+			DispatchEntry GetFCBInfo		; $08 Get FCB information
+			DispatchEntry GetCatInfo		; $09 Get expanded file/dir information
+			DispatchEntry SetCatInfo		; $0A Change CNode information
+			DispatchEntry SetVolInfo		; $0B Change volume information
+			DispatchEntry SetPMSP			; $0C Set up PMSP hook and enable/disable PMSP
+			DispatchEntry SetUpWDCB			; $0D Set up WDCB [raw internal call only]
+			DispatchEntry SetUpDef			; $0E Set up default vol&dir [raw internal]
+			DispatchEntry ReadWDCB			; $0F Get WDCB information [raw internal]
+			DispatchEntry LockRng			; $10 Lock a byte range
+			DispatchEntry UnLockRng			; $11 Unlock a byte range
+
+			DispatchEntry UnknownCall		; $12 
+			DispatchEntry UnknownCall		; $13 
+			DispatchEntry CreateFileIDRef	; $14
+			DispatchEntry DeleteFileIDRef	; $15
+			DispatchEntry ResolveFileIDRef	; $16
+			DispatchEntry PBHExchangeFiles	; $17
+			DispatchEntry CMCatSearch		; $18
+			DispatchEntry CheckCSPB			; $19
+			DispatchEntry OpenDFTrap		; $1A
+			DispatchEntry MakeFSSpec		; $1B
+			DispatchEntry UnknownCall		; $1C
+			DispatchEntry UnknownCall		; $1D
+			DispatchEntry UnknownCall		; $1E
+			DispatchEntry UnknownCall		; $1F
+
+			DispatchEntry DTGetPath			; $20
+			DispatchEntry DTCloseDown		; $21
+			DispatchEntry DTAddIcon			; $22
+			DispatchEntry DTGetIcon			; $23
+			DispatchEntry DTGetIconInfo		; $24
+			DispatchEntry DTAddAPPL			; $25
+			DispatchEntry DTRemoveAPPL		; $26
+			DispatchEntry DTGetAPPL			; $27
+			DispatchEntry DTSetComment		; $28
+			DispatchEntry DTRemoveComment	; $29
+			DispatchEntry DTGetComment		; $2a
+			DispatchEntry DTFlush			; $2b
+			DispatchEntry DTReset			; $2c
+			DispatchEntry DTGetInfo			; $2d
+			DispatchEntry DTOpenInform		; $2e
+			DispatchEntry DTDelete			; $2f
+
+			DispatchEntry GetVolParms		; $30 GetVolParms
+			DispatchEntry VolumeCall		; $31 GetLogInInfo
+			DispatchEntry VolumeCall		; $32 GetDirAccess
+			DispatchEntry VolumeCall		; $33 SetDirAccess
+			DispatchEntry VolumeCall		; $34 MapID
+			DispatchEntry VolumeCall		; $35 MapName
+			DispatchEntry VolumeCall		; $36 CopyFile
+			DispatchEntry VolumeCall		; $37 MoveRename
+			DispatchEntry OpenCall			; $38 OpenDeny
+			DispatchEntry OpenCall			; $39 OpenRFDeny
+			DispatchEntry VolumeCall		; $3A Reserved for future use
+			DispatchEntry VolumeCall		; $3B Reserved for future use
+			DispatchEntry VolumeCall		; $3C Reserved for future use
+			DispatchEntry VolumeCall		; $3D Reserved for future use
+			DispatchEntry VolumeCall		; $3E Reserved for future use
+
+			DispatchEntry VolumeCall		; $3F GetVolMountInfoSize
+			DispatchEntry VolumeCall		; $40 GetVolMountInfo
+			DispatchEntry UnknownCall		; $41 VolumeMount
+			DispatchEntry VolumeCall		; $42 Share
+			DispatchEntry VolumeCall		; $43 UnShare
+			DispatchEntry UnknownCall		; $44 GetUGEntry
+			DispatchEntry UnknownCall		; $45 ServerControl
+			DispatchEntry UnknownCall		; $46 ServerStartup
+			DispatchEntry UnknownCall		; $47 Reserved for future use
+			DispatchEntry UnknownCall		; $48 Reserved for future use
+			DispatchEntry UnknownCall		; $49 Reserved for future use
+			DispatchEntry UnknownCall		; $4A Reserved for future use
+			DispatchEntry UnknownCall		; $4B Reserved for future use
+			DispatchEntry UnknownCall		; $4C Reserved for future use
+			DispatchEntry UnknownCall		; $4D Reserved for future use
+			DispatchEntry UnknownCall		; $4E Reserved for future use
+			DispatchEntry UnknownCall		; $4F Reserved for future use
+
+			DispatchEntry GetParallelFCBFromRefnum	; $50
+			DispatchEntry RefNumCall		; $51 Reserved for future use
+			DispatchEntry RefNumCall		; $52 Reserved for future use
+			DispatchEntry RefNumCall		; $53 Reserved for future use
+			DispatchEntry RefNumCall		; $54 Reserved for future use
+			DispatchEntry RefNumCall		; $55 Reserved for future use
+			DispatchEntry RefNumCall		; $56 Reserved for future use
+			DispatchEntry RefNumCall		; $57 Reserved for future use
+			DispatchEntry RefNumCall		; $58 Reserved for future use
+			DispatchEntry RefNumCall		; $59 Reserved for future use
+			DispatchEntry RefNumCall		; $5A Reserved for future use
+			DispatchEntry RefNumCall		; $5B Reserved for future use
+			DispatchEntry RefNumCall		; $5C Reserved for future use
+			DispatchEntry RefNumCall		; $5D Reserved for future use
+			DispatchEntry RefNumCall		; $5E Reserved for future use
+			DispatchEntry RefNumCall		; $5F Reserved for future use
+
+			DispatchEntry VolumeCall		; $60 GetAltPrivs
+			DispatchEntry VolumeCall		; $61 SetAltPrivs
+			DispatchEntry DoFSCleanUp		; $62 FSCleanUp
+			DispatchEntry AllocateFCBs		; $63 AllocateFCBs
+			DispatchEntry VolumeCall		; $64 Reserved for future use
+			DispatchEntry VolumeCall		; $65 Reserved for future use
+			DispatchEntry VolumeCall		; $66 Reserved for future use
+			DispatchEntry VolumeCall		; $67 Reserved for future use
+			DispatchEntry VolumeCall		; $68 Reserved for future use
+			DispatchEntry VolumeCall		; $69 Reserved for future use
+			DispatchEntry VolumeCall		; $6A Reserved for future use
+			DispatchEntry VolumeCall		; $6B Reserved for future use
+			DispatchEntry VolumeCall		; $6C Reserved for future use
+			DispatchEntry VolumeCall		; $6D Reserved for future use
+			DispatchEntry VolumeCall		; $6E Reserved for future use
+			DispatchEntry VolumeCall		; $6F Reserved for future use
+
+			EndProc
+
+TurboFS 	PROC	EXPORT
+
+			Export	UNLOCKRNG,LOCKRNG,READWDCB,SETUPDEF,SETUPWDCB,SETPMSP,FSCONTROL
+			Export	ALLOCATEFCBS,DOFSCLEANUP,GTNXTMATCH,GT1STMATCH,GETVOLPARMS
+			Export	FLUSHVFILES,FCLOSE,REFNUMCHECK,PUSHCNAME,CVFLGS,POPCNAME
+			Export	ExtOffLinCk,FNDFILNAME,DTRMV3,GT1STFCB,GTNXTFCB,FSQUEUE
+
+			EXPORT	vDoEject			;									<C150/09sep86>
+			EXPORT	DivUp,RoundAlloc,Lg2Phys,TFSVCBTst							; <01Oct85>
+			EXPORT	FInitQueue
+			EXPORT	MountVol,UnMountVolTrap,FlushVolTrap,MarkVCB,MarkVCBTime,FlushMDB	; <08Sep85>
+			EXPORT	OpenWDTrap,CloseWDTrap,SetDir,GetDir,GetWDInfoTrap
+			EXPORT	FileOpen,FileClose
+			EXPORT	FileRead,FileWrite
+			EXPORT	FSQueueSync, CmdDone
+			EXPORT	CreateDir,FileCreate,FileDelete,ReNameTrap,TFMove,OpenRFTrap,OpenDFTrap
+			EXPORT	GetFPosTrap,SetFPosTrap,FileAlloc
+			EXPORT	GetEOFTrap,SetEOFTrap,FlushFile
+			EXPORT	GetFCBInfo
+			EXPORT	GetFileInfo,SetFileInfo,SetFilType,RstFilLock,SetFilLock
+			EXPORT	GetCatInfo,SetCatInfo
+			EXPORT	GetVCBRfn,GetVolInfo,SetVolInfo,EjectTrap,Offline
+			EXPORT	SetVolTrap,GetVolTrap
+			EXPORT	DoEject,MakeStkPB,FindDrive 								;<20Jan86>
+			EXPORT	vDtrmV1,vFileOpen,vPermssnChk,vFndFilName,vRfNCall,vAdjEOF	;<29Oct85>
+			EXPORT	vCkExtFS,vDtrmV3,vTstMod,vBMChk								;<27Oct86>
+			EXPORT	vMtCheck,vCheckReMount,vFindDrive,vDtrmV2,vFClose,vFlushMDB ;<19Feb87>
+			EXPORT	vLg2Phys			;										<08Oct85>
+			EXPORT	DSHook
+			EXPORT	vFileRead, vFileWrite, vFileClose							;<dnf v2.2,v2.3>
+			EXPORT	InitFS					;<1.2>
+
+		IF hasManEject THEN					; <SM8> <BH 03Aug93>
+			EXPORT	SwitchDisk				; for Desk Mgr
+			EXPORT	CleanDSErr				; for Eject patch in FileMgrHooks (ExtFSHookPatch)
+		ENDIF
+			
+			IMPORT	AllocFakeRgns
+			IMPORT	EnqueueTrap,DequeueTrap,InitQueue
+			IMPORT	InitCache,GetBlock,RelBlock,FlushCache,TrashBlocks,TrashVBlks
+			IMPORT	MarkBlock,MarkA5Block,TrashFBlocks										; <01Oct85>
+			IMPORT	CacheWrIP,CacheRdIP 													; <01Oct85>
+			IMPORT	MapFBlock,ExtendFile,TruncateFile,DeallocFile,BlkChk,UpdateFree 		; <08Sep85>
+			IMPORT	BTOpen,BTFlush,BTClose,FXMKeyCmp,CMKeyCmp
+			IMPORT	BTSearch,BTGetRecord,BTUpdate
+			IMPORT	CMCreateCN,CMGetCN,CMDeleteCN,CMGetOff,CMMoveCN,CMRenameCN
+			IMPORT	CMUpdateCN
+			IMPORT	WDCBSwOS				;										<C152><1.2>
+			IMPORT	PMSPSwOS				;										<C152><1.2>
+			IMPORT	DTDBMgrInit,QMInit,CheckDesktopSupport,DesktopCloseDownProc		; from DTDBMgr.a
+			
+			IMPORT	vSyncWait				; from FileMgrHooks.a
+			IMPORT	vAfterFSQHook			; from FileMgrHooks.a
+			IMPORT	fsGeneralWakeUp			; from FileMgrHooks.a
+			IMPORT	fsSCSIFreeHookProc		; from FileMgrHooks.a
+			IMPORT	ProcessMgrExists		; from FileMgrHooks.a
+
+			
+;________________________________________________________________________________
+;
+; Routine:      Stub dispatch handlers
+;
+; Function:   	Pass a call to the external File System if it refers to an
+;               external File System volume.
+;
+;		VolumeCall handles calls defined to take a vRefnum/ioNamePtr
+;		RefNumCall handles calls which take an FCB refnum
+;		OpenCall handles all forms of Open (which need to set up an FCB in d1)
+;		UnknownCall handles call for which there isn't yet a definition
+;
+; Inputs:       A0 = Parameter block
+; Output:       D0 = error code, RfNumErr or zero.
+;________________________________________________________________________________
+
+ExtFSErrExit:
+			moveq.l	#ExtFSErr,d0        ; Good news!
+			bra.l	CmdDone
+
+ParamErrExit:
+			moveq.l	#paramErr, d0		; It's an unknown trap for a local volume
+			bra.l	CmdDone
+
+;________________________________________________________________________________
+;
+; Routine:      VolumeCall
+;
+; Function:     Handles calls defined to take a vRefnum/ioNamePtr.  If
+;				the call refers to an External File System's volume,
+;				the call is passed to the external FS. Otherwise,
+;				a #paramErr is returned to the caller.
+;________________________________________________________________________________
+
+			entry	VolumeCall
+VolumeCall:
+			jsr		FSQueue				; Patiently wait our turn
+			jsr		DtrmV3				; Determine the volume being referred to
+			bne		CmdDone				; Punt at the slightest hint of trouble
+
+			move.l	a2,ReqstVol			; Point to the volume being referred to
+			tst.w	VCBFSID(a2)			; External FS?
+			bne		ExtFSErrExit		; Branch if it's not a local FS
+			bra		ParamErrExit
+
+;________________________________________________________________________________
+;
+; Routine:      RefNumCall
+;
+; Function:     Handle a refNum-based call.  If the call refers to an External
+;               File System's volume, the call is passed to the external FS.
+;               Otherwise, a #paramErr is returned to the caller.
+;________________________________________________________________________________
+
+			entry	RefNumCall
+RefNumCall:
+			jsr		FSQueue				; chill in line
+			move.w  ioRefNum(a0),d0		; Pick up the refNum
+			jsr		RefNumCheck			; Check the refNum supplied
+			bne		CmdDone				; Punt at first hint of trouble
+
+			movea.l FCBsPtr,a1			; Point to the FCB table
+			move.w	ioRefNum(a0),d1		; Pick up the specified refNum
+			movea.l	FCBVPtr(a1,d1),a1	; Point to the VCB for this volume
+			move.l	a1, ReqstVol		; In case it's #extFSErr
+			tst.w	VCBFSID(a1)			; Local FS?
+			bne.s	ExtFSErrExit		; No - let external file systems have it
+			bra.s	ParamErrExit		; Local doesn't implement this call
+
+;________________________________________________________________________________
+;
+; Routine:      OpenCall
+;
+; Function:     Open a fork with specific Deny modes; pass the call to the External;
+;               file system if it's for an Ext. FS volume.
+;________________________________________________________________________________
+;
+			entry	OpenCall
+OpenCall:
+			jsr		FSQueue				; Wait our turn
+            jsr	 	DtrmV3         	  ; Determine the volume being referred to
+            bne		CmdDone				; Punt at the slightest hint of trouble
+
+			move.l	a2,ReqstVol         ; Point to the volume being referred to
+			tst.w	VCBFSID(a2)         ; External FS?
+			beq.s	ParamErrExit		; It's an unknown trap for a local volume
+
+			bsr		OpenAttemptHook		; let ourselves know we're trying				<38>
+			jsr		Gt1stFCB			; get (A1,D1) pointing to first FCB
+@1			tst.l	FCBFlNm(a1,d1)		; FCB unused
+			beq.s	@90					; br if so
+			jsr		GtNxtFCB			; get next one until we run out
+			bcs.s	@1
+
+			moveq.l	#TMFOErr,d0 		; too many files open
+			clr.w	IORefNum(a0)		; make refnum invalid
+			bra		CmdDone
+
+@90			add.l	a1,d1               ; Point to the FCB
+			bra.s	ExtFSErrExit		; ... and pass it along
+
+;________________________________________________________________________________
+;
+; Routine:      UnknownCall
+;
+; Function:     Pass a call to the external File System.  This routine is called for
+;				call selectors that are unknown to HFS and the Desktop Manager, but
+;				which might be implemented for External File Systems.
+;________________________________________________________________________________
+;
+			entry	UnknownCall
+UnknownCall:
+			jsr		FSQueue				; Wait our turn
+			movea.l	VCBQHdr+qHead, a2	; Pick up pointer to first VCB
+			move.l	a2, ReqstVol		; Point someplace semi-innocuous
+			bra.s	ExtFSErrExit		; ... and pass it along
+
+;_______________________________________________________________________
+;
+; Routine:		FSControl
+; Arguments:	  D1 = trap
+;				  A0 = parameter list pointer
+;
+; Function: 	The FSControl entry point is provided in part to allow a
+;				program to sync up with the file system - the completion
+;				routine is called with exclusive access to all file system
+;				data structures...
+;
+;_______________________________________________________________________
+
+FSControl:
+			BSR.S	FSQueue 			; Wait out turn (sync up with FS)
+			MOVE.L	#FSVrsn,ioFSVrsn(A0); Return the current version of TFS 	<27Aug85>
+			MOVEQ	#0,D0				; Indicate success
+			BRA 	CmdDone 			; And call it a day
+
+;________________________________________________________________________________
+;
+; Routine:      RefNumCheck
+;
+; Function:     Check the refNum supplied to make sure it's a real file RefNum.
+;
+; Inputs:		d0 = refnum
+; Output:       d0 = error code, RfNumErr or noErr
+;
+; Note:
+;	This routine is called by the desktop manager and the UnTagFCB _Close patch.
+;________________________________________________________________________________
+; This routine was rolled into into the file TFS.a.						<SM1>
+RefNumCheckRegs		reg	a1/d1
+			entry	RefNumCheck
+RefNumCheck
+			movem.l	RefNumCheckRegs, -(sp)
+			moveq.l	#0, d1				; clear high word
+			move.w	d0, d1				; make a copy of the refnum
+			bmi.s	@RefNumErrExit		; no negative refnums
+
+			divu	FSFCBLen,d1			; Divide by the FCB size
+            swap	d1					; Get remainder in low word
+            subq.w	#2,d1				; Is the remainder 2?
+            bne.s	@RefNumErrExit		; If not, no way this could be a refnum
+
+			move.l	FCBSPtr, a1			; point to length word of FCB array
+			cmp.w	(a1), d0			; check against size of FCB array
+			bgt.s	@RefNumErrExit		; Too high?  Too bad.
+
+			moveq.l	#noErr, d0			; No pwobwem!
+			bra.s	@Exit
+
+@RefNumErrExit:
+			moveq.l	#RfNumErr,d0		; Indicate a bad refNum
+@Exit:
+			movem.l	(sp)+, RefNumCheckRegs
+			tst.w	d0					; Set condition codes
+            rts
+
+;_______________________________________________________________________
+;
+; Routine:		FSQueueSync
+; Arguments:	  D1 = trap
+;				  A0 = parameter list pointer
+; Calls:		calling routine
+; Called by:	File system routines which must be executed synchronously
+;				(MountVol,UnMountVol).
+;
+; Function: 	This entry point waits until the file system queue is
+;				empty, and then calls the calling routine, ensuring
+;				synchronous (with other file system calls) execution of
+;				the file system routine at user-level (memory manager calls
+;				are ok).  The called routine calls CmdDon when through.
+;
+;  Modification History:
+;
+;  02 Dec 82  LAK  New today.
+;
+;_______________________________________________________________________
+
+FSQueueSync
+			BCLR	#AsyncTrpBit,D1 	; ensure async bit is not on
+										; fall thru to FSSync
+;_______________________________________________________________________
+;
+; Routine:		FSQueue,CmdDone
+; Arguments:	  D1 = trap
+;				  A0 = parameter list pointer
+; Calls:		FSQue dispatches to the calling routine unless the call is
+;				 asynchronous and the file system queue is not empty. Pascal
+;				 register save conventions are observed.
+; Called by:	All file system routines when they may be executed asynchronously
+;				(i.e., they don't call the memory manager).
+;
+; Function: 	This entry point determines whether a call is synchronous
+;				or asynchronous; it queues up the call, then, if async and
+;				there is a command already executing, returns immediately.
+;				Otherwise, it enters the sync wait routine, then goes to
+;				command dispatch.
+;
+;				All of these commands finish by branching to CmdDone; this
+;				routine calls any completion routine and dispatches the
+;				next queued command, if any . . .
+;
+;  Modification History:
+;
+;  05 Aug 84  GSS  New today (taken from Larry Kenyon's Mac File System)
+;  24 Sep 84  GSS  Removed JSR Enqueue and put in a trap
+;  10-Feb-85  PWD  Re-inserted JSR to Enqueue (now directly accessible again)
+;  13-Mar-85  PWD  Added code to set up A6 stack for async context storage\
+;  26-Jul-85  PWD  Changed to restore ioTrap to $Ax60 and D0 to TFS trap index
+;				   before going off to external file system hook.
+;  25-Sep-85  PWD  Changed to allow SkipPMSP to come on in mid-parse
+;  22-Oct-85  PWD  Fixed to check PMSP for traps w. TFS bit set but DirID=0.
+;
+;  Do async calls have to be forced synchronous if the file system is not busy?
+;  Make sure interrupts are disabled at this time, though, so another request
+;  issued at interrupt time doesn't interfere.
+;_______________________________________________________________________
+
+FSQueue
+			MOVE.L	FSQueueHook,D2		; queue hook?
+			BLE.S	@0					; br if not . . .
+			MOVE.L	D2,A1
+			JSR 	(A1)				; D2 and A1 are expendable
+
+@0			MOVE.W	#1,IOResult(A0) 	; set IOResult to "in process"
+			MOVE.W	D1,IOTrap(A0)		; save the trap number
+			CMP.B	#$60,D1 			; TFS trap dispatch?
+			BNE.S	@2					; If not, leave ioTrap alone
+
+			AND.B	#$0F,ioTrap(A0) 	; Leave only modifier bits				<27Aug85>
+			MOVE.B	D0,ioTrap+1(A0) 	; Store trap index in low byte			<27Aug85>
+
+@2			MOVE.L	(SP)+,IOCmdAddr(A0) ; save address to go to when ready
+			MOVE.W	#FSQType,IOType(A0) ; say its a file system queueing element
+
+			BTST	#AsyncTrpBit,D1 	; async bit on?
+			BEQ.S	@3					; br if not
+
+			TST.B	FrcSync 			; force it synchronous?
+			BEQ.S	FSAsync 			; if not, do it async
+			BRA.S	@4
+
+@3			CLR.L	IOCompletion(A0)	; no completion routines for sync calls
+@4			MOVE.L	A0,-(SP)			; save parameter block ptr
+			BSR.S	FSAsync 			; queue it up (and maybe call it)
+			MOVE.L	(SP)+,A0
+
+SyncWait	MOVE.W	IOResult(A0),D0 	; get the result code into D0
+			BGT.S	SyncWait			; done when result is zero or negative
+
+			EXT.L	D0					; ALWAYS return a long error code.
+
+			CMP.W	#VolOffLinErr,D0	; volume off-line error? (detected by file
+			BNE.S	@1					;  system) br if not
+			MOVE.L	DskSwtchHook,-(SP)	; OffLineVol points to VCB, A0 to request
+			BGT.S	@1					; br if there is a hook proc
+			ADDQ	#4,SP				; otherwise, just return
+
+			IF		ForROM THEN			;										<27Mar89 V1.8>
+			BTST	#7, DSAlertRect 	; already in our proc?					<06Mar85>
+			BNE 	DSHook				; br if not 							<06Mar85>
+			ENDIF						;										<27Mar89 V1.8>
+			
+@1			RTS 						; return to caller
+
+FSAsync 	LEA 	FSQHdr,A1			; get pointer to file system queue
+			MOVE	SR,-(SP)			; only allow level 3
+			ORI 	#HiIntMask,SR		 ; interrupts for debugging
+			JSR 	EnqueueTrap			; queue up the request
+
+ToFSDispatch
+			BSET	#0,FSBusy			; is a request already executing?
+			BEQ.S	FSDispatch			; if not, just call it
+
+; The file system is busy so we're done for now.  We'll get to it when
+; CmdDone is called.  (maybe check here for async call with off-line vols,
+; since only eject will force something off-line . . .)
+
+			MOVEQ	#0,D0				; no errors (yet)
+			MOVE.W	(SP)+,SR			; re-enable interrupts and return
+			RTS
+
+; dispatch the next request (also called by CmdDon)
+
+FSDispatch
+			MOVE	(SP)+,SR			; re-enable interrupts
+			MOVE.L	FSQHead,A0			; get first parameter block
+			MOVE.L	IOCmdAddr(A0),A1	; get address to call
+			MOVEM.L D3-D7/A2-A6,-(SP)	; observe Pascal regsave conventions
+
+; Just before the initial dispatch into the routine,
+; clear the Poor Man's Search Path:
+
+			MOVEA.L PMSPPtr,A6			; Point to the PMSP table
+			CLR.W	PMSPIndx(A6)		; No entries used yet
+
+			BTST	#AsyncTrpBit,ioTrap(A0) ; set the flavor for this trap		<01Oct85>
+			IF	HFSDebug THEN
+			ST		FSCallAsync 		; If we're debugging, always do async   <27Oct85>
+			ELSE
+			SNE 	FSCallAsync 		; if sync, we'll do our I/O synchronous <01Oct85>
+			ENDIF ;<HFSDebug>
+
+			MOVEA.L HFSStkTop,A6		; Set up A6 for use as stack pointer
+			JSR 	(A1)				;
+			MOVEM.L (SP)+,D3-D7/A2-A6	; restore registers
+			RTS 						; and return (all commands finish by
+										;  jumping to CmdDone)
+
+toDSFSErr	MOVEQ	#DSFSErr,D0
+			_SysError
+
+CmdDone
+			IF		HFSDebug THEN
+			BRA.S	@3					; check to see if cache is cool 		<02Oct85>
+
+@0			MOVEA.L A3,A4				; start at top of queue 				<02Oct85>
+
+@1			MOVEA.L CBHFlink(A4),A4 	; position to next buffer				<02Oct85>
+			CMPA.L	A3,A4				; back to top of queue ?				<02Oct85>
+			BEQ.S	@2					; yes ->								<02Oct85>
+
+			BTST	#CBHinuse,CBHFlags(A4) ; buffer in-use? 					<02Oct85>
+			BEQ.S	@1					; no, continue search ->				<02Oct85>
+			_HFSDebug  $500 			; trap if we exit FS with a buf in-use	<02Oct85>
+@2			RTS 						;										02Oct85
+
+@3			MOVEM.L A3-A4,-(SP) 		; save registers						<02Oct85>
+
+			MOVEA.L SysCtlCPtr,A3		; A3 = ptr(control cache header)		<02Oct85>
+			BSR.S	@0					; check out the control cache			<02Oct85>
+			MOVEA.L SysBMCPtr,A3		;										<02Oct85>
+			BSR.S	@0					; check out the alloc map cache 		<02Oct85>
+			MOVEA.L SysVolCPtr,A3		;										<02Oct85>
+			BSR.S	@0					; check out the volume cache			<02Oct85>
+
+			MOVEM.L (SP)+,A3-A4 		; restore registers 					<02Oct85>
+
+RealCmdDone
+			ENDIF
+
+			CLR.B	CacheFlag			; we're always clean here . . .         <05Sep85>
+
+			EXT.L	D0					; Make a long of it 					<14Jun85>
+			BLE.S	@0					; If zero or negative, we're OK         <01Oct85>
+			MOVE.W	D0,HFSDSErr 		; Save internal error for debug 		<01Oct85>
+			MOVEQ	#FSDSIntErr,D0		; 1-127 codes are internal errors		<01Oct85>
+
+@0			MOVE.L	FSQHead,A0			; A0 -> current request
+			CMP 	#FSQType,IOType(A0) ; it better be an I/O queue element
+			BNE.S 	toDSFSErr			;  or else die
+
+			CMP.W	#FNFErr,D0			; File not found error?
+			BNE.S	cd_CkExtFS			; If not, we're gone.
+			BTST	#HFSBit,ioTrap(A0)	; Use of HFSBit (=9) is OK on high byte ref.
+			BEQ.S	@2					; If clear, consider the next entry on the PMSP <22Oct85>
+			TST.L	ioDirID(A0) 		; TFS trap: was DidID specified?				<22Oct85>
+			BNE.S	cd_CkExtFS			; Yes - there's no search path to consider      <22Oct85>
+
+@2			BTST	#NoPMSP,HFSFlags	; PMSP disabled?								<25Sep85>
+			BNE.S	cd_CkExtFS			; If set, don't search any other directories    <25Sep85>
+
+			BTST	#SkipPMSP,HFSFlags	; Don't bother with PMSP for this operation?    <22Aug85>
+			BNE.S	cd_CkExtFS			; If flag isn't set, give it a chance           <22Aug85>
+
+			MOVEA.L PMSPPtr,A1			; Point to the search path list
+			MOVEM.L D1/A2,-(SP) 		; Save them across the offline check
+			MOVE.W	PMSPIndx(A1),D1 	; Pick up the index
+
+@3			ADDQ.W	#SPEntLen,D1		; Advance to the next entry
+			CMP.W	(A1),D1 			; Index outside table yet?
+			BGE.S	@5					; Yes - give up.
+			MOVE.W	SPVRefNum(A1,D1),D0 ; Pick up the VRefNum
+			BEQ.S	@5					; If there isn't one, give up.
+			BSR 	GetVCBRfn			; Find the VCB
+			BNE.S	@5					; Punt on errors
+			MOVE.W	vcbDrvNum(A2),D0	; Volume on-line?
+			BLE.S	@3					; No - try next entry.
+
+@5			MOVE.W	D1,PMSPIndx(A1) 	; Point to this entry
+			MOVE.W	D1,D0				; Save the index
+
+			MOVEM.L (SP)+,D1/A2 		; Restore scratch registers
+			CMP.W	(A1),D0 			; Exceeded PMSP table limits?
+			BGE.S	@10 				; Yes - punt.
+			TST.W	SPVRefNum(A1,D0)	; Was a new default volume found?
+			BEQ.S	@10 				; Nope - give up.
+			MOVEQ	#0,D0				; Clear high 3 bytes
+			MOVE.B	ioTrap+1(A0),D0 	; Pick up the TFS trap index again, too
+			MOVEA.L ioCmdAddr(A0),A1	; Pick up the CmdAddr from FSQueue
+			JMP 	(A1)				; Repeat the trap with a different default
+
+@10 		MOVEQ	#FNFErr,D0			; Restore error code
+
+cd_CkExtFS	BCLR	#SkipPMSP,HFSFlags	; Don't skip PMSP now that this trap's done <25Sep85>
+			MOVE.L	ExtFSHook,D2		; queue hook?
+			BLE.S	@1					; br if not . . .
+			MOVE.L	D2,A1				; (external fs, debug)
+			JSR 	(A1)				; leave CmdDone address on the stack
+@1
+			move.l	toExtFS,d2			; Any external file systems defined?	<10Nov87>
+			ble.s	cd_DeQueue			; Xfer if not...						<10Nov87>
+			move.l	d2,a1				; Else, point to first proc in chain	<10Nov87>
+
+			cmp.w	#ExtFSErr,d0		; Pass request on to external FS's?		<10Nov87>
+			beq.s	@2					; Xfer if so...							<10Nov87>
+			cmp.w	#NoMacDskErr,d0		; Did a MountVol call fail?				<10Nov87>
+			bne.s	cd_DeQueue			; Xfer if not...						<10Nov87>
+			clr.l	ReqstVol			; Force 'No VCB' for this call			<10Nov87>
+@2
+			MOVE.L	FSQHead,A0			; A0 -> current request
+			CMP 	#FSQType,IOType(A0) ; it better be an I/O queue element
+			BNE 	toDSFSErr			;  or else die
+
+			MOVEQ	#ExtFSErr,D0		; Code to ExtFS's unless an $Ax60 call	<03Mar87>
+			TST.W	ioTrap(A0)			; Check trap word:
+			BLT.S	@3					; If it's negative ($A...), go ahead    <27Aug85>
+
+			MOVEQ	#0,D0				; Clear high 3 bytes					<27Aug85>
+			MOVE.B	ioTrap+1(A0),D0 	; Pick up the TFS trap index			<27Aug85>
+			CLR.B	ioTrap+1(A0)		; and restore original trap 			<27Aug85>
+			ORI.W	#$A060,ioTrap(A0)	;  keeping modifier bits				<27Aug85>
+@3
+			JSR 	(A1)				; leave CmdDone address on the stack	<25Jan85>
+										
+cd_DeQueue	MOVE	SR,-(SP)			; save interrupt state					<27Aug85>
+			ORI 	#HiIntMask,SR		; only debug interrupts allowed
+			CLR.W	FSBusy				; clear file system busy boolean
+
+; delete the current request from the queue and post any completion routines
+
+			MOVE.L	FSQHead,A0			; A0 -> current request
+			CMP 	#FSQType,IOType(A0) ; it better be an I/O queue element
+			BNE 	toDSFSErr			;  or else die
+			MOVE.L	QLink(A0),FSQHead	; get next request, if any
+			BNE.S	cd_CallComp 		; branch if queue not empty 			<27Aug85>
+			CLR.L	FSQTail 			; clear tail ptr, too
+
+cd_CallComp 							;										<27Aug85>
+			MOVE	(SP)+,SR			; restore interrupt state
+			MOVE.W	D0,IOResult(A0) 	; post error code
+
+			MOVE.L	IOCompletion(A0),D1 ; is there a completion routine?
+			BEQ.S	cd_DispNext 		; skip if there's not                   <27Aug85>
+
+			MOVE.L	D1,A1				; get the completion routine address
+			TST.W	D0					; test result code
+			JSR 	(A1)				; call it
+
+; check if there's anything else for this driver to do
+
+cd_DispNext 							;										<27Aug85>
+			MOVE	SR,-(SP)			; save interrupt state
+			ORI 	#HiIntMask,SR		; only debug interrupts allowed
+			TST.L	FSQHead 			; is a command pending?
+			BNE		ToFSDispatch		; if so, launch new command
+			MOVE.W	(SP)+,SR			; restore rupt state and return
+			RTS
+
+;_______________________________________________________________________
+;
+; Routine:		FInitQueue
+; Arguments:	  none
+; Calls:
+; Function: 	Clear the queue of all pending commands except for the one
+;				running (if there is one . . .).
+;
+;  Modification History:
+;
+;  05 Aug 84  New today. Taken directly from LAK's FS code
+;
+;_______________________________________________________________________
+
+FInitQueue
+			MOVE	SR,-(SP)			; save interrupt state
+			ORI 	#HiIntMask,SR		; only debug interrupts
+			MOVE.L	FSQHead,D0			; any commands?
+			BEQ.S	@1					; if not, we are done
+			MOVE.L	D0,A0				; get pointer to the current routine
+			CLR.L	IOLink(A0)			; get rid of any others
+			MOVE.L	A0,FSQTail			; only this one
+@1			MOVEQ	#0,D0				; this routine has no errors
+			MOVE.W	(SP)+, SR
+			RTS
+
+;_______________________________________________________________________
+;
+; Routine:		DSHook
+; Arguments:	  none
+; Calls:
+; Function: 	Implements disk-switch recovery.
+;
+; 29 Jan 85  LAK  Doubled amount of stack slop needed.
+;
+; To Do:
+; - be smarter about number of bytes to save of rectangle (compute from
+;	  rectangle).
+;
+; There was a bug in the DSHook code used to force updates that is used when there is insufficient
+; room on the stack to save the room behind the disk switch dialog. We now use the new global, 
+; SysErrorUpdateRect, instead. See the patch to GetNextEvent that uses SysErrorUpdateRect for more
+; information
+;_______________________________________________________________________
+
+DSHook
+			MOVEM.L A0-A3/A6/D0-D7,-(SP) ; save registers
+
+			LEA 	TrapAgain,A1		; fill in the trap now
+			MOVE.W	IOTrap(A0),(A1)+	; Set up the trap to be retried...
+			MOVE.W	#$4E75,(A1) 		; Follow it with an RTS
+
+; first try mounting the volume in case it was forced off-line due to mem-full:
+
+		IF NOT hasManEject THEN			; if man-eject, defer this a bit <SM8> <BH 03Aug93>
+			BSR 	MakeStkPB			; get a parameter block off the stack . .
+			MOVE.L	A0,D7				; remember it in D7
+		ENDIF
+
+			MOVE.L	ReqstVol,A2 		; VCB for requested volume
+			MOVE.W	VCBDRefNum(A2),D3	; Original drive
+			BPL.S	TellUser			; br if ejected-offline
+			NEG.W	D3					; negative means non-ejected offline
+			
+		IF  hasManEject THEN			; <SM8> <BH 03Aug93>
+			BSR 	MakeStkPB			; get a parameter block off the stack . .
+			MOVE.W	D3,ioDrvNum(A0)		; remount this drive
+			MOVE.L	FSVarsPtr,A1
+			BSET.B	#fsNoAllocate,FSVars.fsFlags(A1) ; inform _Mount that it can't allocate memory
+			_MountVol
+			BCLR.B	#fsNoAllocate,FSVars.fsFlags(A1)
+			ADDA.L	#IOVQElSize,SP		; goodbye paramblock
+			TST		ioResult(A0)		; success?
+			BEQ.S	DSExit
+TellUser	MOVE.W	#dsReinsert,D4		; err code for SwitchDisk
+			BSR.S	SwitchDisk			; ask for the disk
+			; CCR: Z set if disk received, clear if request aborted
+DSExit
+
+		ELSE	; if NOT hasManEject, here's the old DSHook, most of which resides in
+				; SwitchDisk for the manual-eject case.  <SM8> <BH 03Aug93>
+			MOVE.W	D3,IODrvNum(A0) 	; so just remount (reload the buffers)
+			MOVE.L	FSVarsPtr,A2		;															<SM7>
+			BSET.B	#fsNoAllocate,FSVars.fsFlags(A2) ; inform _Mount that it can't allocate memory	<SM7>
+			_MountVol					;															<SM7>
+			BCLR.B	#fsNoAllocate,FSVars.fsFlags(A2);												<SM7>
+			TST		ioResult(A0)		;															<SM7>
+			BNE.S	TellUser			; ?? tell user something ?? 			<03Nov85> LAK
+
+			MOVEQ	#0,D3				; yes, retry the fs call				<03Nov85> LAK
+			BRA 	DSExit				; exit . . .							<03Nov85> LAK
+
+TellUser	MOVE.L	#$00500078,DSAlertRect ; use alternate alert rect 
+			MOVE.L	#$00980195,DSAlertRect+4 ;(high bit is also flag)
+			
+			; the code the saved the screen behind the dialog has been removed.		<SM1>
+
+			MOVEQ	#DSReInsert,D0		; ask for diskette back
+			_SysError
+
+EjectCurDisk
+			MOVE.L	DrvQHdr+QHead,D0	; figure out if this drive has a disk-in-place
+@0			BEQ.S	WaitForDsk
+			MOVE.L	D0,A1
+			CMP.W	DQDrive(A1),D3		; find queue element for this drive
+			BEQ.S	@1
+			MOVE.L	QLink(A1),D0
+			BRA.S 	@0
+
+@1			MOVE.B	-3(A1),D0			; DiskInPlace
+			CMP.B	#1,D0				;
+			BEQ.S	@2
+			CMP.B	#2,D0
+			BNE.S	WaitForDsk			; just wait for disk-insert if no DIP
+
+@2			MOVE.W	D3,D1				; disk to eject
+
+EjectMtDisk 							;										<03Nov85> LAK
+			MOVEQ	#2,D2				; a disk-switch eject					<03Nov85> LAK
+			BSR 	DoEject
+
+WaitForDsk
+			SUB 	#EvtBlkSize,SP		; get event buffer space off the stack
+
+@0			MOVE.W	#128+8,D0			; only disk-inserted/key down events interest us
+			MOVE.L	SP,A0				; event buffer
+			_GetOSEvent
+			BNE.S	@0					; loop until we get one . . .
+
+			MOVE.L	evtMessage(SP),D0	; drive number/key
+			MOVE.W	evtNum(SP),D3		; event
+			MOVE.W	evtMeta(SP),D1		; meta keys (for command bit)
+			ADD 	#EvtBlkSize,SP		; free up event buffer space
+
+			SUBQ	#diskInsertEvt,D3	; disk-insert event?
+			BEQ.S	@3					; br if so								<02Nov85> LAK
+			CMP.B	#$2E,D0 			; period?
+			BEQ.S	@2					; br if so								<02Nov85> LAK
+
+			MOVEQ	#$0B,D2 			; seek cmd, shift, not alphaLock, and option <02Nov85> LAK
+			LSR.W	#8,D1				; get high byte of meta-key info, clear D1.W hi byte <02Nov85> LAK
+			AND.B	D1,D2				; high byte of meta word contains mod bits	<02Nov85> LAK
+			SUBQ.B	#$03,D2 			; want cmd AND shift BUT NOT option 	<02Nov85> LAK
+			BNE.S	WaitForDsk			; if not so, no FKey action!			<02Nov85> LAK
+
+			moveq.l	#-'3',d1			; prepare to convert ascii to binary 	<2.6>
+			add.b	d0,d1				; keyCode - '3'							<2.6>
+			addq.b	#3,d1				; convert key to drivenum, range check	<2.6>
+			bhs.s	WaitForDsk			; if >= '3', or < '0', not an eject req	<2.6>
+			ext.w	d1					; drive number in D1.W				<C150/10sep86><2.6>
+			bne.s	@1					; 1, 2 handled as is,				<C150/10sep86>
+			moveq	#3,D1				; 0 becomes 3 (drive #3)			<C150/10sep86><2.6>
+@1			moveq	#1,D2				; flag from keyboard, 				<C150/10sep86>
+			move.l	jDoEject,A0			; 									<C150/10sep86>
+			jsr		(A0)				; eject the diskette				<C150/10sep86>
+			BRA.S	WaitForDsk			; keep waiting for Disk-In-Place		<02Nov85> LAK
+
+@2			BTST	#cmdKey,D1			; command-. for abort?					<02Nov85> LAK
+			BEQ.S	WaitForDsk			; keep waiting if not
+			BRA.S	PostUpdate	 		; otherwise, let the user beware!
+										; D3 non-zero denotes abort . . .
+@3			MOVE.L	D7,A0				; point to the I/O block				<02Nov85> LAK
+			MOVE.W	D0,IODrvNum(A0) 	; drive to mount
+			MOVE.W	D0,D1				; save in case we have to eject it		<03Nov85> LAK
+			MOVE.L	FSVarsPtr,A2		;															<SM7>
+			BSET.B	#fsNoAllocate,FSVars.fsFlags(A2) ; inform _Mount that it can't allocate memory	<SM7>
+			_MountVol					;															<SM7>
+			BCLR.B	#fsNoAllocate,FSVars.fsFlags(A2) ;												<SM7>
+			TST		ioResult(A0)		;															<SM7>
+			BEQ.S	PostUpdate	 		; cruise on if ok						<03Nov85> LAK
+
+			CMP.W	#MemFullErr,D0		; memory full?
+			BNE.S	EjectMtDisk 		; br if not - eject it and wait some more <03Nov85> LAK
+
+			MOVEQ	#-1,D3				; make it an abort (avoid DS)			<01Oct85>
+
+; OK, we're basically done with the disk switched stuff.
+; The code the saved the screen behind the dialog has been removed.				<SM1>
+PostUpdate								;										<SM1>
+			CLR.B	DSWndUpdate 		; flag GNE to remove the alert . . .	<SM1>
+			PEA		DSAlertRect			; union this in							<SM1>
+			MOVE.L	ExpandMem,a0		;										<SM1>
+			PEA		ExpandMemRec.SysErrorUpdateRect(a0) ; into this rect		<SM1>
+			move.l	(sp),-(sp)							; do it in place		<SM1> <SM4> rb
+			_UnionRect					;										<SM1>
+
+DSExit		BSET	#7, DSAlertRect 	; return to old DS rect (also clears exclusion) <06Mar85>
+										; <removed reinstall of DskSwHook>				<06Mar85>
+			ADD 	#IOVQElSize,SP		; clean up stack
+			TST.W	D3					; zero for non-abort . . .				<01Oct85>
+		ENDIF	; hasManEject--the manual-eject and non-manual-eject threads rejoin here
+			
+			MOVEM.L (SP)+,A0-A3/A6/D0-D7 ; restore registers
+			BEQ.S	@1					; br for retry							<01Oct85>
+
+			MOVEQ	#VolOffLinErr,D0	; well, not much else to do . . .		<01Oct85>
+			RTS 						;										<01Oct85>
+
+@1			MOVE.W	ioTrap(A0),D0		; Pick up trap word again				<01Oct85>
+			
+			BLE.S	FlushTrapAgain		; Go re-execute the original I/O trap	<2> rb	<SM1>
+										; (should we be using a signed branch?)			<SM1>
+										;												<SM1>			
+; Repeat a TFS trap: the word in ioTrap (copied into TrapAgain by now) usually			<SM1>
+; looks like 0mxx, where m contains the modifiers (,ASYNC and ,IMMED for TFS)			<SM1>
+; and xx is the TFS trap dispatch.	TrapAgain must be changed to Ay60 and D0			<SM1>
+; to $00xx.																				<SM1>
+										;												<SM1>			
+TFSAgain:	OR.B	#$A0,TrapAgain		; Set up top nibble								<SM1>
+			MOVE.B	#$60,TrapAgain+1	; Overwrite lower bytes w. TFS trap				<SM1>
+			AND.W	#$00FF,D0			; Remove modifier bits from saved index			<SM1>
+										;												<SM1>			
+FlushTrapAgain							;												<SM1>
+			MOVE.L	D1,-(SP)			; save D1 for 020/030's					<2> rb	<SM1>
+			JSR		([jCacheFlush])		; flush the cache						<2> rb	<SM1>
+			MOVE.L	(SP)+,D1			; restore D1							<2> rb	<SM1>
+			JMP 	TrapAgain			; Go re-execute the original I/O trap	<2> rb	<SM1>
+
+
+	IF hasManEject THEN					; <SM8> <BH 03Aug93>
+; This is now a subroutine so it can be used by the Desk Manager to get back dirty
+; disks that have been manually ejected.  It largely duplicates the old code.
+; Inputs:	A2 -> VCB of desired volume
+;			D4 == DS err ID for alert to be displayed
+SwitchDisk
+			MOVEM.L	D1-D3/A0-A1/A3-A4,-(SP)	; save regs
+			BSR		MakeStkPB			; get ioPB space on stack
+			MOVEA.L	A0,A3				; A3 -> paramblock
+			SUBA.L	#EvtBlkSize,SP		; stack space for evt record
+			MOVEA.L	SP,A4				; A4 -> evt buffer
+			MOVE.L	#$004B006A,DSAlertRect ; set up alternate sys alert rect 
+			MOVE.L	#$00A50196,DSAlertRect+4 ; (high bit is also flag)
+										; all NEW, all BIGGER DSAlertRect! <SM9> <BH 27Aug93>
+			MOVEA.L	FSVarsPtr,A0
+			BSET.B	#fsNoAllocate,FSVars.fsFlags(A0)	; prevent new mounts
+			LEA		vcbVN(A2),A1
+			MOVE.L	A1,FSVars.dsRecoverNamePtr(A0)	; vol name for DS code
+			MOVEQ	#1,D3				; first time through, do draw alert at @getdisk
+			MOVEQ	#2,D2				; prepare disk-switch eject
+			MOVE.W	vcbDrvNum(A2),D1	; try to get the drive in which the vol was last seen
+			BNE.S	@freeDrive
+			MOVE.W	vcbDRefNum(A2),D1	; offline vol's drive num is in DRefNum field
+			BPL.S	@freeDrive			; positive if ejected-offline
+			NEG.W	D1					; negative if only offline
+											
+@freeDrive	; eject the disk in drive number D1, if any.  D2 has "message" for EjectNotify--
+			; 1 for an FKEY eject, 2 for disk-switch.
+			MOVEA.L	DrvQHdr+qHead,A0	; Find drive queue element: get the first
+@chkdrv		CMP.W	dqDrive(A0),D1		; match?
+			BEQ.S	@gotdrv				; yes: go check it out
+			MOVEA.L	qLink(A0),A0		; no: get next drive
+			MOVE.L	A0,D0				; any more?
+			BEQ.S	@getdisk			; can't find the drive
+			BRA.S	@chkdrv
+			
+@gotdrv		BTST	#dqManEjBit,dqInstall(A0)	; is this a manual eject drive?
+			BEQ.S	@0					; if so, the "Insert the disk" dialog will need to be
+			MOVEQ	#1,D3				; redrawn after ejection--set D3 to indicate this
+@0			MOVEA.L	jDoEject,A0
+			JSR		(A0)
+			
+@getdisk	TST.W	D3					; does the dialog need to be drawn?
+			BEQ.S	@getevt
+			MOVE.W	D4,D0				; get DS code
+			_SysError					; draw it
+			MOVEQ	#0,D3				; flag it drawn
+
+@getevt		MOVE.W	#128+8,D0			; only disk-inserted/key down events interest us
+			MOVE.L	A4,A0				; event buffer
+			_GetOSEvent
+			BNE.S	@getevt				; loop until we get one . . .
+
+			MOVE.L	evtMessage(A4),D0	; drive number or key
+			CMPI.W	#diskInsertEvt,evtNum(A4)	; disk-insert event?
+			BEQ.S	@dievt				; br if so								<02Nov85> LAK
+			
+			MOVE.W	evtMeta(A4),D1		; meta keys (for command bit)
+			CMP.B	#$2E,D0 			; period?
+			BEQ.S	@chkabort			; br if so								<02Nov85> LAK
+
+			MOVEQ	#$0B,D2 			; seek cmd, shift, not alphaLock, and option <02Nov85> LAK
+			LSR.W	#8,D1				; get high byte of meta-key info, clear D1.W hi byte <02Nov85> LAK
+			AND.B	D1,D2				; high byte of meta word contains mod bits	<02Nov85> LAK
+			SUBQ.B	#$03,D2 			; want cmd AND shift BUT NOT option 	<02Nov85> LAK
+			BNE.S	@getevt				; if not so, no FKey action!			<02Nov85> LAK
+
+			moveq.l	#-'3',d1			; prepare to convert ascii to binary 	<2.6>
+			add.b	d0,d1				; keyCode - '3'							<2.6>
+			addq.b	#3,d1				; convert key to drivenum, range check	<2.6>
+			bhs.s	@getevt				; if >= '3', or < '0', not an eject req	<2.6>
+			ext.w	d1					; drive number in D1.W				<C150/10sep86><2.6>
+			bne.s	@1					; 1, 2 handled as is,				<C150/10sep86>
+			moveq	#3,D1				; 0 becomes 3 (drive #3)			<C150/10sep86><2.6>
+@1			moveq	#1,D2				; flag from keyboard, 				<C150/10sep86>
+			BRA.S	@freeDrive
+
+@chkabort	BTST	#cmdKey,D1			; command-. for abort?					<02Nov85> LAK
+			BEQ.S	@getevt				; keep waiting if not
+			BRA.S	@aborted	 		; otherwise, let the user beware!
+										; D0 non-zero denotes abort . . .
+@dievt		MOVE.L	D0,D1				; get drive num in D1.W
+			SWAP	D0
+			TST.W	D0					; is this a genuine insert event?
+			BNE.S	@ejectevt			; no: it's some sort of ejection
+			MOVEA.L	A3,A0				; yes: get mountvol paramblock
+			MOVE.W	D1,ioDrvNum(A0)		; drive to mount
+			_MountVol
+			BEQ.S	@exitok				; success!
+			MOVEQ	#2,D2				; going to be a disk-switch eject
+			BRA.S	@freeDrive			; wrong disk--go eject it and try again
+			
+@ejectevt	CMP.W	#-1,D0				; is this an ejection request?
+			BEQ.S	@1					; yes: treat it like an FKEY
+			CMP.W	vcbDRefNum(A2),D1	; no: manual eject--is it the drive we expected the vol in?
+			BEQ.S	@getevt				; yes: probably spurious, so drop it...that drive should be empty
+										; no: hmm, what to do...repost, deal with it later
+			SWAP	D0					; restore message
+			MOVEA.W	#DiskInsertEvt,A0	; event type
+			_PostEvent					; post it
+			BRA.S	@getevt				; go back for another
+			
+@aborted	MOVEQ	#1,D3
+			BRA.S	PostUpdate
+@exitok		MOVEQ	#0,D3
+; OK, we're basically done with the disk switched stuff.
+; The code the saved the screen behind the dialog has been removed.				<SM1>
+PostUpdate								;										<SM1>
+			BSR.S	CleanDSErr			; cleanup code now a subroutine, for sharing
+			CLR.W	DSErrCode			; don't freak out the Process Mgr
+			MOVEA.L	FSVarsPtr,A0
+			BCLR.B	#fsNoAllocate,FSVars.fsFlags(a0)	; new mounts are OK again
+			MOVE.W	D3,D0								; get result, set CC
+			ADDA.L	#EvtBlkSize+IOVQElSize,SP			; clean that stack
+			MOVEM.L	(SP)+,D1-D3/A0-A1/A3-A4				; restore those registers
+			RTS
+
+; Clean up the disk-switch error box--now a subroutine for sharing purposes.
+; It is called from CmdDone after _Eject has been called for a manual-eject
+; drive; CmdDone uses a DS alert to tell the user to take the disk out of the
+; drive.
+CleanDSErr
+			CLR.B	DSWndUpdate 		; flag GNE to remove the alert . . .	<SM1>
+			PEA		DSAlertRect			; union this in							<SM1>
+			MOVE.L	ExpandMem,a0		;										<SM1>
+			PEA		ExpandMemRec.SysErrorUpdateRect(a0) ; into this rect		<SM1>
+			move.l	(sp),-(sp)							; do it in place		<SM1> <SM4> rb
+			_UnionRect					;										<SM1>
+			BSET	#7, DSAlertRect 	; return to old DS rect (also clears exclusion) <06Mar85>
+										; <removed reinstall of DskSwHook>				<06Mar85>
+			RTS
+	ENDIF								; <SM8> <BH 03Aug93>
+
+
+;
+;________________________________________________________________
+;
+; Routine: vDoEject,DoEject
+; Arguments:
+;		D1 = drive # to eject
+;		D2 = 1 for keyboard/eject button source,
+;			 2 for Disk Switch code hook
+;
+;	calls EjectNotify function as:
+;
+;	Function EjectNotify(drive:int;caller:int):boolean;
+;
+;	if false is returned, the disk is not ejected;
+;	caller=1 for eject key, caller=2 for DS hook
+;_______________________________________;
+
+vDoEject	;this label for export only
+DoEject
+			BSR 	MakeStkPB			; get a parameter block
+			MOVE.W	D1,IODrvNum(A0)
+
+			MOVE.L	EjectNotify,D0		; notify proc?
+			BLE.S	@1					; br if not
+
+			MOVEM.L D2/A0-A2,-(SP)
+			CLR.W	-(SP)
+			MOVE.W	D1,-(SP)			; pass eject drive
+			MOVE.W	D2,-(SP)			; 1=fkey eject, 2=ds hook eject
+			MOVE.L	D0,A0				; procedure pointer
+			JSR 	(A0)				; call it (it should preserve Pascal regs)
+			TST.B	(SP)+				; still want to eject?
+			MOVEM.L (SP)+,D2/A0-A2
+			BEQ.S	@2					; br if not
+
+@1			_Eject						; get rid of it . . .
+			BEQ.S	@2
+
+			MOVE.W		#8,-(SP)
+			_SysBeep					; make a beep
+
+@2			ADD 	#IOVQElSize,SP		; clean up stack and return
+			RTS
+
+;-----------------------------------------------------------------
+; Initialize the file system.
+;
+; D0	->	number of FCBs to allocate.
+;
+;-----------------------------------------------------------------
+
+InitFS		TST.W	FSFCBLen					; are we in already?
+			BPL 	FSInitOK					; br if so
+
+; first, announce the presence of TFS by publishing the FCB size:
+
+			MOVE.W	#FCBEntLen,FSFCBLen  		; Store size of TFS FCB there; non- -1 value means TFS is in
+
+; next, zero the low-memory file system area
+
+			LEA 	FileVars,A0 		 		; initialize our lomem vars to 0
+			MOVEQ	#(FSClrWdLen/2)-1,D1 		; esp. VCB, FS queue hdrs, params, FSBusy
+@1			CLR.W	(A0)+
+			DBRA	D1,@1
+
+			MOVE.W	#StrtDir,DRMstrBlk			; set up master block address
+
+; get some memory for the FCBs
+
+			CMP.W	#2,MemTop					; 128K machine? 						<25Oct85>
+			BLE.S	@2							; no multiplier for 128K				<22Oct85>
+			LSL.W	#2,D0						; mult by 4 for 512K+					<25Oct85>
+
+@2			MOVE	D0,D2						; save for WDCB allocation				<25Oct85>
+			MULU	#FCBEntLen,D0				; number of bytes needed for FCBs		<25Oct85>
+			ADDQ.W	#2,D0						; and 2 for length prefix				<25Oct85>
+			MOVE.W	D0,D1						; and save in D1						<25Oct85>
+			_NewPtr ,SYS,CLEAR					; get buffer with D0 bytes in it.
+			BNE 	FSInitErr					; Stop execution on any errors
+
+			MOVE.W	D1,(A0) 					; first word is FCB part length
+			MOVE.L	A0,FCBSPtr					; set the FCB pointer
+
+; Set up a WDCB array with the same number of entries as the FCB array:
+
+			MULU	#WDCBLen,D2 				; number of bytes needed for WDCBs		<25Oct85>
+			MOVE.L	D2,D0						;										<25Oct85>
+			ADDQ.W	#2,D0						; and 2 for length prefix				<08Aug85>
+			MOVE.W	D0,D1						; and save in D1						<11Apr85>
+			_NewPtr ,SYS,CLEAR					; Allocate room for the WDCB array		<11Apr85>
+			BNE 	FSInitErr					; Crash and burn on errors				<11Apr85>
+
+			MOVE.W	D1,(A0) 					; Store length of WDCB array			<11Apr85>
+			MOVE.L	A0,WDCBsPtr 				; Store pointer in lomem				<11Apr85>
+
+			BigLEA	WDCBSwOS,A2					; point to offset to the WDCB entry		<1.2>
+			MOVE.W	(A2),A2						; Get the offset to the WDCB entry		<1.2>
+			ADD.L	SwitcherTPtr,A2 			; Index into Switcher Table				<1.2>
+			MOVE.L	A0,(A2) 					; Fill in entry for WDCB switch 		<A271><27Oct86><1.2>
+			NOT.L	(A2)+						; ... complement for long addresses		<A271><27Oct86><1.2>
+			MOVE.W	D1,(A2)						;										<A271><27Oct86><1.2>			
+
+; Allocate a File System Stack:
+
+			MOVE.L	#(HFSStkLen+HFSTmpSize),D0	; Size of stack area 					<26Aug85><C206>
+			_NewPtr ,SYS,CLEAR					; Allocate space in system heap 		<11Apr85>
+			BNE		FSInitErr					; Stop execution on any errors			<11Apr85>
+			ADD 	#HFSStkLen,A0				; Point beyond the end of the stack 	<25Oct85><C206>
+			MOVE.L	A0,HFSStkTop				; Store pointer in lo-mem				<11Apr85><C206>
+
+			MOVEQ	#PMSPSize,D0				; Size of Poor Man's Search Path        <18Aug85>
+			_NewPtr ,SYS,CLEAR					; Allocate space for it 				<18Aug85>
+			BNE		FSInitErr					; Punt on errors						<18Aug85>
+
+			BigLEA	PMSPSwOS,A2					; point to offset to the PMSP entry		<C152><1.2>
+			MOVE.W	(A2),A2						; Get the offset to the PMSP entry		<C152><1.2>
+			ADD.L	SwitcherTPtr,A2 			; Index into Switcher Table				<C152><1.2>
+			MOVE.L	A0,(A2) 					; Fill in entry for PMSP hook switch	<A271><27Oct86><1.2>
+			NOT.L	(A2)						; ... complement for long addresses		<A271><27Oct86><1.2>
+			ADDQ.L	#SPHdrSize,A0				; Point beyond PMSP header				<18Aug85>
+			MOVEQ	#(PMSPSize-SPHdrSize),D0	; Get length of remaining table	<18Aug85>
+			MOVE.W	D0,(A0) 					; Stash it at the start of the table	<18Aug85>
+			MOVE.L	A0,PMSPPtr					; Set up the lo-mem pointer 			<18Aug85>
+
+; Set up the lomem system cache pointers: (hack in until new cache arrives . . .)
+
+			MOVE.W	#512,D1 					; Set up cache block size				<26Aug85>
+
+			MOVEQ	#1,D0						; Allocate 1-block bitmap cache 		<26Aug85>
+			Jsr 	InitCache					; Set up the cache						<26Aug85><1.2>
+			BNE.S	FSInitErr					;										<26Aug85>
+			MOVE.L	A1,SysBMCPtr				; Bitmap cache pointer. 				<26Aug85>
+
+			MOVEQ	#1,D0						; Allocate a 1-block volume cache		<20Sep85>
+			CMP.W	#2,MemTop					; 128K machine? 						<20Sep85>
+			BLE.S	@4							; br if so								<20Sep85>
+			MOVEQ	#2,D0						; Allocate a 2-block volume cache		<20Sep85>
+@4			Jsr 	InitCache					; Set up the cache						<20Sep85><1.2>
+			BNE.S	FSInitErr					;										<26Aug85>
+			MOVE.L	A1,SysVolCPtr				; Volume cache pointer					<26Aug85>
+
+			MOVEQ	#4,D0						; Allocate a small B*-Tree cache		<04Nov85>
+			CMP.W	#2,MemTop					; 128K machine? 						<27Aug85>
+			BLE.S	@5							; br if so								<27Aug85>
+			MOVEQ	#16,D0						; Allocate a LARGE B*-Tree cache		<20Sep85>
+@5			Jsr 	InitCache					; Create a new cache					<26Aug85><1.2>
+			BNE.S	FSInitErr					;										<26Aug85>
+			MOVE.L	A1,SysCtlCPtr				; B*-Tree Control cache pointer 		<26Aug85>
+
+; Set up a disk switch hook
+
+			LEA 	DSHook,A0					; Point to the disk switch code 		<22Jul85>
+			MOVE.L	A0,DskSwtchHook 			; Make it available for use 			<22Jul85>
+
+; Begin SuperMario
+; allocate our file system variable block <SM1> FM
+
+			move.l	FSVarsPtr,D0			; has this been initialized?
+			cmp.l	#-1,D0					; $FFFF FFFF if not
+			bne.s	FSInitOK				; initialized
+
+
+			move.l		#FSVars.size, d0	; d0 = size of file system variable block
+			_NewPtr		sys, clear			; go get the block
+			bne			FSInitErr			; die horribly if we don't get it
+			move.l		a0, FSVarsPtr		; stash the address in lomem
+			move.w		#FSVars.size, FSVars.length(a0)	; store length of block in 1st word
+
+			jsr			FSGrowPatchInit		; FCBs, WDCBs and vectors
+			jsr			QMInit				; initialize the Queue Manager
+			jsr			DTDBMgrInit			; initialize desktop DB manager
+			jsr			InstallVectors		; install the vectors that hang off ExpandMem
+
+; End of SuperMario patch roll in… <SM@> FM
+
+FSInitOK	MOVEQ	#0,D0						; success!
+			RTS
+
+FSInitErr	MOVEQ	#-1,D0						; we failed
+			RTS
+
+;_____________________________________________________________________________________
+; <38>
+;	CountFCBs
+;
+;	Function:
+;		Return the number of free FCBs
+;		Return the total number of FCBs
+;
+;		Use d0 as a max number to count, to allow for callers to check for a
+;		specific quantity of free FCBs.
+;
+;	Input:
+;		d0.w - requested # of free FCBs
+;
+;	Output:
+;		d0.w - number of free FCBs (clipped to input value of d0)
+;		d1.w - total number of FCBs
+;
+;		ccr -	Z set if requested number were free
+;				Z clear if not
+;
+; Note: When called with d0.w = #-1, the output in d1 is the total number
+; of FCBs that exist.
+;
+;_____________________________________________________________________________________
+; This routine was copied FileMgrPatches.a									<SM1>
+
+CountFCBs	
+@Regs		reg		d2/a0/a1
+			movem.l	@Regs,-(sp)
+			move.l	FCBSPtr,a1			; point to base of FCB array
+			moveq.l	#0,d1				; clear high word
+			move.w	(a1),d1				; grab length of the array
+			lea.l	2(a1),a0			; point to base of 1st FCB
+			add.w	d1,a1				; point to end of FCB array
+			divu	FSFCBLen,d1			; d1 = number of FCBs
+			move.w	d0,d2				; copy limit value
+
+@loop:
+			suba.w	FSFCBLen,a1			; point to beginning of previous FCB
+			tst.l	(a1)				; is it free?
+			bne.s	@notFree
+			subq.w	#1,d2				; tally the free FCB
+			beq.s	@enough				; hit our quota?
+@notFree:
+			cmpa.l	a0,a1				; are we done with the array?
+			bhi.s	@loop				; as long as we're above the bottom now
+@enough:
+			sub.w	d2,d0				; d0 = number of free FCBs
+			tst.w	d2					; d2 is zero if we hit our target
+			movem.l	(sp)+,@Regs
+			rts
+
+
+;_____________________________________________________________________________________
+; <38>
+;	OpenAttemptHook
+;
+;	Function:
+;		This procedure is called each time some sort of Open call (one that allocates
+;		an FCB) is attempted.  We're here to schedule the FCB allocator if
+;		necessary.  The FCB allocator is now run after the sync wait loop (on failed
+;		opens) and at _SynchIdleTime, although it could be run anytime moving memory
+;		is cool.
+;
+;		Optimization:
+;		Since counting the number of free FCBs is time consuming, we use fsFCBCounter
+;		to hold the approximate number of free FCBs in excess of the fsFCBBurst amount.
+;		We conservatively assume that each time we attempt an open we use up an FCB.  This
+;		is obviously wrong, since some opens fail and _Close frees up FCBs, but this
+;		will allow us to avoid our more expensive check most of the time.  When the counter
+;		does hit zero we count the array and set fsFCBCounter back up.  We also might set
+;		the fsNeedsFCBs value if there are too few FCBs around.
+;
+;	Input:
+;		a0	- pointer to caller's PB
+;
+;	Output:
+;		none
+;_____________________________________________________________________________________
+; This routine was copied FileMgrPatches.a									<SM1>
+OpenAttemptHook:
+@regs		reg		d0/d1/a1
+			movem.l	@regs,-(sp)
+
+			move.l	FSVarsPtr,a1
+			with	FSVars
+
+			btst.b	#fsNoFCBExpansion,fsFlags(a1)	; are we in the ballgame?
+			bne.s	@exit
+
+			sub.w	#1,fsFCBCounter(a1)				; see if we need to check
+			bgt.s	@exit							; no need to check if we're > 0
+
+			moveq.l	#-1,d0							; we want to know about all FCBs
+			bsr		CountFCBs						; see how many there are
+
+			sub.w	fsFCBBurst(a1),d0				; do we have enough headroom?
+			bls.s	@needMore						; need more if  (#free) <= (burst amount)
+
+			move.w	d0,fsFCBCounter(a1)				; remember the amount of slack
+			bra.s	@exit
+
+@needMore:
+			bset.b	#fsNeedFCBs,fsFlags(a1)			; remind ourselves of our need
+			clr.w	fsFCBCounter(a1)				; and make sure we check next time
+
+@exit:
+			movem.l	(sp)+,@regs
+			rts
+
+;_____________________________________________________________________________________
+; <38>
+;	AllocateFCBs
+;
+;	Function:
+;		This is a private queued file system call which returns information
+;		about the FCB array and can allocate more FCBs.
+;
+;		If a request for more FCBs is being made then AllocateFCBs must be
+;		called only when moving memory is legal.  If the call is made for
+;		information only it can be made anytime.
+;
+;		parameter block:
+;			ioFCBBurst			offset $20, word, input  	requested burst headroom
+;			ioFCBGrow		   	offset $22	word, input 	requested free if allocation triggered
+;			ioTotalFCBs			offset $24	word, output 	returns number of FCBs present
+;			ioTotalFreeFCBs		offset $26	word, output 	returns number of free FCBs
+;			ioFCBsAdded			offset $2A, word, output	returns number allocated this time
+;
+;	Input:
+;		a0.l - pointer to PB
+;
+;	Output:
+;		d0.w - #noErr if at least one FCB is free on exit.
+;			 - #tmfoErr if no FCBs are free on exit
+;
+;	AllocateFCBs always counts the total number of FCBs and the total number free.  If there
+;	are ioFCBBurst FCBs free, no other work is performed.  If there are fewer than ioFCBBurst
+;	FCBs free then AllocateFCBs will attempt to allocate enough new ones so that ioFCBGrow
+;	are free.
+;
+;	ioFCBBurst and ioFCBGrow work together.  ioFCBBurst is the number of opens that we'd
+;	like to be able to perform between visits to sync time.  ioFCBGrow is the number that
+;	we'd like to have available when we go to the trouble of growing the array.  ioFCBBurst
+;	must always be <= ioFCBGrow.
+;
+;_____________________________________________________________________________________
+; This routine was copied FileMgrPatches.a									<SM1>
+AllocateFCBs
+			import	MoreFCBs
+
+			bsr.s	FSQueue 					; Wait out turn
+
+			moveq.l	#-1,d0						; more FCBs than we'll ever have
+			bsr		CountFCBs					; count all of them
+			move.w	d0,ioTotalFreeFCBs(a0)		; remember how many are free
+			move.w	d1,ioTotalFCBs(a0)			; remember how many there are
+
+			movea.l	FSVarsPtr,a1
+			with	FSVars
+			move.w	ioFCBBurst(a0),d2			; get the # we'd like to keep free
+			cmp.w	d2,d0						; see if we have that many free
+			bhs.s	@noAllocate
+
+			move.w	ioFCBGrow(a0),d2			; d2 = the number of free FCBs we'd like to grow to
+			sub.w	d0,d2						; d2 = the number we need to grow to there
+
+			move.w	fsFCBMax(a1),d3				; d3 = the most FCBs we can have
+			sub.w	d1,d3						; d3 = the most we can grow
+			beq.s	@noAllocate					; bail if we're out of array room
+			cmp.w	d2,d3						; can we grow as much as we want to?
+			bhs.s	@grow						; if (most we can grow) >= (amount desired), we're OK
+			move.w	d3,d2						; otherwise, just grow as much as we can
+
+@grow:
+			bsr		MoreFCBs					; try to get the FCBs
+			beq.s	@gotSome					; leave with a smile
+
+			asr.w	#1,d2						; try to get half that many
+			beq.s	@noAllocate					; if we're down to zero, bail
+			bra.s	@grow
+
+@gotSome:
+			add.w	d2,ioTotalFCBs(a0)			; update the total count
+			add.w	d2,ioTotalFreeFCBs(a0)		; update the free count
+			move.w	d2,ioFCBsAdded(a0)			; note the number added
+			bra.s	@done
+
+@noAllocate:
+			clr.w	ioFCBsAdded(a0)				; we didn't add any new ones
+
+@done:
+			tst.w	ioTotalFreeFCBs(a0)			; check the number that are free now
+			beq.s	@noFCBsAvailable			; if none are left, report the problem
+			moveq.l	#noErr,d0					; if some are left, we're happy
+
+@exit:		bra 	CmdDone			 			; And call it a day
+
+@noFCBsAvailable:
+			moveq.l	#tmfoErr,d0
+			bra.s	@exit
+			endwith
+
+;________________________________________________________________________________
+; Routine:	File System cleanup routine			<2.7>
+; Function: Closes all open files belong to the process upon process termination.
+;			The process serial number in the Ext. FCB is cleared.
+;
+; By:		Kenny Tung
+;			Copyright © 1989 Apple Computer, Inc.
+; Input:	D1 = trap, A0 = parameter block pointer
+;			HFS call requires an ioPB, but in this call no parameter is passed in.
+;			However, A0 is used to make the PBClose call within the routine. (Therefore
+;			it should be at least 26 bytes long).
+; Revision History:
+; 26Sep89	KSCT	New today (from TFSDir1.a)
+;________________________________________________________________________________
+DoFSCleanUp								; serial ID is 64 bits
+FSCleanupRegs		REG		A2-A3/D2-D6
+			MOVEM.L	FSCleanupRegs,-(SP)
+
+; ask the Process Mgr which process is current
+			MOVE.L	A0,-(SP)			; save needed, but volatile, register
+			LEA		-10(SP),SP			; get current PSN and verify it's for us
+			PEA		2(SP)				; push address of PSN
+			_GetCurrentProcess			; call the OS
+			MOVE.W	(SP)+,D0			; save result
+			MOVE.L	(SP)+,D6			; D6 = process ID1
+			MOVE.L	(SP)+,D2			; D2 = process ID2
+			MOVEA.L	(SP)+,A0			; restore volatile register
+			TST.W	D0					; check result now that stack restored
+			BLT		CleanupDone			; if so, we can do nothing
+
+			MOVEA.L	FSVarsPtr,A1
+			MOVEa.L	FSVars.fcbPBuf(A1),A2	; A2=parallel array
+			MOVE	cbPBufCount(A2),D3		; D3=number of FCBs
+			SUBQ	#1,D3					; for DBcc
+			MOVE	cbPBufULen(A2),D4		; D4=ext. FCB unit size
+			LEA		fcbPBufData(A2),A2		; A2=ext. fcb array
+			MOVE	FSFCBLen,D5				; D5=FCB len
+			jsr		Gt1stFCB				; A1=FCB, D1=1st RefNum
+
+; First close all the open files belong to this process:
+;	A1=FCBptr, A2=Ext. FCBptr, D1.W=RefNum, D2=id2, D3.W=loop index,
+;	D4.W=ext FCBlen, D5.W=original FCBlen, D6=id1 (not D1!)
+@cleanLoop	MOVE.L	xFCBPid2(A2),D0		; do the 2nd one first
+			CMP.L	D0,D2				; FCB belongs to this process?
+			BNE.S	@3					; no->
+			MOVE.L	xFCBPid1(A2),D0
+			CMP.L	D0,D6				; FCB belongs to this process?
+			BNE.S	@3					; no->
+		;; close the file only if it is open and not a system file.
+			MOVE.L	fcbFlNm(A1,D1),D0	; file open?
+			BEQ.S	@2					; not open -> invalidate PIDs
+			CMP.L	#FSUsrCNID,D0		; Is it a system control file?
+			BLO.S	@2					; yes, don't touch it
+
+		;; this open path belongs to this proc, let's close it
+			BSR		clearPB				; clear iopb in A0
+			MOVE	D1,ioRefNum(A0)		; close this access path
+			MOVEM.L	A1/D1/D2,-(SP)		; these registers are trashed
+			_Close	,Async				; close the file ASYNCly (to avoid deadlock)
+		;; but we will wait synchronously until it's done .....
+@wait		TST		ioResult(A0)
+			BGT.S	@wait
+			MOVEM.L	(SP)+,A1/D1/D2
+			BNE.S	@3					; if error don't clear IDs
+@2			CLR.L	xFCBPid1(A2)		; clear procID 1
+			CLR.L	xFCBPid2(A2)		; clear procID 2
+@3			ADDA	D4,A2				; go to next ext.FCB
+			ADD.W	D5,D1				; go to next FCB RefNum
+			DBF		D3,@cleanLoop		; process them all …
+
+		;; Then close all the working direstories: D2.L/D6.L=procID, others are free
+			MOVEA.L	FSVarsPtr,A1		; FSVars
+			MOVEA.L	FSVars.WDCBPBuf(A1),A2
+			MOVE	cbPBufCount(A2),D3		; D3=number of WDCBs
+			SUBQ	#1,D3					; for DBcc
+			MOVE	cbPBufULen(A2),D4		; D4=ext. WDCB unit size
+			LEA		wdcbPBufData(A2),A2		; A2=1st ext. WDCB array
+			MOVE	#WDCBLen,D5			; D5 = old WDCB len
+			jsr		Gt1stWDCB			; A1=WDCB array, D1=WDRefNum
+		;; A1=WDCBptr, A2=Ext WDCB, D1.W=WD RefNum, D2=id2, D3.W=loop index,
+		;; D4.W=ext wdcblen, D5.W= orginal WDCBlen, D6=id1
+@WDLoop		MOVE.L	xWDCBPid2(A2),D0
+			CMP.L	D0,D2				; same process?
+			BNE.S	@6					; no->
+			MOVE.L	xWDCBPid1(A2),D0
+			CMP.L	D0,D6				; WDCB belongs to this process?
+			BNE.S	@6					; no->
+			TST.L	WDVCBPtr(A1,D1)		; WD open?
+			BEQ.S	@5					; no-> already closed
+
+			BSR.S	clearPB				; clear iopb
+			MOVEM.L	A1/D1/D2,-(SP)		; these registers are trashed
+			ADD.W	#WDRfnMin,D1		; Offset the index to make a WDRefNum (-32767)
+			MOVE	D1,ioVRefNum(A0)	; close this WD
+			_CloseWD
+			MOVEM.L	(SP)+,A1/D1/D2
+			BNE.S	@6					; if error don't clear IDs
+@5			CLR.L	xWDCBPid1(A2)		; clear procID 1
+			CLR.L	xWDCBPid2(A2)		; clear procID 2
+@6			ADDA	D4,A2				; go to next ext.WDCB
+			ADD.W	D5,D1				; go to next WDCB RefNum
+			DBF		D3,@WDLoop			; process them all …
+
+			BSR.S	clearPB				; all done, return a clear PB
+
+CleanupDone
+			MOVEM.L	(SP)+,FSCleanupRegs
+			MOVEQ	#0,D0				; happy ending
+			RTS
+
+
+; clear iopb in A0 up to ioRefnum. (28 bytes), A3 is free
+clearPB		MOVEA.L	A0,A3				; A3=A0=iopb
+			MOVEQ	#(fscPBLen/4)-1,D0	; iopb len in long -1
+@2			CLR.L	(A3)+
+			DBRA	D0,@2				; clear 28 bytes
+			RTS
+
+; __________________________________________________________________________________
+; InstallVectors
+;
+;	Function:
+;		Attach ourselves to the appropriate vectors.
+;
+;		For fsQueueHook, ExtFSHook and jFileOpen we selfishly insist that
+;		we're the first piece of code hooked in so that we can assume
+;		that we're the last one called.
+;
+; __________________________________________________________________________________
+InstallVectors
+
+; slam onto fsQueueHook, ExtFSHook and jFileOpen
+			Import		fsQueueHookPatch,ExtFSHookPatch
+
+			Lea			fsQueueHookPatch, a0	; our patch address
+			move.l	a0, fsQueueHook				; be the first ones
+
+			Lea			ExtFSHookPatch, a0		; our patch address					<38>
+			move.l	a0, ExtFSHook				; be the first ones					<38>
+
+; install some vectors:
+			move.l	ExpandMem, a1
+			lea		vSyncWait, a0				; get addr of syncwait (in this fsQueueHook patch)
+			move.l	a0, ExpandMemRec.jSyncWait(a1)
+			lea		vAfterFSQHook, a0			; get addr just past call to fsQueueHook (in fsQueueHook patch)
+			move.l	a0, ExpandMemRec.jAfterFSQHook(a1)
+
+			lea		CmdDone, a0					; get addr of CmdDone 
+			move.l	a0, ExpandMemRec.jCmdDone(a1)
+			lea		fsGeneralWakeUp, a0			; get addr of general purpose File System kickstart
+			move.l	a0, ExpandMemRec.jDispatchNext(a1)
+
+			lea		fsSCSIFreeHookProc, a0		; get addr of File System SCSI Busy deferral completion
+			move.l	a0, ExpandMemRec.jSCSIFreeHook(a1)
+
+			rts
+
+;__________________________________________________________________________________
+;
+;	Initialize FCB expansion patch, WDCB expansions patch, and vectors
+;__________________________________________________________________________________
+; Roll into SuperMario <SM1> fm
+FSGrowPatchInit:
+; allocate the FCB parallel array
+			movea.L	FCBSPtr,a1				; a1 = address of main FCB array
+			moveq	#0,d0					; clear d0 for long calc
+			move.w	(a1),d0 				; bytes in FCB array and header
+			divu.w	FSFCBLen,d0				; divide by element size to get count of FCBs
+			andi.l	#$FFFF,d0				; clear d0 top word set by divu
+			move.w	d0,d1					; Save # of FCBs in d1
+			lsl		#L2ExtFCBLen,d0			; d0 = total size of the parallel array
+			addq	#fcbPBufData,d0			; include info words
+			_NewPtr sys, clear				; Allocate buffer for FCBs
+			bne.s	GrowErrExit				; Any errors are fatal
+
+; initialize parallel FCB array header and install the array in FSVars
+			move.w	d1,cbPBufCount(a0)		; first word = count
+			move.w	#ExtFCBLen,cbPBufULen(a0)	; second word = unit size
+			movea.L	FSVarsPtr,a1				; save array address in FSVars
+			move.l	a0,FSVars.FCBPBuf(a1)		; now we're ready to record file opens!
+
+; allocate the WDCB parallel array
+			move.l	WDCBSPtr,a1				; a1 = address of main WDCB array
+			moveq	#0,d0					; clear d0 for long calc
+			move.w	(a1),d0 				; length of WDCB array
+			divu.w	#WDCBLen,d0				; divide by element size to get count of WDCBs
+			andi.l	#$FFFF,d0				; clear d0 top word
+			move.w	d0,d1					; Save # of WDCBs in d1
+			lsl		#L2ExtWDCBLen,d0		; d0 = total size of the parallel array
+			addq	#wdcbPBufData,d0		; include info words
+			_NewPtr sys, clear				; Allocate buffer for FCBs
+			bne.s	GrowErrExit				; Any errors are fatal
+
+; initialize parallel WDCB array header and install the array in FSVars
+			move.w	d1,cbPBufCount(a0)		; first word = count
+			move.w	#ExtWDCBLen,cbPBufULen(a0)	; second word = unit size
+			movea.L	FSVarsPtr,a1				; save array address in FSVars
+			move.l	a0,FSVars.WDCBPBuf(a1)		; now we're ready to record _OpenWDs!
+
+; initialize FCB expansion mechanism <38>
+			movea.l	FSVarsPtr,a1
+			move.w	#fsDesiredFCBBurst,FSVars.fsFCBBurst(a1)
+			move.w	#fsDesiredFCBFree,FSVars.fsFCBGrow(a1)
+			clr.w	FSVars.fsFCBCounter(a1)		; make us check on the next open
+			move.w	#$7fff,d0					; max signed int is all we can have for the FCB array
+			ext.l	d0							; divide takes a long input
+			divs	fsFCBLen,d0					; d0 = max # of FCBs
+			move.w	d0,FSVars.fsFCBMax(a1)
+
+			rts
+GrowErrExit:
+			MOVEQ	#dsMemFullErr,D0			; no mem
+			_SysError
+
+		
+
+;________________________________________________________________________________
+;
+; Routine:		GetVolParms
+;
+; Input:		a0 - pointer to user's param block
+; Output:		d0 - result code
+;
+; Function: 	Return a version 2 GetVolParms param block
+;
+; Interesting problems with GetVolParms (which aren't important enough to cause
+; us to make a change this close to 7.0 final.  Obviously, if you're reading this
+; after 7.0 final, please make these changes for the good of humanity. You should find
+; these written up in the BRC).
+; 2) The suba.w @VolParmsBufferSize,a6 instruction needs to be changed to a long subtract.
+; What happens now is that zero is subtracted from a6, but the size of the saved registers
+; happens to be bigger than the buffer, so there's enough room on the stack.  Since the File
+; Manager happens to save registers before dispatching, the fact that GetVolParms trashes
+; the registers is unimportant.  Thus, the three parallel changes are to get rid of the 
+; regster save/restore, change the suba.w to a suba.l, and add an adda.l at the bottom of
+; the routine to deallocate the buffer.
+;
+;________________________________________________________________________________
+; Roll in for SuperMario. Fix up the 
+GetVolParms:		
+@GetVolRegs			reg			d2/d3/a1-a4
+
+; <SM1> FM	bclr	#asyncTrpBit, ioTrap(a0)	; force synchronous  (wrong.  See note, above)
+			jsr		FSQueue 					; Patiently wait our turn in line
+; <SM1> FM	movem.l	@GetVolRegs, -(a6)			; save regs on FS stack
+			suba.l	@VolParmsBufferSize, a6		; <SM1> FM allocate a GetVolParms buffer on the stack
+;
+; Find the VCB in question:
+;
+			jsr		DtrmV3					; find vol using ioNamePtr & ioVRefNum (D023/A234 trashed)
+			bne.s	@GetVolParmsExit			; (DtrmV3 puts VCBPtr in A2)
+
+			tst.w	vcbFSID(a2) 				; Check: external file system?  (•• TFSVCBTst?)
+			beq.s	@ForUs 						; If zero, it's HFS.
+;
+; This call is for an External File System volume:
+;
+			moveq	#extFSErr, d0				; Tell the world
+			bra.s	@GetVolParmsExit			; and let them worry about it
+;
+; This call is for us.  First, make a modifiable copy of the return buffer.
+;
+@ForUs:
+			movea.l	a0, a4						; move user's pb to a safe register
+			move.l	@VolParmsBufferSize, d0		; d0 = size of GetVolParms' ioBuffer
+			movea.l	a6, a1						; onto our stack buffer
+			lea.l	@HFSVolParmsBuffer, a0		; copy the static values for HFS volumes
+			cmp.w	#SigWord,vcbSigWord(a2)		; is this an MFS volume?
+			bne.s	@notMFS						; no, skip the following
+			lea.l	@MFSVolParmsBuffer, a0		; copy the static values for MFS volumes
+@notMFS:
+			_BlockMove
+
+			bsr		CheckDesktopSupport			; returns zero clear if support, set if none
+			beq.s	@NoDTSupport				; z set means no support
+
+			move.l	vmAttrib(a6), d0			; get the attributes word
+			bset.l	#bHasDesktopMgr, d0			; set the bit indicating support
+			move.l	d0, vmAttrib(a6)			; put the modified word back in the buffer
+@noDTSupport:
+
+;
+; The buffer on the stack reflects the correct values for this volume.
+; Copy back as much of it as the caller gave us room.
+;
+			move.l	ioReqCount(a4), d0			; get user's buffer size
+			cmp.l	@VolParmsBufferSize, d0		; is it smaller than our buffer?
+			bls.s	@NoClip						; then just return that amount
+
+			move.l	@VolParmsBufferSize, d0		; clip the return to just the size of our data
+
+@noClip:
+			move.l	d0, ioActCount(a4)			; tell'em how much we're copying
+			move.l	a6, a0						; copy from our stack buffer
+			move.l	ioBuffer(a4), a1			; copy into the user's pb buffer
+			_BlockMove
+
+@GetVolParmsExit:
+			adda.l	@VolParmsBufferSize, a6		; <SM1> FM deallocate a GetVolParms buffer on the stack
+;<SM1> fm	movem.l	(a6)+, @GetVolRegs			; restore regs
+			jmp		CmdDone						; Go home
+
+; This buffer contains the appropriate values for local HFS volumes.
+@HFSVolParmsBuffer:
+			dc.w	2							; this is a version 2 getvolparms
+			dc.l	localvMAttribs				; static set of local attribute bits
+			dc.l	0							; no local window handle
+			dc.l	0							; no server address
+			dc.l	localVolGrade				; standard volume grade
+			dc.w	0							; local volumes don't support alt priv models
+@VolParmsBufferSize:
+			dc.l	*-@HFSVolParmsBuffer
+
+; This buffer contains the appropriate values for local MFS volumes.
+@MFSVolParmsBuffer:
+			dc.w	2							; this is a version 2 getvolparms
+			dc.l	0							; no optional calls supported for MFS volumes
+			dc.l	0							; no local window handle
+			dc.l	0							; no server address
+			dc.l	localVolGrade				; standard volume grade
+			dc.w	0							; local volumes don't support alt priv models
+			
+
+;			.NoList
+			INCLUDE  'TFSCommon.a'	 ; Common subroutines w. TFSUtil
+			INCLUDE  'TFSVol.a'		 ; TFS volume level routines
+			INCLUDE  'MFSVol.a'		 ; MFS-specific volume level stuff
+			INCLUDE  'TFSDir1.a' 	 ; include routines using filenames
+			INCLUDE  'MFSDir1.a' 	 ;
+			INCLUDE  'TFSDir2.a' 	 ;
+			INCLUDE  'MFSDir2.a' 	 ;
+			INCLUDE  'TFSDir3.a' 	 ;
+			INCLUDE  'MFSDir3.a' 	 ;
+
+			INCLUDE  'TFSRfN1.a' 	 ; include routines using refnums
+			INCLUDE  'MFSRfN1.a' 	 ;
+			INCLUDE  'TFSRfN2.a' 	 ;
+			INCLUDE  'MFSRfN2.a' 	 ;
+			INCLUDE  'TFSRfN3.a' 	 ;
+			INCLUDE  'MFSRfN3.a' 	 ;
+
+******************************************************************************************
+* some lucky person gets to roll the following file into the rest of the sources
+
+			INCLUDE  'FileMgrHooks.a'
+
+******************************************************************************************
+
+
+			END 
+
+
+
+
+

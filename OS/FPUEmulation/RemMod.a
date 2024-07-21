@@ -1,0 +1,400 @@
+;
+;	File:		RemMod.a
+;
+;	Contains:	Routines to handle emulation of FREM and FMOD instructions
+;			  (floating-point remainder and modulus functions)
+;
+;	Originally Written by:	Motorola Inc.
+;	Adapted to Apple/MPW:	Jon Okada
+;
+;	Copyright:	© 1990, 1991 by Apple Computer, Inc., all rights reserved.
+;
+;   This file is used in these builds:   Mac32
+;
+;	Change History (most recent first):
+;
+;		 <3>	 6/26/91	BG		Rolled in Jon's REM code change that speeds up the emulation for
+;							this instruction by a factor of 9.
+;		 <2>	 3/30/91	BG		Rolling in Jon Okada's latest changes.
+;		 <1>	12/14/90	BG		First checked into TERROR/BBS.
+
+;  remmod.a
+
+;  Based upon Motorola file 'srem_mod.a'
+
+;  CHANGE LOG:
+;  07 Jan 91	JPO	Changed variable names Y and R to YMOD and RMOD.  Changed
+;			  constant label "Scale" to "SCREM".  Renamed labels
+;			  "HiX_not0" and "Finish" to "RMHiX_not0" and "RMFinish",
+;			  respectively.  Deleted unreferenced label "HiX_0".
+;  25 Jun 91	JPO	Rewrote to use "div32" subroutine which does up to
+;			  32 remainder steps at a time.
+;
+
+*
+*	srem_mod.sa 3.1 12/10/90
+*
+*      The entry point sMOD computes the floating point MOD of the
+*      input values X and Y. The entry point sREM computes the floating
+*      point (IEEE) REM of the input values X and Y.
+*
+*      INPUT
+*      -----
+*      Double-extended value Y is pointed to by address in register
+*      A0. Double-extended value X is located in -12(A0). The values
+*      of X and Y are both nonzero and finite; although either or both
+*      of them can be denormalized. The special cases of zeros, NaNs,
+*      and infinities are handled elsewhere.
+*
+*      OUTPUT
+*      ------
+*      FREM(X,Y) or FMOD(X,Y), depending on entry point.
+*
+*       ALGORITHM
+*       ---------
+*
+*       Step 1.  Save and strip signs of X and Y: signX := sign(X),
+*                signY := sign(Y), X := |X|, Y := |Y|, 
+*                signQ := signX EOR signY. Record whether MOD or REM
+*                is requested.
+*
+*       Step 2.  Set L := expo(X)-expo(Y), k := 0, Q := 0.
+*                If (L < 0) then
+*                   R := X, go to Step 4.
+*                else
+*                   R := 2^(-L)X, j := L.
+*                endif
+*
+*       Step 3.  Perform MOD(X,Y)
+*            3.1 If R = Y, go to Step 9.
+*            3.2 If R > Y, then { R := R - Y, Q := Q + 1}
+*            3.3 If j = 0, go to Step 4.
+*            3.4 k := k + 1, j := j - 1, Q := 2Q, R := 2R. Go to
+*                Step 3.1.
+*
+*       Step 4.  At this point, R = X - QY = MOD(X,Y). Set
+*                Last_Subtract := false (used in Step 7 below). If
+*                MOD is requested, go to Step 6. 
+*
+*       Step 5.  R = MOD(X,Y), but REM(X,Y) is requested.
+*            5.1 If R < Y/2, then R = MOD(X,Y) = REM(X,Y). Go to
+*                Step 6.
+*            5.2 If R > Y/2, then { set Last_Subtract := true,
+*                Q := Q + 1, Y := signY*Y }. Go to Step 6.
+*            5.3 This is the tricky case of R = Y/2. If Q is odd,
+*                then { Q := Q + 1, signX := -signX }.
+*
+*       Step 6.  R := signX*R.
+*
+*       Step 7.  If Last_Subtract = true, R := R - Y.
+*
+*       Step 8.  Return signQ, last 7 bits of Q, and R as required.
+*
+*       Step 9.  At this point, R = 2^(-j)*X - Q Y = Y. Thus,
+*                X = 2^(j)*(Q+1)Y. set Q := 2^(j)*(Q+1),
+*                R := 0. Return signQ, last 7 bits of Q, and R.
+*
+*                
+             
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* SREM_MOD    IDNT    2,1 Motorola 040 Floating Point Software Package
+
+
+MOD_FLAG equ	L_SCR3
+;SignY	equ	FP_SCR3+4	; DELETED <6/25/91, JPO>				<T3>
+;SignX	equ	FP_SCR3+8	; DELETED <6/25/91, JPO>				<T3>
+;SignQ	equ	FP_SCR3+12	; DELETED <6/25/91, JPO>				<T3>
+;Sc_Flag	equ	FP_SCR4	; DELETED <6/25/91, JPO>				<T3>
+
+EXPOY	equ	FP_SCR3+4	; <6/25/91, JPO>
+
+;Y	equ	FP_SCR1		; Renamed <1/7/91, JPO>
+YMOD	equ	FP_SCR1		; <1/7/91, JPO>
+Y_Hi	equ	YMOD+4		; <1/7/91, JPO>
+Y_Lo	equ	YMOD+8		; <1/7/91, JPO>
+
+;R	equ	FP_SCR2		; Renemed <1/7/91, JPO>
+RMOD	equ	FP_SCR2		; <1/7/91, JPO>
+R_Hi	equ	RMOD+4		; <1/7/91, JPO>
+R_Lo	equ	RMOD+8		; <1/7/91, JPO>
+
+	ALIGN	16		; <1/7/91, JPO>
+
+;SCREM     DC.L	$00010000,$80000000,$00000000,$00000000		; Renamed <1/7/91, JPO> - DELETED <6/25/91, JPO>
+
+; New FMOD and FREM algorithms begin here <6/25/91, JPO>				<T3> thru next <T3>
+smod:
+
+	move.l	#0,MOD_FLAG(a6)
+	bra.b	mod_rem
+
+
+srem:
+
+	move.l	#1,MOD_FLAG(a6)
+
+mod_rem:
+	movem.l	d2-d7/a2,-(sp)	; save data registers and A2
+	suba.l	a2,a2		; clear scaling flag (A2)
+	bfextu	(a0){1:15},d3	; |Y| in D0.w/D1/D2
+	move.l	8(A0),d5
+	move.l	4(a0),d4
+	bmi.b	chk_x		; Y is normal
+	bne.b	@1		; normalize Y
+
+	move.l	d5,d4		; Y sig.hi is zero. normalize
+	clr.l	d5
+	subi.l	#32,d3
+	bfffo	d4{0:32},d6
+	lsl.l	d6,d4
+	sub.l	d6,d3
+	bra.b	chk_x
+@1:
+	bfffo	d4{0:32},d6		; Y sig.hi is nonzero.  normalize
+	sub.l	d6,d3
+	lsl.l	d6,d4
+	bfextu	d5{0:d6},d7
+	lsl.l	d6,d5
+	or.l	d7,d4
+
+chk_x:
+	bfextu	-12(a0){1:15},d0	; D0.w/D1/D2 is |x|
+	move.l	-4(a0),d2
+	move.l	-8(a0),d1
+	bmi.b	mod_init		; X is normal
+	bne.b	@1
+
+	move.l	d2,d1			; X sig.hi is zero.  normalize
+	clr.l	d2
+	subi.l	#32,d0
+	bfffo	d1{0:32},d6
+	lsl.l	d6,d1
+	sub.l	d6,d0
+	bra.b	mod_init
+@1:
+	bfffo	d1{0:32},d6		; X sig.hi is nonzero.  normalize
+	sub.l	d6,d0
+	lsl.l	d6,d1
+	bfextu	d2{0:d6},d7
+	lsl.l	d6,d2
+	or.l	d7,d1
+
+mod_init:
+	move.l	d3,EXPOY(a6)		; save expo(Y)
+	sub.l	d3,d0			; L = expo(X) - expo(Y)
+	bge.b	@1			; L >= 0
+
+	add.l	d3,d0			; L < 0 -> |x| < |y|. restore expo(X)
+	suba.l	a1,a1			; zero quotient in a1
+	bra.b	get_mod
+
+@1:
+	movea.l	d0,a1			; save L in a1
+	
+;  Remainder algorithm using DIV32 subroutine handles large exponent
+;  differences much faster than any subtraction algorithm.
+;
+;  D3/D1/D2:  dividend/shifted remainder (96 bits)
+;  D4/D5:     divisor (64 bits)
+;  D0/D6/D7:  scratch
+;  A1:	      loop count
+
+	moveq	#0,D3		; zero high longword of dividend
+	andi.l	#$0000001f,d0	; alignment shift count
+	beq.b	@2		; if zero, do first DIV32
+				; shift dividend in d1/d2 left into d3/d1/d2
+	bfextu	d1{0:d0},d3	; shift high bits from d1 into d3
+	lsl.l	d0,d1		; shift d1 left
+	bfextu	d2{0:d0},d6	; extract d2 high bits
+	lsl.l	d0,d2		; shift d2 left
+	or.l	d6,d1		; insert extracted d2 bits into shifted d1
+
+;  Do initial division of D3/D1/D2 by D4/D5.  32-bit quotient in D0 with
+;  remainder in D3/D1 shifted by 32 bits.
+@2:
+	bsr	div32
+
+;  Remaining number of REM/MOD steps, if any, are done 32 at a time using DIV32.
+;  Final D0 value is lowest 32 bits of the quotient, and result is in D3/D1.
+	move.l	a1,d6		; get number of remaining 32-bit steps
+	bfextu	d6{16:11},d6
+	beq.b	moddivdone	; if zero, clean up
+
+	move.l	d6,a1		; a1 <- # of 32-bit steps
+	moveq	#0,d2		; zero trailing remainder bits
+
+modlp32:
+	bsr	div32
+	subq.l	#1,a1
+	move.l	a1,d6
+	bne.b	modlp32
+
+;  At this point, remainder is in D3/D1 and exponent is in EXPOY(a6).  Remainder
+;  may not be normalized.  Low 32 bits of quotient in D0.
+moddivdone:
+	move.l	d1,d2		; put result in D0/D1/D2
+	move.l	d3,d1
+	move.l	EXPOY(a6),d3	; d3.w <- expoy
+	movea.l	d0,a1		; quotient in a1
+	move.l	d3,d0		; result expo = EXPOY
+	tst.l	d1		; test high significand
+	bne.b	@1		; nonzero
+
+	tst.l	d2		; test low significand
+	beq	rem_is_0	; zero result
+
+	move.l	d2,d1		; unnormalized with sig.hi zero
+	moveq	#0,d2		; normalize it
+	subi.l	#32,d0
+	bfffo	d1{0:32},d6
+	lsl.l	d6,d1
+	sub.l	d6,d0
+	bra.b	get_mod
+@1:				; sig.hi is nonzero
+	bmi.b	get_mod		; normalized
+	bfffo	d1{0:32},d6	; unnormalized.  Normalize it
+	sub.l	d6,d0
+	lsl.l	d6,d1
+	bfextu	d2{0:d6},d7
+	lsl.l	d6,d2
+	or.l	d7,d1
+
+;  At this point, normalized remainder/mod in D0/D1/D2, low 32 bits of quotient
+;  in a1.  D3/D4/D5 holds Y. 
+get_mod:
+	cmpi.l	#64,d0		; if result is too small, scale upward
+	bge.b	no_scale	; large enough
+
+	addi.l	#126,d0		; scale result and Y upward by 2**126
+	addi.l	#126,d3
+	addq.l	#1,a2		; flag scaled values
+
+no_scale:
+	move.w	d0,RMOD(a6)	; store result in RMOD
+	clr.w	RMOD+2(a6)
+	move.l	d1,RMOD+4(a6)
+	move.l	d2,RMOD+8(a6)
+	move.w	d3,YMOD(a6)	; store Y in YMOD
+	clr.w	YMOD+2(a6)
+	move.l	d4,YMOD+4(a6)
+	move.l	d5,YMOD+8(a6)
+	fmove.x	RMOD(a6),fp0	; fp0 <- scaled RMOD
+	
+	
+	tst.l	MOD_FLAG(a6)	; mod or rem?
+	beq.b	fix_sign	; mod
+
+	subq.l	#1,d3		; rem.  Is RMOD small enough?
+	cmp.l	d3,d0
+	blt.b	fix_sign	;       yes 
+	bgt.b	last_sub	;       no
+
+	cmp.l	d4,d1		; rem with expo(RMOD) = expo(YMOD) - 1
+	bne.b	not_eq		; sig(RMOD) != sig(YMOD)
+	cmp.l	d5,d2
+	beq.b	tie_case	; rem with RMOD = YMOD/2 exactly
+not_eq:
+	bcs.b	fix_sign	; RMOD < YMOD/2
+last_sub:			; rem with YMOD > RMOD > YMOD/2
+	fsub.x	ymod(a6),fp0	; last rem step (no exceptions)
+	addq.l	#1,a1		; increment quotient
+fix_sign:
+	move.w	-12(a0),d6	; test sign of X
+	bpl.b	@1		; positive
+
+	fneg.x	fp0		; negative.  negate fp0
+@1:
+	move.w	(a0),d7		; d7.w <- sign/exp of Y
+	eor.w	d7,d6
+	lsr.l	#8,d6
+	andi.l	#$00000080,d6	; d6 bit 7 is sign of quotient
+	move.l	a1,d7		; get low 7 bits of quotient in d7
+	andi.l	#$7f,d7
+	or.l	d7,d6		; OR in sign bit
+	swap	d6
+	fmove.l	FPSR,d7		; insert quotient in FPSR
+	andi.l	#$ff00ffff,d7
+	or.l	d6,d7
+	fmove.l	d7,FPSR
+
+; Restore registers and round result
+	move.l	a2,d0			; d0 <- scaling flag
+	movem.l	(a7)+,d2-d7/a2		; restore registers
+	fmove.l	USER_FPCR(a6),FPCR	; restore user's rounding
+	tst.l	d0			; scaling?
+	beq.b	@2			; no
+
+	fmul.s	#"$00800000",fp0	; scale by 2**(-126)
+	bra	t_avoid_unsupp		; check for denorm as a
+					;   result of the scaling
+
+@2:
+	fmove.x	fp0,fp0			; capture rounding exceptions
+	rts				; done
+
+
+; Result is zero
+rem_is_0:
+	fmove.b	#0,fp0			; +0 in fp0
+	bra.b	fix_sign
+
+
+; rem result RMOD = YMOD/2 exactly
+tie_case:
+	move.l	a1,d6			; check parity of quotient
+	andi.b	#1,d6
+	beq.b	fix_sign		; even
+
+	addq.l	#1,a1			; odd -> bump quotient
+	fneg.x	fp0			;  and toggle sign of X in fp0
+	bra.b	fix_sign
+
+
+;  Subroutine DIV32 calculates a 32-bit quotient from a 64-bit dividend
+;  and a 64-bit divisor and returns a shifted (by 32 bits) remainder.
+;
+;	D3/D1 - dividend cum shifted remainder
+;	D2 - bits to be shifted into low half of remainder
+;	D4/D5 - divisor
+;	D0 - 32-bit quotient
+;	D6,D7 - scratch
+div32:
+	divu.l	d4,d3:d1	; divide step (64 bits / 32 bits)
+	bvs.b	divofl		; rare overflow case
+
+	move.l	d1,d0		; initialize quotient
+
+	move.l	d1,d7		; multiply quotient by divisor.low
+	mulu.l	d5,d6:d7
+
+ctndiv:
+	move.l	d2,d1		; shifted remainder in D3/D1
+
+	sub.l	d7,d1		; subtract correction from shifted remainder
+	subx.l	d6,d3
+	bcc.b	divok		; ok if no carry
+
+onemore:
+	subq.l	#1,d0		; correction produced carry; decr quotient
+	add.l	d5,d1		;   and adjust remainder upward until positive
+	addx.l	d4,d3
+	bcc.b	onemore
+
+divok:
+	rts			; return
+
+; rare case of division producing overflow.  Fix up and continue
+divofl:
+	move.l	d5,d6		; set D6/D7 to $100000000 * D5
+	moveq	#0,d7
+	move.l	d1,d3		; simulate remainder for quotient of $100000000
+	moveq	#0,d0		; quotient effectively $100000000
+	bra.b	ctndiv		;									<T3>
+
+

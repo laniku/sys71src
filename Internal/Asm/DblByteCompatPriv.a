@@ -1,0 +1,225 @@
+;
+;	File:		DblByteCompatPriv.a
+;
+;	Contains:	See Dan's heart-wrenching tale below…
+;
+;	Written by:	Dan Quayle
+;
+;	Copyright:	© 1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <2>	 1/15/92	SMB		Remove END. Moved equates, records and macros to ScriptPriv.a.
+;		 <1>	 1/14/92	SMB		first checked in
+;
+;
+;-------------------------------------------------------------------------------------
+;
+; So what is this nightmare??
+;	Once long, long ago there was going to be a new age for KanjiTalk with an elegant
+;	method for doing input methods.  The design proceeded it was sweet and clear as a 
+;	child's eyes.  But then things started to darken, angry war clouds darkened the
+;	sky and the titans of Ops/Tech and Cupertino did battle once again.
+;
+;	When the sky cleared there were many causualities, but perhaps the greatest was
+;	the need to support old input methods. Thus this ugly, ugly file.
+;	
+;	The deal is that we hacked together an Init that supports old input methods.
+;	We also decided that new input methods should be selectable from the Apple Menu
+;	just the way keyboards have been since 7.0.
+;
+;	In the pre-7.0 kanjitalk you selected FEPs from a control panel just like
+;	you select keyboards from a control panel.  The original (apparently not very clear)
+;	thinking was that old feps would still be selected from the old cdev.  But feps
+;	be they old or new are much more complicated.  For example, when you pick one
+;	you have to turn off another that might be on.
+;	The old cdev couldn't just handle the old ones because it has no way of knowing about
+;	anybody selecting the new ones
+;
+;	So we have to put all the responsibility on the keyboard menu.  Which now displays old
+;	and new input methods for CJK scripts and keyboards for all other scripts.
+;	
+;	There are 4 switching conditions to worry about:
+;		old input method -> old input method
+;		old input method -> new input method
+;		new input method -> new input method
+;		new input method -> old input method
+;-------------------------------------------------------------------------------------
+
+	Include 'SysEqu.a'
+	Include 'ScriptEqu.a'		; Public Script manager equates
+	Include	'ScriptPriv.a'		; Private Script manager equates. <1>
+	Include 'Traps.a'
+
+; Moved ScriptSystemGlobals record, NewScriptSystemGlobals record, intfRecord and selectors
+; and error codes for these routines to ScriptPriv.a. This file will now only contain 
+; code and not templates and equates.
+
+; ----------------------------------------------------------------------------
+; Routine:	GetIDEntry(table: Handle; id: Integer) : LongInt;
+; Input:	(sp).l	Handle to table.
+;		(sp).w	ID number in entry Record to return.
+; Output:	(sp).l	Item from table.
+; Warning:	This routine follows Pascal register conventions.
+;
+; Retreive an item from a table using the ID number.
+; ----------------------------------------------------------------------------
+
+gidRecord	Record	{a6link},decr
+entry		ds.l	1			; entry returned from table.
+handle		ds.l	1			; table handle.
+id			ds.w	1				; id of entry Record to fetch.
+return		ds.l	1			; return address.
+a6link		ds.l	1			; old a6 register.
+gidFrame	equ	*				; size of local variables.
+		EndR
+
+GetIDEntry Proc Export
+	With	gidRecord,ScriptSystemGlobals,SMgrRecord
+	link	a6,#gidFrame			; link the stack.
+	move.l	a4,-(sp)				; save registers
+	
+	GetSmgrCore	a4								; load script manager core.
+	move.l	smgrEntry+(smJapanese*4)(a4),a4		; load doubleTalkRecord for Japanese.
+	clr.w	FISError(a4)			; clear the error global
+
+; Search the table for the given ID number.  If we do not find it in the
+; table, set an error value and bail out.
+
+	move.l	handle(a6),a0			; Load table handle.
+	move.l	(a0),a0					; Load table pointer.
+	move.l	(a0)+,d0				; Load table length.
+	move.w	id(a6),d1				; Load search id number.
+	bra.s	@1						; enter loop at bottom.
+
+@0	move.l	(a0)+,a1				; Load table entry.
+	cmp.w	(a1),d1					; same id number?
+	beq.s	@okID					; yes -> we found it!
+@1	dbra	d0,@0					; do the next entry.
+
+	clr.l	entry(a6)				; clear the result.
+	move.w	#euBadID,FISError(a4)	; set the error code.
+	bra.s	@getIDDone				; return to the caller.
+
+; We've found the entry, so save the entry value.
+
+@okID
+	move.l	a1,entry(a6)			; save the result.
+
+; Unlink the stack, remove the arguments, and return to the caller.
+
+@getIDDone
+	move.l	(sp)+,a4				; restore registers
+	unlk	a6						; unlink the stack.
+	move.l	(sp)+,a0				; pop return address.
+	add.w	#6,sp					; pop the arguments.
+	jmp	(a0)						; return to the caller.
+	EndWith
+	EndProc
+
+
+; ----------------------------------------------------------------------------
+; Routine	GetKanjiUserIDIntf(id: Integer);
+; Input		sp.w	record ID for interface routine.
+; Output
+; Function	If this is a valid record ID, and the new interface is ready,
+;		deactivate the old interface and activate the new one.
+; ----------------------------------------------------------------------------
+
+uidRecord	Record	{a6link},decr
+id			ds.w	1			; interface routine ID number.
+return		ds.l	1			; return address.
+a6link		ds.l	1			; old a6 register.
+trueResult	ds.w	1			; activate result.
+envRec		ds.b	SysEnvRec.sysEnv1Size
+uidFrame	equ	*				; size of local variables.
+		EndR
+
+GetKanjiUserIDIntf Proc Export
+	With	uidRecord,intfRecord,ScriptSystemGlobals,SMgrRecord
+	link	a6,#uidFrame						; link the stack.
+	movem.l	a2-a4,-(sp)							; save the registers.
+	GetSmgrCore	a4								; load script manager core.							<2>
+	move.l	smgrEntry+(smJapanese*4)(a4),a4		; load doubleTalkRecord for Japanese.				<2>
+	clr.w	FISError(a4)						; clear error global
+	clr.w	trueResult(a6)						; clear error result.
+
+; Try to find the new user interface routine.  If we cannot find it in
+; the table, or it is not ready, return immediately.
+
+@fetchNew
+	sub.w	#4,sp								; make room for the pointer.
+	move.l	intfArray(a4),-(sp)					; push the array handle.
+	move.w	id(a6),-(sp)						; push record ID number.
+	jsr		GetIDEntry							; get the entry.
+	move.l	(sp)+,a3							; load the record pointer.
+	tst.w	FISError(a4)						; bad index?
+	bne		@noNew								; yes -> bail out.
+	btst.b	#intfFReady-8,intfFlags(a3)			; is it ready?
+	beq	@noNew									; no -> bail out.
+
+; Try to find the old user interface routine.  If we cannot find it in
+; the table, skip it entirely.  Note that this is an attempt at recovery
+; since the interface index should always point to a valid interface.
+
+	sub.w	#4,sp								; make room for the pointer.
+	move.l	intfArray(a4),-(sp)					; push the array handle.
+	move.w	imMethod(a4),-(sp)					; push old Record ID number.
+	jsr		GetIDEntry							; get the entry.
+	move.l	(sp)+,a2							; load the Record pointer.
+	tst.w	FISError(a4)						; bad index?
+	bne.s	@noOld								; yes -> skip old.
+
+; Deactivate the old user interface and set its flags correctly.
+
+	cmp.l	a2,a3								; interface method same?
+	beq.s	@noOld								; yes -> pretend like no old.
+	btst.b	#intfFActive-8,intfFlags(a2)		; old intf active?
+	beq.s	@noOld								; no -> skip deactivate.
+	move.w	intfVol(a2),-(sp)					; push volume refNum.
+	pea		intfFile(a2)						; push file name pointer.
+	IntfDeactivate								; deactivate old intf.
+	bclr.b	#intfFActive-8,intfFlags(a2)		; clear active bit.
+
+; Set the interface index to the passed index and activate the new user
+; interface.  Remember to set the flags correctly again and also set
+; the saved ID number.
+
+@noOld
+	move.w	id(a6),imMethod(a4)				; set new intf ID.
+	btst.b	#intfFActive-8,intfFlags(a3)	; new intf active?
+	bne.s	@noNew							; yes -> skip activate.
+	
+	;now get the boot drive so input method can find its dictionaries
+	lea.l	envRec(a6),a0					; get system folder's “volRefNum”.
+	moveq.l	#1,d0							; actually, it’s WDRefNum.
+	_SysEnvirons							; this is calling OpenWD to get it.
+	move.w	SysEnvRec.sysVRefNum(a0),intfVol(a3)	; set new volume refnum.
+	clr.w	FISError(a4)					; clear the error value.
+	move.w	intfVol(a3),-(sp)				; put the volref on the stack
+	pea		intfFile(a3)					; push file name ptr.
+	IntfActivate							; activate new intf.
+	
+	tst.w	id(a6)							; activating default?
+	beq.s	@0								; yup, skip error check.
+	clr.w	id(a6)							; assume error, set default id.
+	move.w	FISError(a4),trueResult(a6)		; save true result.
+	bne		@fetchNew						; error -> one more try...
+
+@0	bset.b	#intfFActive-8,intfFlags(a3)	; set active bit.
+	move.w	trueResult(a6),FISError(a4)		; set result.
+
+; Restore the registers, unlink the stack, pop the arguments, and return
+; to the caller.
+
+@noNew
+	movem.l	(sp)+,a2-a4						; restore the registers.
+	unlk	a6								; unlink the stack.
+	move.l	(sp)+,a0						; Load the return address.
+	add.w	#2,sp							; pop the arguments.
+	jmp	(a0)								; return to the caller.
+	EndWith
+	EndProc
+	End	
+	
+	

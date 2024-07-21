@@ -1,0 +1,459 @@
+;
+;	File:		BTPScan.a
+;
+;	Written by:	David Feldman
+;
+;	Copyright:	© 1988-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM1>	 4/15/92	kc		Removed the "ROM" prefix from the RomBind routines.
+;									• Pre-SuperMario comments follow •
+;		<13>	 9/13/91	JSM		Cleanup header.
+;		<12>	 3/11/91	dnf		dba, #83780: Remove HFS stack overflow check from BTPScan, which
+;									isn’t the right place for such a check. Also, this was left over
+;									debugging code which should be removed. Also, this code didn’t
+;									really help because it checks the stack depth at the wrong time.
+;		<11>	 2/12/91	dnf		gbm, #RemoveDebuggerStatements: Change _Debugger break on stack
+;									overflow to a call to _SysErr with #dsFSErr.
+;		<10>	 1/17/91	dnf		(kst) Turn on the “please cache this” advisory bit when reading
+;									catalog nodes. Do a FlushVFiles before we start parsing records
+;		 <9>	11/06/90	dnf		(with dba) Remove explicit noCache setting on _Reads.  Kenny's
+;									spiffy new cache code makes the cache case better.
+;		 <8>	10/30/90	dnf		(with dba) Fix off-by-one bug that was screwing up handling of
+;									the noMoreReads bit (showed up in timed CatSearch).
+;		 <7>	 9/22/90	dnf		Add error check to #FirstTime case through ValidateNode
+;		 <6>	 9/10/90	dnf		Fix incorrect handling of catPositionChangedErr.
+;		 <5>	 8/20/90	gbm		(dnf and gbm, actually) Fix overcounting of nodes on search
+;									exit/restart.
+;		 <4>	 7/30/90	dnf		convert to linked patch; change rom reference names and use
+;									jsrRom macro.
+;		 <3>	 2/26/90	dnf		Add support for NoMoreReads bit and LastTime bit
+;		 <2>	  2/4/90	dnf		Get rid of include of HFS70Equ.a
+;	   <1.3>	  9/7/89	dnf		Rewrote BTIPScan and BTEndPScan to support CatPosition record
+;	   <1.2>	 8/26/89	dnf		Put in temporary code to check for stack high water mark
+;	   <1.1>	 7/31/89	dnf		Change cache bypass to per-call, redo BTGetPhys
+;	   <1.0>	 5/30/89	dnf		Integrate CatSearch, FileID's and Desktop Database Mgr into one
+;									ptch
+;				12/20/88	dnf		Broke off from CatSearch
+;
+;	BTree Manager routines
+;	Function: These routines provide rapid access to unordered BTree records
+;
+;   External 		BTIPScan	 -  Initializes state info for a physical file scan, returns 1st record
+;  	 Routines:	 	BTEndPScan	 -  Cleans state off of A6 stack, returns hint			
+;					BTGetPhys   -  Increments current record, gets it
+;
+; 	Internal		GetMultNodes -  Reads disk-order sequential Btree nodes
+;	 Subroutines:	ValidateNode -  Validates PSR.curNodePtr
+;					ValidateRec  -  Finds next valid record at or after PSR.curRec
+;
+
+
+	PRINT	OFF
+	LOAD		'StandardEqu.d'
+	INCLUDE		'BTScanPriv.a'
+	Include		'FileMgrPrivate.a'
+	Include		'LinkedPatchMacros.a'
+	PRINT	ON
+
+	export		BTGetPhys
+	
+;__________________________________________________________________________________
+;
+; Routine:		BTIPScan
+;
+; Function: 	Initializes PScan state record on A6 stack.
+;				Checks CatPosition record
+;				Returns 1st record from btree
+;
+; Input:		D0.W  -  Btree reference number
+;				D3.L  -  Length of read buffer
+;				A0.L  -  Pointer to CatPos record
+;				A1.L  -  Address of read buffer
+;
+; Output:		D0.L  -  result code (CatPosChanged or result from BTFirstPhys)
+;				D1.W  -  size of record
+;				A0.L  -  ptr(key)
+;				A1.L  -  ptr(data record)
+;				A4.L  -  pointer to PScan state record
+;				A6.L  -  lower by size of PScan state record
+; Called by:	CMCatSearch
+;__________________________________________________________________________________
+BTIPScanRegs	reg			a2
+
+BTIPScan:		proc	export
+	SUBA.W		#PSR.size, A6			; allocate a state record on A6 stack
+	MOVEA.L		A6, A4					; save pointer to state record
+	MOVE.L		(SP)+, -(A6)			; move return address to file system stack
+	MOVE.L		A2, -(A6)				; save a2	
+	
+	with		CatPosition
+	MOVEA.L		FCBSPtr, A2				; A2 = ptr(base of FCB array)
+	ADDA.W		D0, A2					; A2 = ptr(Btree FCB)
+	MOVE.L		A2, PSR.fcbPtr(A4)		; hold on to fcbPtr
+
+	st			FlushOnly				; only flushing . . .
+	move.l		fcbVPtr(a2), a2			; vcb pointer into a2
+	jsrROM		FlushVFiles 			; flush all files on this volume
+	bne.s		@BTIExit				; bail on the first hint of trouble
+	
+	move.l		PSR.fcbPtr(a4), a2		; a2 = ptr(Catalog FCB)
+	MOVE.L		fcbBTCBPtr(A2), A2		; A2 = ptr(Catalog Btree BTCB)
+
+	MOVE.L		A2, PSR.btcbPtr(A4) 	; hold on to btree control block ptr
+	MOVE.L		D3, PSR.readBufLen(A4)	; hold on to length of read buffer
+	MOVE.L		A1, PSR.readBufPtr(A4)	; hold on to address of read buffer
+	MOVE.L		cpNodeNumber(A0), PSR.curNode(A4)		; move 1st btree node # to state record
+	MOVE.W		cpRecNumber(A0), PSR.curRec(A4)			; move 1st record # to state record
+	MOVE.L		cpGoodNodeCount(A0), PSR.goodCount(A4)	; move count to state record
+
+	MOVE.L		btcNNodes(A2), D0		; D0 = total # of nodes in catalog btree
+	SUB.L		btcFree(A2), D0			; D0 = total # - free nodes. ( = # allocated)
+	MOVE.L		D0, PSR.maxNodes(A4)	; D0 = max # nodes we need to look at
+	
+	CLR.B		PSR.flags(A4)				; clear the flags
+
+	MOVE.L		cpWriteCount(A0), D0	; D0 = user's expected writecount
+	BNE.S		@UserWriteCount
+	
+	; the user put a zero in the writecount, indicating that we should
+	; start at the beginning of the catalog.
+	CLR.L		PSR.curNode(A4)	
+	CLR.W		PSR.curRec(A4)
+	CLR.L		PSR.goodCount(A4)
+	MOVE.L		btcWCount(A2), D0		; D0 = current catalog writecount
+	MOVE.L		D0, cpWriteCount(A0)	; validate the user's position
+
+@UserWriteCount:
+	CMP.L		btcWCount(A2), D0		; does the catalog's writecount match the user's?
+	BEQ.S		@sameCatalog
+	MOVE.L		btcWCount(A2), cpWriteCount(A0)	; store current writecount in case caller really wants it
+	MOVE.W		#catChangedErr, d0		; report the catalog changed error
+	BRA.S		@BTIExit
+	
+@sameCatalog:
+	BSET		#FirstTime, PSR.flags(A4) 	; since the buffer is empty, force a read
+	BSR			BTGetPhys				; go get the 1st record
+	
+@BTIExit:
+	MOVE.L		(A6)+, A2				; restore a2
+	MOVE.L		(A6)+, -(SP)			; restore return address
+	TST.W		D0						; re-test the result code to set flags
+	RTS
+	
+	endwith
+	endproc
+	
+;__________________________________________________________________________________
+;
+; Routine:		BTEndPScan
+;
+; Function: 	Cleans up PScan state record on A6 stack and transfers btree position
+;				back into CatPosition record.
+;
+; Input:		A0.L  - pointer to CatPos record
+;				A4.L  - pointer to PScan state record
+;
+; Output:		A0.L  - pointer to updated CatPos record
+;				A6.L  - higher by size of PScan state record
+;				
+; Called by:	CMCatSearch
+;__________________________________________________________________________________
+
+BTEndPScan:		proc	export
+	with		CatPosition
+	MOVE.L		PSR.curNode(A4), cpNodeNumber(A0)	; save node we're on now
+	MOVE.W		PSR.curRec(A4), cpRecNumber(A0)		; save record we're on now
+	MOVE.L		PSR.goodCount(A4), cpGoodNodeCount(A0)	; save how many good nodes we've seen
+	ADDA.W		#PSR.size, A6						; deallocate state record
+	RTS
+	endwith
+	endproc
+	
+;__________________________________________________________________________________
+;
+; Routine:		GetMultNodes
+;
+; Function: 	Reads multiple Btree nodes into a buffer.  
+;				Nodes in buffer are "raw", I.E. not ChkNode'd
+;				GetMultNodes trusts the caller about the size of the read buffer
+;
+; Input:		D1.L  -  # nodes wanted
+;				D2.L  -  1st btree node wanted
+;				A1.L  -  address of read buffer	
+;				A2.L  -  BTCB ptr
+;
+; Output:		D0.W  -  result code (from read)
+;
+; Called by:	ValidateNode
+;__________________________________________________________________________________
+GMRegs			reg			D1-D6/A0-A3
+GetMultNodes:	proc
+	MOVE.L		(A7)+, -(A6)						; move return address to HFS stack
+	MOVEM.L		GMRegs, -(A6)
+	SUBA.W		#HIOP.size, A6						; allocate a param block on A6	
+	MOVEA.L		A6, A0								; A0 = ptr(param block)
+	MOVE.W		btcRefNum(A2), HIOP.ioRefNum(A0)	; refNum of btree file
+	MULU		btcNodeSize(A2), D1					; D1 = # bytes wanted
+	MOVE.L		D1, HIOP.ioReqCount(A0)				; for consistency, stick in ioReqCount
+	MOVE.L		A1, HIOP.ioBuffer(A0)				; user's buffer
+	MULU		btcNodeSize(A2), D2					; D2 = byte position of 1st node requested
+	MOVE.L		D2, D5								; CacheRdIP wants file pos in D5
+	MOVE.L		FCBSPtr, A1							; A1 = ptr(FCB array)
+	MOVE.W		btcRefNum(A2), D1					; (A1, D1.W) = FCB ptr
+	MOVE.L		HIOP.ioReqCount(A0), D4				; D4 = # bytes  (for CacheRdIP)
+	LEA			(A1, D1.W), A3						; A3 = ptr(FCB)
+	MOVEA.L		fcbVPtr(A3), A2						; A2 = ptr(VCB) (for CacheRdIP)
+
+	; Since I don't call seek, I'll set the inputs anyway, for consistency
+	MOVE.W		#fsFromStart, HIOP.ioPosMode(A0)	; we'll set the mark ourselves		<1.1> <9>
+	ori.b		#fsCacheAdvise, HIOP.ioPosMode+1(a0); ask for extra caching attention	<10>
+	MOVE.B		#fsRdPerm, HIOP.ioPermssn(A0)		; read permission on file
+	CLR.L		ioPosOffset(A0)						; offset = 0 'cus we're doing the mapping
+	CLR.L		ioActCount(A0)						; since we haven't read any bytes yet
+	MOVE.L		D2, fcbCrPs(A3)						; put our current pos back into fcb
+	
+@RdTop:
+	jsrRom		CACHERDIP   						; go do the read
+@1:	BNE.S		@Exit
+	ADD.L		D6, D5								; advance current file position
+	ADD.L		D6, ioActCount(A0)					; and tally up bytes read
+	SUB.L		D6, D4								; D4 now has ioReqCount - what was just read
+	BNE.S		@RdTop
+	
+@Exit
+	ADDA.W		#HIOP.size, A6						; deallocate param block
+	MOVEM.L		(A6)+, GMRegs
+	MOVE.L		(A6)+, -(A7)						; restore return address
+	TST.W		D0
+	RTS
+	endproc
+	
+;__________________________________________________________________________________
+;
+; Routine:		TallyAndCheckNodeCount
+;
+; Function: 	Add one to PSR.goodCount.  Check PSR.goodCount against PSR.maxNodes
+;				and if we've seen maxNodes good nodes, set PSR.flags LastGoodNode 
+;
+;				When PSR.flags LastGoodNode is set it indicates that we've seen all of
+;				the allocated nodes in the current btree, and if more nodes are requested
+;				we should return end of file, since we know no more could possibly be valid.
+;
+; Input:		A4.L  -  pointer to PScan state record			
+;
+; Output:		A4.L  -  pointer to PScan state record
+;
+; Called by:	ValidateRec, ValidateNode
+;__________________________________________________________________________________
+TallyAndCheckNodeCount:		proc
+
+		MOVE.L		D1, -(SP)					; save one dirty register
+		ADD.L		#1, PSR.goodCount(A4)		; tally another node
+		MOVE.L		PSR.goodCount(A4), D1
+		CMP.L		PSR.maxNodes(A4), D1		; have we seen enough?
+		BLO.S		@notDone					; if D1 < maxNodes, we've got lots of nodes left
+		
+		BSET.B		#LastGoodNode, PSR.flags(A4)
+@notDone
+		MOVE.L		(SP)+, D1					; restore one dirty register
+		RTS
+				endproc
+				
+;__________________________________________________________________________________
+;
+; Routine:		ValidateNode
+;
+; Function: 	Validates PSR.curNodePtr by looking for the current node # in the 
+;				read buffer.  If it's not there, then a buffer full of nodes
+;				is read in.  Once the node is there, it is checked (with ChkNode)
+;				and then verified to be a leaf node.  If not, the current node # is
+;				incremented and we try again from the top.
+;
+;				On entry, PSR.curNode must be valid.
+;				If FirstTime is not set, then PSR.buf1stNode and PSR.bufCount must be valid
+;				On exit, PSR.curNode, PSR.curNodePtr, PSR.buf1stNode, and PSR.bufCount are all valid
+;
+;				Buffer variables buf1stNode and bufCount:
+;				buf1stNode = btree node # of the 1st node in the buffer
+;				bufCount = total # nodes in the buffer
+;
+;				If we find the flag "noMoreReads" set true, we'll return nodes
+;				until we're forced to go to disk.  When we're forced to go to disk
+;				we return a userCanceledErr, which signals to the caller that 
+;				we're done with the current buffer.  This allows a caller to 
+;				ask the bt scanner not to do any more expensive disk reads while
+;				processing all of the records already read in from disk.  A caller 
+;				can set noMoreReads true in between any two calls to BTGetPhys
+;
+; Input:		A4.L  -  pointer to PScan state record			
+;
+; Output:		D0.W  -  result code (from read)
+;				A4.L  -  pointer to PScan state record
+;
+; Called by:	ValidateRec, BTGetPhys
+;__________________________________________________________________________________
+VNRegs				reg		A0-A2/D1-D2
+ValidateNode:		proc
+		MOVE.L		(A7)+, -(A6)				; move return address to HFS stack
+		MOVEM.L		VNRegs, -(A6)
+
+@VNTop	MOVE.L		PSR.curNode(A4), D0			; D0 = node # we're looking for
+		BCLR.B		#FirstTime, PSR.flags(A4)	; force a disk read?
+		BNE.S		@read
+		BTST.B		#LastGoodNode, PSR.flags(A4) ; force an eof?
+		BNE			@eofExit
+
+		MOVE.L		PSR.buf1stNode(A4), D1		; D1 = 1st node # in buffer
+		CMP.L		D1, D0						; if (curNode < buf1stNode), read
+		BLO.S		@read
+		ADD.L		PSR.bufCount(A4), D1		; D1 = 1st + count = last node # in buffer + 1
+		CMP.L		D1, D0						; if (curNode < last node + 1), don't read
+		BLO.S		@inBuf						; I.E. curNode is already in the buffer
+		
+@read	MOVEA.L		PSR.btcbPtr(A4), A2			; A2 = ptr(BTCB)
+		MOVE.L		btcNNodes(A2), D1			; D1 = # nodes in btree
+		SUB.L		D0, D1						; D1 = # nodes left to process
+		BHI.S		@1							; any left?
+		BRA			@eofExit
+
+@1:		BTST.B		#NoMoreReads, PSR.flags(A4)	; Should we do any more reads?
+		BEQ.S		@DoMoreReads
+		MOVE.W		#userCanceledErr, d0		; set up our signaling error
+		BRA			@done
+		
+@DoMoreReads:
+		MOVE.L		PSR.readBufLen(A4), D2		; D2 = buffer length in bytes
+		LSR.L		#8, D2
+		LSR.L		#1, D2						; D2 = buffer length in 512-byte nodes
+		CMP.L		D2, D1						; is buffer big enough for all remaining nodes?
+		BLS.S		@2							; yup; go ahead and read
+		MOVE.L		D2, D1						; D1 = size of buffer in nodes
+@2		MOVE.L		D0, D2						; D2 = curNode = 1st node to read
+		MOVE.L		PSR.readBufLen(A4), D0		; buffer length
+		MOVEA.L		PSR.readBufPtr(A4), A1		; buffer address
+		BSR			GetMultNodes
+		BNE.S		@done						; error?
+		MOVE.L		D2, PSR.buf1stNode(A4) 		; curNode is now 1st in read buffer
+		MOVE.L		D1, PSR.bufCount(A4)		; # now in buffer = # nodes read
+		
+@inBuf	MOVEA.L		PSR.readBufPtr(A4), A1		; A1 = ptr(read buffer)
+		MOVE.L		PSR.curNode(A4), D1			; D1 = current node
+		SUB.L		PSR.buf1stNode(A4), D1		; D1 = curNode - buf1stNode
+		MOVEA.L		PSR.btcbPtr(A4), A2			; A2 = ptr(BTCB)
+		MULU		btcNodeSize(A2), D1			; D1 = (curNode - buf1stNode) * nodeSize
+		ADDA.L		D1, A1						; A1 now points to current node in buffer
+		MOVE.L		A1, PSR.curNodePtr(A4)		; and we have a valid curNodePr
+		
+		MOVE.L		A4, D2						; save PSR around ChkNode
+		MOVEA.L		PSR.btcbPtr(A4), A4			; A4 = ptr(BTCB)
+		jsrRom		CHKNODE   					; is this node valid?
+		MOVEA.L		D2, A4						; restore PSR
+		BNE.S		@more						; not valid, get another node
+
+		MOVEA.L		PSR.curNodePtr(A4), A0		; A0 = ptr(current node)
+		CMP.B		#ndLeafNode, ndType(A0)		; is this also a leaf node?
+		BEQ.S		@done						; yes, this is a valid leaf node
+
+		BSR			TallyAndCheckNodeCount		; count the valid non-leaf node
+
+@more	ADDQ.L		#1, PSR.curNode(A4)			; let's try the next node
+		CLR.W		PSR.curRec(A4)				; starting at record 0
+		BRA			@VNTop
+
+@eofExit:
+		MOVEQ.L		#eofErr, D0
+		
+@done	MOVEM.L		(A6)+, VNRegs
+		MOVE.L		(A6)+, -(A7)				; restore return address
+		TST.W		D0
+		RTS
+		endproc
+		
+;__________________________________________________________________________________
+;
+; Routine:		ValidateRec
+;
+; Function: 	Looks for PSR.curRec in the current node.  If it's not there, 
+;				the node count is advanced and the next node read.
+;				N records in a node are numbered 0 - (N-1)
+;
+;				PSR.curNodePtr must be valid on entry to ValidateRec
+;
+; Input:		A4.L  -  pointer to PScan state record			
+;
+; Output:		DO.L  -  result code (from read)
+;				A4.L  -  pointer to PScan state record
+;
+; Called by:	BTGetPhys
+;__________________________________________________________________________________
+ValidateRec:	proc
+	MOVE.L		(A7)+, -(A6)				; move return address to HFS stack
+	MOVE.L		A0, -(A6)
+@VRTop:
+	MOVEA.L		PSR.curNodePtr(A4), A0		; A0 = ptr(current node)
+	MOVE.W		ndNRecs(A0), D0				; D0 = # records in current node
+	CMP.W		PSR.curRec(A4), D0			; # recs in node >= current rec #?
+	BHI.S		@noErr						; cur rec is in cur node, so exit	
+
+	BSR			TallyAndCheckNodeCount		; count the valid leaf node we're now done with
+	ADDQ.L		#1, PSR.curNode(A4)			; next BTree node
+	CLR.W		PSR.curRec(A4)				; and the 1st record in that node
+	BSR			ValidateNode				; go find new node
+	BNE.S		@1							; error?
+	BRA.S		@VRTop						; Keep going until you find a good one
+@noErr:
+	SUB.W		D0, D0						; clear result code
+@1:	MOVEA.L		(A6)+, A0
+	MOVE.L		(A6)+, -(A7)				; restore return address
+	TST.W		D0
+	RTS
+	endproc
+	
+;__________________________________________________________________________________
+;
+; Routine:		BTGetPhys
+;
+; Function: 	Returns the next btree record in physical disk order.
+;
+; Input:		A4.L  -  pointer to PScan state record.
+;				checks the state of the FirstTime bit in the flags word
+;
+; Output:		D0.W  -  result code (from read)
+;				D1.W  -  size of record
+;				A0.L  -  ptr(key)
+;				A1.L  -  ptr(data record)
+;				A4.L  -  pointer to PScan state record
+;
+; Called by:	CMCatSearch
+;__________________________________________________________________________________
+
+BTGetPhys:		proc
+	MOVE.L		(A7)+, -(A6)				; move return address to HFS stack
+	BTST.B		#FirstTime, PSR.flags(A4)	; is this the first time through?
+	BEQ.S		@NotFirstTime				; if not, just get the record
+	
+	; it's the first time through, so do a read before trying
+	; to get a record from the buffer.
+	BSR			ValidateNode				; get the 1st valid node
+	BNE.S		@Exit						; punt on errors						<7>
+	
+@NotFirstTime
+	MOVE.L		A4, -(A6)					; save PSR ptr around LocRec call
+	BSR			ValidateRec					; point PSR.curRecPtr at node w/next record
+	BNE.S		@1							; error?
+	MOVEA.L		PSR.curNodePtr(A4), A1		; A1 = ptr(node)
+	MOVE.W		PSR.curRec(A4), D1			; D1 = record we want
+	ADDQ.W		#1, PSR.curRec(A4)			; advance to next record for next time	<8>
+	MOVEA.L		PSR.btcbPtr(A4), A4			; A4 = ptr(BTCB)
+	jsrRom		LOCREC   
+@1: MOVEA.L		(A6)+, A4					; restore PSR ptr
+@Exit:
+	MOVE.L		(A6)+, -(A7)				; restore return address
+	TST.W		D0
+	RTS
+	endproc
+	
+	end
+

@@ -1,0 +1,1704 @@
+;
+;	File:		SCSIMgrHW96BIOS.a
+;
+;	Contains:	SCSI Manager BIOS based 53c96 Hardware-Specific routines
+;
+;	Written by:	James Blair
+;
+;	Copyright:	© 1992, 1994 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 1/26/94	rab		Removed padForOverpatch stuff from the end of this file
+;									(SuperMario does not use it…).
+;	   <SM1>	  2/5/93	CSS		Checkin from Horror.
+;		<H5>	10/17/92	jab		Added fixes for doing OneByte read/writes and fixed the lea
+;									looping problem.
+;		<H4>	 10/5/92	jab		Fixed few byte read/write and bus error handler.
+;		<H3>	  9/9/92	jab		Fixed word transfer if alignment requires an odd word.
+;		<H2>	  9/9/92	jab		Fixed FastRead odd word/byte problem.  Now accessing the FIFO
+;									instead of the DMA register.
+;		 <1>	  9/6/92	jab		first checked in
+;__________________________________________________________________________________________________
+
+
+			MACHINE		MC68020			; '020-level
+			BLANKS		ON				; assembler accepts spaces & tabs in operand field
+			STRING		ASIS			; generate string as specified
+			PRINT		OFF				; do not send subsequent lines to the listing file
+										;	don't print includes
+
+PostNOP		EQU		1					;														
+
+			LOAD		'StandardEqu.d'			; from StandardEqu.a and for building ROMs
+			INCLUDE		'HardwarePrivateEqu.a'
+			INCLUDE		'UniversalEqu.a'		; for VIA bit and -TestFor- definitions			
+			INCLUDE		'SCSI.a'				; <SM1> CSS
+			INCLUDE 	'SCSIPriv.a'
+			INCLUDE		'SCSIEqu96.a'
+			INCLUDE		'MC680x0.a'
+
+			PRINT		ON				; do send subsequent lines to the listing files
+
+SCSIHW96BIOS	PROC		EXPORT	
+
+			EXPORT	SlowRead_96_BIOS,	Transfer_96_BIOS
+			EXPORT	Wt4DREQorInt_BIOS,	HandleSelInProg_BIOS
+			EXPORT	ResetBus_96_BIOS
+			EXPORT	BusErrHandler_96_BIOS											;				
+
+			EXPORT	InitHW_SCSI96_BIOS	
+			EXPORT	SlowWrite_96_BIOS,	SlowComp_96_BIOS							;				
+			EXPORT	FastRead_96_BIOS,	FastWrite_96_BIOS,	FastComp_96_BIOS		;				
+
+			IMPORT	ClearSCSIInt					; from InterruptHandlers.a					
+
+		; From SCSIMgr96BIOS.a ---
+
+			IMPORT	Error_BIOS						; from SCSIMgr96BIOS.a							
+
+		; From SCSIMgr96HW.a ---
+
+			IMPORT	WaitForIntNoTime, WtForFIFOData							;		<H5>
+
+			WITH	scsiPB, scsiPrivPB	 			; access record without explicit qualification
+			WITH	scsiGlobalRecord, dcInstr
+			WITH	DecoderInfo, DecoderKinds, ProductInfo	;									
+
+
+;--------------------------------------------------------------------------						
+;
+; InitHW_SCSI96_BIOS - reset and initialize the 53C96 SCSI controller	once the glibbly loads.								
+;						This routine resets all functions in the chip and returns
+;						it to a disconnected state.
+;
+;  INPUTS
+;		a3 -> pointer to SCSI port base address													
+;
+;	OUTPUTS
+;		d0 <- rINT(a3)																			
+;
+; trashes: d0, d1																			
+
+InitHW_SCSI96_BIOS
+
+			move.b	#cRstSChp, rCMD(a3)			; load reset-scsi-chip cmd, this cmd has
+												;    the same effect as a hw reset
+			move.b	#cNOP, rCMD(a3)				; NOP required after HW or SW reset
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO
+			
+			move.b	#initCF1, rCF1(a3)			; load init config. value which affects:
+												;	busID, SCSI reset reporting & parity checking
+			move.b	#initCF2, rCF2(a3)			; load init config. value
+			move.b	#initCF3, rCF3(a3)			; load init config. value
+			
+;	Check whether or not we're 25 or 33MHz and set SCSI bus speed values appropriately			
+;	Get machine type + CPU speed information from VIA1
+;
+;		Useful VIA1 PortA bits to read:  PA6, PA4, PA2, PA1  ($56)
+;
+;			PA6      = Lego (1), or Frigidaire (0) plastics for Wombat
+;			PA4, PA2 = CPU Speed.  0=20MHz, 1=25MHz, 2=33MHz, 3=40MHz
+;			PA1      = WLCD (0) or NOT! [Reserved] (1)
+;
+;		Retrieve CPU Speed information from VIA1 Port A
+
+			movem.l	a0/a2/d0/d2/d3,-(sp)				; save stuff
+
+			movea.l	UnivInfoPtr,a0						; point to the DecoderInfo table
+			adda.l	ProductInfo.DecoderInfoPtr(a0),a0
+
+			movea.l	VIA1Addr(a0),a2				; get VIA1 address to get machine/cpu_speed info
+			moveq	#%00101000,d3				; force VIA1 VDirA to have the correct directions
+			move.b	d3,VDirA(a2)				; ... so we can read the CPU ID extension info
+			moveq	#%00010100,d3				; get VBufA, bits PA4, PA2 (dont need PA6, PA1)
+			and.b	VBufA(a2),d3				; get plastics_type/cpu_speed information
+			
+			lea		BIOSAddr,a2					; get BIOS address for ConfigSonic_SCSI setup
+			move.b	BIOS_SONIC_SCSI(a2),d2		; save Sonic bit but trash 							
+			andi.b	#BIOSSCSIFilter,d2			;	everything else
+			
+			lsr.b	#2,d3						; shift PA4,PA2 down to bits 2-0
+			bne.s	@25MHz						; 0=20MHz, otherwise check higher
+@20MHz			
+			ori.b	#BIOScfg20MHz,d2			; setup for and'ing the correct SCSI cfg bits
+			bra.s	@contSetup
+@25MHz			
+			subq.b	#4,d3						; split the rest of the values
+			beq.s	@33MHz
+			bgt.s	@40MHz				
+			
+			ori.b	#BIOScfg25MHz,d2			; setup for and'ing the correct SCSI cfg bits
+			bra.s	@contSetup
+@33MHz
+			ori.b	#BIOScfg33MHz,d2			; setup for and'ing the correct SCSI cfg bits
+			bra.s	@contSetup
+
+@40MHz
+			ori.b	#BIOScfg40MHz,d2			; setup for and'ing the correct SCSI cfg bits
+
+@contSetup
+			move.b	d2,BIOS_SONIC_SCSI(a2)		;													
+
+			; the rest of this stuff is used to configure the internals of the c96...
+
+			move.b	#ccf20to25MHz, rCKF(a3)		; load clock conversion factor (CCF) value
+			move.b	#SelTO25Mhz, rSTO(a3)		; load select/reselect timeout value
+			move.b	#initOp, rSYO(a3)			; select syn or async operation; if sync then
+												;   sync offset value must be nonzero
+												; Set synch xfer period and offset if using
+												;	synch data xfer
+			move.b	rINT(a3), d0				; read & clear rFOS, rSTA & rINT into throwaway		
+
+			movem.l	(sp)+,a0/a2/d0/d2/d3			; restore stuff
+			rts									;													
+
+
+
+			
+;--------------------------------------------------------------------------				<H5> thru next <H5>
+; OneByteRead_BIOS/OneByteWrite_BIOS - proc to transfer 1 byte													
+;
+;		d0 - <-- error (if any)
+;		d1 - --> copy of d2
+;		d1 - <-- bytes transferred
+;		d2 - --> number of bytes to transfer
+;		d3 -     scratch - saved
+;		d4 - --> type of transfer to perform
+;		d5 -     scratch - saved
+;		d6 -     scratch - saved
+;
+;		a0 - scratch - saved
+;		a1 - SCSI chip read base address - NON-SERIALIZED
+;		a2 - ptr to data buffer - saved
+;		a3 - SCSI chip read base address - SERIALIZED
+;		a4 - ptr to SCSI Mgr globals
+;		a5 - scratch - saved
+
+OneByteRead_BIOS								;													
+			bra.s	@oneReadBot					;											
+@oneReadTop
+			move.b	#cIOXfer, rCMD(a3)			; load IO transfer cmd & begin xfers
+			bsr.l	WaitForIntNoTime			; Wait for intrp w/o timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			bne.w	xferErr						; bra. on xfer error
+			move.b	rFFO(a3), (a2)+				; xfer byte from FIFO into input buffer				
+@oneReadBot
+			dbra	d2,@oneReadTop				;												
+			
+			move.b	rINT(a3), d3				; read Intrp regr & clear rSTA, rSQS & rINT
+			btst.l	#bDSC, d3					; check for disconnected intrp 
+			bne.w	xferErr						; bra. on xfer error
+			moveq.l	#noErr, d0					; successful read op								
+			rts			
+
+OneByteWrite_BIOS
+			bra.s	@oneWriteBot				;											
+@oneWriteTop
+			move.b	(a2)+, rFFO(a3)				; preload the FIFO with d2 bytes
+@oneWriteBot
+			dbra	d2,@oneWriteTop				;											
+			move.b	#cIOXfer, rCMD(a3)			; load IO transfer cmd & begin xfers
+			bsr.l	WaitForIntNoTime			; Wait for intrp w/o timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			bne.w	xferErr						; bra. on xfer error
+			moveq.l	#noErr, d0					; successful write op
+			rts									;										<H5> from last <H5>
+
+
+;--------------------------------------------------------------------------
+;	Transfer_96 - 																			
+; 
+;	Called by:	dataCommon_96 
+;				(NewSCSIWBlind_96, NewSCSIWrite_96, NewSCSIRBlind_96, NewSCSIRead_96)
+; 
+;	Calls:		The primitive data transfer routines 
+; 
+;	Registers:	d0	<-- error, if any 
+;				d1	<-- bytes transferred 
+;				d2	--> number of bytes to transfer 
+;				d4	--> type of transfer to perform (offset into "dataTable") 
+; 
+;				a2	--> ptr to data buffer 
+;				a3	--> SCSI chip read base address - SERIALIZED
+;				a4	--> ptr to SCSI Mgr globals 
+; 
+;	Function:	Sets up and dispatches to the simple data-transfer routines 
+; 
+;	All primitive data transfer routines called by this routine assume: 
+; 
+;		d0 - <-- error (if any) 
+;		d1 - <-- bytes transferred 
+;		d2 - --> number of bytes to transfer 
+;		d3 -     scratch - saved 
+;		d4 - --> type of transfer to perform 
+;		d5 -     scratch - saved 
+;		d6 -     scratch - saved 
+; 
+;		a0 - scratch - saved 
+;		a1 - SCSI chip read base address - NON-SERIALIZED
+;		a2 - ptr to data buffer - saved 
+;		a3 - SCSI chip read base address - SERIALIZED
+;		a4 - ptr to SCSI Mgr globals 
+;		a5 - scratch - saved 
+; 
+	;
+	; Stack frame definitions (frame allocated in StdEntry)
+	;
+	
+XferFrame		RECORD	{LINK},DECR
+returnAddr	ds.l	1	; return address
+	; no parameters
+LINK		ds.l	1	; location of old A6 (after LINK A6)
+	; local variables  (set up and checked in BusErrHandler)
+BusErrTO	ds.l	1	; when to stop retrying bus errs
+BusErrAddr	ds.l	1	; user's data address when bus err happens
+
+linkSize		EQU	*
+				ENDR
+		
+		WITH	XferFrame
+		
+Transfer_96_BIOS:
+			link	a6, #linkSize				; allocate local storage
+
+			moveq	#Max020030BusErrs,d0		; upper limit for 020s and 030s					
+			cmp.b	#cpu68040,CpuFlag			; check if we're on an 040							
+			bne.s	@storeValue					; NO  ... leave BusErrCount alone				
+			moveq	#Max040BusErrs,d0			; YES ... use 040 MaxBusErr value					
+@storeValue										;												
+			move.l	#0, BusErrAddr(a6)			; init so first bus err is seen as a new one
+
+			moveq.l	#noErr, d0					; assume no error
+			move.l	d2, d1						; make a copy of the count - is it zero ?
+			beq.w	@exit						; if so, get out
+
+			movem.l a1-a5/d2-d6, -(sp)			; save registers
+
+			movea.l	a3,a1						; point to serialized chip image
+			adda.l	#nonSerlzdDisp,a1			; point to non-serialized chip image
+
+			bsr		HandleSelInProg_BIOS		; handle unfinished select command
+			bne.w	@phaseErr					; if it is stuck, we are not in data phase
+
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO									
+
+
+			move.l	BusErrVct,yeOldeBusErrVct(a4)	; keep old vector in low-mem				
+			move.l	jvBusErr(a4), BusErrVct			; install our BE Handler
+@1
+			bset.b	#HandleBusErrs, G_State96(a4)	; signal our bus err handler to be operative
+			move.w	d4, transferType(a4)			; store the type of transfer (only word is worth anything)
+
+			lea.l	dataTable(a4), a0			; point to data transfer table in globals
+			movea.l	0(a0,d4.l), a0				; get the routine address
+			
+			jsr		(a0)						; go to the appropriate routine
+
+@done
+			bclr.b	#HandleBusErrs, G_State96(a4)	; signal our bus err handler to be unoperative
+			move.l	yeOldeBusErrVct(a4),BusErrVct	; restore previous Bus Error vector			
+
+			movem.l (sp)+, a1-a5/d2-d6			; restore these guys
+			tst.w 	d0							; set the condition codes
+@exit
+			unlk	a6							; release local storage
+			rts									;												
+
+@phaseErr
+			moveq.l	#scPhaseErr, d0				; return a phase error
+			moveq.l	#0, d1						; number of bytes transferred
+			bra.s	@done						; 
+
+		ENDWITH
+		
+phaseErr1
+			move.l	#$F0, d6					; load proc ID, generic trnasfer
+			moveq.l	#scPhaseErr, d0				; return a phase error
+errExit			
+			jsr		Error_BIOS					; call Error proc - for debug
+			clr.l	d1							; no bytes transferred
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO
+			rts									;													
+
+			
+;--------------------------------------------------------------------------
+; SlowRead - implements Polled Read																	
+;
+;	Called by:	Transfer
+;
+; All primitive data transfer routines assume:
+;
+;		d0 - <-- error (if any)
+;		d1 - --> copy of d2
+;		d1 - <-- bytes transferred
+;		d2 - --> number of bytes to transfer
+;		d3 -     scratch - saved
+;		d4 - --> type of transfer to perform
+;		d5 -     scratch - saved
+;		d6 -     scratch - saved
+;
+;		a0 - scratch - saved
+;		a1 - SCSI chip read base address - NON-SERIALIZED
+;		a2 - ptr to data buffer - saved
+;		a3 - SCSI chip read base address - SERIALIZED
+;		a4 - ptr to SCSI Mgr globals
+;		a5 - scratch - saved
+;
+; Method of Data Transfer: (pDMA and programmed IO)										
+;  0) Make sure we got our intrp from the last cmd send
+;  1) calculate # of 16-byte block transfers to perform using pDMA & remember the remainder
+;  2) Enable c96 DMA and wait till the 16-byte FIFO is full and DREQ is asserted for the 17th byte
+;  3) Transfer all data in the FIFO and wait for the intrp
+;  4) Repeat until all block have been transferred
+;  5) Transfer remaining data using non-DMA transfer command byte then 
+;		Wait and poll for byte-in-fifo interrupt
+;  6) Transfer data from fifo to input buffer
+;  7) Repeat process until all remaining bytes have been transferred
+;
+
+SlowRead_96_BIOS
+			bsr		HandleSelInProg_BIOS		; handle unfinished select command
+			bne.w	@phaseErr					; if it is stuck, we are not in data phase
+@doRead
+			moveq.l	#iPhaseMsk, d0				; load mask for phase bits
+			and.b	rSTA(a3), d0				; are we in data-in phase?
+			cmpi	#iDataIn, d0				; data-in phase bits = 001
+			bne.s	phaseErr1					; bra. on phase err
+			
+			lea		rDMA(a1),a1					; 													<H5>
+
+			clr.l	d6							;
+			move.l	d2, d4						; d4 = copy of transfer count
+			lsr.l	#4, d4						; divide xfer count by 16
+			beq.w	@16orLess					; bra. if < 16 bytes
+			subq.l	#1, d4						; adjust for DBRA
+			move.l	d4, d6						; d4.w has lower 16-byte block count
+			swap	d6							; d6.w has upper 16-byte word count
+@16orMore
+			move.l	G_SCSIDREQ(a4), a0			; load SCSI DREQ regr
+			
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO										
+			move.b	#0, rXCM(a3)				; rXCM = 0, clear most-sig. byte count
+			move.b	#$10, rXCL(a3)				; rXCL = 16 bytes, least-sig. byte value
+			and.l	#$F, d2						; d2 = remainder word count after 16-byte moves
+@read16			
+			moveq.l	#iPhaseMsk, d5				; load mask bits for phase value
+			and.b	rSTA(a3), d5				; are we still in data-in phase?
+			cmpi.b	#iDataIn, d5				; data-in phase bits = 001
+			bne.w	@premature2					; no: probably in status phase - split										
+
+			move.b	#cDMAXfer, rCMD(a3)			; load DMA transfer cmd & start loading FIFO
+			nop									;   currently loaded transfer count is used/reused
+@1
+			btst.b	#bTRC, rSTA(a3)				; check if we've rcvd all the data						
+			bne.s	@4							; if we have, go get the bytes
+			btst.b	#bINT, rSTA(a3)				; poll for unexpected intrp while waiting
+			bne.w	@prematureEnd				; ... maybe disconnected or something catastrophic.
+												; premature phase change won't generate intrp bit 'cuz of outstanding DREQ...
+												; ... we have to check this condition explicitly
+			moveq.l	#iPhaseMsk, d5				; load mask bits for phase value
+			and.b	rSTA(a3), d5				; are we still in data-in phase?
+			cmpi.b	#iDataIn, d5				; data-in phase bits = 001
+			beq.s	@1							; yes, bra. & keep polling										
+			tst.b	rXCL(a3)					; not data-in anymore, have we xferred all data (XCL = 0)?
+			beq.s	@1							; if yes then there MUST be a transfer count zero bit set
+			bra.w	@prematureEnd				; transfer count not 0 so we have a premature end		
+		
+			; We need 16 guaranteed DREQs to safely transfer 16 bytes without bus error.
+			; Ideally, DREQ should be active as long there are threshold number of bytes in the
+			; FIFO--as the c96 user's guide imply.  But the c96 implementation also requires that
+			; REQ be active in order to get DREQ.  This is why we must wait for the 17th REQ from
+			; the target--and it must remain active--before we proceed with the 16-byte transfer.
+@4
+			move.l	(a0), d5					; read DAFB SCSI DREQ 
+			move.b	G_bitDREQ(a4),d0			; load DREQ bit position		
+			btst.l	d0, d5						; DREQ ?						
+			beq.s	@1							; loop until asserted
+			btst	#4, rFOS(a3)				; see if FIFO is full
+			beq.s	@1							; loop until asserted
+@10
+			nop									; squoosh pipeline								
+			move.l	(a1),(a2)+					; read 16 bytes										<H4> thru next <H4>					
+			move.l	(a1),(a2)+					; 										
+			move.l	(a1),(a2)+					; 										
+			move.l	(a1),(a2)+					; 													<H4> from last <H4>									
+		IF PostNOP THEN
+			nop									; squoosh pipeline								
+		ENDIF
+			
+			; Note that intrp is asserted only after transfer count is 0, FIFO is empty
+			; and the target asserts REQ for the next byte.
+@2
+			btst.b	#bINT, rSTA(a3)				;  check for c96 INTRP
+			beq.s	@2							;  loop until we get the intrp
+			
+			move.b	rINT(a3), d5				; read Intrp regr & clear rSTA, rSQS & rINT
+			btst.l	#bDSC, d5					; check for disconnected intrp 
+			bne.s	@premature2					; Branch if transfer error
+
+			dbra	d4, @read16					; loop until done, d4 is lower word count
+			dbra	d6, @read16					; loop until done, d6 is upper word count
+			bra.s	@16OrLess					; take care of remaining data, if any
+@rdSingle										; use non-pDMA for remainder
+			moveq.l	#iPhaseMsk, d5				; load mask bits for phase value
+			and.b	rSTA(a3), d5				; are we still in data-in phase?
+			cmpi.b	#iDataIn, d5				; data-in phase bits = 001
+			bne.s	@phaseErr					; bra. on phase err
+			move.b	#cIOXfer, rCMD(a3)			; load IO transfer cmd & begin xfers
+@3
+			btst.b	#bINT, rSTA(a3)				; check for c96 INTRP
+			beq.s	@3							; loop until we get an intrp
+			move.b	rFFO(a3), (a2)+				; xfer byte from FIFO into input buffer
+			
+			move.b	rINT(a3), d5				; read Intrp regr & clear rSTA, rSQS & rINT
+			btst.l	#bDSC, d5					; check for disconnected intrp 
+			bne.s	@xferErr					; Branch if transfer error
+@16OrLess
+			dbra	d2, @rdSingle				; read the rest of the remainders
+@goodSRead										; d1 = # of bytes transferred
+			moveq.l	#noErr, d0					; successful read op
+			rts									; 
+
+
+; Premature phase change - get leftover bytes out of FIFO, clear DREQ and INTRPT		
+
+@prematureEnd
+			moveq.l	#iFOFMsk, d0				; use mask to get FIFO flag field
+			and.b	rFOS(a3), d0				; how many bytes left in FIFO?
+			bra.s	@btmLeftovers
+@topLeftovers
+			move.b	rFFO(a3), (a2)+
+@btmLeftovers
+			dbra	d0,@topLeftovers
+@removeDREQ
+			move.l	(a0), d5					; read DAFB SCSI DREQ 
+			move.b	G_bitDREQ(a4),d0			; load DREQ bit position		
+			btst.l	d0, d5						; DREQ ?						
+			beq.s	@5							; if no DREQ, skip dummy rDMA access
+			move.w	rDMA(a3), d5				; remove that outstanding DREQ (magic),
+			bra		@removeDREQ					; and see if there's more (more magic)
+@5												; and give us that intrp
+			bsr.l	WaitForIntNoTime			; Wait for intrp w/o timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+
+; Premature phase change with no leftover bytes
+
+@premature2
+; calc how many bytes we've xferred...
+			addq.w	#1, d4						; undo adjustment for dbra
+			swap	d6							; calculate bytes left to transfer
+			move.w	d4, d6						; form long word count
+			lsl.l	#4, d6						; mult by 16
+
+			and.b	#iPhaseMsk, d5				; are we still in data-in phase?
+			cmpi.b	#iDataIn, d5				; data-in phase bits = 001
+			beq.s	@xferErr					; bra. to check for disconnect
+@phaseErr
+			moveq.l	#scPhaseErr, d0				; return a phase error
+			bra.s	@badSRead					;
+
+@xferErr										; anything else is a comm. err
+			moveq.l #scCommErr, d0				; transfer error
+@badSRead
+			add.l	d2, d6						; add un-xferred remainder
+			sub.l	d6, d1						; number of bytes transferred
+			
+			move.l	#scsiRead, d6				; load proc ID
+			jsr		Error_BIOS					; call Error proc - for debug
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO
+			rts									; 									
+			
+
+
+			
+;--------------------------------------------------------------------------
+; SlowWrite - implements Polled Write
+;
+;	Called by:	Transfer
+;
+; All primitive data transfer routines assume:
+;
+;		d0 - <-- error (if any)
+;		d1 - --> copy of d2
+;		d1 - <-- bytes transferred
+;		d2 - --> number of bytes to transfer
+;		d3 -     scratch - saved
+;		d4 - --> type of transfer to perform
+;		d5 -     scratch - saved
+;		d6 -     scratch - saved
+;
+;		a0 - scratch - saved
+;		a1 - SCSI chip read base address - NON-SERIALIZED
+;		a2 - ptr to data buffer - saved
+;		a3 - SCSI chip read base address - SERIALIZED
+;		a4 - ptr to SCSI Mgr globals
+;		a5 - scratch - saved																		
+;
+; Method of Data Transfer: (uses pseudo-DMA mode)
+;  0) Make sure we got our intrp from the last cmd send
+;  1) Parcel transfer into 64KB blocks since TC regr. handles 64KB max
+;  2) Calc. the number of 16-byte block transfers to perform
+;  3) Calc. the remaining number of transfers to perform
+;  4) Write data 16-byte blocks at a time using word MOVEs
+;  5) Wait without timeouts until FIFO is empty ie. 16-byte transfer completed
+;  6) Transfer residual byte if there is one
+;
+
+SlowWrite_96_BIOS
+			bsr		HandleSelInProg_BIOS		; handle unfinished select command
+			bne.w	@phaseErr					; if it is stuck, we are not in data phase
+@doWrite			
+			lea		rDMA(a1),a1					; 												<H5>
+			moveq.l	#iPhaseMsk, d0				;
+			and.b	rSTA(a3), d0				; are we in data-out phase?
+			bne.w	phaseErr1					; data-out phase bits = 0, bra. on phase err	
+			
+			cmpi.l	#3, d2						; if not 3 or less bytes write then...			<H5>
+			bgt.s	@moreThan3					; 	jump into move.l loop						<H5>
+@doSingles
+			bra.l	OneByteWrite_BIOS			;												<H5>
+
+@moreThan3
+			move.l	a2,d6						; get location of buffer						
+			and.l	#3,d6						; odd words or bytes mean alignment req'd 
+			bne.w	@alignLoop					;
+@aligned
+			move.l	d2, d6						; d6 = number 64KB block to perform
+			swap	d6							; upper word of d6 = lower word of d2
+			andi.l	#$0000FFFF, d2				; mask out upper word
+			beq.s	@2							; if 0 then we have $10000 (64K) bytes to xfer
+@next64KB
+			moveq.l	#iPhaseMsk, d3				; load mask bits for phase value
+			and.b	rSTA(a3), d3				; are we still in data-out phase?
+			bne.w	@phaseErr					; bra. if phase err
+
+			move.l	d2, d4						; d4 <- d2
+			move.b	d4, rXCL(a3)				; TC regr (least-sig. byte) <- d4.b 
+			lsr.l	#8, d4						; get upper byte of low word
+			move.b	d4, rXCM(a3)				; TC regr (most-sig. byte) <- d4.b
+			move.b	#cDMAXfer, rCMD(a3)			; load DMA transfer cmd & begin xfers
+			nop									; squoosh pipeline								
+												;   DREQ* should be active at this time
+			move.l	d2, d4						; d4 <- d2
+			lsr.l	#4, d4						; divide xfer count by 16
+			and.l	#15,d2						; remainder is byte count after 16 byte moves	<H5>
+			ror.l	#1, d2						; xfer byte count to word & remember odd byte
+			move.l	d2,d5						;
+			ror.l	#1,d5 						; xfer word count to long & remember odd word
+			neg.w	d5
+			jmp		@emptyWait(d5.w*2)			; bra. into the loop									
+@write16										; 
+			nop									; squoosh pipeline									
+			move.l	(a2)+, (a1)					; do 16 bytes									
+			move.l	(a2)+, (a1)					; 												
+			move.l	(a2)+, (a1)					; 												 
+			move.l	(a2)+, (a1)					; 												
+@emptyWait			
+		IF PostNOP THEN
+			nop									; squoosh pipeline								
+		ENDIF
+			btst.b	#bINT, rSTA(a3)				; ...poll for unexpected intrp while waiting
+			bne.s	@prematureEnd				; ... maybe disconnected, phase changed, etc.
+
+			moveq.l	#iPhaseMsk, d3				; load mask bits for phase value
+			and.b	rSTA(a3), d3				; are we still in data-out phase?
+			bne.s	@prematureEnd				; bra. if phase err
+
+			moveq.l	#iFOFMsk, d0				; use mask to get FIFO flag field				
+			and.b	rFOS(a3), d0				; get # of bytes in FIFO
+			bne.s	@emptyWait					; bra. if FIFO is empty else...					
+@1			
+			dbra	d4, @write16				; d4 = # of 16-byte tranfers
+
+			btst.l	#31, d5						; check if we have a residual word
+			beq.s	@chkByte					; bra. if no residual
+@resWord
+			move.w	(a2)+,rDMA(a3)				; xfer residual byte							
+@chkByte
+			btst.l	#31, d2						; check if we have a residual byte
+			beq.s	@noResidual					;
+@residual			
+			move.b	(a2)+, rDMA(a3)				; xfer residual byte														
+@noResidual			 
+			bsr.l	WaitForIntNoTime			; Wait for intrp w/o timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			bne.s	@xferErr					; bra. if xfer err
+@2			
+			move.l	#$10000, d2					; init to transfer 64K bytes					
+			dbra	d6, @next64KB				;
+@goodSWrite										; d1 = # of bytes transferred
+			moveq.l	#noErr, d0					; successful write op
+			rts									; 
+
+@misAligned										;
+			subq.l	#1, d2						; adjust for transfer count calc
+			move.b	(a2)+, rFFO(a3)				; ...preload fifo with odd byte			
+@alignLoop
+			dbra	d6,@misAligned				;  keep doing it until we are long aligned
+			bra.s	@aligned					; transfer the rest of data						
+
+@prematureEnd									;												
+			; 3 reasons to get an intrp 1) when TC=0 (bus service), xfer done 2) premature
+			; phase changes (bus service) 3) premature disconnect (disconnect)
+			bsr.l	WaitForIntNoTime			; Wait for intrp w/o timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			btst.l	#bTRC, d5					; Maybe we're done xferring data ie. TC=1
+			bne.s	@2							; ...so proceed with next 64Kb block
+			
+			moveq.l	#iPhaseMsk, d3				; load mask bits for phase value
+			and.b	d5, d3						; are we still in data-out phase? (d5 from WaitFor call)
+			cmpi.b	#iDataOut, d3				; data-out phase bits = 000
+			beq.s	@xferErr					; bra. if not phase err
+@phaseErr
+			moveq.l	#scPhaseErr, d0				; return a phase error
+			move.l	#0, d1						; no bytes transferred
+			move.l	#0, G_FakeStat(a4) 			; Return a fake status
+			bra.s	@bytesXferd
+
+@xferErr			
+			moveq.l #scCommErr, d0				; comm error
+@bytesXferd
+			lsl.l	#4, d4						; multiply by 16
+			swap	d6							; calculate bytes left to transfer
+			move.w	d4, d6						; get low order word
+			moveq.l	#iFOFMsk, d2				;										
+			and.b	rFOS(a3), d2				; add # of un-xferred data in FIFO
+			add.l	d2, d6						;
+			sub.l	d6, d1						; d1 = bytes xferred
+@badSWrite
+			move.l	#0, G_FakeStat(a4) 			; Return a fake status
+			move.l	#scsiWrite, d6				; load proc ID
+			jsr		Error_BIOS					; call Error proc - for debug
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO											
+			rts									; 
+
+
+
+			
+;--------------------------------------------------------------------------
+; FastWrite - implements Blind Write
+;
+;	Called by:	Transfer
+;
+; All primitive data transfer routines assume:
+;
+;		d0 - <-- error (if any)
+;		d1 - --> copy of d2
+;		d1 - <-- bytes transferred
+;		d2 - --> number of bytes to transfer
+;		d3 -     scratch - saved
+;		d4 - --> type of transfer to perform
+;		d5 -     scratch - saved
+;		d6 -     scratch - saved
+;
+;		a0 - scratch - saved
+;		a1 - SCSI chip read base address - NON-SERIALIZED
+;		a2 - ptr to data buffer - saved
+;		a3 - SCSI chip read base address - SERIALIZED
+;		a4 - ptr to SCSI Mgr globals
+;		a5 - scratch - saved
+;
+; Method of Data Transfer: (uses pseudo-DMA mode)
+;  0) Make sure we got our intrp from the last cmd send
+;  1) Parcel transfer into 64KB blocks since TC regr. handles 64KB max
+;  2) Preload FIFO with non-aligned byte; get us word aligned
+;  3) Calc. the number of 32-byte block transfers to perform
+;  4) Calc. the remaining number of transfers to perform
+;  5) Write data 32-byte blocks at a time using word MOVEs
+;  6) Write remaining data using word MOVEs
+;  7) Transfer residual byte if there is one
+
+FastWrite_96_BIOS
+			bsr		HandleSelInProg_BIOS		; handle unfinished select command
+			bne.w	@phaseErr					; if it is stuck, we are not in data phase
+@doWrite
+			lea		rDMA(a1),a1					; 												<H5>
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO										
+			moveq.l	#iPhaseMsk, d0				;
+			and.b	rSTA(a3), d0				; are we in data-out phase?
+			bne.w	phaseErr1					; data-out phase bits = 0, bra. on phase err			
+			
+			cmpi.l	#3, d2						; if not 3 or less bytes write then...			<H5> 
+			bgt.s	@moreThan3					; 	jump into move.l loop						<H5>
+@doSingles
+			bra.l	OneByteWrite_BIOS			;												<H5>
+@moreThan3		
+			move.l	a2,d6						; get location of buffer							 
+			and.l	#3,d6						; odd words or bytes mean alignment req'd 
+			bne.w	@alignLoop					;
+@aligned
+			move.l	d2, d6						; d6 = number 64KB block to perform
+			swap	d6							; upper word of d6 = lower word of d2
+			andi.l	#$0000FFFF, d2				; mask out upper word
+			beq		@2							; if 0 then we have $10000 (64K) bytes to xfer
+
+@next64KB										; buffer is aligned from this point						
+			move.l	d2, d4						; d4 <- d2
+			move.b	d4, rXCL(a3)				; TC regr (least-sig. byte) <- d4.b 
+			lsr.l	#8, d4						; get upper byte of low word
+			move.b	d4, rXCM(a3)				; TC regr (most-sig. byte) <- d4.b						
+			move.b	#cDMAXfer, rCMD(a3)			; load DMA transfer cmd & begin xfers
+												;   DREQ* should be active at this time
+
+			move.l	d2, d4						; d4 = copy of transfer count					<H5>
+			lsr.l	#7, d4						; divide xfer count by 128 						<H5>
+			and.l	#$7f,d2						; remainder is byte count after 128 byte moves	<H5>
+			ror.l	#1, d2						; xfer byte count to word & remember odd byte
+			move.l	d2,d3
+			ror.l	#1,d3						; xfer word count to long & remember odd word
+			neg.w	d3							; negate to form a backward jump offset
+			nop									; squoosh pipeline								
+			jmp		@WrLoop(d3.w*2)				; bra. into the loop							
+
+@write128										; 
+			move.l	(a2)+,(a1)					; write 16 bytes	     
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 						finished 16 bytes
+
+			move.l	(a2)+,(a1)					; write 16 bytes	     
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 						finished 32 bytes
+
+			move.l	(a2)+,(a1)					; write 16 bytes	     
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 						finished 48 bytes
+
+			move.l	(a2)+,(a1)					; write 16 bytes	     
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 						finished 64 bytes
+
+			move.l	(a2)+,(a1)					; write 16 bytes	     
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 						finished 80 bytes
+
+			move.l	(a2)+,(a1)					; write 16 bytes	     
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 						finished 96 bytes
+
+			move.l	(a2)+,(a1)					; write 16 bytes	     
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 						finished 112 bytes
+
+			move.l	(a2)+,(a1)					; write 16 bytes	     
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 
+			move.l	(a2)+,(a1)					; 						finished 128 bytes
+
+@WrLoop
+			dbra	d4, @write128				; d4 = # of 128-byte tranfers			
+		IF PostNOP THEN
+			nop									; squoosh pipeline							
+		ENDIF
+
+			btst.l	#31, d3						; check if we have a residual word
+			beq.s	@chkByte					; bra. if no residual
+@resWord
+			move.w	(a2)+,rDMA(a3)				; xfer residual byte					
+@chkByte
+			btst.l	#31, d2						; check if we have a residual byte
+			beq.s	@noResidual					;
+@resByte
+			move.b	(a2)+,rDMA(a3)				; xfer residual byte							
+
+@noResidual										; INT & TC maybe TRUE at this point   
+			bsr.l	WaitForIntNoTime			; Wait for intrp w/o timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			bne.s	@xferErr					; bra. if xfer err
+@2			
+			move.l	#$10000, d2					; init to transfer 64K bytes
+			dbra	d6, @next64KB				;
+			
+			moveq.l	#iFOFMsk, d2				;										<H5> thru next <H5>					
+			and.b	rFOS(a3), d2				; add un-xferred byte in FIFO
+			beq.s	@goodFWrite					;
+			moveq.l	#scPhaseErr, d0				; return a phase error
+			bra.s	@badFWrite					;										<H5> from prev <H5>
+@goodFWrite										; d1 = # of bytes transferred
+			moveq.l	#noErr, d0					; successful write op
+			rts									; 
+
+
+@misAligned										;
+			subq.l	#1, d2						; adjust for transfer count calc
+			move.b	(a2)+, rFFO(a3)				; ...preload fifo with odd byte			
+@alignLoop
+			dbra	d6,@misAligned				;  keep doing it until we are long aligned
+			bra.s	@aligned					; transfer the rest of data						
+
+@phaseErr
+			moveq.l	#scPhaseErr, d0				; return a phase error
+			bra.s	@bytesXferd					;										
+
+@xferErr			
+			moveq.l #scCommErr, d0				; comm error
+@bytesXferd										;										
+			swap	d6							; calculate bytes left to transfer
+			move.w	d4, d6						; get low order word
+			lsl.l	#5, d6						; multiply by 32
+			ext.l	d2							; make d2 a long
+			addq.l	#1, d2						; undo adjustment for dbra
+			add.l	d2, d6						; add to total
+			moveq.l	#iFOFMsk, d2				;										
+			and.b	rFOS(a3), d2				; add un-xferred byte in FIFO
+			add.w	d2, d6						;
+			sub.l	d6, d1						; result
+@badFWrite										;										
+			move.l	#0, G_FakeStat(a4) 			; Return a fake status
+			move.l	#scsiWBlind, d6				; load proc ID
+			jsr		Error_BIOS					; call Error proc - for debug
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO							
+			rts									; 
+
+
+
+			
+;--------------------------------------------------------------------------
+; FastRead - implements FastRead
+;
+;	Called by:	Transfer
+;
+; All primitive data transfer routines assume:
+;
+;		d0 - <-- error (if any)
+;		d1 - --> copy of d2
+;		d1 - <-- bytes transferred
+;		d2 - --> number of bytes to transfer
+;		d3 -     scratch - saved
+;		d4 - --> type of transfer to perform
+;		d5 - <-- xxxx|xxxx|xxxx|rSTA
+;		d6 -     scratch - saved
+;
+;		a0 - scratch - saved
+;		a1 - SCSI chip read base address - NON-SERIALIZED
+;		a2 - ptr to data buffer - saved
+;		a3 - SCSI chip read base address - SERIALIZED
+;		a4 - ptr to SCSI Mgr globals
+;		a5 - scratch - saved
+;
+; Method of Data Transfer: (uses Pseudo-DMA)
+;  0) Make sure we got our intrp from the last cmd send
+;  1) Parcel transfer into 64KB blocks since TC regr. handles 64KB max
+;  2) Read 1st byte if input buffer is NOT word aligned
+;  3) Calc. the number of 32-byte block transfers to perform
+;  4) Calc. the remaining number of byte transfers to perform
+;  5) Read data 32-byte blocks at a time using word MOVEs
+;  6) Read remaining data a word at a time
+;  7) Transfer residual byte if there is one
+
+FastRead_96_BIOS
+			bsr		HandleSelInProg_BIOS		; handle unfinished select command
+			bne.w	@phaseErr					; if it is stuck, we are not in data phase
+@doRead
+			lea		rDMA(a1),a1					; 												<H5>
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO										
+			moveq.l	#iPhaseMsk, d0				; load mask for phase bits							
+			and.b	rSTA(a3), d0				; are we in data-in phase?
+			cmpi.b	#iDataIn, d0				; data-in phase bits = 001
+			bne.w	phaseErr1					; bra. on phase err
+			
+			cmpi.l	#3, d2						; if not 3 or less bytes read then...			<H5>
+			bgt.s	@moreThan3					; 	jump into move.l loop						<H5>
+@doSingles
+			bra.l	OneByteRead_BIOS			; 												<H5>
+
+@moreThan3
+			move.l	a2,d6						; get location of buffer							
+			and.l	#3,d6						; odd words or bytes mean alignment req'd 
+			bne.w	@alignLoop					;
+@aligned
+			move.l	d2, d6						; d6 = number 64KB block to perform
+			swap	d6							; upper word of d6 = lower word of d2
+			andi.l	#$0000FFFF, d2				; mask out upper word
+			beq		@2							; if 0 then we have $10000 (64K) bytes to xfer
+@next64KB
+			move.l	d2, d4						; d4 <- d2
+			move.b	d4, rXCL(a3)				; TC regr (least-sig. byte) <- d4.b 
+			lsr.l	#8, d4						; get upper byte of low word
+			move.b	d4, rXCM(a3)				; TC regr (most-sig. byte) <- d4.b						
+			move.b	#cDMAXfer, rCMD(a3)			; load DMA transfer cmd & begin xfers
+												;   DREQ* should be active at this time
+			move.l	d2, d4						; d4 = copy of transfer count					<H5>
+			lsr.l	#7, d4						; divide xfer count by 128 						<H5>
+			and.l	#$7f,d2						; remainder is byte count after 128 byte moves	<H5>
+			ror.l	#1, d2						; xfer byte count to word & remember odd byte
+			move.l	d2,d3
+			ror.l	#1,d3						; xfer word count to long & remember odd word
+			neg.w	d3							; negate to form a backward jump offset
+			nop									; squoosh pipeline								
+			jmp		@RdLoop(d3.w*2)				; bra. into the loop							
+
+@read128										; 
+			move.l	(a1),(a2)+					; read 16 bytes	     
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 						finished 16 bytes
+
+			move.l	(a1),(a2)+					; read 16 more bytes	     
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 						finished 32 bytes
+
+			move.l	(a1),(a2)+					; read 16 more bytes	     
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 						finished 48 bytes
+
+			move.l	(a1),(a2)+					; read 16 more bytes	     
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 						finished 64 bytes
+
+			move.l	(a1),(a2)+					; read 16 more bytes	     
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 						finished 80 bytes
+
+			move.l	(a1),(a2)+					; read 16 more bytes	     
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 						finished 96 bytes
+
+			move.l	(a1),(a2)+					; read 16 more bytes	     
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 						finished 112 bytes
+
+			move.l	(a1),(a2)+					; read 16 more bytes	     
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 
+			move.l	(a1),(a2)+					; 						finished 128 bytes
+@RdLoop											;													
+			dbra	d4, @read128				; d4 = # of 128-byte transfers
+		IF PostNOP THEN
+			nop									; squoosh pipeline								
+		ENDIF
+@finshMv16										; INT & TC bits should be TRUE at this point
+			btst.l	#31, d3						; check if we have a residual word
+			beq.s	@chkByte					; bra. if no residual
+@resWord
+			bsr.l	WtForFIFOData				; returns number of bytes in FIFO				<2>
+			beq.s	@timedOut					;										
+			move.w	(a1),(a2)+					; xfer residual word							<H3>
+@chkByte
+			bsr.l	WaitForIntNoTime			; Wait for intrp w/o timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			bne.s	@xferErr					; bra. if xfer err
+
+			btst.l	#31, d2						; check if we have a residual byte
+			beq.s	@2							; bra. if no residual
+@resByte
+			bsr.l	WtForFIFOData				; returns number of bytes in FIFO		
+			beq.s	@timedOut					;										
+			move.b	rFFO(a3), (a2)+				; xfer residual byte
+@2			
+			move.l	#$10000, d2					; init to transfer 64K bytes						
+			dbra	d6, @next64KB				;
+@goodFRead										; d1 = # of bytes transferred
+			moveq.l	#noErr, d0					; successful read op
+			rts									; 
+
+
+@misAligned
+			move.b	#cIOXfer, rCMD(a3)			; load IO transfer cmd & begin xfers
+			bsr.l	WaitForIntNoTime			; Wait for intrp w/o timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			bne.s	@xferErr					; bra. on xfer error
+			move.b	rFFO(a3), (a2)+				; xfer byte from FIFO into input buffer					
+			move.b	rINT(a3), d3				; read Intrp regr & clear rSTA, rSQS & rINT
+			btst.l	#bDSC, d3					; check for disconnected intrp 
+			bne.l	@xferErr					; bra. on xfer error
+			subq.l	#1, d2						; decr. for DBRA									
+@alignLoop
+			dbra	d6,@misAligned				;  keep doing it until we are long aligned
+			bra.s	@aligned					; transfer the rest of data						
+
+@timedOut										;										
+			moveq.l	#scBusTOErr, d0				; if we timed out, return error			
+			bra.s	@bytesXferd					;										
+
+@phaseErr
+			moveq.l	#scPhaseErr, d0				; return a phase error
+			bra.s	@bytesXferd					;													
+
+@xferErr
+			moveq.l #scCommErr, d0				; comm error
+@bytesXferd										;													
+			swap	d6							; calculate bytes left to transfer
+			move.w	d4, d6						; get low order word
+			lsl.l	#5, d6						; multiply by 32
+			ext.l	d2							; make d2 a long
+			addq.l	#1, d2						; undo adjustment for dbra
+			add.l	d2, d6						; add to total
+			sub.l	d6, d1						; d1 = xfer count - bytes remaining to xfer			
+@badFRead
+			move.l	#0, G_FakeStat(a4) 			; Return a fake status
+			move.l	#scsiRBlind, d6				; load proc ID
+			jsr		Error_BIOS					; call Error proc - for debug
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO										
+			rts									;
+
+
+xferErr											; 											<H4> thru next <H4>
+			move.l	#$F0, d6					; load proc ID, generic transfer				
+			moveq.l #scCommErr, d0				; transfer error
+			bra.s	errExit						;											<H4> from last <H4>
+
+			
+
+
+			
+;--------------------------------------------------------------------------
+;
+;	ResetBus_96_BIOS - Reset the SCSI bus by asserting the SCSI Reset Output signal
+;				for some number of uS as determined by the clock conv. factor (CCF)
+;
+;		a3 - SCSI chip read base address - SERIALIZED
+;
+
+ResetBus_96_BIOS
+												; disable all intrps
+			move.b	#cRstSBus, rCMD(a3)			; load reset scsi bus cmd							
+												; re-enable all intrps
+			rts	
+
+
+
+			
+;--------------------------------------------------------------------------
+;
+;	HandleSelInProg
+;
+;	0 if no select in progress or if select is now complete
+;	1 if a select is still in progress (i.e. in cmd or msg_out phase)
+;
+HandleSelInProg_BIOS
+			btst.b	#SelInProg, G_State96(a4)		; is Select cmd still in progress?
+			beq.w	@skipIt							; no - skip it
+
+			btst.b	#NeedMsgOut, G_State96(a4)		; are we expecting a Msg_Out phase?
+			beq.s	@chkCmd							; no - see about Command
+			move.b	#iMsgOut, d1					; yes - wait for this phase or interrupt
+			bra.s	@doWait
+@chkCmd
+			btst.b	#NeedCmdSent, G_State96(a4)		; are we expecting a Command phase?
+			beq.s	@wtForFC						; no - wait for an interrupt then
+			move.b	#iCommand, d1					; yes - wait for this phase or interrupt
+@doWait
+			bsr.s	Wt4DREQorInt_BIOS
+			bne.s	@gotDREQ
+@gotInt
+			bclr.b	#FCIntPend, G_State96(a4)		; clear the FC Int pend flag		
+			bclr.b	#SelInProg, G_State96(a4)		; and clear the SelectInProgress flag	
+			bclr.b	#NeedMsgOut, G_State96(a4)		; and Message_Out  						
+			bclr.b	#NeedCmdSent, G_State96(a4)		; and Command expected flags			
+			tst.b	d0								; setup result again
+@gotDREQ
+@skipIt
+			rts
+			
+@wtForFC
+			bsr.l	WaitForIntNoTime			; Wait for intrp w/o timeout
+			move.b	#cFlshFFO, rCMD(a3)				; Flush FIFO							
+			moveq.l	#0, d0
+			bra.s	@gotInt
+
+
+
+			
+;--------------------------------------------------------------------------
+;
+; Wt4DREQorInt - infinite loop to wait for a DREQ signal or SCSI chip intrp.
+;
+; Uses: d3, d5
+;
+;	Entry:
+;		--> d1	 = phase to wait for (concurrent with DREQ)
+;
+;		--> G_SCSIDREQ(a4)	= addr of DAFB reg (for reading value of 
+;
+;	Exit:
+;		<-- d5	 = rFOS|rINT|0|rSTA, byte values from the Seq.Step, Status & INT regrs.
+;		<-- d0	 = 1 if DREQ,  0 if Int
+;
+;-----------------
+
+Wt4DREQorInt_BIOS
+
+	; Check for interrupt first (to avoid unnecessary dog-slow DREQ check)
+@noTimeout		
+			clr.l	d5							;
+			move.b	rSTA(a3), d5				; read Status regr
+			btst.l	#bINT, d5					; poll intrp on status regr. for pending intrp
+			bne.s	@gotInt						; 
+
+	; If no Interrupt, check for DREQ
+			move.l	G_SCSIDREQ(a4), a0			; G_SCSIDREQ contains DREQ regr address
+			move.l	(a0), d5					; read DAFB regr
+
+		; DREQ?
+			move.b	G_bitDREQ(a4),d0			; load DREQ bit position		
+			btst.l	d0, d5						; DREQ ?						
+			beq.s	@noTimeout					; no: try again
+
+@gotDREQ
+			move.b	rSTA(a3), d3				; get phase value								
+			and.b	#iPhaseMsk, d3				; load mask bits for phase value
+			cmp.b	d3, d1						; are we in requested phase?
+			bne.s	@noTimeout					;  
+			moveq.l	#1, d3						; return value = Got DREQ
+			bra.s	@exit
+
+	; Get sequence and FIFO status registers into D5 (already got rSTA)
+@gotInt			
+			swap	d5							;
+			move.b	rFOS(a3), d5				; read FIFO flag/Sequence Step regr
+			lsl.w	#8, d5						; shift left by 1 byte
+			move.b	rINT(a3), d5				; read & clear rFOS, rSTA & rINT
+			move.l	d5, d0						; we got here because of an intrp
+			swap	d5							; d5 = rFOS|rINT|0|rSTA
+			moveq.l	#0, d3						; return value = Got Interrup
+
+@exit
+			move.l	d3, d0
+			rts									;
+
+
+;--------------------------------------------------------------------------
+; FastCompare - implements FastRead
+;
+;	Called by:	Transfer
+;
+; All primitive data transfer routines assume:
+;
+;		d0 - <-- error (if any)
+;		d1 - --> copy of d2
+;		d1 - <-- bytes transferred
+;		d2 - --> number of bytes to transfer
+;		d3 -     scratch - saved
+;		d4 - --> type of transfer to perform
+;		d5 - <-- xxxx|xxxx|xxxx|rSTA
+;		d6 -     scratch - saved
+;
+;		a0 - scratch - saved
+;		a1 - SCSI chip read base address - NON-SERIALIZED
+;		a2 - ptr to data buffer - saved
+;		a3 - SCSI chip read base address - SERIALIZED
+;		a4 - ptr to SCSI Mgr globals
+;		a5 - scratch - saved
+;
+; Method of Data Transfer: (uses Pseudo-DMA)
+;  0) Make sure we got our intrp from the last cmd send
+;  1) Parcel transfer into 64KB blocks since TC regr. handles 64KB max
+;  2) Read 1st byte if input buffer is NOT word aligned
+;  3) Calc. the number of 32-byte block transfers to perform
+;  4) Calc. the remaining number of byte transfers to perform
+;  5) Read data 32-byte blocks at a time using word MOVEs
+;  6) Read remaining data a word at a time
+;  7) Transfer residual byte if there is one
+
+FastComp_96_BIOS
+			bsr		HandleSelInProg_BIOS		; handle unfinished select command
+			bne.w	@phaseErr					; if it is stuck, we are not in data phase
+@doRead
+			moveq.l	#iPhaseMsk, d0				; load mask for phase bits								
+			and.b	rSTA(a3), d0				; are we in data-in phase?
+			cmpi.b	#iDataIn, d0				; data-in phase bits = 001
+			bne.w	phaseErr1					; bra. on phase err
+			
+			cmpi.l	#1, d2						; special case a 1 byte compare						
+			beq.w	SlowComp_96_BIOS			; 														
+
+			clr.l	d3							; init compare status							
+			move.l	d2, d6						; d6 = number 64KB block to perform
+			swap	d6							; upper word of d6 = lower word of d2
+			andi.l	#$0000FFFF, d2				; mask out upper word
+			beq.s	@2							; if 0 then we have $10000 (64K) bytes to xfer
+@next64KB
+			move.l	d2, d4						; d4 <- d2
+			move.b	d4, rXCL(a3)				; TC regr (least-sig. byte) <- d4.b 
+			lsr.l	#8, d4						; get upper byte of low word
+			move.b	d4, rXCM(a3)				; TC regr (most-sig. byte) <- d4.b
+			move.b	#cDMAXfer, rCMD(a3)			; load DMA transfer cmd & begin xfers
+												;   DREQ* should be active at this time
+
+			ror.l	#1, d2						; xfer byte count to word & remember odd byte
+			subq.w	#1, d2						; adjust for DBRA
+@RdAndCmp
+			move.w	rDMA(a3), d0				;										
+			cmp.w	(a2)+, d0					; compare a word at a time
+			beq.s	@Ok
+			moveq.l	#scCompareErr, d3 			; record a compare error
+@Ok
+			dbra	d2, @RdAndCmp				; loop until done
+												; INT & TC bits should be TRUE at this point
+			bsr.l	WaitForIntNoTime			; Wait for intrp w/o timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+			bne.s	@xferErr					; bra. if xfer err
+			btst.l	#31, d2						; check if we have a residual byte
+			beq.s	@2							; bra. if no residual
+@residual
+			move.b	rFFO(a3), d0				; read byte data from FIFO
+			cmp.b	(a2)+, d0					; xfer byte from FIFO into input buffer
+			beq.s	@2
+			moveq.l	#scCompareErr, d3 			; record a compare error
+@2			
+			move.l	#$10000, d2					; init to transfer 64K bytes
+			dbra	d6, @next64KB				;
+@ExitFCmp										; d1 = # of bytes transferred
+			move.l	d3, d0						; return status			
+			rts									; 
+
+@phaseErr
+			moveq.l	#scPhaseErr, d0				; return a phase error
+			bra.s	@bytesXferd
+
+@xferErr
+			moveq.l #scCommErr, d0				; comm error
+@bytesXferd
+			swap	d6							; calculate bytes left to transfer
+			move.w	d4, d6						; get low order word
+			lsl.l	#5, d6						; multiply by 32
+			ext.l	d2							; make d2 a long
+			addq.l	#1, d2						; undo adjustment for dbra
+			add.l	d2, d6						; add to total
+			sub.l	d6, d1						; d1 = xfer count - bytes remaining to xfer
+@badFRead
+			move.l	#0, G_FakeStat(a4) 			; Return a fake status
+			move.l	#scsiRBlind+$F0, d6			; load proc ID, Fast compare
+			jsr		Error_BIOS					; call Error proc - for debug
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO
+			rts									; 
+			
+
+
+			
+;--------------------------------------------------------------------------
+; SlowComp - implements Polled Read 
+;
+;	Called by:	Transfer
+;
+; All primitive data transfer routines assume:
+;
+;		d0 - <-- error (if any)
+;		d1 - --> copy of d2
+;		d1 - <-- bytes transferred
+;		d2 - --> number of bytes to transfer
+;		d3 -     scratch - saved
+;		d4 - --> type of transfer to perform
+;		d5 -     scratch - saved
+;		d6 -     scratch - saved
+;
+;		a0 - scratch - saved
+;		a1 - SCSI chip read base address - NON-SERIALIZED
+;		a2 - ptr to data buffer - saved
+;		a3 - SCSI chip read base address - SERIALIZED
+;		a4 - ptr to SCSI Mgr globals
+;		a5 - scratch - saved
+;
+; Method of Data Transfer: (pDMA and programmed IO)											
+;  0) Make sure we got our intrp from the last cmd send
+;  1) calculate # of 16-byte block transfers to perform using pDMA & remember the remainder
+;  2) Enable c96 DMA and wait till the 16-byte FIFO is full and DREQ is asserted for the 17th byte
+;  3) Transfer all data in the FIFO and wait for the intrp
+;  4) Repeat until all block have been transferred
+;  5) Transfer remaining data using non-DMA transfer command byte then 
+;		Wait and poll for byte-in-fifo interrupt
+;  6) Transfer data from fifo to input buffer
+;  7) Repeat process until all remaining bytes have been transferred
+
+SlowComp_96_BIOS
+			bsr		HandleSelInProg_BIOS		; handle unfinished select command
+			bne.w	@phaseErr					; if it is stuck, we are not in data phase
+@doRead
+			moveq.l	#iPhaseMsk, d0				; load mask for phase bits
+			and.b	rSTA(a3), d0				; are we in data-in phase?
+			cmpi	#iDataIn, d0				; data-in phase bits = 001
+			bne.w	phaseErr1					; bra. on phase err
+			
+			clr.l	d3							; init compare status
+			move.l	d2, d4						; d4 = copy of transfer count
+			lsr.l	#4, d4						; divide xfer count by 16
+			beq.w	@16orLess					; bra. if < 16 bytes
+			subq.l	#1, d4						; adjust for DBRA
+			move.l	d4, d6						; d4.w has lower 16-byte block count
+			swap	d6							; d6.w has upper 16-byte word count
+@16orMore
+			move.l	G_SCSIDREQ(a4), a0			; load SCSI DREQ regr
+			
+			move.b	#0, rXCM(a3)				; rXCM = 0, clear most-sig. byte count
+			move.b	#$10, rXCL(a3)				; rXCL = 16 bytes, least-sig. byte value
+			and.l	#$F, d2						; d2 = remainder word count after 16-byte moves
+@read16			
+			move.b	#cDMAXfer, rCMD(a3)			; load DMA transfer cmd & start loading FIFO
+@1												;   currently loaded transfer count is used/reused
+			btst.b	#bINT, rSTA(a3)				; poll for unexpected intrp while waiting
+			bne.s	@prematureEnd				; ... maybe disconnected, phase changed, etc.
+			btst.b	#bTRC, rSTA(a3)				; check if we've rcvd all the data
+			beq.s	@1							; loop until FIFO is full
+			
+			; We need 16 guaranteed DREQs to safely transfer 16 bytes without bus error.
+			; Ideally, DREQ should be active as long there are threshold number of bytes in the
+			; FIFO--as the c96 user's guide imply.  But the c96 implementation also requires that
+			; REQ be active in order to get DREQ.  This is why we must wait for the 17th REQ from
+			; the target--and it must remain active--before we proceed with the 16-byte transfer.
+
+			move.l	(a0), d5					; read DAFB SCSI DREQ 
+			move.b	G_bitDREQ(a4),d0			; load DREQ bit position		
+			btst.l	d0, d5						; DREQ ?						
+			beq.s	@1							; loop until asserted
+			move.w	#$7, d5						; load loop counter, 8 words
+@cmpFFO	
+			move.w	rDMA(a3), d0				;												
+			cmp.w	(a2)+, d0					; compare a word at a time
+			beq.s	@Ok1
+			moveq.l	#scCompareErr, d3 			; record a compare error
+@Ok1		dbra	d5, @cmpFFO					; continue with compare operation
+@2												; Intrp should occur after ALL data have been
+												;    read out of the FIFO
+			btst.b	#bINT, rSTA(a3)				;  check for c96 INTRP
+			beq.s	@2							;  loop until we get the intrp
+			
+			move.b	rINT(a3), d5				; read Intrp regr & clear rSTA, rSQS & rINT
+			btst.l	#bDSC, d5					; check for disconnected intrp 
+			bne.s	@premature2					; Branch if transfer error
+
+			dbra	d4, @read16					; loop until done, d4 is lower word count
+			dbra	d6, @read16					; loop until done, d6 is upper word count
+			bra.s	@16OrLess					; take care of remaining data, if any
+@rdSingle										; use non-pDMA for remainder
+			moveq.l	#iPhaseMsk, d5				; load mask bits for phase value
+			and.b	rSTA(a3), d5				; are we still in data-in phase?
+			cmpi.b	#iDataIn, d5				; data-in phase bits = 001
+			bne.s	@phaseErr					; bra. on phase err
+			move.b	#cIOXfer, rCMD(a3)			; load IO transfer cmd & begin xfers
+@3
+			btst.b	#bINT, rSTA(a3)				; check for c96 INTRP
+			beq.s	@3							; loop until we get an intrp
+			move.b	rFFO(a3), d0				; read byte data from FIFO
+			cmp.b	(a2)+, d0					; xfer byte from FIFO into input buffer
+			beq.s	@Ok2
+			moveq.l	#scCompareErr, d3 			; record a compare error
+@Ok2
+			move.b	rINT(a3), d5				; read Intrp regr & clear rSTA, rSQS & rINT
+			btst.l	#bDSC, d5					; check for disconnected intrp 
+			bne.s	@xferErr					; Branch if transfer error
+@16OrLess
+			dbra	d2, @rdSingle				; read the rest of the remainders
+@ExitCmp										; d1 = # of bytes transferred
+			move.l	d3, d0						; return status			
+			rts									; 
+
+@prematureEnd
+			bsr.l	WaitForIntNoTime			; Wait for intrp w/o timeout
+												;    on exit d5 = rFOS|rINT|0|rSTA
+@premature2
+			addq.w	#1, d4						; undo adjustment for dbra
+			swap	d6							; calculate bytes left to transfer
+			move.w	d4, d6						; form long word count
+			lsl.l	#4, d6						; mult by 16
+
+			and.b	#iPhaseMsk, d5				; are we still in data-in phase?
+			cmpi.b	#iDataIn, d5				; data-in phase bits = 001
+			beq.s	@xferErr					; bra. to check for disconnect
+@phaseErr
+			moveq.l	#scPhaseErr, d0				; return a phase error
+			bra.s	@badSCmp					;
+
+@xferErr										; anything else is a comm. err
+			moveq.l #scCommErr, d0				; transfer error
+@badSCmp
+			add.l	d2, d6						; add un-xferred remainder
+			sub.l	d6, d1						; number of bytes transferred
+
+			move.l	#scsiRead+$F0, d6			; load proc ID, Slow compare
+			jsr		Error_BIOS					; call Error proc - for debug
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO
+			rts									; 										
+			
+
+
+			
+;___________________________________________________________________________		
+;
+;	BusErrHandler_96
+;		When the SCSI Mgr is performing a blind data transfer, it patches
+;		out the bus error vector.  The old SCSI Mgr bus error handler
+;		assumed that if it got called, it must be handling a SCSI bus error.
+;		Unfortunately, NuBus cards could bus error while the SCSI Mgr is
+;		installed.  To be a better bus error citizen, the SCSI bus error
+;		handler now checks that the fault address is the SCSI chip, and if
+;		not, it chains to the bus error handler that it replaced.
+;
+;		This code returns control to Transfer_96 and not to the routine
+;		caused the bus error.  It does this by popping off the buserr stack
+;		frame and then doing an RTS, so...
+;		 DON'T PUT ANYTHING ON THE STACK IN TRANSFER ROUTINES (FastRead,
+;		Fast…, etc.).  At least don't leave it there during periods where a
+;		buserr may be possible.
+;
+___________________________________________________________________________;
+
+		WITH	AEXFrame, XferFrame
+
+savedRegs	REG		d0-d3/a0-a3		; save these registers because we need to use them			
+savedRSize	EQU		8*4				; # bytes on stack for saved registers					
+
+BusErrHandler_96_BIOS
+
+; Is it our fault? -----
+			subq.l	#4, sp						; make room for return addr (@notSCSIFault)
+			movem.l	savedRegs, -(sp)			; 
+			move.l	SCSIBase,a3					; save DMA access address							<H4>
+			lea		savedRSize+4(sp), a0		; make A0 our AEXFrame pointer (regs+1 LW on stack)
+
+			cmp.l	SCSIGlobals, a4				; equal if this is from our transfer routine
+			bne.s	@notSCSIFault
+
+			btst.b	#HandleBusErrs, G_State96(A4)	; are we supposed to be active?
+			beq.s	@notSCSIFault					; no - not SCSI's fault
+			
+			lea		BIOSAddr,a1							; setup for testing BIOS buffer				
+			btst.b #bBIOSSCSIBERR,BIOS_PDMA(a1)			; did we buserr on access via BIOS ?		
+			bne.s	@SCSIFault							; if so, start processing the bus error
+
+; It's not our fault ------
+
+@notSCSIFault
+			move.l	SCSIGlobals, a0				; put entry point to prev BEH on stack
+			move.l	yeOldeBusErrVct(a0), savedRSize(sp)	; (registers saved beneath return addr)
+			movem.l	(sp)+, savedRegs			; restore regs
+			rts									; jump to old handler, assuming it'll RTE
+
+; It's all our fault (blame it on us) ------
+
+@SCSIFault
+
+		; Wait for either DREQ, or INT or a timeout (from blindBusTO value)			
+
+			move.l	G_SCSIDREQ(a4), a1			; G_SCSIDREQ contains DREQ regr address
+
+			move.b	G_bitDREQ(a4),d3			; load DREQ bit position	
+@DREQloop	move.l	(a1), d0					; read DAFB regr
+			btst.l	d3, d0						; DREQ ?						
+			bne.s	@retry
+			btst	#bINT, rSTA(A3)				; see if we have a phase change or something		<H4>
+			bne		@phzChange
+			bra.s	@DREQloop
+
+	; if DREQ, retry the transfer -----
+@retry
+	; Clean up the writebacks on the stack frame											
+
+			move.w	WB1S(a0), d0				; check WB1 for validity
+			move.l	WB1A(a0), a1				; pass WB Address 
+			move.l	WB1D(a0), d1				; pass WB Data
+			bsr.w	DoWriteBack					; to routine that takes care of it
+
+			move.w	WB2S(a0), d0				; check WB2 for validity
+			move.l	WB2A(a0), a1				; pass WB Address 
+			move.l	WB2D(a0), d1				; pass WB Data
+			bsr.w	DoWriteBack					; to routine that takes care of it
+
+			move.w	WB3S(a0), d0				; check WB3 for validity
+			move.l	WB3A(a0), a1				; pass WB Address 
+			move.l	WB3D(a0), d1				; pass WB Data
+			bsr.w	DoWriteBack					; to routine that takes care of it			
+			
+	; we have to check the residual register in BIOS....										
+	;		1.  if there is a residual word we have to retrieve it, read another word
+	;           with the posted DREQ and nuke the stack to skip the move.l that buserr'd
+	;       2.  if there is no residual then we can just rte like flint!
+	;
+			lea		BIOSAddr,a1							; setup for testing BIOS buffer
+
+			cmp.w	#scsiReadFast, transferType(a4)		; did we buserr from a read?
+			beq.s	@chkRead							; 0=yes, 1=no
+@chkWrite
+			btst.b #bBIOSW1Cmplt,BIOS_PDMA(a1)			; did one word from the long make it to the c96?	
+			beq.s	@doRTE								; 0=no, so restart move.l
+	; 
+	;   Only 1 word of the long word write made it to the controller so we have
+	;   to move the second word manually and increment the buffer pointer.
+	;       Note: the value of a2 will be the value after the move.l postincrement 
+	;             so we have to move it backward a word to access the second buffer word.
+	;   We also have to advance the PC so that the rte doesn't restart the faulted 
+	;   instruction.
+			
+			move.l	xPC(a0),d0					; get pc where buserr occurred	
+
+		; Fake a format code 0 exception frame (4 words) to finish cleaning up								
+
+			clr.w	PD3+2(a0)					; stuff a format code 0 (format code is really only a word)
+			move.l	d0,PD2+2(a0)				; stuff the new pc in stack
+			move.w	xSR(a0),PD2(a0)				; 
+			
+			clr.w	BIOS_PDMA(a1)				; clear the status register									
+
+			movem.l	(sp)+, savedRegs			; restore regs
+			addq.l	#4, sp
+@adjW040XFrame									; 040 Bus Error frame-cleaning done here
+			lea		aeXFrameSize-8(sp),sp		; remove 040 Access Error Exception Frame 
+;;			addq.l	#2, a2						; adjust user buffer because we manually did the move.l	<H4>
+			rte									; resume execution at next instruction
+
+@chkRead
+			btst.b #bBIOSR1Cmplt,BIOS_PDMA(a1)		; is there a residual word?								
+			beq.s	@doRTE							; 0=no, so restart move.l
+	; 
+	;   Only 1 word of the long word read made it from the controller.  We have to 
+	;   move the word stored in the residual buffer within BIOS to memory and then
+	;   manually extract the next word from the controller.
+	;       Note: the value of a2 will be the value before the move.l postincrement. 
+	;   We also have to advance the PC so that the rte doesn't restart the faulted 
+	;   instruction.
+			
+			move.w	BIOS_SCSI_RESID(a1),(a2)+	; retrieve the residual word stored in BIOS
+			move.w	rDMA(a3),(a2)+				; get word from chip and put into user's buffer			<H4>
+	
+	; now cleanup the stack and return to the transfer code.
+
+			move.l	xPC(a0),d0					; get pc where buserr occurred	
+			addq	#2,d0						; adjust the pc to point to the next instruction		<H4>
+
+		; Fake a format code 0 exception frame (4 words) to finish cleaning up
+
+			clr.w	PD3+2(a0)					; stuff a format code 0 (format code is really only a word)
+			move.l	d0,PD2+2(a0)				; stuff the new pc in stack
+			move.w	xSR(a0),PD2(a0)				; 															
+			
+			clr.w	BIOS_PDMA(a1)				; clear the status register									
+
+			movem.l	(sp)+, savedRegs			; restore regs
+			addq.l	#4, sp
+			addq.l	#4, a2						; adjust user buffer because we manually did the move.l	<H4>
+@adjR040XFrame									; 040 Bus Error frame-cleaning done here
+			lea		aeXFrameSize-8(sp),sp		; remove 040 Access Error Exception Frame 
+												;   but leave PD3 return address
+			rte									; resume execution at next instruction			
+
+@doRTE
+			movem.l	(sp)+, savedRegs			; restore regs
+			addq.l	#4, sp
+			rte									; haven't reached max retry count, so restart
+
+	; if phase change or timeout, cleanup and abort the transfer -----
+@phzChange				
+@cleanup
+		; return SP to the exception stack frame
+		
+			movem.l	(sp)+, savedRegs			; restore regs
+			addq.l	#4, sp						; take scratch space off stack
+
+		; get any leftover bytes out of the FIFO if we were doing a FastRead
+		
+			cmp.w	#scsiReadFast, transferType(a4)
+			bne.s	@skipLeftovers
+			move.b	rFOS(a3), d0				; get FIFO status - how many bytes in FIFO
+			and.w	#iFOFMsk, d0				; 
+			ror.l	#1, d0
+			bra.s	@btm0
+@top0
+			move.w	rDMA(a3), (a2)+				; get word from chip and put into user's buffer
+@btm0
+			dbra	d0, @top0
+			tst.l	d0
+			bpl.s	@2
+			move.b	rFFO(a3), (a2)+				; get byte from chip and put into user's buffer
+@2			
+			
+	; get rid of excp'n frame and create a throwaway frame for return to Transfer_96
+
+@skipLeftovers
+			move.b	#cFlshFFO, rCMD(a3)			; Flush FIFO										<H5>							
+			move.w	xSR(sp), d0					; save SR for new exception frame
+			bfextu	FrameType(sp){0:4}, d1		; get format code from stack
+
+			cmp.b	#AEXFrameType, d1			; check for 040 Access Error Exception Frame
+			beq.s	@Drop040XFrame				; dispose of 040 AE exception frame	
+			cmp.b	#shortBEXFrameType, d1		; short 020/030 exception frame?
+			bne.s	@Drop46w					; no, so use larger frame
+			adda.w	#shortBEXFrameSize, sp		; dispose of the 16-word frame
+			bra.s	@DummyFrame					;  and finish up
+
+@Drop040XFrame									; 040 Bus Error frame-cleaning done here
+			add.w	#aeXFrameSize, sp			; remove 040 Access Error Exception Frame
+			bra.s	@DummyFrame					; and create dummy return frame
+
+@Drop46w
+			add.w	#46*2, sp					; size of exception frame
+			
+@DummyFrame
+		; Fake a format code 0 exception frame (4 words) to finish cleaning up
+
+			move.w	zeroReg, -(sp)				; format code 0
+			pea		FinishErr					; PC value
+			move.w	d0, -(sp)					; sr value
+			rte									; 'return' from the fake exception
+
+
+; If we busErr due to a slow peripheral then the c96 is still expecting to transfer
+; data since it has no concept of bus error.  Hopefully, the client upon seeing busTOErr
+; will do the right thing and call SCSIComplete to clean up the bus.
+
+;-----------------
+FinishErr
+;-----------------
+; What we really need to do here is to first empty the FIFO the call Wt4DREQorINT
+; then do the right thing. %%%
+			moveq.l	#scBusTOErr, d0				; assume bus timeout
+			btst.b	#bINT, rSTA(a3)				; poll for intrp due to premature phase change
+			beq.s	@ErrorDone					; bra. if no SCSI intrp 'cuz we busTO
+			move.b	rINT(a3), d5				; got intrp so check cause also read & clear rFOS, rSTA & rINT 
+			btst.l	#bBSS, d5					; test for bus service intrp
+			beq.s	@ErrorDone					; bra. if not bus service
+			moveq.l	#scPhaseErr, d0				; yup it's a premature phase change
+@ErrorDone
+			rts									; return status in d0 to the Transfer routine										
+
+;-----------------
+DoWriteBack
+;-----------------
+			move.l	a2,-(sp)					;										<H4>
+			
+			btst	#bValid, d0					; if this writeback valid?
+			beq.s	@wbDone						; no - done
+			
+			and.w	#SIZE_MSK, d0				; yes, transfer proper size
+			
+			cmp.w	#WB_BYTE, d0
+			bne.s	@1
+			move.B	d1, (a1)					; move Byte
+			bra.s	@wbDone
+@1
+			cmp.w	#WB_WORD, d0
+			bne.s	@2
+			move.W	d1, (a1)					; move Word
+			bra.s	@wbDone
+@2
+			cmp.w	#WB_LONG, d0
+			bne.s	@wbDone
+
+			lea		BIOSAddr,a2							; setup for testing BIOS buffer	<H4> thru next <H4>
+			btst.b #bBIOSW1Cmplt,BIOS_PDMA(a2)			; did one word from the long make it to the c96?	
+			bne.s	@doWord								;
+			move.L	d1, (a1)					; move LongWord
+			bra.s	@wbDone
+@doWord											;										<H4> thru next <H4>
+			move.w	d1,(a1)						; 
+			clr.w	BIOS_PDMA(a2)				; clear the status register									
+@wbDone
+			move.l	(sp)+,a2					;										<H4>
+			rts
+			
+		ENDWITH
+		
+
+		END 

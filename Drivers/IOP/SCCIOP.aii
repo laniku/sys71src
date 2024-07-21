@@ -1,0 +1,2286 @@
+;
+;	File:		SCCIOP.aii
+;
+;	Contains:	xxx put contents here (or delete the whole line) xxx
+;
+;	Written by:	xxx put name of writer here (or delete the whole line) xxx
+;
+;	Copyright:	© 1988-1990 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <3>	 1/18/90	SWC		WTO/Fix bugs in InstallTask and KillTask.
+;	   <1.4>	 12/8/89	WTO		Fixed bug in version message to kernel. Range check on Driver ID
+;									was returning error. Needed to add compare to $00.
+;	   <1.3>	  7/8/89	CCH		Added EASE comments to file.
+;	   <1.2>	 6/27/89	BTO		Needed for AURORA padding
+;	  <¥1.1>	  2/8/89	SGS		Initial release
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;
+;	To Do:
+;
+
+
+*
+* File SCCIop.aii
+*
+* Copyright	1988 (c) Apple Computer Inc.
+*
+* Main routines to handle IOP. The Kernel is downloaded into the IOP
+* during the IOPMgr initialization process. The IOPMgr then reads
+* PRAM to set the ByPass mode to the appropriate state. 
+*
+* Written by Bill O'Connor						2/19/88
+* with ideas and code from	Ron Hocksprung
+* 							Gary Davidian
+*
+* Edit History
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+				Machine 	M65CX02
+				Longa		off
+				Longi		off
+				blanks		on
+				print		nopage, nomdir
+							
+				include		'SCCIOPSysEqu.aii'		; IOP Sytem includes
+				include		'SCCIOPEqu.aii'			; IOP Kernel includes
+
+				Seg			'IOPOS'
+				
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Vectored interrupt table
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+				Seg			'Vectors'
+				
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+*	Interrupt vector address table.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^				
+				
+Vect			Proc
+
+				Import		NonMaskable,		\
+							Reset,				\
+							IRQ				:Code
+																		
+				DC.W		NonMaskable
+				DC.W		Reset
+				DC.W		IRQ
+				
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Main entry into PIC kernel
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+				Seg			'Main'
+
+				Export		NonMaskable,		\
+							Reset,				\
+							IRQ
+			
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* NonMaskable interrupt handler.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+NonMaskable		Proc
+
+				Lda		#NonMask			; Let us know we are in NonMaskable Loop
+				Bra		NonMaskable			; Should never get one
+				
+				endproc
+				
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* IRQ - save registers and jsr to ISR dispatcher.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+				
+IRQ				Proc
+
+				Import	ISR_Dsptch		: Code
+
+				Pha							; Save registers.
+				Phy
+				Phx
+				
+				Jsr		ISR_Dsptch			; Interrupt handler
+				
+				Plx							; Restore registers
+				Ply
+				Pla
+				Rti
+				
+				endproc
+
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Reset handler.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Reset			Proc
+
+				Import		Cmd_Table,			\
+							VerInfo			: Data
+				Import		Kern_Task,			\
+							Cmd_JmpTable,		\
+							RxMsg_Signal,		\
+							SCC_Dsptch,			\
+							Timer_ISR,			\
+							Init_Timer,			\
+							Msg_Scan		: Code
+
+				Sei								; Interrupts off
+
+
+				Stz		Int_Host
+				Lda		#SCC_Port|ByPass_Bit|PClk39		
+				Sta		SCC_Cntl				; Initialize SCC control reg
+				Lda		#IO_Cntl_init			; Get initial value
+				Sta		IO_Cntl					; Initialize I/O control reg
+				Lda		#Host_Msk				; Enable host interrupts
+				Sta		Int_Mask
+				Lda		SCC_ACntl				; Sync SCC for writes
+
+
+*
+* Clear page zero 
+*
+
+				Ldx		#$00					; Index
+@ClearLoop		
+				Stz		$00,x					; Zero out a byte
+				Dex								; Point to next byte
+				Bne		@ClearLoop				; Clear the entire zero page
+				
+				Stz		DMA1_Cntl				; Init DMA1
+				Stz		DMA2_Cntl				; Init DMA2
+				Stz		TD_Cntl					; Init Timer DPLL control
+				Stz		Int_Host				; Init host interrupt register
+				
+*
+* Transfer the kernel command addresses to the zero page table
+*
+
+				Ldx		#KCmd_Table_size		; Begin transfer of command table
+				
+@Loop			Lda		Cmd_Table,x
+				Sta		Krn_CmdBase,x
+				Dex
+				Bpl		@Loop
+				
+				
+*
+* Initialize Zero Page variables
+*
+*
+* IMPORTANT !!!!!
+*
+* Because of the manor in which the 6502 does a rts the address
+* used must be the actual address minus 1
+*
+
+DvrA_Addr		Set		DvrA_Base-1
+DvrB_Addr		Set		DvrB_Base-1
+		
+				Lda		#DvrA_ID			; Initialize the driver task ID table
+				Sta		Dvr_TaskID
+				Lda		#DvrB_ID
+				Sta		Dvr_TaskID+1
+
+				Lda		#>DvrA_Addr			; Install the Initialization vector for driver A
+				Sta		Init_Vec+1
+				Lda		#<DvrA_Addr
+				Sta		Init_Vec
+
+				Lda		#>DvrB_Addr			; Install the Initialization vector for driver B
+				Sta		Init_Vec+3
+				Lda		#<DvrB_Addr
+				Sta		Init_Vec+2
+
+				Lda		#>DvrA_Close		; Install the Close vector for driver A
+				Sta		Close_Vec+1
+				Lda		#<DvrA_Close
+				Sta		Close_Vec
+
+				Lda		#>DvrB_Close		; Install the Close vector for driver B
+				Sta		Close_Vec+3
+				Lda		#<DvrB_Close
+				Sta		Close_Vec+2
+
+				Lda		#$ff
+				Sta		Bypass_Flag			; Set ByPass_Flag to on.
+
+				Jsr		Init_Timer
+
+				_Reg_Ver	Kern, VerInfo
+				_Inst_ISR	HOST, Msg_Scan		; Install message scan for host interrupt
+				_Inst_ISR	SCC, SCC_Dsptch		; Install the SCC interrupt dispatcher
+				_Inst_ISR	TIMER, Timer_ISR
+				
+				_Inst_RxMsgSgn	1, RxMsg_Signal	; Install the kernel receive message signaller
+								
+				Lda		#MaxRxMsg
+				Sta		RxMsgCnt				; PIC Kernel uses 7 messages
+				Sta		TxMsgCnt				; Both in and out
+
+				Ldx		#$ff					; Stack base is $01FF
+				Stx		Int_Reg					; Clear the interrupt register
+				Stx		IOPAlive				; Tell IOPMgr we are Alive
+				Txs								; Initialize stack
+				
+				Jmp		Kern_Task				; Interrupts will be cleared when
+												;  Event Wait is called.
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* ISR_Dsptch - determine interrupt source and dispatch to ISR.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+								
+ISR_Dsptch		Proc
+				
+				Import	ISR_table,			\ 
+						ISR_Decode		:Data
+				
+				Ldx		Int_reg				; Get the interrupt latch
+				Lda		ISR_Decode,x
+				Tax
+				Jmp		(ISR_table,x)		; Dispatch the interrupt
+				
+				endproc
+				
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* SCC_Dsptch - determine source and dispatch SCC interrupts.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+				
+SCC_Dsptch		Proc
+
+				Import	SCC_table,		\
+						UnKnown_Int		:Code
+
+				Lda		#Rd_Reg2			; Read the SCC interrupt latch
+				Sta		SCC_BCntl			; Interrupt latch is register 2 port B
+				Ldx		SCC_BStat			; Read the status V1 V2 V3
+				Jmp		(SCC_table,x)		; Dispatch the interrupt
+				
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Unknown_SCCInt - unknown SCC interrupt handler.
+*
+* This routine handles interrupts that occur but do
+* not have an SCCISR installed.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+UnKnown_SCCInt	Proc
+
+				Brk
+				
+				endproc
+				
+				
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Unknown_Int - unknown interrupt handler.
+*
+* This routine handles interrupts that occur but do
+* not have an ISR installed.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Unknown_Int		Proc
+
+				Tsx								; Get the stack pointer
+				Lda		StackPage+6,x			; Get the psw from the stack
+				Bit		#pswB					; Was it a break that caused the interrupt
+				Bne		BRK_Handler				; Yes
+				Rts								; No, just return
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* BRK_Handler - handle a software interrupt
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+BRK_Handler		Tsx								; Get the stack pointer
+
+*
+* Cycle through stack so that we can see it on the logic analyzer
+*
+
+Do_Again		Inx
+				Beq		BRK_Handler
+				Lda		StackPage,x
+				Bra		Do_Again
+
+				endproc
+								
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+* Entry Points
+*
+* Rel_Task - release a task for one task cycle.
+*
+* Ev_Wait - wait for an event to happen.
+* 
+* The return address should already be on the stack.
+* Ev_Wait falls through into Ev_Dsptch.
+*			  
+* Register A - event mask.
+*
+* On exit register A contains the tEvent for the Task.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Rel_Task		Proc
+
+				Export	Ev_Wait
+
+				Import	tSp,		\
+						tNext,		\
+						tEvent,		\
+						tWait		: Data
+
+				Lda		#$80			; This event is always set
+										;  therefore the task will execute the 
+										;  next task cylce
+				
+Ev_Wait			Ldy		Cur_Task		; Get the Task ID
+				Sta		tWait,y			; Store the event mask
+
+*
+* Ev_Dsptch - entry to task dispatcher. 
+*
+
+				Sei
+				Ldy		Cur_Task			; Get the current task ID
+				Tsx
+				Txa
+				Sta		tSp,y				; Save the task's stack pointer
+				Cli
+
+				Ldx		#$FF				
+
+@Scan			Lda		tNext,y				; Get the next task ID
+				Tay
+				Lda		tEvent,y			; Check the flags to see if this one is ready
+				And		tWait,y
+				Stx		IOPAlive			; This lets the Host know we're still alive				
+				Beq		@Scan
+				
+				Sei
+				Sty		Cur_Task			; Switch Tasks
+				Ldx		tSp,y				; Get this task's stack pointer
+				Txs
+				Cli
+
+				Rts							; go to the task 
+				
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Ev_Signal - signal a task that an event has occurred.
+*
+* Events are flagged by setting bits in the tEvent byte of the
+* TCB of the task to receive the signal.  
+*
+* Register X - ID of task to signal.
+* Register A - event flag.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Ev_Signal		Proc
+
+				Import	tEvent : Data
+
+				Php
+				Sei
+				Ora		tEvent,x		; Set the event bit
+				Sta		tEvent,x		; Save it in the task's TCB
+				Plp
+				Rts
+				
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Ev_Reset - reset an event flag.
+*
+* Register A - complement of event flag.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Ev_Reset		Proc
+			
+				Import	tEvent : Data
+
+				Php
+				Sei
+				Ldx		Cur_task		; We can only reset our own task
+				And		tEvent,x		; Reset the event bit
+				Sta		tEvent,x		; Save it in the task's TCB
+				Plp
+				Rts
+				
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Msg_Scan - handle interrupts from host CPU. Must be installed 
+*			 when processor is reset.
+*
+* Scan messages for New Message Sent and Message Complete. Each
+* task installs message handlers that signal the task when new messages
+* are received or messages are completed. Each task must install a
+* handler for each message box it intends to use.
+*
+* The only message the kernel will accept when in ByPassMode
+* is ByPassMode(Off).  
+* 
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Msg_Scan		Proc
+
+				Import	TxMsgSignal,		\
+						RxMsgSignal		: Code
+						
+				Import	MsgNumTimes2	: Data
+
+				Lda		#Host_Msk
+				Sta		Int_Reg					; Clear the host interrupt
+				Trb		Int_Mask				; Disable host interrupts
+				Cli								; Renable interrupts of higher priority
+
+				Lda		ByPass_Flag				; We don't do anything in bypass mode
+				Bne		Do_ByPass				; except receive on message one
+				
+*				
+* Service Completed Transmit Messages first
+*
+
+				Ldy		TxMsgCnt				; Get highest Tx message number
+				Lda		#MsgCmplt				; Get the desired message state
+
+@TxMsgLoop		Cpa		TxMsgState,y			; See if the message completed
+				Bne		@TxMsgNext				; If no service needed goto next msg
+
+				Phy								; Preserve loop counter
+				Ldx		MsgNumTimes2,y			; Convert message number to table index
+				Jsr		TxHandler				; Call the handler
+				Ply								; Restore the message number
+
+				Lda		#Idle
+				Sta		TxMsgState,y			; Change message state to Idle
+				Lda		#MsgCmplt				; Restore desired message state
+
+@TxMsgNext		Dey								; Point to previous message
+				Bne		@TxMsgLoop				; Loop through all messages
+				
+				Bra		RxMsgStart
+
+*
+* Service Receive New Message Sent last
+*
+
+Do_ByPass		Ldy		#1						; In ByPass mode we only receive message 1
+				Bra		ByPassSkip				; for the kernel
+
+RxMsgStart		Ldy		RxMsgCnt				; Get highest Rx message number
+
+ByPassSkip		Lda		#NewMsgSent				; Get the desired message state
+
+@RxMsgLoop		Cpa		RxMsgState,y			; See if message just arrived
+				Bne		@RxMsgNext				; If no service needed
+
+				Lda		#MsgRcv
+				Sta		RxMsgState,y			; Change message state to Message Received
+				Phy								; Preserve loop counter
+				Ldx		MsgNumTimes2,y			; Convert message number to table index
+				Jsr		RxHandler				; Call the handler
+				Ply								; Restore the message number
+				Lda		#NewMsgSent				; Restore desired message state
+
+@RxMsgNext		Dey								; Point to previous message
+				Bne		@RxMsgLoop				; Loop through all messages
+
+				Sei
+				Lda		#Host_Msk				; Get the host interrupt bit
+				Tsb		Int_Mask				; Re-enable host interrupts
+				Rts								; All done
+
+TxHandler		Jmp		(TxMsgSignal-2,x)		; Go to handler - msg's start at 1 
+
+RxHandler		Jmp		(RxMsgSignal-2,x)		; Go to handler - msg's start at 1
+
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* RxMsg_Signal - signal kernel that a message has arrived.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+RxMsg_Signal	Proc
+
+				Import	Cmd_JmpTable	: Code
+				
+				Ldx		#Kern_ID			; ID of task we wish to signal
+				Lda		#RxMsg				; Signal we want to send
+				Jmp		Cmd_JmpTable+(SignalTask*3)	; Signal Task Command has an RTS
+				
+				endproc
+				
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Kern_Task - main kernel task routine and event dispatcher
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Kern_Task		Proc
+
+				Import	Dsptch_KRxMsg	: Code
+				Import	Cmd_JmpTable    : Code
+				
+				_Wait_Event	RxMsg		; Wait until we get a receive message event
+				
+				Asl		A				; tEvent is already in register A
+				Tax
+				Jmp		(Kern_Disp-2,x)
+								
+Kern_Disp		DC.W	Dsptch_KRxMsg	; Dispatch Kernel message is the only
+										; event we look for.
+				
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Dsptch_KRxMsg	- Decode and dispatch messages to Kernel
+*
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Dsptch_KRxMsg	Proc
+
+				Import	MsgNumTimes32		: Data
+
+				Import	Kern_Task,					\
+						Alloc_Driver,				\
+						DeAlloc_Driver,				\
+						ByPass_Mode,				\
+						Init_Driver,				\
+						Version,					\
+						SCC_Control,				\
+						Cmd_JmpTable		: Code
+				
+				_Reset_Event	RxMsg			; Reset the event
+					
+				Ldy		#$01				; Kernel has only one message (msg1)								
+				Ldx		MsgNumTimes32,y		; Get the Receive message page offset
+				
+				Lda		ByPass_Flag			; Check for ByPass mode
+				Bne		Do_ByPass
+				
+Procede			Lda		RxMsgPage,x			; Get the command byte
+				Beq		UnKnown_Msg			; Zero is not a command
+				
+				Cmp		#Max_KMsg+1			; If > the max msg #
+				Bge		Unknown_Msg			;  branch to unknown message routine
+				
+				Stz		RxMsgPage,x			; Clear the message byte
+				
+				Asl		A					; Make it a word offset
+				Phx
+				Tax
+				Jmp		(Msg_Table-2,x)		; Dispatch the command
+
+Do_ByPass		Lda		RxMsgPage,x
+				Cmp		#ByPass				; Is it a ByPass Call
+				Beq		Procede				; Yes, procede
+				
+				Cmp		#SCCCntl			; Allow the SCC Control register call.
+				Beq		Procede				; Yes, procede with message
+				
+				Stz		RxMsgPage+2,x
+				Lda		ByPass_Flag
+				Sta		RxMsgPage+1,x		; Return ByPass client ID
+				Lda		#InByPass
+				Bra		Complete
+
+UnKnown_Msg		Stz		RxMsgPage+2,x
+				Stz		RxMsgPage+1,x
+				Lda		#UnKnwnMsg			;
+
+Complete		Sta		RxMsgPage,x			; Return the error
+				Lda		#MsgCmplt			; Tell host we've completed the message
+				Sta		RxMsgState,y		; Store it in the message state variable
+				Lda		#Int0				; Load A with host interrupt bit
+				Tsb		Int_Host
+				Jmp		Kern_Task			; Return to wait for next event
+
+Msg_Table		DC.W	Alloc_Driver
+				DC.W	DeAlloc_Driver
+				DC.W	Init_Driver
+				DC.W	ByPass_Mode
+				DC.W	Version
+				DC.W	SCC_Control
+								
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Alloc_Driver
+*
+* Passed
+*
+* struct	AllocMsgType {
+*							byte	msgNum; 		/* Alloc_Channel msg = $01		*/
+*							byte	Driver;			/* Dvr A = $00 Dvr B = $01		*/
+*							byte	ClientID;		/* Port use ID > $00			*/
+*						}
+*
+* Returns
+*
+* struct	AllocErrType{
+*							  byte	errNum;			/* NoErr 		= $00
+*													   Error	 	= -1		
+*													   DvrInUse 	= -4
+*													   InBypass  	= -5
+*													*/
+*							  byte	ClientID;		/* ID > 0 if port in use		*/
+*							  int	Addr;			/* Driver load address - 1		*/
+*						}
+*
+* Stack Info
+*   		-----------------
+*			| Msg # * 32	|
+*			-----------------
+*	SP -> 
+*
+*	Register Y - contains message number starting at 1
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+				
+Alloc_Driver	Proc
+
+				Import	Kern_Task	: Code
+
+				Plx							; Restore X - msg number * 32
+				Phy
+				Ldy		RxMsgPage+1,x		; Get the channel byte (DvrA or DvrB)
+				Cpy		#MaxDvr+1			; Are we trying to open a nonexistant driver
+				Bge		ERR
+				Cpy		#DvrA
+				Blt		ERR
+				Stz		RxMsgPage+1,x		; Clear the Driver byte
+				Lda		Dvr_Use,y			; See if the driver is in use
+				Bne		InUse
+
+				Lda		RxMsgPage+2,x		; Get the ClientID byte
+				Sta		Dvr_Use,y			; Store the ID if the driver is free
+				Stz		RxMsgPage+2,x		; Clear the ClientID
+				Tya							; Make the driver ID a word offset
+				Asl		A
+				Tay
+				Lda		Init_Vec,y			; Return the driver starting address
+				Sta		RxMsgPage+3,x
+				Lda		Init_Vec+1,y
+				Sta		RxMsgPage+2,x
+				Bra		Complete			; NoErr is reported because we've been
+											;  clearing bytes as we go!!!
+				
+InUse			Stz		RxMsgPage+2,x		; Clear the ClientID of the message
+				Sta		RxMsgPage+1,x		; Return the ClientID of the client using the Driver
+				Lda		#DvrInUse
+				Sta		RxMsgPage,x			; Return the error Driver In Use
+				Bra		Complete
+
+ERR				Stz		RxMsgPage+2,x		; Clear ClinetID
+				Stz		RxMsgPage+1,x		; Clear driver byte
+				Lda		#Error				; We made a boo boo
+				Sta		RxMsgPage,x			; Return the code
+				
+Complete		Ply
+				Lda		#MsgCmplt			; Tell host we've completed the message
+				Sta		RxMsgState,y		; Store it in the message state variable
+				Lda		#Int0				; Load A with host interrupt bit
+				Tsb		Int_Host
+				Jmp		Kern_Task			; Return to wait for next event
+				
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* DeAlloc_Driver
+*
+* Passed
+*
+* struct	DeAllocMsgType {
+*							byte	msgNum; 		/* DeAlloc_Channel msg = $02		*/
+*							byte	Driver;			/* Dvr A = $00 Dvr B = $01			*/
+*						 	}
+*
+* Returns
+*
+* struct	DeAllocErrType{
+*							byte	errNum;			/* NoErr = $00
+*													   Error = -1
+*													   InByPass = -5
+*													*/
+*						}
+* 
+* Stack Info
+*   		-----------------
+*			| Msg # * 32	|
+*			-----------------
+*	SP ->
+*
+*	Register Y - contains message number starting at 1
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+				
+DeAlloc_Driver	Proc
+
+				Import	Kern_Task	: Code
+
+				Plx							; Restore X - msg number * 32			
+				Phy				
+				Ldy		RxMsgPage+1,x		; Get the driver byte (DvrA or DvrB)
+				Cpy		#MaxDvr+1			; Are we trying to close a nonexistant driver
+				Bge		ERR
+				Cpy		#DvrA
+				Blt		ERR
+				Stz		RxMsgPage+1,x		; clear the channel byte
+
+				Lda		#00
+				Sta		Dvr_Use,y			; Disable driver use byte
+
+				Tya
+				Asl		A					; Make the channel number a word offset
+				Tax
+				Jsr		FakeIndirX
+				Bra		Complete
+				
+ERR				Lda		#Error				; Report that we made a boo boo
+				Sta		RxMsgPage,x			; We were trying to close a nonexistant Driver
+				
+Complete		Ply
+				Lda		#MsgCmplt			; Tell host we've completed the message
+				Sta		RxMsgState,y		; Store it in the message state variable
+				Lda		#Int0				; Load A with host interrupt bit
+				Tsb		Int_Host
+				Jmp		Kern_Task			; Return to wait for next event
+
+FakeIndirX		Jmp		(Close_Vec,x)		; Jump to the channel's close routine
+				
+				endproc
+				
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Init_Driver
+*
+* Passed
+*
+* struct	InitMsgType {
+*							byte	msgNum; 		/* Init_Channel msg = $03		*/
+*							byte	Driver;			/* Dvr A = $00 Dvr B = $01		*/
+*						 }
+*
+* Returns
+*
+* struct	InitErrType	{
+*							byte	errNum;			/* NoErr = $00
+*													   Error = -1
+*													   InByPass = -5
+*													   NotAlloc  = -6
+*													*/
+*						}
+* 
+*
+* On Entry
+*
+* Stack Info
+*   		-----------------
+*			| Msg # * 32	|
+*			-----------------
+*	SP ->
+*
+*	Register Y - contains message number starting at 1
+*
+* On Exit
+*
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+				
+Init_Driver		Proc
+
+				Import	Kern_Task,		\
+						Cmd_JmpTable	: Code
+
+				Plx							; Get the message offset
+				Phy							; Save the message number			
+
+				Ldy		RxMsgPage+1,x		; Get the driver byte (DvrA or DvrB)
+				Cpy		#MaxDvr+1			; Are we trying to init a nonexistant driver
+				Bge		ERR
+				Cpy		#DvrA
+				Blt		ERR
+
+				Stz		RxMsgPage+1,x		; Clear driver byte
+				
+				Lda		Dvr_Use,y			; Check to see if driver has been allocated
+				Beq		Not_Open
+				
+				Phx							; Save the message offset
+				Lda		Dvr_TaskID,y		; Get the Task ID for this driver
+				Pha							; Save Task ID temp.
+				Tya							; Load A with the driver byte
+				Asl		A					; Make the driver byte a word offset
+				Tax				
+				Lda		Init_Vec,x			; Get the address of the driver init routine
+				Ldy		Init_Vec+1,x
+				Plx							; Get the task ID
+				Sec							; Set Carry for Install Task
+
+				Jsr		Cmd_JmpTable+(InstTask*3)	; Install the task into the Q
+				
+				_Wait_Event	InitFin			; Wait for the task to signal it's completion
+				
+				_Reset_Event	InitFin		; Reset tWait so we don't get this event again
+				
+				Plx							; Restore the message offset
+				Stz		RxMsgPage,x			; Signal No Error
+				Bra		Complete
+
+Not_Open		Lda		#NotAlloc			; Not open, therefore cannot be initialized
+				Sta		RxMsgPage,x
+				Bra		Complete
+
+ERR				Lda		#Error				; Report that we made a boo boo
+				Sta		RxMsgPage,x			; We were trying to close a nonexistant driver
+				
+Complete		Ply
+				Lda		#MsgCmplt			; Tell host we've completed the message
+				Sta		RxMsgState,y		; Store it in the message state variable
+				Lda		#Int0				; Load A with host interrupt bit
+				Tsb		Int_Host
+				Jmp		Kern_Task			; Return to wait for next event
+						
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* ByPass_Mode
+*
+* Passed
+*
+* struct	ByPassMsgType {
+*							byte	msgNum; 		/* ByPass_Mode msg = $04		*/
+*							byte	On_Off;			/* Off = 0  On = 1				*/
+*							byte	ClientID;		/* ID > 0						*/
+*						 }
+*
+* Returns
+*
+* struct	ByPassErrType{
+*							byte	errNum;			/* NoErr 		= $00
+*													   ChanInUse 	= -4
+*													   InByPass  	= -5
+*													   BadID 		= -7
+*													*/
+*							Union {
+*									byte	ByPassID;	/* ID > 0 if in ByPass			 */
+*									byte	ClientAID;  /* ID > 0 If currently allocated */
+*								   } switch;
+*						    byte	ClientBID;          /* ID > 0 IF currently allocated */
+*						}
+*
+* Stack Info
+*   		-----------------
+*			| Msg # * 32	|
+*			-----------------
+*	SP ->
+* 
+*
+*	Register Y - contains message number starting at 1
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+				
+ByPass_Mode		Proc
+
+				Import	Kern_Task,			\
+						Cmd_JmpTable	: Code
+
+				Plx
+				Phy				
+				Ldy		RxMsgPage+1,x		; Get the On/Off byte 
+				Beq		ByPass_Off			; = 0 means we want to turn ByPass Off 
+				Stz		RxMsgPage+1,x		; Clear On/Off byte
+
+				Lda		Dvr_AUse			; Check to see if Driver A is closed
+				Bne		In_Use
+
+				Lda		Dvr_BUse			; Check to see if Driver B is closed
+				Bne		In_Use
+				
+				Lda		ByPass_Flag			; Check to see if we are in ByPass Mode
+				Bne		In_ByPass
+
+				Php
+				Sei
+				Phx
+				Jsr		OnReset
+				Plx
+				Plp
+				Lda		#ByPass_Bit|RTXCA_36|RTXCB_36	; Put PIC into ByPass Mode, RTXC=3.6 MHZ
+				Tsb		SCC_Cntl
+				Lda		RxMsgPage+2,x		; Set ByPass_Flag to  ID byte
+				Sta		ByPass_Flag			; 
+				Bra		Complete
+				
+ByPass_Off		Stz		RxMsgPage+1,x		; Clear on off byte
+				Lda		RxMsgPage+2,x		; Get the ID
+				Stz		RxMsgPage+2,x		; Clear the ID
+				Cmp		ByPass_Flag			; Make sure who ever put us in ByPass takes us out
+				Bne		WrongID
+				
+				Php
+				Sei
+				Lda		#ByPass_Bit			; Take PIC out of ByPass Mode
+				Trb		SCC_Cntl
+				Jsr		OffReset
+				Plp
+				Stz		ByPass_Flag			; Turn ByPass mode off
+				Bra		Complete
+				
+WrongID			Lda		ByPass_Flag
+				Sta		RxMsgPage+1,x		; Return the ID of the person who turned ByPass on
+				Lda		#BadID				; Make sure who ever put us
+				Sta		RxMsgPage,x			;  in bypass mode takes us out!!!!
+				Bra		Complete
+
+In_ByPass		Lda		ByPass_Flag
+				Sta		RxMsgPage+1,x		; Return the ID of the person who turned ByPass on
+				Stz		RxMsgPage+2,x		; Clear ID
+				Lda		#InByPass
+				Sta		RxMsgPage,x			; Return the error In ByPass mode
+				Bra		Complete
+				
+In_Use			Lda		Dvr_AUse
+				Sta		RxMsgPage+1,x		; Return driver A ClientID
+				Lda		Dvr_BUse
+				Sta		RxMsgPage+2,x		; Return driver B ClientID
+				
+				Lda		#DvrInUse			; Report that a driver is in use
+				Sta		RxMsgPage,x
+				
+Complete		Ply
+				Lda		#MsgCmplt			; Tell host we've completed the message
+				Sta		RxMsgState,y		; Store it in the message state variable
+				Lda		#Int0				; Load A with host interrupt bit
+				Tsb		Int_Host
+				Jmp		Kern_Task			; Return to wait for next event
+
+OffReset		Lda		#SCC_Msk
+				Tsb		Int_Mask			; Enable SCC interrupts
+				Bra		OffSkip
+				
+OnReset			Lda		#SCC_Msk
+				Trb		Int_Mask
+
+*
+* Initialize the SCC 
+*
+
+OffSkip			Lda     SCC_ACntl        	; Synchronize Read/Writes
+
+*
+* Initialize the SCC 
+*
+
+DoB				Lda		#Wr_reg9
+				Sta		SCC_ACntl
+				Lda		#ChanB_Reset
+				Sta		SCC_ACntl
+
+				Ldx		#0
+@LoopB          Lda     Table,X         	; Get the register number
+                Tay                     	; Transfer indicator bits
+                Iny                     	; Was it an $FF? (END OF TABLE?)
+                Beq     DoA		      		; If so, exit
+
+                Sta     SCC_BCntl        	; Set register
+		        Inx                     	; Move to next character
+                Lda     Table,X         	; Register contents
+		        Sta     SCC_BCntl
+                Inx
+                Bra     @LoopB
+
+DoA				Lda		#Wr_reg9
+				Sta		SCC_ACntl
+				Lda		#ChanA_Reset
+				Sta		SCC_ACntl
+				
+				Ldx		#0
+@LoopA          Lda     Table,X         	; Get the register number
+                Tay                     	; Transfer indicator bits
+                Iny                     	; Was it an $FF? (END OF TABLE?)
+                Beq     @Done		      	; If so, exit
+
+                Sta     SCC_ACntl        	; Set register
+		        Inx                     	; Move to next character
+                Lda     Table,X         	; Register contents
+		        Sta     SCC_ACntl
+                Inx
+                Bra     @LoopA
+
+
+@Done			Rts
+
+Table			
+				DC.B	Wr_reg4, X16CLK|StopBit2
+				DC.B	Wr_reg2, 00
+				DC.B	Wr_reg3, Rx_8Bits
+				DC.B	Wr_reg15, 00			; Clear External status interrupts
+				DC.B	Wr_reg0, Reset_ExtInt	; Reset external status interrupts twice ??
+				DC.B	Wr_reg0, Reset_ExtInt
+				DC.B	Wr_reg1, 00				; Disable all interrupts
+				DC.B	$ff						; End of table
+
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Version
+*
+* Passed
+*
+* struct	VersionMsgType {
+*							byte	msgNum; 		/* Version = $05		*/
+*							byte	DriverID;		/* Driver A = $00		*/
+*													/* Driver B = $01		*/
+*													/* Kernel   = $02		*/
+*						 }
+*
+* Returns
+*
+* struct	VersionErrType{
+*							byte	errNum;			/* NoErr = $00						*/
+*							ptr	 	VerInfo;		/* Pointer to  version info			*/
+*						}
+*
+* Stack Info
+*   		-----------------
+*			| Msg # * 32	|
+*			-----------------
+*	SP ->
+* 
+*
+*	Register Y - contains message number starting at 1
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+				
+Version			Proc
+
+				Import	VerInfo		: Data
+				Import	Kern_Task	: Code
+
+				Plx
+				Phy				
+				
+				Lda		RxMsgPage+1,x
+				Cmp		#00					; Do a range check on Driver ID
+				Blt		Err
+
+				Cmp		#Kern+1
+				Bge		Err
+
+				Asl		A
+				Tay
+				Lda		Ver_Ptr,y			; Return the address of the version info
+				Sta		RxMsgPage+1,x
+				Lda		Ver_Ptr+1,y
+				Sta		RxMsgPage+2,x
+				
+Cmplt			Ply
+				Lda		#MsgCmplt			; Tell host we've completed the message
+				Sta		RxMsgState,y		; Store it in the message state variable
+				Lda		#Int0				; Load A with host interrupt bit
+				Tsb		Int_Host
+				Jmp		Kern_Task			; Return to wait for next event
+				
+Err				Lda		#Error				; Report Error and complete
+				Sta		RxMsgPage,x
+				Bra		Cmplt
+				
+				endproc
+				
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* SCC_Control - turn the general purpose clock source on and
+*				off when in bypass.
+*
+* Passed
+*
+* struct	SCCCntlMsgType {
+*							byte	msgNum; 		/* SCC_Cntl msg = $06			*/
+*							byte	Driver;			/* Dvr A = $00 Dvr B = $01		*/
+*							byte	GPI;			/* GPI = 0 (Off) GPI = 1 (On)	*/
+*						}
+*
+* Returns
+*
+* struct	SCCCntlErrType{
+*							  byte	errNum;			/* NoErr 		= $00
+*													   Error	 	= -1		
+*													*/
+*						}
+*
+* Stack Info
+*   		-----------------
+*			| Msg # * 32	|
+*			-----------------
+*	SP -> 
+*
+*	Register Y - contains message number starting at 1
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+				
+SCC_Control		Proc
+
+				Import	Kern_Task	: Code
+
+				Plx							; Restore X - msg number * 32
+				Phy
+				Lda		ByPass_Flag			; This command only works in bypass.
+				Beq		ERR				
+				
+				Stz		RxMsgPage,x			; Assume no error.
+				Lda		RxMsgPage+1,x		; Get the channel byte (DvrA or DvrB)
+				Cpa		#DvrA				; Is it for DvrA or DvrB
+				Bne		@Chck_B
+				
+				Lda		RxMsgPage+2,x		; Get the GPI
+				Bne		@GPIA_On			; <> 0 means turn GPIA on
+				
+				Lda		SCC_Cntl			; Get the current value of the register. 
+				And		#ÅRTXCA_GPIA		; Make the clock source for RTXCA 3.686 MHZ			
+				Sta		SCC_Cntl			; Store the new value
+				Bra		Complete
+				
+@GPIA_On		Lda		#RTXCA_GPIA			; Get the bit mask.
+				Tsb		SCC_Cntl			; Make the clock source for RTXCA GPIA 
+				Bra		Complete		
+			
+@Chck_B			Cpa		#DvrB				; Was it Driver B
+				Bne		ERR					; It is an error if it isn't.
+				
+				Lda		RxMsgPage+2,x		; Get the GPI
+				Bne		@GPIB_On			; <> 0 means turn GPIB on
+				
+				Lda		SCC_Cntl			; Get the current value of the register
+				And		#ÅRTXCB_GPIA		; Make the clock source for RTXCB 3.686 MHZ
+				Sta		SCC_Cntl			; Store the new value.
+				Bra		Complete
+				
+@GPIB_On		Lda		#RTXCB_GPIA			; Get the bit mask.
+				Tsb		SCC_Cntl			; Make the clock source for RTXB GPIB
+				Bra		Complete
+
+ERR				Lda		#Error				; We made a boo boo
+				Sta		RxMsgPage,x			; Return the code
+				
+Complete		Ply
+				Lda		#MsgCmplt			; Tell host we've completed the message
+				Sta		RxMsgState,y		; Store it in the message state variable
+				Lda		#Int0				; Load A with host interrupt bit
+				Tsb		Int_Host
+				Jmp		Kern_Task			; Return to wait for next event
+				
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Kernel Subroutines called by indirect jump through table
+* in the Zero Page
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Remv_RxMsgSgn - Install receive message signaller
+*
+* Register X - message number * 2 (msg numbers start at 1)
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Remv_RxMsgSgn	Proc
+
+				Import	RxMsgSignal		: Data
+				
+				Export	NullRxMsgSgn
+				
+				Bcs		Inst_RxMsgSgn
+				Ldy		#>NullRxMsgSgn
+				Lda		#<NullRxMsgSgn
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Inst_RxMsgSgn - Install receive message signaller
+*
+* Register X - message number * 2 (msg numbers start at 1)
+* Register Y - High byte of message signaller address
+* Register A - Low byte of message signaller address
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Inst_RxMsgSgn	Php							; Save the status byte
+				Sei
+				Sta		RxMsgSignal-2,x		; Store the low byte of the msg handler
+				Inx
+				Tya
+				Sta		RxMsgSignal-2,x		; Store the high byte of the msg handler
+				Plp							; Restore the status byte
+				
+				Rts							; Return to caller
+				
+NullRxMsgSgn	Rts
+				
+				EndProc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Remv_TxCmplSgn - Removel transmit completion signaller
+*
+* Register X - message number * 2 (msg numbers start at one)
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Remv_TxCmplSgn Proc
+
+				Import	TxMsgSignal		: Data
+				Export	NullTxCmplSgn
+				
+				Bcs		Inst_TxCmplSgn
+				Ldy		#>NullTxCmplSgn
+				Lda		#<NullTxCmplSgn
+				
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Inst_TxCmplSgn - Install transmit completion signaller
+*
+* Register X - message number * 2 (msg numbers start at one)
+* Register Y - High byte of completion handler
+* Register A - Low byte of completion handler
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Inst_TxCmplSgn 	Php
+				Sei
+				Sta		TxMsgSignal-2,x		; Store the low byte of the msg handler
+				Tya
+				Sta		TxMsgSignal-1,x		; Store the high byte of the msg handler
+				Plp
+				
+				Rts							; Return to caller
+				
+NullTxCmplSgn	Rts
+				
+				EndProc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Inst_Task - Install task.  Always installs task after Kernel.
+*
+* Register X - TaskID of task to install
+* Register Y - High byte of task address
+* Register A - Low byte of task address
+*
+* Carry Clear - Branch to Kill Task
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Inst_Task		Proc
+
+				Import	tPrev,		\
+						tNext,		\
+						tSp,		\
+						tEvent,		\
+						tWait		: Data
+										
+				Bcc		Kill_Task
+				Php
+				Sei
+				
+				Cpx		#DvrA_ID
+				Beq		Do_DvrA
+
+				Sta		DvrB_Sp-1		; Push the task address on the stack
+				Sty		DvrB_Sp		
+				Lda		#<(DvrB_Sp-2)	; Init the stack pointer
+				Bra		SkipA
+				
+Do_DvrA			Sta		DvrA_Sp-1		; Push the task address on the stack
+				Sty		DvrA_Sp		
+				Lda		#<(DvrA_Sp-2)	; Init the stack pointer
+
+SkipA			Sta		tSp,x
+
+				Ldy		#Kern_ID		; Insert the Task after the Kernel task
+				Lda		tNext,y			; Get the Kernel's tNext link. 
+				Sta		tNext,x			; Make the new Task link to what the kernel
+										;  was linked to.
+				Tay						; Make y-reg point to what the tNext of the Kernel
+				Txa						; Make a-reg the value of the one we are inserting
+				Sta		tPrev,y			; Update the previous pointer of the task we are inserting
+										;  in front of.
+				
+				Ldy		#Kern_ID
+				Sta		tNext,y			; Make the Kernel TCB point to the new TCB
+				Tya						; Make a-reg point to Kernel
+				Sta		tPrev,x			; Make tPrev of the task to be inserted
+										;  point to the Kernel.
+
+				Lda		#$80			
+				Sta		tEvent,x		; Set the Always Event
+				Sta		tWait,x			; Wait for the Always event
+
+				Plp
+				
+				Rts
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Kill_Task - Kill task.
+*
+* Register X - TaskID of the task to be removed. (ChanA_ID ChanB_ID only !)
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Kill_Task		
+				
+				Php
+				Sei
+				Lda		tPrev,x			; Get tPrev of task to be removed.
+				Tay						; y-reg points to task before the task to be removed.
+				Lda		tNext,x			; Get tNext from task to be removed
+				Tax						; Make x-reg point to next task.
+				Sta		tNext,y			; Make tNext of previous task point the task
+										;  after the task to be removed.
+				Tya						; Make a-reg point to prev task
+				Sta		tPrev,x			; Make tPrev of next task point to the tNext
+										;  of the task that is removed.
+				Plp
+				
+				Rts
+				
+				EndProc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Remv_ISR - remove an Interrupt service routine
+*
+* Register X - interrupt type
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Remv_ISR		Proc
+
+				Export	Inst_ISR
+
+				Import	UnKnown_Int		: Code
+				Import	ISR_Table 		:Data
+
+				Bcs		Inst_ISR			; Is this a Remove or Install ISR call??
+				Ldy		#>UnKnown_Int		; For Remove we fill in values for the
+				Lda		#<Unknown_Int		;  Unknown interrupt handler.
+				
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Inst_ISR     - make an entry into the interrupt table. 
+*
+* Register X - interrupt type
+* Register Y - High byte of interrupt address
+* Register A - Low byte of interrupt address
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Inst_ISR		Php
+				Sei
+				Sta		ISR_table,x			; Store the low byte of the address
+				Tya
+				Sta		ISR_table+1,x		; Store the high byte of the address
+				
+				Plp
+				Rts				
+
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Remove_ISR - remove an Interrupt service routine
+*
+* Carry -> Set - install SCC ISR routine
+*		   Clear - remove SCC ISR routine
+*
+* Register X - interrupt type
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Remv_SCC_ISR	Proc
+
+				Import	UnKnown_SCCInt	: Code
+				Import	SCC_table		:	Data
+
+				Bcs		Inst_SCC_ISR
+				Ldy		#>UnKnown_Int
+				Lda		#<Unknown_Int
+				
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Inst_SCC_ISR - make an entry into the SCC interrupt table. 
+*
+* Register X - interrupt type
+* Register Y - High byte of interrupt address
+* Register A - Low byte of interrupt address
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+Inst_SCC_ISR	Php
+				Sei
+				Sta		SCC_table,x			; Store the low byte of the address
+				Tya
+				Sta		SCC_table+1,x		; Store the high byte of the address
+				
+				Plp
+				Rts				
+
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Reset Channel - reset channel A or B of the SCC
+*
+* Carry -> Set - reset A
+* 		   Clear - reset B
+*
+* A Register is corrupted
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Reset_Chan		Proc
+
+				Bcc		ChanB			; Is this a ChanA or ChanB reset
+				Php						; Do ChanA reset
+				Sei
+				Lda		#Wr_Reg9
+				Sta		SCC_ACntl
+				Lda		#ChanA_Reset|MIE|No_Vec
+				Sta		SCC_ACntl
+				Plp
+				Rts
+				
+ChanB			Php						; Do ChanB Reset
+				Sei
+				Lda		#Wr_Reg9
+				Sta		SCC_ACntl
+				Lda		#ChanB_Reset|MIE|No_Vec
+				Sta		SCC_ACntl
+				Plp
+				Rts
+				
+				endproc
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Reg_Ver - register version info.
+*
+* Register A - Driver ID
+* Register Y - High byte of info address
+* Register X - Low byte of info address
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Reg_Ver			Proc
+
+				Phx
+				Asl		A
+				Tax
+				Pla
+				Sta		Ver_Ptr+1, x	; Store the Low byte of the address
+				Sty		Ver_Ptr, x		; Store the High byte of the address
+				Rts				
+
+				endproc
+				
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Inst_TmTask - install a timer task.
+*
+* Carry	->  Set - Branch to cancel timer task
+*			Clear - execute install timer task
+*
+* Register A - Low byte of parameter address
+* Register X - High byte of the parameter address
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Inst_TmTask		Proc
+
+				Export	Get_TMPB,			\
+						Init_Timer,			\
+						Timer_ISR
+
+				Php
+				Sei
+				Bcs		Can_TmTask		; Cancel timer task if carry is set
+
+				Sta		AddressLo		; Store the parameter address
+				Stx		AddressHi
+
+				Ldy		#$00
+				Lda		(AddressLo),y
+				Tax
+				Iny
+				Lda		(AddressLo),y	; Get the low byte of the completion routine
+				Sta		TMPBpcL,x
+				Iny
+				Lda		(AddressLo),y	; Get the high byte of the completion routine
+				Sta		TMPBpcH,x
+				Iny
+				Lda		(AddressLo),y	; Get the low byte of the time value
+				Sta		TMPBTimeL,x
+				Iny
+				Lda		(AddressLo),y	; Get the high byte of the time value
+				Sta		TMPBTimeH,x
+				Txa
+				Tay
+				Jsr		StartTimer
+
+				Plp
+				Rts
+				
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+*  Routine:	Can_TmTask
+*  Inputs:	Y - TMPB index
+*  Outputs:	none
+*  Destroys:	A, X, Y, n, v, z, c
+*  Size:	100 bytes
+*  Cycles:	15 - if it is already completed
+*			50 - if it is the only running timer
+*			98 + StopTimer + StartTimer - if head, with successors
+*			65..94+ - if not head
+*  Stack Usage:	2 bytes
+*  Calls:	Stop, Start
+*  Called by:	
+*
+*  Function:	Cancels the timer in the indicated TMPB, and removes it
+*				from the timer queue.
+*
+*  NOTE:	This routine must be called with interrupts DISABLED
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Can_TmTask	
+			
+			Lda		TMPBcmplt,y				; Exit if the task has completed
+			Beq		@Exit
+			
+			Cpy		tmReqQhead				; See if it is running
+			Bne		@SrchQueue				; If not head of queue
+		
+			Lda		TMPBnext,y				; Check for successor
+			Bpl		@HasSucc				; If not the only entry
+
+			Sta		tmReqQhead				; Set head to nil
+			Lda		#$00
+			Sta		TMPBpcH,y				; Indicate that the routine is complete
+			Lda		#Timer_Msk				; Disable timer interrupts
+			Trb		Int_Mask				; Update the interrupt mask
+			Plp
+			Rts								; All done
+
+@HasSucc	Ldx		tmReqQhead				; Get queue head
+			Jsr		Stop					; Stop the head timer
+			Ldy		tmReqQhead				; Get index of entry to dequeue
+			Lda		#$00
+			Sta		TMPBpcH,y				; Indicate that the routine is complete
+			Ldx		TMPBnext,y				; Get index of successor
+			Stx		tmReqQhead				; Successor is new head
+			Jsr		@AdjTime				; Adjust the delay time
+			Jsr		Start					; Start new head timer
+			Plp
+			Rts
+
+@SrchQueue	Lda		tmReqQhead				; Index tmReqQhead
+			Sty		tmIndexTemp
+		
+@loop		Tax								; Load index register
+			Bmi		@exit					; Exit if end of list (nil)
+			
+			Lda		TMPBnext,x				; Get index to next TMPB
+			Cpa		tmIndexTemp				; Check for a match
+			Bne		@loop					; Loop if not a match
+			
+			Lda		TMPBnext,y				; Prepare to un-link entry
+			Sta		TMPBnext,x				; Finish unlinking it
+			Bmi		@exit					; If entry has no successor
+			
+			Tax
+@AdjTime	Clc								; Clear carry for addition
+			lda		TMPBtimeL,x				; TMPBtime,x := TMPBtime,x + TMPBtime,y
+			Adc		TMPBtimeL,y
+			Sta		TMPBtimeL,x
+			Lda		TMPBtimeH,x
+			Adc		TMPBtimeH,y
+			Sta		TMPBtimeH,x
+@exit		Plp
+			Rts								; All done
+							
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+*  Routine:	StartTimer
+*  Inputs:	Y - TMPB index
+*  Outputs:	none
+*  Destroys:	A, X, Y, n, v, z, c
+*  Size:	114 bytes
+*  Cycles:	39 + Start - if timer queue was empty
+*			142 + Stop + StartTimer +..., otherwise
+*  Stack Usage:	2 bytes
+*  Calls:	Stop, Start
+*  Called by:	
+*
+*  Function:	Starts running the timer in the TMPB.
+* 				The timeH and timeL fields of the TMPB must be filled in prior
+*				to this call.
+*
+*  NOTE:	This routine must be called with interrupts DISABLED
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+StartTimer	
+			Lda		#$ff
+			Sta		TMPBcmplt,y				; Completion state is active
+			Ldx		tmReqQhead				; Get index of head of list
+			Bpl		@QNotEmpty				; If queue already has entries
+			
+			Sty		tmReqQhead				; New entry is queue head
+			Lda		#nil					; Mark this entry as end of list
+			Sta		TMPBnext,y				; Indicate no successor
+			Lda		#Timer_Msk				; Enable timer interrupts
+			Tsb		Int_Mask				; Update the interrupt mask
+			Tya								; Get TMPB index
+			Tax								; Setup TMPB index for StartTimer
+			Bra		Start					; Start the timer and return
+
+@QNotEmpty	Jsr		Stop					; Stop the currently running timer
+
+			Ldx		tmReqQhead				; Index tmReqQhead
+@loop		Stx		tmIndexTemp				; Remember index of previous TMPB
+			Lda		TMPBnext,x				; Get index to next TMPB
+			Tax								; Load index register
+			Bmi		@exit					; Exit if end of list (nil)
+			
+			Sec								; Set carry for subtract
+			Lda		TMPBtimeL,y				; TMPBtime,y := TMPBtime,y - TMPBtime,x
+			Sbc		TMPBtimeL,x
+			Sta		TMPBtimeL,y
+			Lda		TMPBtimeH,y
+			Sbc		TMPBtimeH,x
+			Sta		TMPBtimeH,y
+			Bpl		@loop					; Loop until TMPBtime,y is < 0
+			
+			Clc								; Clear carry for addition
+			Lda		TMPBtimeL,y				; TMPBtime,y := TMPBtime,y + TMPBtime,x
+			Adc		TMPBtimeL,x
+			Sta		TMPBtimeL,y
+			Lda		TMPBtimeH,y
+			Adc		TMPBtimeH,x
+			Sta		TMPBtimeH,y
+			Sec								; Set carry for subtract
+			Lda		TMPBtimeL,x				; TMPBtime,x := TMPBtime,x - TMPBtime,y
+			Sbc		TMPBtimeL,y
+			Sta		TMPBtimeL,x
+			Lda		TMPBtimeH,x
+			Sbc		TMPBtimeH,y
+			Sta		TMPBtimeH,x
+@exit		Txa								; Prepare to store x
+			Sta		TMPBnext,y				; Add rest of list after new entry
+			Ldx		tmIndexTemp				; Get index of entry before new one
+			Tya								; Prepare to store y
+			Sta		TMPBnext,x				; Add new entry after beginning of list
+			Ldx		tmReqQhead				; Get index of head of list
+*
+* Falls into Start, which follows below
+*			bra		Start 					; Start the timer for the list head
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+*  Routine:	Start
+*  Inputs:	X - tmReqQhead TMPB index
+*  Outputs:	none
+*  Destroys:	A, n, v, z, c
+*  Size:	75 bytes
+*  Cycles:	26 - when timer in range $8000..$FFFF
+*			33 - when timer in range $0000..$007F
+*			40 - when timer in range $0080..$00FF
+*			43/49 - when timer in range $0100..$7FFF
+*  Stack Usage:	2 bytes
+*  Calls:	none
+*  Called by:	StartTmr, Timer_Int, CancelTmr
+*
+*  Function:	Loads the hardware timer with the amount of time remaining
+*				for the timer at the head of the timer queue, or $0080 if
+*				the amount is less than 1, or $7F80 if the value is greater
+*				than $007F.  Adjusts the value in the TMPB to reflect the
+*				value loaded into the hardware time.  The timer is then
+*				started and will interrupt when it reaches zero.
+*
+*  NOTE:	This routine must be called with interrupts DISABLED
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Start		
+			
+			Lda		TMPBtimeH,x			; Get high bits
+			Bne		@OORangeH			; If way too big
+			
+			Lda		TMPBtimeL,x			; Get low bits
+			Bmi		@OORangeL			; Not in range $0000..$007F
+			
+			Stz		TMPBtimeL,x			; Clear low bits
+			Sta		TmCnt_Hi			; Start the counter
+			Lda		#$FF				; Set latch to $FF to re-load timer
+			Sta		TmLatch_Hi			;  with $FF when timer runs out
+			Rts
+
+@OORangeH	Bmi		@OORangeNeg			; If negative
+			Lda		#$7F				; Load timer with $7F80
+			Sta		TmCnt_Hi			; Start the counter
+			Lda		#$FF				; Set latch to $FF to re-load timer
+			Sta		TmLatch_Hi			;  with $FF when timer runs out
+			Sec							; Set carry for subtract
+			Lda		TMPBtimeL,x			; Get low bits
+			Sbc		#$7F				; TMPBtime,x := TMPBtime,x - $007F
+			Sta		TMPBtimeL,x
+			Bcs		@exit				; If no borrow
+			
+			Dec		TMPBtimeH,x			; Adjust for borrow
+@exit		Rts
+
+
+@OORangeNeg	Stz		TmCnt_Hi			; Use $0080 if negative
+			Lda		#$FF				; Set latch to $FF to re-load timer
+			Sta		TmLatch_Hi			;  with $FF when timer runs out
+			Rts
+
+@OORangeL	Sec							; Set carry for subtract
+			Sbc		#$7F				; TMPBtime,x := TMPBtime,x - $007F
+			Sta		TMPBtimeL,x
+			Lda		#$7F				; Load timer with $7F80
+			Sta		TmCnt_Hi			; Start the counter
+			Lda		#$FF				; Set latch to $FF to re-load timer
+			Sta		TmLatch_Hi			;  with $FF when timer runs out
+			Rts
+			
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+*  Routine:	Stop
+*  Inputs:	X - tmReqQhead TMPB index
+*  Outputs:	n - indicates sign of TMPBtimer,x
+*  Destroys:	A, v, z, c
+*  Size:	41 bytes
+*  Cycles:	38..40  + 9 if close to rollover
+*  Stack Usage:	2 bytes
+*  Calls:	none
+*  Called by:	StartTimer, Timer_Int, CancelTmr
+*
+*  Function:	Reads the hardware timer, and updates the head of the
+*				timer queue to reflect the actual amount of time remaining.
+*				It also returns an indication of the sign of the timer
+*				remaining for the queue head.
+*
+*  NOTE:	This routine must be called with interrupts DISABLED
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Stop		
+			Lda		TmCnt_Lo 			; Read low byte of counter
+			Cpa		#$10				; See if close to rollover
+			Blt		Stop				; Wait if close to rollover
+			
+			Lda		TmCnt_Hi			; Read high byte of counter
+			Clc							; Clear carry for addition
+			Bpl		@ZeroExt			; If high byte was positive
+			
+			Adc		TMPBtimeL,x			; Add to timer remaining for the
+			Sta		TMPBtimeL,x			; Timer at head of the timer list
+			Bcs		@TestSign			; If no borrow from high byte
+			
+			Dec		TMPBtimeH,x			; Adjust high byte
+
+@TestSign	Lda		TMPBtimeH,x
+			Rts							; All done
+
+@ZeroExt	Adc		TMPBtimeL,x			; Add to timer remaining for the
+			Sta		TMPBtimeL,x			; Timer at head of the timer list
+			Bcc		@TestSign			; If no carry into high byte
+			
+			Inc		TMPBtimeH,x			; Adjust high byte
+			Rts							; All done
+			
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+*  Routine:	Timer_ISR
+*  Inputs:	none
+*  Outputs:	none
+*  Destroys:	A, X, Y, n, v, z, c
+*  Size:	60 bytes
+*  Cycles:	15 + Stop + Start, if timer not fully expired
+*			60 + Stop, if expired, no more queued,
+*							no completion handler
+*			84 + Stop, if expired, no more queued,
+*							has completion handler
+*			62 + Stop + Start, if expired, and more queued
+*							no completion handler
+*			86 + Stop + Start, if expired, and more queued
+*							has completion handler
+*  Stack Usage:	2 bytes
+*  Calls:	Stop, Start, TMPB completion handler
+*  Called by:	Interrupt
+*
+*  Function:	Handles timer interrupts, determines if the timer at the
+*				head of the timer queue has fully expired, and calls the
+*				completion handler for that timer if one exists. Start
+*				any remaining timers on the timer queue.
+*
+*  NOTE:	This routine must be called with interrupts DISABLED
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Timer_ISR	
+
+			Ldx		tmReqQhead			; Get index of head of list
+			Bmi		@unknownint			; If timer queue is empty
+			
+			Jsr		Stop				; Stop timer and update queue head
+			Bpl		Start				; If not expired, restart timer and exit
+			
+			Phx							; Save pointer to dequeued entry
+			Stz		TMPBcmplt,x			; Zero completion routine indicating done.
+			Lda		TMPBnext,x			; Get next queue entry
+			Sta		tmReqQhead			; Dequeue head
+			Bmi		@DisTimer			; If no successor disable timer
+			
+			Tax							; Get pointer to new queue head
+			Jsr		Start				; Start next timer
+			Bra		@RunCmplt			; Go run the completion routine
+
+@DisTimer	Lda		#Timer_Msk			; Disable timer interrupts
+			Trb		Int_Mask			; Update the interrupt mask
+
+@RunCmplt	Plx							; Restore pointer to dequeued entry
+			Lda		TMPBpcL,x
+			Sta		AddressLo
+			Lda		TMPBpcH,x
+			Sta		AddressHi
+			Jmp		(AddressLo)			; Jump to the completion routine. The
+										;	return address is on the stack
+
+@unknownint	Brk							; TMR interrupt with empty Q
+		
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+*  Routine:	Get_TMPB
+*  Inputs:	none
+*  Outputs:	Y - TMPB index
+*			n - 1 if no free TMPBs available
+*  Destroys:	A, Y, n, z
+*  Size:	22 bytes
+*  Cycles:	34 if BCPB was available
+*			13 if BCPB was not available
+*  Stack Usage:	2 bytes
+*  Calls:	none
+*  Called by:	
+*
+*  Function:	Returns the index of a free TiMer Parameter Block
+*				(TMPB), and removes it from the list of free TMPBs.
+*				A flag is returned to indicate if a free TMPB existed.
+*
+*  NOTE:	This routine must be called with interrupts DISABLED.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Get_TMPB		
+			
+			Php
+			Sei
+			Bcs		Free_TMPB
+			
+			Ldy		availhead			; Get the available list head
+			Bmi		@exit				; If list empty
+
+			Lda		TMPBnext,y			; Get successor
+			Sta		availhead			; Update list head
+@exit		Plp
+			Rts							; All done
+			
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+*  Routine:	Free_TMPB
+*  Inputs:	Y - TMPB index
+*  Outputs:	none
+*  Destroys:	A, n, z, c
+*  Size:	19 bytes
+*  Cycles:	27
+*  Stack Usage:	2 bytes
+*  Calls:	none
+*  Called by:	
+*
+*  Function:	Adds the TMPB that was passed in, to the list of available
+*				TMPBs.  If the TMPB is currently active, the system crashes
+*
+*  NOTE:	This routine must be called with interrupts DISABLED
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Free_TMPB	
+			
+			Lda		availhead			; Get the available list head
+			Sta		TMPBnext,y			; Link it to end of new entry
+			Sty		availhead			; New entry is new list head
+			Lda		TMPBstate,y			; Check the state
+
+			Plp
+			Rts							; All done
+
+
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+*  Routine:	Init_Timer
+*  Inputs:	none
+*  Outputs:	none
+*  Destroys:	A, X, n, v, z, c
+*  Size:	40 bytes
+*  Cycles:	45 + 14 per TMPB
+*  Stack Usage:	2 bytes
+*  Calls:	none
+*  Called by:	Reset
+*
+*  Function:	Initializes Timer data structures.
+*
+*  NOTE:	This routine must be called with interrupts DISABLED.
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Init_Timer			
+
+last		Equ		TMPBsize*(MaxTMPBs-1)
+
+			Lda		#0					; Index of first TMPB
+			Sta		availhead			; All TMPBs are now available
+			Clc							; Clear carry for additions
+@loop		Tax							; Setup index register
+			Adc		#TMPBsize			; Point to next TMPB
+			Sta		TMPBnext,x			; Have previous point to next
+			Stz		TMPBcmplt,x			; Zero the completion state
+			Cpa		#last				; Check for last TMPB
+			Blt		@loop				; Process next TMPB
+
+			Lda		#nil				; Mark empty lists
+			Sta		last+TMPBnext		; Mark end of free list
+			Sta		tmReqQhead			; Request queue head is empty
+			Lda		#Timer_Msk			; Disable timer interrupts
+			Trb		Int_Mask			; Update the interrupt mask
+			Lda		#One_Shot			; Prepare to force one shot mode
+			Trb		TD_Cntl				; Reset the bit
+			Lda		#$80				; Low byte latch is a constant
+			Sta		TmLatch_Lo			; Initialize the low timer latch
+			Rts
+		
+*
+* TiMer Parameter Block (TMPB)
+*
+
+
+TMPBnext	DS.B	1						; Next TMPB on list
+TMPBstate	DS.B	1						; Request state
+
+TMPBtimeH	DS.B	1						; High byte of 2 byte timer
+TMPBtimeL	DS.B	1						; Low byte of 2 byte timer
+
+TMPBpcH		DS.B	1						; Completion routine PC high
+TMPBpcL		DS.B	1						; Completion routine PC low
+TMPBcmplt	DS.B	1						; Completion state (0 = complete 0<> means running)
+
+			DS.B	TMPBsize*(MaxTMPBs-1)	; Allocate remaining TMPBs
+
+availhead	DS.B	1						; Head of TMPB free list
+tmReqQhead	DS.B	1						; Head of TMPB request queue
+tmIndexTemp DS.B	1						; Temporary storage for index			
+
+			endproc
+		
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+*
+* Global Data Area for kernel
+*
+*^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Global_Kernel	Proc
+
+				Export	ISR_table,		\
+						ISR_Decode,		\
+						MsgNumTimes2,	\ 
+						MsgNumTimes32,	\
+						Cmd_Table,		\
+						Cmd_JmpTable,	\
+						SCC_Table,		\
+						TxMsgSignal,	\
+						RxMsgSignal,	\
+						tPrev,			\
+						tNext,			\
+						tSp,			\
+						tEvent,			\
+						tWait,			\
+						tTNxt,			\
+						tTEvent,		\
+						tTISR,			\
+						VerInfo
+						
+				Import	Remv_RxMsgSgn,	\
+						Remv_TxCmplSgn,	\
+						Remv_ISR,		\
+						Remv_SCC_ISR,	\
+						Inst_Task,		\
+						Rel_Task,		\
+						Ev_Wait,		\
+						Ev_Signal,		\
+						Ev_Reset,		\
+						TEv_Reset,		\
+						Get_TMPB,		\
+						Inst_TmTask,	\
+						Reg_Ver,		\
+						NullRxMsgSgn,	\
+						NullTxCmplSgn,	\
+						UnKnown_Int,	\
+						UnKnown_SCCInt,	\
+						Dsptch_KRxMsg
+						
+*
+* TCB - Task Control Block
+*
+* Each active task has a TCB entry in the TCB linked list.
+* The List starts out with only one active task which is the kernel task.
+* The Kernel is always active.
+*
+
+tPrev			DC.B	Kern_ID			; Previous Task
+tNext			DC.B	Kern_ID			; Next task ID (initially 0 for Kernel Task only)
+tSp				DC.B	$FF				; Stack Pointer for this task
+tEvent			DC.B	$80				; Event flags (bit 7 event always active)
+tWait			DC.B	$00				; Event Mask (Wait for RxMsg1 event always)
+
+TCB_Size		Equ		*-tPrev
+
+				DC.B	$00				; tPrev		ChanA Task
+				DC.B	$00				; tNext		ChanA Task
+				DC.B	$a9				; tSp		ChanA Task
+				DC.B	$80				; tEvent	ChanA Task	(bit 7 event always active)
+				DC.B	$00				; tWait		ChanA Task
+				
+				DC.B	$00				; tPrev		ChanB Task
+				DC.B	$00				; tNext		ChanB Task
+				DC.B	$54				; tSp		ChanB Task
+				DC.B	$80				; tEvent	ChanB Task	(bit 7 event always active)
+				DC.B	$00				; tWait		ChanB Task
+								
+*
+* 6502 and SCC interrupt service routine vector tables
+*
+												
+ISR_table		DC.W	Unknown_Int		; 0 priority
+				DC.W	UnKnown_Int		; DMA1
+				DC.W	Unknown_Int		; DMA2
+				DC.W	UnKnown_Int		; SCC
+				DC.W	UnKnown_Int		; Timer
+				DC.W	UnKnown_Int		; Host				
+
+ISR_Decode		DC.B	0					; %00000000
+				DC.B	0
+				DC.B	DMA1				; %00000010
+				DC.B	0
+				DC.B	DMA2				; %00000100
+				DC.B	0
+				DC.B	DMA2				; %00000110
+				DC.B	0
+				DC.B	SCC					; %00001000
+				DC.B	0
+				DC.B	SCC					; %00001010
+				DC.B	0
+				DC.B	SCC					; %00001100
+				DC.B	0
+				DC.B	SCC					; %00001110
+				DC.B	0
+				DC.B	HOST				; %00010000
+				DC.B	0
+				DC.B	DMA1				; %00010010
+				DC.B	0
+				DC.B	DMA2				; %00010100
+				DC.B	0
+				DC.B	DMA2				; %00010110
+				DC.B	0
+				DC.B	SCC					; %00011000
+				DC.B	0
+				DC.B	SCC					; %00011010
+				DC.B	0
+				DC.B	SCC					; %00011100
+				DC.B	0
+				DC.B	SCC					; %00011110
+				DC.B	0
+				DC.B	TIMER				; %00100000
+				DC.B	0
+				DC.B	DMA1				; %00100010
+				DC.B	0
+				DC.B	DMA2				; %00100100
+				DC.B	0
+				DC.B	DMA2				; %00100110
+				DC.B	0
+				DC.B	SCC					; %00101000
+				DC.B	0
+				DC.B	SCC					; %00101010
+				DC.B	0
+				DC.B	SCC					; %00101100
+				DC.B	0
+				DC.B	SCC					; %00101110
+				DC.B	0
+				DC.B	TIMER				; %00110000
+				DC.B	0
+				DC.B	DMA1				; %00110010
+				DC.B	0
+				DC.B	DMA2				; %00110100
+				DC.B	0
+				DC.B	DMA2				; %00110110
+				DC.B	0
+				DC.B	SCC					; %00111000
+				DC.B	0
+				DC.B	SCC					; %00111010
+				DC.B	0
+				DC.B	SCC					; %00111100
+				DC.B	0
+				DC.B	SCC					; %00111110
+				
+SCC_table		DC.W	UnKnown_SCCInt
+				DC.W	UnKnown_SCCInt
+				DC.W	UnKnown_SCCInt
+				DC.W	UnKnown_SCCInt
+				DC.W	UnKnown_SCCInt
+				DC.W	UnKnown_SCCInt
+				DC.W	UnKnown_SCCInt
+				DC.W	UnKnown_SCCInt
+				
+*
+*	Transmit message Request Completion signal routines
+*
+
+TxMsgSignal		DC.W	NullTxCmplSgn
+				DC.W	NullTxCmplSgn				
+				DC.W	NullTxCmplSgn				
+				DC.W	NullTxCmplSgn				
+				DC.W	NullTxCmplSgn				
+				DC.W	NullTxCmplSgn				
+				DC.W	NullTxCmplSgn				
+				
+*
+*	Receive new message signal routines
+*
+
+RxMsgSignal		DC.W	NullRxMsgSgn
+				DC.W	NullRxMsgSgn
+				DC.W	NullRxMsgSgn
+				DC.W	NullRxMsgSgn
+				DC.W	NullRxMsgSgn
+				DC.W	NullRxMsgSgn
+				DC.W	NullRxMsgSgn
+
+*
+*	Kernel Command Table - this contains the addresses of the kernel commands
+*    					   which will later be tranfered to the zero page,
+*						   Up to twenty commands are supported. They must be
+*						   in order of their command numbers.
+*
+
+Cmd_Table		DC.W	Remv_RxMsgSgn
+				DC.W	Remv_TxCmplSgn
+				DC.W	Remv_ISR
+				DC.W	Remv_SCC_ISR
+				DC.W	Inst_Task
+				DC.W	Rel_Task
+				DC.W	Ev_Wait
+				DC.W	Ev_Signal
+				DC.W	Ev_Reset
+				DC.W	Reset_Chan
+				DC.W	Get_TMPB
+				DC.W	Inst_TmTask
+				DC.W	Reg_Ver
+				DS.W	7
+				
+Cmd_JmpTable	Jmp		(Krn_CmdBase+(RemvRxMsg*2))
+				Jmp		(Krn_CmdBase+(RemvTxCmpl*2))
+				Jmp		(Krn_CmdBase+(RemvISR*2))
+				Jmp		(Krn_CmdBase+(RemvSCCISR*2))
+				Jmp		(Krn_CmdBase+(InstTask*2))
+				Jmp		(Krn_CmdBase+(RelTask*2))
+				Jmp		(Krn_CmdBase+(WaitEvent*2))
+				Jmp		(Krn_CmdBase+(SignalTask*2))
+				Jmp		(Krn_CmdBase+(ResetEvent*2))
+				Jmp		(Krn_CmdBase+(ResetChan*2))
+				Jmp		(Krn_CmdBase+(GetTMPB*2))
+				Jmp		(Krn_CmdBase+(InstTmTask*2))
+				Jmp		(Krn_CmdBase+(RegVer*2))
+
+MsgNumTimes2	DC.B	0,2,4,6,8,10,12,14
+				
+MsgNumTimes32	DC.B	0,32,64,96,128,160,192,224
+
+*
+* Version Information
+*
+
+				String 	Pascal				
+
+VerInfo			DC.B	$02
+				DC.B	'Enhanced Communications Controller'
+				DC.B	'Version 1.0A0 © Apple Computer Inc. 1988'
+				
+				DCB.W	512, $00FF							; Needed for AURORA ROM resource padding
+
+
+				endproc
+
+				
+				End
+
+

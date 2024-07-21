@@ -1,0 +1,178 @@
+;_______________________________________________________________________
+;
+;	File:		SonySWIM3GC.a
+;
+;	Written by:	Monte Benaresh 1/4/94.
+;
+;	Copyright:	© 1994 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 1/31/94	LB		Changed SWIM3 register accesses to use the new address table in
+;									SWIM3Vars.  See <SM22> comments in SonySWIM3.a.
+;		 <1>	  1/4/94	LB		first checked in
+;_______________________________________________________________________
+;
+;	Grand Central DMA routines for Sony SWIM3 driver
+;
+;	This file contains the hardware-specific routines for the Grand
+;	Central DMA controller, used on Tsumani/TNT.  These routines are
+;	installed into vectors which are called by the Sony SWIM3 floppy
+;	driver.
+;
+;	To do:
+;_______________________________________________________________________
+
+			INCLUDE		'DBDMA.a'
+			INCLUDE		'GrandCentralPriv.a'
+
+
+			with	SWIM3Vars
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	StartDMAAction
+;  Inputs:		d0.l-	DMA timeout value
+;				d1	-	drive#
+;				a1	- 	Globals
+;  Outputs: 	none
+;  Destroys:	d0,a0
+;  Calls:		none
+;  Called by:	RawTrackRead, ReadRawHeader
+;
+;  Function:	This routine saves state in the DMARegSave area, and starts
+;				the DMA, returning to the caller's caller.
+;_______________________________________________________________________
+
+jStartGCDMAAction
+				movem.l	a3/d1-d3,DMARegSave(a1)		; save state
+				move.l	(sp)+,DMACompletionPtr(a1)	; stuff the completion routine
+				
+				bsr.s	StartDMATimeout				; start a time-out for the DMA
+
+;	enable floppy DMA channel interrupts
+
+				_GCEnableInterruptSource	gcifDmaFloppy
+
+				move.b 	#StartAction,([vOnes,a1])	; Start action
+				
+				moveq	#noErr,d0					; return to caller's caller with no error
+				rts
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	SetUpDMAXFer
+;  Inputs:		a0	-	DMA transfer address
+;				a1 	- 	SonyVars ptr
+;				d0	-	bit 31 = 0	-> read
+;						       = 1	-> write
+;						bits 0-30	-> transfer count
+;  Outputs:		none
+;  Destroys:	d0
+;  Calls:
+;  Called by:
+;
+;  Function:	Sets up address, count, and direction for a DMA
+;				transfer.
+;_______________________________________________________________________
+
+jSetUpGCDMAXfer
+				movem.l	a2-a3/d1,-(sp)				; use a2 for DMA regs ptr, a3 for SonyVars
+
+				move.l	a1,a3						; SonyVars
+
+				move.l	a0,a1						; set xfer address
+				move.l	DBDMADescPtr(a3),a0			; set ptr to descriptor
+				swap	d0							; count in high word, bit 15 = command
+				btst	#15,d0
+				bne		@write
+@read
+				move.w	#INPUT_LAST,d0
+				bra		@makeCCD
+@write
+				move.w	#OUTPUT_LAST,d0
+@makeCCD
+				swap	d0							; high word = cmd, low word = count
+				_MakeCCDescriptor					; set up the descriptor
+
+
+; Point the DMA hardware at our CCL
+
+				movea.l	DMABaseAddr(a3),a0			; pointer to Grand Central reg base
+				adda.l	#kGCDMAChannelRegisterSpace \
+						+ gcChannelFloppy*$100,a0	; point to floppy channel registers
+
+; Reset anything wrong with the channel status
+
+				move.l	#	kdbdmaClrRun |\
+							kdbdmaClrPause |\
+							kdbdmaClrHalted |\
+							kdbdmaClrDead, d0
+				_SetChannelControl
+
+				move.l	DBDMADescPtr(a3),d0			; pointer to channel command list in D0
+				_SetCommandPtr						; A0 still points to DBDMAChannelRegisters
+
+; Start our channel running
+
+				move.l	#	kdbdmaSetRun |\
+							kdbdmaClrPause |\
+							kdbdmaClrHalted |\
+							kdbdmaClrDead |\
+							kdbdmaSetActive, d0
+				_SetChannelControl					; A0 still points to DBDMAChannelRegisters
+
+				move.l	a3,a1						;restore a1
+				movem.l	(sp)+,a2-a3/d1
+				rts
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	ClearDMAInt
+;  Inputs:		a1 	- 	SonyVars ptr
+;  Outputs:		none
+;  Destroys:	none
+;  Calls:
+;  Called by:
+;
+;  Function:	Clears floppy DMA controller interrupt.
+;_______________________________________________________________________
+
+jClearGCDMAInt
+				move.l	a0,-(sp)
+
+				_GCClearInterruptSource	gcifDmaFloppy		; clear the floppy DMA interrupt
+
+				move.l	(sp)+,a0
+				rts
+
+
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	StopDMA
+;  Inputs:		a1 	- 	SonyVars ptr
+;  Outputs:		none
+;  Destroys:	none
+;  Calls:
+;  Called by:
+;
+;  Function:	Stops the floppy DMA channel.
+;_______________________________________________________________________
+
+jStopGCDMA
+				movem.l	a0/d0,-(sp)
+
+;	clear the run bit in the Grand Central floppy DMA channel control register
+
+				movea.l	DMABaseAddr(a1),a0			; pointer to Grand Central reg base
+				adda.l	#kGCDMAChannelRegisterSpace \
+						+ gcChannelFloppy*$100,a0	; point to floppy channel registers
+				move.l	#kdbdmaClrRun, d0
+				_SetChannelControl
+
+				movem.l	(sp)+,d0/a0
+				rts
+
+
+			endwith		; SWIM3Vars

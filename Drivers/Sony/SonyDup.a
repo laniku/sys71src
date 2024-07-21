@@ -1,0 +1,1359 @@
+;
+;	File:		SonyDup.a
+;
+;	Contains:	Extensions to the Sony driver for Apple 3.5" Disk Duplicator Support
+;
+;	Written by:	Steve Christensen
+;
+;	Copyright:	© 1988-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM8>	12/14/92	RC		Restore Pre-PDM D2 with Horror Roll in
+;	   <SM6>	 12/7/92	rab		Roll in Horror changes. Comments follow…
+;		 <5>	11/14/91	SWC		Converted the SCC polling code to a macro (in SonyHdr.a) so it's 
+;									easier to overpatch.
+;		 <2>	10/18/91	CMP		Added support for SWIM2. Also, in DoFmtCopy, put read of error
+;									register after the other SWIM setup stuff so that it REALLY gets
+;									cleared.
+;	   <SM5>	12/02/92	HY		Added hasPwrControls conditional.
+;	   <SM4>	10/18/92	CCH		Added nop's for systems with non-serial writes to IO space.
+;		 <7>	 7/14/92	CSS		Fixed the comment below so an exact version of this
+;									file could be copied into SuperMario.
+;		 <6>	 4/27/92	JSM		Get rid of conditionals: hasPowerMgr, hasPwrControls,
+;									supportsMFM, and isUniversal are always true (although
+;									hasPowerMgr currently isn’t for the ROM, it will be and was
+;									always ORed with hasPwrControls here anyway). This file now has
+;									no conditionals.
+;		 <5>	 1/21/91	SWC		Cleaned up the header comments.
+;		 <4>	 9/21/90	BG		Removed <3>. 040s are behaving more reliably now.
+;		 <3>	 6/18/90	CCH		Added NOPs for flaky 68040's.
+;		 <2>	 5/11/90	MSH		Converted all onHcMac or hasPowerMgr conditionals to universal
+;									versions.  Test is based on the existence of the power manager
+;									bit in the config word.
+;	   <2.5>	  6/6/89	SWC		Just fixed the comment describing CtlFmtCopy's input parameters
+;									to reflect reality.
+;	   <2.4>	 5/23/89	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <2.3>	 4/29/89	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <2.2>	 4/10/89	gmr		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <2.1>	 2/21/89	GGD		SWC/Fixed a bug in MFM format: didn't allow enough time before
+;									switching heads. Added a status call to return the duplicator
+;									version this driver supports. Increased default GapSync from 7
+;									to 8, to allow more optimal sector spacing, and more margin if 1
+;									to 1 writes are attempted.
+;	   <2.0>	12/15/88	GGD		Changed some machine based conditionals to feature based.
+;	   <1.1>	11/11/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.1>	 9/29/88	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <1.0>	 9/19/88	GGD		Steve Christensen's disk duplicator additions to the Sony Driver.
+;				 9/12/88	SWC		Added index mark stuff to MFM format as in SonyMFM.
+;				  9/2/88	SWC		Added an option to CtlFmtCopy to just format (Cork asked).
+;	   <1.8>	 8/23/88	SWC		Added this file into Sony driver sources.
+;
+;______________________________________________________________________________
+;
+;	This file contains all routines necessary to add support for DiskCopy
+;	(Apple's disk duplication software) to the standard Sony driver.  These
+;	routines are built into Mac IIci and newer ROMs, and are installed by
+;	DiskCopy as a RAM-based driver for Macs that don't have the support built in.
+;______________________________________________________________________________
+
+			title	'File: SonyDup.a'
+
+			BLANKS	ON
+			STRING	ASIS
+
+
+;_______________________________________________________________________
+;
+; Routine:	DupVersion
+;
+; Inputs:	A0 -- pointer to csParam field of user's parameter block
+;			A1 -- pointer to SonyVars
+;			D1 -- offset to drive's private variables
+;
+; Outputs:	D0 -- result code (always zero)
+;
+; Function:	Returns the duplicator version that this driver supports.
+;			This is so that common features are properly matched.
+;_______________________________________________________________________
+
+DupVersion	MOVE.W	#$0410,(A0)			;current version is 4.1
+			MOVEQ	#0,D0
+			BRA		DiskDone
+
+
+;_______________________________________________________________________
+;
+; Routine:	GetFmtByte
+;
+; Inputs:	A0 -- pointer to csParam field of user's parameter block
+;			A1 -- pointer to SonyVars
+;			D1 -- offset to drive's private variables
+;
+; Outputs:	D0 -- result code (always zero)
+;
+; Function:	Returns the format byte from the last address field read so
+;			that we can determine what the interleave is for 800K disks.
+;			This call can also be used to determine if the RAM-based
+;			Disk Duplicator version of the driver is installed.
+;_______________________________________________________________________
+
+GetFmtByte	MOVE.B	gcrFmtByte(A1),(A0)
+			MOVEQ	#0,D0
+			BRA		DiskDone
+
+
+;_______________________________________________________________________
+;
+; Routine:	CtlFmtCopy
+;
+; Inputs:	A0 -- pointer to user's parameter block
+;					csParam+ 0: format type (0=400K, 1=800K, 2=720K, 1=1440K[HD])			<2.5>
+;					csParam+ 2: pointer to user data buffer									<2.5>
+;					csParam+ 6: pointer to tag data buffer									<2.5>
+;					csParam+10: format byte ($12=Mac 400K, $22=Mac 800K, $24=Apple II 800K)	<2.5>
+;					csParam+11: if ≠0 then also verify each track							<2.5>
+;			A1 -- pointer to SonyVars
+;			D1 -- offset to drive's private variables
+;
+; Outputs:	D0 -- result code (0 if correctly formatted)
+;
+; Function:	Formats, copies [and verifies] each track on a disk in one
+;			pass for the Apple 3.5" Floppy Disk Duplicator program.
+;_______________________________________________________________________
+
+; offsets into our private fmtParams(A1) block [really at csParam(A0)]
+
+fDataBuf	EQU		0					;user data
+fTagBuf		EQU		fDataBuf+4			;tag data
+fFmtByte	EQU		fTagBuf+4			;format byte
+fDoVerify	EQU		fFmtByte+1			;whether or not to verify also
+
+CtlFmtCopy	BNE		DiskDone			;-> no drive installed so exit with error
+
+			SUB 	#512,SP 			;get space for buffers we need off stack
+			MOVE.L	SP,DiskBuffer(A1)	;StackBuf for mark, block buffer
+
+		IF hasPwrControls THEN			;									<SM5>
+			TestFor	hwCbPwrMgr
+			BEQ.S	@pmgrdone
+			BSR		TurnIWMon			;Turn IWM on with pmgr call
+@pmgrdone
+		ENDIF							;									<SM5>
+
+			LEA		csParam+2(A0),A0
+			MOVE.L	A0,fmtParams(A1)	;(save this address for later)
+			MOVE.W	-(A0),D4			;Use current format?
+			BEQ.S	@0					;-> yes, don't change anything
+
+			MOVEQ	#numSDFmts-1,D3		;Assume no SWIM or SuperDrive
+			MOVE.B	isSWIM(A1),D0		;Is a SWIM connected AND
+			AND.B	mfmDrive(A1,D1),D0	; is this a SuperDrive?
+			BPL.S	@00
+			MOVEQ	#numSDFmts,D3		;Yes, we can do MFM!!
+			TST.B	twoMegFmt(A1,D1)	;Is this a double-density disk?
+			BPL.S	@00
+			MOVEQ	#numDDFmts,D3		;Yes, it must be 1440K
+@00
+
+			MOVEQ	#paramErr,D0		;Assume format type is outta range
+			CMP.W	D3,D4				;Well, is it?
+			BHI		FmtCopyExit			;-> yep, just exit
+
+			CMPI.W	#NumSDFmts,D4		;(thanks, Mr. Davidian, sir)
+			SEQ		D0					;MFM format if it's the last SD one
+			OR.B	twoMegFmt(A1,D1),D0	; or it's double-density?
+			SMI		mfmDisk(A1,D1)
+@0			TST.B	isSWIM(A1)			;Is a SWIM installed?
+			BPL.S	@01					;-> no, skip
+			BSR		SetChipMode			;Set up the mode for MFM or GCR
+			BNE		FmtCopyExit			;-> couldn't initialize the chip
+@01
+			BSR		DiskSelect			;Re-select the interface
+			TST.B	mfmDisk(A1,D1)		;Are we in MFM mode?
+			SMI		TwoSided(A1)
+			BMI.S	@1					;-> yes, we're 2-sided
+
+			TST.B	Sides(A1,D1)		;for now, format according to drive
+			SMI 	TwoSided(A1)		;$00 for 1-sided format
+			BPL.S	@1					;-> one-sided
+			SUBQ.W	#1,D4				;format 2-sided as 1-sided?
+			BNE.S	@1					;-> no
+			CLR.B	TwoSided(A1)		;force one-sided
+
+@1			TST.B	TwoSided(A1)		;so, 1-sided or 2-sided?
+			SNE 	TwoSideFmt(A1,D1)	;update it for future interested parties...
+
+			MOVE.W	#8,GapSync(A1)		; start with 8 sync groups before sector	<2.1>
+
+			BSR 	FVPowerUp			; start up the drive (synchronously)
+
+			MOVEQ	#WrProtAdr,D0		;Is the disk write-protected?
+			BSR 	AdrAndSense
+			BMI.S	@11					;-> nope, onward!
+			MOVEQ	#wPrErr,D0			;Return a write-protect error
+			BRA.S	FmtCopyExit			;someone OBVIOUSLY wasn't checking--
+@11										;(massive finger pointing--Scott?)
+
+			MOVE.L	SonyVars,A1
+			MOVE.L	DiskBuffer(A1),A0	;now fill stack buffer with blank marks
+			MOVEQ	#12-1,D0			;marks for 12 sectors
+@2			MOVEQ	#36-1,D1			;36 bytes per sector
+			LEA 	AdrMkTbl,A1			;point A1 to blank image
+@3			MOVE.B	(A1)+,(A0)+
+			DBRA	D1,@3
+			DBRA	D0,@2
+
+			BSR 	GetDrv1
+			CLR.W	SideTrack(A1)		;start with track 0
+
+@TrackLoop	BSR		SpdSeek 			;seek to track and adjust speed if needed
+			BNE.S	FmtCopyExit			;exit on errors
+
+			BSR		GetDrv1
+			TST.B	mfmDisk(A1,D1)		;Are we in MFM mode?
+			BPL.S	@40					;-> no, do the regular format
+			BSR		mFmtCopyTrk			;Format/Copy/Verify the track (MFM style)
+			BRA.S	@4
+@40
+
+			BSR 	gFmtCopyTrk 		;Format/Copy/Verify the track (GCR style)
+@4			BNE.S	FmtCopyExit			;exit on errors
+			BSR 	GetDrv1
+
+			BCLR	#3,SideTrack(A1)	;clear 'side' bit
+			ADDQ	#1,SideTrack(A1)	;go on to the next track
+			CMP 	#80,SideTrack(A1)	;until we're done with all 80
+			BLT.S	@TrackLoop
+
+FmtCopyOK	MOVEQ	#0,D0				;successful exit
+FmtCopyExit	ADD 	#512,SP 			;clean up the stack
+			BRA 	DskRWOff			;Share SonyRWT exit routine
+										;(sets up the power down time)
+
+
+			eject
+;_______________________________________________________________________
+;
+; Routine:	gFmtCopyTrk
+;
+; Inputs:	SideTrack contains the current side and track number
+;
+; Outputs:	D0 -- result code (0 if format ok)
+;
+; Function: This routine formats and copies a track (both sides for
+;			double-sided disks), verifying that sync is evenly spread
+;			between the sectors, then verifies the format.  It will
+;			format both Macintosh (2-1 interleave) and Apple II (4-1
+;			interleave) disks.
+;_______________________________________________________________________
+
+gFmtCopyTrk BSR 	GetDrv1
+			MOVE.W	SideTrack(A1),D6	; current side/track
+			BSR 	FillMarks 			; update mark buffer for this track/side
+
+@FmtTrk1	BSR		gDoFmtCopy			; format the track (disables interrupts)
+			BEQ.S	@1					; br if ok
+			ANDI	#$F8FF,SR			; open up interrupts
+			BRA 	@FTExit				; exit immediately for write errors
+
+; now we check the intersector gap...
+
+@1			BSR		GetDrv1
+			BSR 	RdAddrSetup			; get next address mark
+			BMI.S	@2					; br if error
+			TST.B	D2					; should be sector 0
+			BEQ.S	@2
+			MOVEQ	#Fmt1Err,D0 		; set "not sector 0" error otherwise
+
+@2			BSR 	toEmptyPD			; get rid of poll data (saves D0 in DskErr))
+			ANDI	#$F8FF,SR			; open up interrupts
+
+			LEA 	GapSync(A1),A0		; useful addr
+			MOVE.W	DskErr,D0			; check error code
+			BMI.S	@DecrSn1 			;-> error (change amt of sync in case erase turn-off
+										;   glitched us out or not sector 0--too much sync)
+			MOVE.L	#MustFindCt+4,D2	; nibble must find count, adjusted
+			SUB.W	D0,D2				; nibble gap before sector 0
+			DIVU	#5,D2				; sync group count
+			MOVEQ	#Fmt2Err,D0		 	; assume "not enuf sync"
+
+			SUB.W	(A0),D2				; groups more than the standard GapSync
+			BMI.S	@DecrSync			; br if too little
+
+			EXT.L	D2
+			DIVU	SectCnt(A1),D2		; divide by groups per sector
+			BEQ.S	@FTExitOK			; br if ok
+			SUBQ.W	#1,D2				; don't increase if only by 1
+			BEQ.S	@FTExitOK
+			ADDQ.W	#1,(A0)				; increase GapSync by 1 only
+
+@FTExitOK	BSR		GetDrv1				; set A1,D1 to point to drive vars
+			MOVEA.L	fmtParams(A1),A0
+			TST.B	fDoVerify(A0)		;should we verify the track also?
+			BEQ.S	@FTNoVfy			;-> naw…
+			BSR.S	gVerCopy			;go verify that the format's OK
+			BNE.S	@FTExit				;-> it's not
+
+			MOVEA.L	fmtParams(A1),A0	;get the format parameters pointer
+@FTNoVfy	MOVEQ	#0,D1
+			MOVE.W	SectCnt(A1),D1		; adjust data and tag buffer pointers
+			LSL.L	#2,D1
+			MOVE.L	D1,D2				; SectCnt*4
+			ADD.L	D1,D1
+			ADD.L	D1,D2				; SectCnt*12
+			LSL.L	#6,D1				; SectCnt*512
+			ADD.L	D1,(A0)+			;advance the user data buffer pointer
+			ADD.L	D2,(A0)+			; and the tag data buffer pointer
+
+			BSET	#3,SideTrack(A1)	; are we on the second side already?
+			BNE.S	@FTSide2			; br if so
+			TST.B	TwoSided(A1)		; format two-sides?
+			BNE 	gFmtCopyTrk 		; br if so and format the other side
+@FTSide2	MOVEQ	#0,D0				; success!
+
+@FTExit		TST.W	D0
+			RTS
+
+@DecrSync	ADDQ.W	#1,D2				; if only one, don't worry
+			BEQ.S	@FTExitOK
+
+@DecrSn1	SUBQ.W	#1,(A0) 			; decrement GapSync
+			CMP.W	#minSync,(A0)		; not below the minimum tho
+			BLT.S	@FTExit
+			BRA.S	@FmtTrk1 			; otherwise, go again
+
+
+;_______________________________________________________________________________
+;
+; Routine:	gVerCopy
+;
+; Inputs:	A1 -- pointer to SonyVars
+;			D1 -- offset to drive's vars
+;			SideTrack -- current side and track number
+;
+; Outputs:	D0 -- result code
+;
+; Function:	Verifies that all sectors (current side) have been written correctly.
+;_______________________________________________________________________________
+
+gSectorSave	EQU		gapSync+2
+gSectorMap	EQU		gSectorSave+2
+gSectorCnt	EQU		gSectorMap+2
+
+gVerCopy	ORI 	#HiIntMask,SR		; no interrupts
+			LEA		gSectorMap(A1),A0
+			MOVEQ	#0,D0
+			MOVE.B	SideTrack+1(A1),D0	;get the current track
+			LSR.W	#4,D0				; and convert it to a zone number
+			MOVE.W	#$0FFF,D2			;calculate the bitmap for this track
+			LSR.W	D0,D2
+			MOVE.W	D2,(A0)+
+			MOVEQ	#12,D2
+			SUB 	D0,D2				; sectors this track
+			LSL.W	#2,D2				; allow some slop (may not get 1-1)
+			MOVE.W	D2,(A0)
+
+@VTLoop		BSR 	RdAddrSetup 		; get next address mark
+			BMI.S	@1					; br if error
+
+			MOVE.W	D2,gSectorSave(A1)	; save sector number
+
+			CMP.W	SideTrack(A1),D1	;Do the track and side also match our expectations?
+			BNE.S	@1					;-> no, something's a tad wrong, me thinks
+
+			MOVEA.L	fmtParams(A1),A0	;get our format parameters
+			MOVEA.L	(A0),A0				; and point to the base buffer address for this track
+			MOVEQ	#9,D0
+			LSL.W	D0,D2
+			ADDA.W	D2,A0				;point to where this sector's data should be
+			ST		DskVerify			; make sure we're verifying
+			BSR 	RdData				; verify a sector
+			BMI.S	@1					; -> verify error
+
+			BSR		GetDrv1
+			LEA		gSectorSave(A1),A0
+			MOVE.W	(A0)+,D2			; sector we just read
+			MOVE.W	(A0),D3 			; sector map
+			BCLR	D2,D3				; mark this sector gotten
+			MOVE.W	D3,(A0)				; stash bitmap back
+
+@1			BSR.S	toEmptyPD			; get rid of data
+
+			LEA		gSectorMap(A1),A0
+			TST.W	(A0)+	 			; have we read all the sectors?
+			BEQ.S	@VTExitOK			; -> yes, all done
+
+			SUBQ.W	#1,(A0) 			; decrement sector count
+			BNE.S	@VTLoop				; loop until done
+			MOVEQ	#VerErr,D0			; should get 1-1 ok reads
+			BRA.S	@VTExit
+
+@VTExitOK	MOVEQ	#0,D0
+@VTExit		ANDI	#$F8FF,SR
+			TST.W	D0
+			RTS
+
+
+			eject
+;_____________________________________________________________________
+;
+; Routine:	gDoFmtCopy
+;
+; Inputs:	none
+;
+; Outputs:	D0 -- result code (0 if format ok)
+;
+; Function: Formats the current track; the disk is assumed to be up
+;			to speed and correctly positioned, and interrupts disabled.
+;
+;			write 200 sync groups (get something on the disk)
+;			start with sector 0: do 2-1 soft interleave
+;
+;	 		loop:	intersector gap sync groups
+;					10 $A9 nybbles (only before sector 0)
+;					1 sync group (6)
+;					D5 AA 96 trk sec side vol cksum DE AA FF (11)
+;					1 sync group (6)
+;					D5 AA AD sec (4)
+;
+;					703 96 nibbles
+;					DE AA FF
+;			loop for all sectors
+;_____________________________________________________________________
+
+AdjGapSync	EQU		DskErr				;someplace fast to put the adjusted gap
+
+gDoFmtCopy	ORI 	#HiIntMask,SR		; no interrupts
+
+			MOVEQ	#RdDtaAdr,D0		; PAL address for side 0
+			MOVE.L	SonyVars,A1
+			BTST	#3,SideTrack(A1)	; side 1?
+			BEQ.S	@1					; br if not
+			MOVEQ	#RdDta1Adr,D0		; PAL address for side 1
+@1			BSR 	AdrDisk
+
+			MOVEA.L	IWM,A4
+			LEA		Q6H(A4),A3			; set up Q6H pointer
+			LEA		Q6L(A4),A4			; set up Q6L pointer
+			MOVE.L	DiskBuffer(A1),A5	; point to nibble buffer
+			LEA		DupNibl,A2			; points to nibble table
+
+			MOVE.W	SectCnt(A1),-(SP)	; number of sectors to write here
+
+;_______________________________________________________________________
+;
+;	D7 = CkSumC					(SP)= sector count
+;	D6 = CkSumB					 A6 = pointer to sync group, data mk slip
+;	D5 = CkSumA					 A5 = pointer to mark buffer
+;	D4 = loop counts			 A4 = ptr to Q6L OR ptr rHandshake (SWIM2)		<H2><SM5>
+;	D3 = A7A6B7B6C7C6 nibble	 A3 = ptr to Q6H OR ptr wData (SWIM2)			<H2><SM5>
+;	D2 = C5C4C3C2C1C0 nibble	 A2 = ptr to nibble table
+;	D1 = B5B4B3B2B1B0 nibble	 A1 = ptr to data buffers
+;	D0 = A5A4A3A2A1A0 nibble	 A0 = ptr to user buffer (to A1 after 12)
+;
+;_______________________________________________________________________
+
+			MOVE.W	GapSync(A1),D1		; set up D1 now
+			SUBQ.W	#2,D1				; adjust for DBRA and adr mk sync
+			MOVE.W	D1,AdjGapSync
+
+			MOVEQ	#0,D0				; clear high bytes of D0-D3 now for
+			MOVEQ	#0,D1				;  indexing
+			MOVEQ	#0,D2
+			MOVEQ	#0,D3
+
+			MOVE.W	#strtSync-1,D6
+
+			TST.B	mfmMode(A1)			; are we in ISM mode?					<SM5>
+			BPL.S	@NotSWIM2			; -> no, it's either an IWM or SWIM		<SM5>
+			LEA		wData-Q6L(A4),A3		; point to the write data and		<SM5>
+			LEA		rHandshake-Q6L(A4),A4	;  handshake registers for speed	<SM5>
+			MOVE.B	#$18,wZeroes-wData(A3)	; clear the write and action bits	<SM5>
+			MOVE.B	#$10,wOnes-wData(A3)	; set the write bit					<SM5>
+			MOVE.B	#$01,wOnes-wData(A3)	; toggle the clFIFO bit to clear out<SM5>
+			MOVE.B	#$01,wZeroes-wData(A3)	;  any data in the FIFO				<SM5>
+			TST.B	rError-wData(A3)		; clear the error register again	<SM5>
+			MOVE.B	D6,(A3)				; write garbage to FIFO					<SM5>
+			MOVE.B	#$08,wOnes-wData(A3); turn on the action bit: GO!			<SM5>
+			bra.s	@WrStrtSync			;										<SM5>
+@NotSWIM2								;										<SM5>
+
+			TST.B	(A3)				; first byte written is a bit wierd
+			MOVE.B	D6,Q7H-Q6H(A3)		; write garbage to start
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+@WrStrtSync	LEA		SyncTbl,A6
+			MOVEQ	#(syncBytCnt/2)-1,D7
+
+@WSS1		MOVE.B	(A6)+,D4			; prefetch
+
+@WrAddrMk1	TST.B	(A4)				; check write handshake
+			BPL.S	@WrAddrMk1
+			MOVE.B	D4,(A3)				; write out next header nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			MOVE.B	(A6)+,D4			; prefetch
+
+@WrAddrMk2	TST.B	(A4)				; check write handshake
+			BPL.S	@WrAddrMk2
+			MOVE.B	D4,(A3)				; write out next header nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			DBRA	D7,@WSS1
+			DBRA	D6,@WrStrtSync
+
+@WrNxtSect	MOVE.W	AdjGapSync,D6		; number of sync groups - 2
+
+@WrSyncLp	LEA		SyncTbl,A6
+			MOVEQ	#syncBytCnt-1,D7
+
+@WrSyncByte	TST.B	(A4)				; check write handshake
+			BPL.S	@WrSyncByte
+			MOVE.B	(A6)+,(A3)			; write out next gap nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D7,@WrSyncByte
+			DBRA	D6,@WrSyncLp
+
+			MOVEQ	#adrBytCnt-5,D7
+@WrDataMk1	TST.B	(A4)				; check write handshake
+			BPL.S	@WrDataMk1
+			MOVE.B	(A5)+,(A3)			; write out next data mk nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D7,@WrDataMk1
+
+			MOVE.B	(A5)+,D0			; prefetch $D5
+			MOVE.B	(A5)+,D3			; prefetch $AA
+			MOVE.B	(A5)+,D1			; prefetch $AD
+			MOVE.B	(A5)+,D2			; encoded sector number
+
+@WrDataMk2	TST.B	(A4)				; check write handshake
+			BPL.S	@WrDataMk2
+			MOVE.B	D0,(A3)				; write out next data mk nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			ADDQ	#1,A5				; one garbage byte to even it out
+			MOVE.L	(A5)+,A1			; tag data pointer
+			MOVE.L	(A5)+,A0			; data pointer
+
+			MOVE.L	#$2010009,D4		; adjusted byte write counts for 2 buffers
+
+@WrDataMk3	TST.B	(A4)				; check write handshake
+			BPL.S	@WrDataMk3
+			MOVE.B	D3,(A3)				; write out next adr mk nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			MOVEQ	#0,D5				; zero the initial checksums
+			MOVEQ	#0,D6
+			MOVEQ	#0,D7
+			BRA.S	@WrData2			; D1 has last sync byte, D2 the sector #
+
+
+@WrDataSw	MOVE.L	A0,A1				; switch to user buffer
+
+@WrData1	
+			ADDX.B	D2,D7				; CSumC'' <- ByteC + CSumC' + ex
+			EOR.B	D6,D2				; ByteC' <- ByteC XOR CSumB'
+			MOVE.B	D2,D3				; D3 = [00][00][00][00][A7][A6][B7][B6]
+										;      [C7][C6][C5][C4][C3][C2][C1][C0]
+			LSR.W	#6,D3				; D3 = [00][00][A7][A6][B7][B6][C7][C6]
+
+@WrByteHi1	TST.B	(A4)				; check write handshake
+			BPL.S	@WrByteHi1
+			MOVE.B	0(A2,D3.W),(A3)		; nibblize and write hi-bits out
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			SUBQ.W	#3,D4				; got 3 more bytes (wipes out ex bit!)
+			MOVE.B	D7,D3				; D3 <- CSumC
+			ADD.B	D7,D3				; ex <- CSumC[7]
+			ROL.B	#1,D7				; CSumC' <- ROL (CSumC)
+										; D0 = [xx][xx][A5][A4][A3][A2][A1][A0]
+@WrByteA1	TST.B	(A4)				; check write handshake
+			BPL.S	@WrByteA1
+			MOVE.B	0(A2,D0.W),(A3)		; write low ByteA out
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+@WrData2	MOVE.B	(A1)+,D0			; read next ByteA
+			ADDX.B	D0,D5				; CSumA' <- ByteA + CSumA + ex
+			EOR.B	D7,D0				; ByteA' <- ByteA XOR CSumC'
+			MOVE.B	D0,D3				; D3 = [A7][A6][A5][A4][A3][A2][A1][A0]
+			ROL.W	#2,D3
+										; D1 = [xx][xx][B5][B4][B3][B2][B1][B0]
+@WrByteB1	TST.B	(A4)				; check write handshake
+			BPL.S	@WrByteB1
+			MOVE.B	0(A2,D1.W),(A3)		; nibblize and write low ByteB out
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			MOVE.B	(A1)+,D1			; read next ByteB
+			ADDX.B	D1,D6				; CSumB' <- ByteB + CSumB + ex
+			EOR.B	D5,D1				; ByteB' <- ByteB XOR CSumA'
+			MOVE.B	D1,D3
+			ROL.W	#2,D3
+										; D2 = [xx][xx][C5][C4][C3][C2][C1][C0]
+@WrByteC1	TST.B	(A4)				; check write handshake
+			BPL.S	@WrByteC1
+			MOVE.B	0(A2,D2.W),(A3)		; nibblize and write low ByteC out
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			MOVE.B	(A1)+,D2			; read next ByteC
+			TST.W	D4					; reached end of buffer?
+			BNE.S	@WrData1
+			SWAP	D4
+			BNE.S	@WrDataSw			; br if we are switching to user buffer
+
+; the last 2 data bytes are written out separately since they are odd . . .
+; the missing third byte is just zero . . .
+
+@WrLast2	CLR.B	D3					; D3 = [00][00][00][00][A7][A6][B7][B6]
+										;      [00][00][00][00][00][00][00][00]
+			LSR.W	#6,D3				; D3 = [00][00][A7][A6][B7][B6][00][00]
+
+@WrByteHi2	TST.B	(A4)				; check write handshake
+			BPL.S	@WrByteHi2
+			MOVE.B	0(A2,D3.W),(A3)		; nibblize and write hi-bits out
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			MOVE.B	D5,D3				; start preparing 1st cksum byte
+			ROL.W	#2,D3
+			MOVE.B	D6,D3
+			ROL.W	#2,D3
+										; D0 = [xx][xx][A5][A4][A3][A2][A1][A0]
+@WrByteA2	TST.B	(A4)				; check write handshake
+			BPL.S	@WrByteA2
+			MOVE.B	0(A2,D0.W),(A3)		; write low ByteA out
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+										; D1 = [xx][xx][B5][B4][B3][B2][B1][B0]
+@WrByteB2	TST.B	(A4)				; check write handshake
+			BPL.S	@WrByteB2
+			MOVE.B	0(A2,D1.W),(A3)		; nibblize and write low ByteB out
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+; now we write out the three checksum bytes as 4 nibbles
+
+@WrCkSum	MOVE.B	D7,D3				; D3 = [00][00][00][00][A7][A6][B7][B6]
+										;      [C7][C6][C5][C4][C3][C2][C1][C0]
+			LSR.W	#6,D3				; D3 = [00][00][A7][A6][B7][B6][C7][C6]
+
+@WrChkHi	TST.B	(A4)				; check write handshake
+			BPL.S	@WrChkHi
+			MOVE.B	0(A2,D3.W),(A3)		; nibblize and write hi-bits out
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+@WrChkA		TST.B	(A4)				; check write handshake
+			BPL.S	@WrChkA
+			MOVE.B	0(A2,D5.W),(A3)		; write CkSumA out
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+@WrChkB		TST.B	(A4)				; check write handshake
+			BPL.S	@WrChkB
+			MOVE.B	0(A2,D6.W),(A3)		; write CkSumB out
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+@WrChkC		TST.B	(A4)				; check write handshake
+			BPL.S	@WrChkC
+			MOVE.B	0(A2,D7.W),(A3)		; write CkSumC out
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+
+; now, finally, write the two bit slip marks and FF byte
+
+			MOVEQ	#3,D7
+			ADDQ	#8,A6				; point to bit slip marks . . .
+@WrBitSlip	MOVE.B	(A4),D1				; check write handshake
+			BPL.S	@WrBitSlip
+			MOVE.B	(A6)+,(A3)			; write out next bit slip nibble
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D7,@WrBitSlip
+
+			SUBQ.W	#1,(SP)
+			BGT		@WrNxtSect			; write all sectors
+			ADDQ	#2,SP				; clean up stack . . .
+
+			MOVEQ	#0,D0				; assume no underrun
+			MOVEA.L	SonyVars,A1			;									<SM6>
+			TST.B	mfmMode(A1)			; are we in ISM mode?				<SM6>
+			BPL.S	@NotSWIM22			; -> no, it's either an IWM or SWIM	<SM6>
+
+			MOVEQ	#3-1,D7				; now write out three more gap bytes to fully clear the FIFO<SM6>
+@0			MOVE.B	(A4),D1				; check write handshake				<SM6>
+			BPL.S	@0					;									<SM6>
+			MOVE.B	#$FF,(A3)			; write out next gap nibble			<SM6>
+			DBRA	D7,@0				;									<SM6>
+
+			BTST	#5,D1				; any errors?						<SM6>
+			BEQ.S	@WriteOK2			; branch if no underrun was detected<SM6>
+			MOVEQ	#WrUnderRun,D0		; underrun error					<SM6>
+
+@WriteOK2	MOVE.B	#$18,wZeroes-wData(A3)	;Clear the write and action bits<SM6>
+			MOVE.W	D0,Dskerr			; set CCR							<SM6>
+			RTS
+@NotSWIM22								;									<SM6>
+			BTST	#6,D1				; test for errors
+			BNE.S	@WriteOK			; branch if no underrun was detected
+			MOVEQ	#WrUnderRun,D0		; underrun error
+
+@WriteOK	TST.B	Q7L-Q6L(A4)			; get out of write mode after half
+			TST.B	(A4)				; of garbage nibble is written
+			MOVE.W	D0,Dskerr			; set CCR
+			RTS
+
+
+;______________________________________________________________________________
+;
+; Routine:	FillMarks
+;
+; Inputs:	D6 -- [side (bit 11)][track (bits 10-0)]
+;
+; Outputs:	none (all registers are preserved)
+;
+; Function:	Fills in the buffer with the address marks (buffer is already
+;			filled with appropriate sync bytes)
+;
+;				1 sync group (6)
+;				D5 AA 96 trk sec side vol cksum DE AA FF (11)
+;				1 sync group (6)
+;				D5 AA 0B[->AD] sec 00 (5)
+;				tag buffer pointer (4)
+;				data buffer pointer (4)
+;
+;______________________________________________________________________________
+
+FillMarks	MOVEM.L	A0-A4/D0-D7,-(SP)
+			MOVEA.L	DiskBuffer(A1),A0	;stack buffer
+			MOVEA.L	fmtParams(A1),A2
+			MOVEA.L	(A2)+,A4			; get the user data buffer pointer
+			MOVE.L	(A2)+,A3			; get the tag buffer pointer
+			MOVEQ	#0,D3
+			MOVE.B	(A2),D3				; get format byte
+			MOVEQ	#12,D0				; max number of sectors/track
+			MOVEQ	#$7F,D2				; isolate the track
+			AND.W	D6,D2				; copy side/track
+			LSR.W	#4,D2				; divide by 16 to get speed group
+			SUB.W	D2,D0				; number of sectors on this track
+			MOVE.W	D0,SectCnt(A1)		; save for later
+			LEA		DupNibl,A1			; nibble code table
+
+			LEA		TwoToOne,A2			; point to 2-1 interleave table
+			MOVE.B	0(A1,D3),D7			; D7 holds encoded volume byte
+			MOVE.B	D3,D5				; start checksum
+			ANDI.B	#$0F,D3				; isolate bits 3-0
+			SUBQ.B	#2,D3				; if = 2, then 2-1 interleave
+			BEQ.S	@0
+			LEA		FourToOne,A2		; use 4-1 table instead...
+@0			MULU	#12,D2				; multiply by 12 to index into table
+			ADD.W	D2,A2				; bump table pointer to correct entry
+
+			MOVEQ	#$3F,D3				; 6-bit mask
+			AND.B	D6,D3				; get track low 6 bits
+			MOVE.B	0(A1,D3),D2			; D2 holds encoded track number
+			EOR.B	D3,D5				; add it to checksum
+
+			LSR.W	#6,D6				; get track high bits/side
+			EOR.B	D6,D5				; add it to checksum
+			MOVE.B	0(A1,D6),D6			; D6 holds encoded side/trk
+
+@1			SWAP	D0					; D0=[max sectors][current sector]
+			MOVEQ	#0,D1
+			MOVE.B	0(A2,D0),D1			; get next sector number from table
+			MOVE.B	0(A1,D1),D3			; D1 = next sector number, d3 = encoded
+			MOVEQ	#0,D4				; clear high bytes
+			MOVE.B	D5,D4				; checksum minus sector nibble
+			EOR.B	D1,D4				; add it in
+
+			ADDA.W	#TrkOffset,A0		; bump to track
+			MOVE.B	D2,(A0)+			; encoded track
+			MOVE.B	D3,(A0)+			; encoded sector
+			MOVE.B	D6,(A0)+			; encoded side
+			MOVE.B	D7,(A0)+			; encoded volume
+			MOVE.B	0(A1,D4),(A0)+		; checksum
+			ADDA.W	#11,A0				; point to data mark $AD
+			MOVE.B	#11,(A0)+			;this must be "unencoded" (11->$AD)
+			MOVE.B	D1,(A0)+			; unencoded sector number
+			CLR.B	(A0)+				; unused byte
+
+			MOVE.L	D1,D4				; sector number
+			ADD.W	D4,D4
+			ADD.W	D1,D4
+			LSL.W	#2,D4				; sector number*12
+			ADD.L	A3,D4				; appropriate tags
+			MOVE.L	D4,(A0)+			; tag buffer pointer
+
+			MOVEQ	#9,D4
+			LSL.W	D4,D1				; sector number*512
+			ADD.L	A4,D1				; appropriate data
+			MOVE.L	D1,(A0)+			; data buffer pointer
+
+			ADDQ.W	#1,D0				; count a sector
+			MOVE.W	D0,D1
+			SWAP	D0
+			CMP.W	D0,D1				; at max?
+			BLT.S	@1					; -> no, next sector
+			MOVEM.L	(SP)+,A0-A4/D0-D7
+			RTS
+
+;______________________________________________________________________________
+;
+; Routine:	mFmtCopyTrk
+;
+; Inputs:	SideTrack contains the current track and side
+;
+; Outputs:	D0 -- result code
+;
+; Function:	Formats the current track by writing the address header and data
+;			block for all sectors on both sides.
+;______________________________________________________________________________
+
+mFmtCopyTrk	BSR 	GetDrv1
+			MOVE.W	SideTrack(A1),D4	;Current side/track
+			MOVEQ	#0,D5				;Assume side 0
+			BCLR	#11,D4				;Is it?
+			BEQ.S	@1
+			MOVEQ	#1,D5				;No, it's side 1
+
+			MOVEQ	#0,D2				;											<2.1>
+			MOVE.W	TimeDBRA,D2			;wait 750usec before switching heads or		<2.1>
+			MOVE.L	D2,D0				; the drive will ignore us, and then		<2.1>
+			ADD.L	D2,D0				; where will we be?							<2.1>
+			ADD.L	D2,D0				;											<2.1>
+			LSR.L	#2,D0				;											<2.1>
+@0			DBRA	D0,@0				;just sit here for a bit...					<2.1>
+
+@1			MOVEQ	#9-1,D2				;Assume 1 meg format
+			MOVE.B	twoMegFmt(A1,D1),D0	;Is this a double-density disk?
+			BPL.S	@2
+			MOVEQ	#18-1,D2			;Yes, there are twice as many sectors
+			BSET	#31,D2				;Mark as double-density
+@2			BSR		mDoFmtCopy			;Format the track (disables interrupts)
+			MOVEA.L	fmtParams(A1),A1
+			MOVEA.L	(A1),A2				;get the base buffer pointer for this track side
+			MOVE.L	A0,(A1)				; and update it for next time
+
+			BSR		toEmptyPD			;Get rid of poll data (saves D0 in DskErr)
+			ANDI	#$F8FF,SR			;Open up interrupts
+			MOVE.W	DskErr,D0			;Was there an error?
+			BNE.S	@4					;-> yes, return immediately
+			MOVEA.L	fmtParams(A1),A0
+			TST.B	fDoVerify(A0)		;should we verify the track also?
+			BEQ.S	@3					;-> naw…
+			BSR.S	mVerCopy			;now go verify the format's OK
+			BNE.S	@4					;-> error so exit immediately
+
+			BSR		GetDrv1				;Point to drive vars
+@3			BSET	#3,SideTrack(A1)	;Is this the second side?
+			BEQ.S	mFmtCopyTrk			;-> no, go format it now
+			MOVEQ	#0,D0				;Format was successful
+@4			RTS
+
+
+;_______________________________________________________________________________
+;
+; Routine:	mVerCopy
+;
+; Inputs:	A1 -- pointer to SonyVars
+;			A2 -- pointer to base buffer address for this track side
+;			D1 -- offset to drive's vars
+;			SideTrack -- current side and track number
+;
+; Outputs:	D0 -- result code
+;
+; Function:	Verifies that all sectors (current side) have been written correctly.
+;_______________________________________________________________________________
+
+mVerCopy	MOVEM.L D2-D7,-(SP)
+			ORI		#HiIntMask,SR		;Turn off interrupts
+@1			MOVEQ	#2*9,D7				;Assume 1 meg format (double sector count)
+			MOVE.L	#$000003FE,D6		;Sector map (1-9)
+			BSR		GetDrv1
+			TST.B	twoMegFmt(A1,D1)	;Is this a double-density disk?
+			BPL.S	@2
+			MOVEQ	#2*18,D7			;Yes, twice as many sectors
+			MOVE.L	#$0007FFFE,D6		; and a bigger sector map (1-18)
+
+@2			BSR		RdAddrSetup			;Get the next address mark
+			BNE.S	@3					;-> error
+			BTST	D2,D6				;Have we already read this sector?
+			BEQ.S	@3					;-> yes, skip
+
+			CMP.W	SideTrack(A1),D1	;Do the track and side also match our expectations?
+			BNE.S	@3					;-> no, something's a tad wrong, me thinks
+
+			MOVE.W	D2,D3				;Save the sector number
+			SUBQ.W	#1,D2				;calculate the buffer offset for this sector
+			MOVEQ	#9,D0
+			LSL.L	D0,D2
+			ADD.L	DiskBuffer(A1),D2
+			MOVEA.L	D2,A0
+			ST		DskVerify			;make sure we're verifying
+			BSR		mRdData				;Verify the sector
+			BNE.S	@3					;-> error
+			BCLR	D3,D6				;Mark the sector as read
+
+@3			BSR		toEmptyPD			;Get rid of poll data (saves D0 in DskErr)
+			TST.L	D6					;Have all the sectors been read?
+			DBEQ	D7,@2				;Keep looping if not
+			BEQ.S	@4
+			MOVEQ	#VerErr,D0			;Return an error 'cause we couldn't
+
+@4			ANDI	#$F8FF,SR			;Open up interrupts
+			MOVEM.L	(SP)+,D2-D7
+			TST.W	D0
+			RTS
+
+
+;_______________________________________________________________________________
+;
+; Routine:	mDoFmtCopy
+;
+; Inputs:	D2 -- sectors/track - 1 (8 or 17); if 17, bit 31 will be set=1
+;			D4 -- track
+;			D5 -- side
+;
+; Outputs:	A1 -- updated user data buffer pointer
+;			D0 -- result code
+;
+; Uses: 	A3 -- pointer to Write Data register
+;			A4 -- pointer to Handshake register
+;			A5 -- pointer to 6522 A-reg (has wait/req)
+;			A6 -- pointer to SCC A-channel data register
+;			D0 -- loop counter
+;			D1 -- byte to write
+;			D3 -- loop counter
+;			D6 -- sector
+;
+; Function:	Formats the current track; the disk is assumed to be up to
+;			speed and correctly positioned, and interrupts disabled.
+;
+;
+;			write some gap bytes while waiting for the rising edge of index
+;
+;			Gap bytes ($4E)						[ 32]
+;
+;			starting with sector 1:
+;	loop:	Sync bytes ($00)					[ 12]
+;			A1 A1 A1 FE cyl side sect size CRC	[ 10]
+;			Gap bytes ($4E)						[ 22]
+;			Sync bytes ($00)					[ 12]
+;			A1 A1 A1 FB  data bytes  CRC		[518]
+;			Gap bytes ($4E)						[ 80 for 720K, 108 for 1440K]
+;			loop for all sectors
+;
+;			write gap bytes until the rising edge of index is sensed
+;_______________________________________________________________________________
+
+mDoFmtCopy	MOVE.L	(SP)+,DskRtnAdr		;Save return address
+			MOVEQ	#RdDtaAdr,D0		;PAL address for side 0
+			TST.W	D5					;Side 0?
+			BEQ.S	@1					;-> yes
+			MOVEQ	#RdDta1Adr,D0		;PAL address for side 1
+@1			BSR		AdrDisk				;Select head
+
+			MOVEQ	#4,D0
+			BSR		SetUpPoll			;Set up A5, A6, PollStack
+
+			MOVEA.L	fmtParams(A1),A0	;pointer to the user data buffer
+			MOVEA.L	(A0),A0
+			MOVE.L	A0,DiskBuffer(A1)	;save it for later
+
+			MOVEA.L	IWM,A4
+			LEA		wData(A4),A3		;Point to the write data and
+			LEA		rHandshake(A4),A4	;handshake registers for speed
+			TST.B	rError-wData(A3)		;Clear the error register
+			MOVE.B	#$18,wZeroes-wData(A3)	;Clear the write and action bits
+			MOVE.B	#$10,wOnes-wData(A3)	;Set the write bit
+			MOVE.B	#$01,wOnes-wData(A3)	;Toggle the clFIFO bit to clear out
+			MOVE.B	#$01,wZeroes-wData(A3)	;  any data in the FIFO			<SM6>
+			TST.B	rError-wData(A3)		; clear the error register again<SM6>
+
+;  Write a bunch of gap bytes while waiting for the start of index.  We track index
+;  by waiting for it to go low (if it starts high), then go high (start of index).
+
+			MOVEQ	#gapByte,D1
+			MOVE.B	D1,(A3)				;Write the first two gap bytes
+			MOVE.B	D1,(A3)				; to fill up the FIFO
+			MOVE.B	#$08,wOnes-wData(A3);Turn on the action bit: GO!
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			MOVE.W	#2*6750,D3			;Assumes 300 rpm disk (with variation), 16uSec/byte
+@WtIndexLo	_PollSCC					; poll the SCC modem port				<H5><SM6>
+@WtIndexLo1	MOVE.B	(A4),D0				;Wait until there's an opening in the FIFO
+			BPL.S	@WtIndexLo1
+			MOVE.B	D1,(A3)				;Write a gap byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			BTST	#3,D0				;Is index pulse low?
+			BEQ.S	@WtIndexHi			;-> yes, now go wait for it to go high
+			DBRA	D3,@WtIndexLo
+			BRA 	@NoFmtIndex			;-> timed out waiting for index
+
+@WtIndexHi	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@WtIndexHi1	MOVE.B	(A4),D0				;Wait until there's an opening in the FIFO
+			BPL.S	@WtIndexHi1
+			MOVE.B	D1,(A3)				;Write a gap byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			BTST	#3,D0				;Is index pulse high?
+			BNE.S	@FmtStart			;-> yes, start the actual format
+			DBRA	D3,@WtIndexHi
+			BRA 	@NoFmtIndex			;-> timed out waiting for index
+
+;  When we get here, we're just after the rising edge of the index pulse.
+;  First thing we write on the track is a starting gap and sync bytes...
+
+@FmtStart	MOVE.B	#$F5,wPhase-wData(A3)	;turn off the index signal while we format
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			MOVEQ	#gap4aSize-1-1,D0
+@FmtGap4a	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@FmtGap4aHS	TST.B	(A4)				;Wait until there's an opening in the FIFO
+			BPL.S	@FmtGap4aHS
+			MOVE.B	D1,(A3)				;Write out a gap byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D0,@FmtGap4a
+
+			MOVEQ	#syncSize-1,D0
+			MOVEQ	#theSync,D1
+@FmtIdxSync	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@FmtIdxSnHS	TST.B	(A4)				;Wait until there's an opening in the FIFO
+			BPL.S	@FmtIdxSnHS
+			MOVE.B	D1,(A3)				;Write out a sync byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D0,@FmtIdxSync
+
+;  Now write the index mark ($C2 $C2 $C2 $FC)...
+
+			MOVEQ	#markSize-1-1,D0
+@WrIndexMk	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@WrIndxMkHS	TST.B	(A4)				;Wait until there's an opening in the FIFO
+			BPL.S	@WrIndxMkHS
+			MOVE.B	#$C2,wMark-wData(A3);Write out an index mark byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D0,@WrIndexMk
+
+@WrIndxMkFC	TST.B	(A4)				;Wait until there's an opening in the FIFO
+			BPL.S	@WrIndxMkFC
+			MOVE.B	#$FC,(A3)			;Write out the last mark byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+;  Write another gap...
+
+			MOVEQ	#gap1Size-1,D0
+@FmtGap1	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@FmtGap1HS	TST.B	(A4)				;Wait until there's an opening in the FIFO
+			BPL.S	@FmtGap1HS
+			MOVE.B	#gapByte,(A3)		;Write out a gap byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>			<SM4>
+	endif
+			DBRA	D0,@FmtGap1
+
+
+			MOVEQ	#1,D6				;Starting sector number
+			BRA.S	@FmtAdrSync			;Start a sector with the address mark sync
+
+;  Tack yet another gap onto the end of the sector...
+
+@FmtNxtSect	MOVEQ	#gap3Sz720K-1,D0
+			TST.L	D2					;Is it the 1440K format?
+			BPL.S	@FmtGap3
+			MOVEQ	#gap3Sz1440K-1,D0	;Yes, there's a larger inter-sector gap
+@FmtGap3	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@FmtGap3HS	TST.B	(A4)
+			BPL.S	@FmtGap3HS
+			MOVE.B	#gapByte,(A3)		;Write out a gap byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D0,@FmtGap3
+
+;  For each sector -- write sync bytes...
+
+@FmtAdrSync	MOVEQ	#syncSize-1,D0
+			MOVEQ	#theSync,D1
+@FmtASyncLp	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@FmtASyncHS	TST.B	(A4)				;Wait until there's an opening in the FIFO
+			BPL.S	@FmtASyncHS
+			MOVE.B	D1,(A3)				;Write out a sync byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D0,@FmtASyncLp
+
+;  Write the address mark and field...
+
+			MOVEQ	#markSize-1-1,D0
+@FmtAdrMark	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@FmtAdrMkHS	TST.B	(A4)
+			BPL.S	@FmtAdrMkHS
+			MOVE.B	#$A1,wMark-wData(A3);Write out a mark byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D0,@FmtAdrMark
+
+@FmtAdrMkFE	TST.B	(A4)
+			BPL.S	@FmtAdrMkFE
+			MOVE.B	#$FE,(A3)			;Write out the last mark byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			_PollSCC					; poll the SCC modem port			<H5><SM6>
+
+@FmtAdrTrk	TST.B	(A4)
+			BPL.S	@FmtAdrTrk
+			MOVE.B	D4,(A3)				;Write the track number
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			_PollSCC					; poll the SCC modem port			<H5><SM6>
+
+@FmtAdrSide	TST.B	(A4)
+			BPL.S	@FmtAdrSide
+			MOVE.B	D5,(A3)				;Write the side number
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			_PollSCC					; poll the SCC modem port			<H5><SM6>
+
+@FmtAdrSect	TST.B	(A4)
+			BPL.S	@FmtAdrSect
+			MOVE.B	D6,(A3)				;Write the sector number
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			_PollSCC					; poll the SCC modem port			<H5><SM6>
+
+@FmtAdrBlkS	TST.B	(A4)
+			BPL.S	@FmtAdrBlkS
+			MOVE.B	#$02,(A3)			;Write the blocksize ($02=512 bytes/block)
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+;  End the address field with 2 CRC bytes...
+
+			_PollSCC					; poll the SCC modem port			<H5><SM6>
+
+@FmtAddrCRC	TST.B	(A4)
+			BPL.S	@FmtAddrCRC
+			MOVE.B	D0,wCRC-wData(A3)	;"Write" CRC bytes
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+;  Write the intra-sector gap and sync bytes...
+
+			MOVEQ	#gap2Size-1,D0
+@FmtGap2	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@FmtGap2HS	TST.B	(A4)
+			BPL.S	@FmtGap2HS
+			MOVE.B	#gapByte,(A3)		;Write out a gap byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D0,@FmtGap2
+
+			MOVEQ	#syncSize-1,D0
+			MOVEQ	#theSync,D1
+@FmtDtaSync	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@FmtDSyncHS	TST.B	(A4)
+			BPL.S	@FmtDSyncHS
+			MOVE.B	D1,(A3)				;Write out a sync byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D0,@FmtDtaSync
+
+;  Write the data marks...
+
+			MOVEQ	#markSize-1-1,D0
+@FmtDtaMark	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@FmtDtaMkHS	TST.B	(A4)
+			BPL.S	@FmtDtaMkHS
+			MOVE.B	#$A1,wMark-wData(A3);Write out a mark byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D0,@FmtDtaMark
+
+@FmtDtaMkFB	TST.B	(A4)
+			BPL.S	@FmtDtaMkFB
+			MOVE.B	#$FB,(A3)			;Write out the last mark byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+;  Write the format byte for the sector data...
+
+			MOVE.W	#512-1,D0
+@FmtDataBlk	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@FmtDBlkHS	TST.B	(A4)
+			BPL.S	@FmtDBlkHS
+			MOVE.B	(A0)+,(A3)			;Write out a data byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			DBRA	D0,@FmtDataBlk
+
+;  End the sector data with 2 CRC bytes...
+
+@FmtDataCRC	TST.B	(A4)
+			BPL.S	@FmtDataCRC
+			MOVE.B	D0,wCRC-wData(A3)	;"Write" CRC bytes
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+
+			ADDQ.W	#1,D6				;Next sector
+			DBRA	D2,@FmtNxtSect
+
+;  Finally, finish off the track with a gap to index to clean things up.
+;  Five gap bytes will be written before checking for index to make sure
+;  that the data CRC for the last sector is completely written in case
+;  it ends up VERY close to the end of the disk (motor speed variation).
+;  If this is side 0, we'll end the format before the index pulse so that
+;  we can switch heads in time (about 1ms).  This reduces the number of
+;  revolutions from 4 to 3 per cylinder which saves 16 seconds overall.
+
+			MOVEQ	#5-1,D0				;We need to write 5 gap bytes so the CRC is shifted out
+			MOVEQ	#gapByte,D1
+			MOVE.W	#gap4bSize,D3
+			TST.W	D5					;is this side 0?							<2.1>
+			BNE.S	@FmtLastGap			;											<2.1>
+			MOVEQ	#5-1,D3				;yes, use the Reader's Digest gap size...	<2.1>
+			BRA.S	@FmtLastGap
+
+@TurnIndxOn	MOVE.B	#$F4,wPhase-wData(A3)	;turn the index signal back on here
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+											; so there's no glitch in the data
+@FmtLastGap	_PollSCC					; poll the SCC modem port			<H5><SM6>
+@FmtLGapHS	MOVE.B	(A4),D2				;Wait until there's an opening in the FIFO
+			BPL.S	@FmtLGapHS
+			MOVE.B	D1,(A3)				;Write a gap byte
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			SUBQ.W	#1,D0				;Have we written enough gap bytes yet?
+			BGT.S	@NoChkIndex			;-> nope
+			BEQ.S	@TurnIndxOn			;-> turn index back on before we check it
+			BTST	#3,D2				;Is index pulse high?
+			BNE.S	@FmtDone			;-> yes, all done							<2.1>
+@NoChkIndex	DBRA	D3,@FmtLastGap
+			TST.W	D5					;is this side 0?							<2.1>
+			BEQ.S	@FmtDone			;-> yes, we don't care if we don't see index<2.1>
+@NoFmtIndex	MOVEQ	#noIndexErr,D0		;Timed out waiting for index
+			BRA.S	@DoFmtExit			;-> timed out
+
+@FmtDone	MOVEQ	#0,D0				;Assume no underrun
+			BTST	#5,D2				;Any errors?
+			BEQ.S	@DoFmtExit
+			MOVEQ	#WrUnderRun,D0		;Yes, underrun error
+
+@DoFmtExit	MOVE.B	#$18,wZeroes-wData(A3)	;Clear the write and action bits
+	if NonSerializedIO then
+			nop							; force write to complete			<SM4>
+	endif
+			MOVE.L	DskRtnAdr,-(SP)
+			TST.W	D0					;Set CCR
+			RTS
+
+; Interleave tables used by FillInMarks to decide which sector interleave to use
+
+FourToOne 	DC.B	0, 3, 6, 9, 1, 4, 7,10, 2, 5, 8,11 ;tracks  0-15
+          	DC.B	0, 3, 6, 9, 1, 4, 7,10, 2, 5, 8, 0 ;tracks 16-31
+          	DC.B	0, 5, 3, 8, 1, 6, 4, 9, 2, 7, 0, 0 ;tracks 32-47
+          	DC.B	0, 7, 5, 3, 1, 8, 6, 4, 2, 0, 0, 0 ;tracks 48-63
+          	DC.B	0, 2, 4, 6, 1, 3, 5, 7, 0, 0, 0, 0 ;tracks 64-79
+
+TwoToOne  	DC.B	0, 6, 1, 7, 2, 8, 3, 9, 4,10, 5,11 ;tracks  0-15
+          	DC.B	0, 6, 1, 7, 2, 8, 3, 9, 4,10, 5, 0 ;tracks 16-31
+          	DC.B	0, 5, 1, 6, 2, 7, 3, 8, 4, 9, 0, 0 ;tracks 32-47
+          	DC.B	0, 5, 1, 6, 2, 7, 3, 8, 4, 0, 0, 0 ;tracks 48-63
+          	DC.B	0, 4, 1, 5, 2, 6, 3, 7, 0, 0, 0, 0 ;tracks 64-79
+
+
+; Nibblizing Table: convert 6 bits into 8-bit code word.
+; This table has been specially expanded to 4x the size of the normal table to
+; allow the masking operations (zeroing high 2 bits) to be skipped to save time
+
+DupNibl		DC.B	$96,$97,$9A,$9B,$9D,$9E,$9F,$A6,$A7,$AB,$AC,$AD,$AE,$AF,$B2,$B3
+  			DC.B	$B4,$B5,$B6,$B7,$B9,$BA,$BB,$BC,$BD,$BE,$BF,$CB,$CD,$CE,$CF,$D3
+  			DC.B	$D6,$D7,$D9,$DA,$DB,$DC,$DD,$DE,$DF,$E5,$E6,$E7,$E9,$EA,$EB,$EC
+  			DC.B	$ED,$EE,$EF,$F2,$F3,$F4,$F5,$F6,$F7,$F9,$FA,$FB,$FC,$FD,$FE,$FF
+
+			DC.B	$96,$97,$9A,$9B,$9D,$9E,$9F,$A6,$A7,$AB,$AC,$AD,$AE,$AF,$B2,$B3
+  			DC.B	$B4,$B5,$B6,$B7,$B9,$BA,$BB,$BC,$BD,$BE,$BF,$CB,$CD,$CE,$CF,$D3
+  			DC.B	$D6,$D7,$D9,$DA,$DB,$DC,$DD,$DE,$DF,$E5,$E6,$E7,$E9,$EA,$EB,$EC
+  			DC.B	$ED,$EE,$EF,$F2,$F3,$F4,$F5,$F6,$F7,$F9,$FA,$FB,$FC,$FD,$FE,$FF
+
+			DC.B	$96,$97,$9A,$9B,$9D,$9E,$9F,$A6,$A7,$AB,$AC,$AD,$AE,$AF,$B2,$B3
+  			DC.B	$B4,$B5,$B6,$B7,$B9,$BA,$BB,$BC,$BD,$BE,$BF,$CB,$CD,$CE,$CF,$D3
+  			DC.B	$D6,$D7,$D9,$DA,$DB,$DC,$DD,$DE,$DF,$E5,$E6,$E7,$E9,$EA,$EB,$EC
+  			DC.B	$ED,$EE,$EF,$F2,$F3,$F4,$F5,$F6,$F7,$F9,$FA,$FB,$FC,$FD,$FE,$FF
+
+			DC.B	$96,$97,$9A,$9B,$9D,$9E,$9F,$A6,$A7,$AB,$AC,$AD,$AE,$AF,$B2,$B3
+  			DC.B	$B4,$B5,$B6,$B7,$B9,$BA,$BB,$BC,$BD,$BE,$BF,$CB,$CD,$CE,$CF,$D3
+  			DC.B	$D6,$D7,$D9,$DA,$DB,$DC,$DD,$DE,$DF,$E5,$E6,$E7,$E9,$EA,$EB,$EC
+  			DC.B	$ED,$EE,$EF,$F2,$F3,$F4,$F5,$F6,$F7,$F9,$FA,$FB,$FC,$FD,$FE,$FF
+

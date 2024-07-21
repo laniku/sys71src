@@ -1,0 +1,328 @@
+;
+;	File:		MakeFSSpec.a
+;
+;	Contains:	The call MakeFSSpec
+;
+;	Written by:	Dave Feldman
+;
+;	Copyright:	© 1990,1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 11/7/93	pdw		ConsultCatalog was assuming totally synchronous behavior (i.e.
+;									it was using the A7 stack instead of A6).  Changed register
+;									saving and return address handling to use HFS stack.
+;	   <SM1>	 4/15/92	kc		Removed the "ROM" prefix from the RomBind routines.
+;									¥ Pre-SuperMario comments follow ¥
+;		<12>	  1/6/91	dnf		(fjs) Add code to check for terminating ::'s on pathname
+;									parsing.
+;		<11>	 9/22/90	dnf		Add ExtOffLinCheck
+;		<10>	 8/29/90	dnf		Make sure TFSVCBTst happens after FndFilName.
+;		 <9>	 8/28/90	dnf		Don't clobber a3 (WDCB pointer after FndFilName) so external
+;									file systems can use it.
+;		 <8>	  8/6/90	dnf		Rename __MakeFSSpec to MakeFSSpec
+;		 <7>	 7/30/90	dnf		Change all bsr and jsr instructions that point at Rom bind
+;									symbols into jsrRom macros.
+;		 <6>	  7/2/90	dnf		Use TFSVCBTst
+;		 <5>	  7/2/90	dnf		Check for volume-only input and convert to root directory.
+;									Handle fnfErr, dirNFErr, volume info only, and multiply
+;									simultaneous error cases.
+;		 <4>	  6/2/90	dnf		Handle fnfErr case
+;		 <3>	  5/4/90	dnf		Eliminate hardcoded include pathnames
+;		 <2>	  5/4/90	dnf		version for a10
+;		 <1>	  5/4/90	dnf		first checked in
+;
+;	To Do:
+;		add proper cname capitalization
+
+	print		push
+	print		off
+	LOAD		'StandardEqu.d'
+	include		'FileMgrPrivate.a'
+	include		'LinkedPatchMacros.a'
+	print		pop
+	
+	MACHINE		MC68020
+	
+;_______________________________________________________________________
+;
+; Routine:		CopyCName
+;
+; Registers In:
+;	a1		- target buffer
+;	a4		- pointer to CName (no length byte)
+;	d2.b	- length of CName
+;
+; All registers preserved
+;
+; Prepends length byte to CName in buffer
+;_______________________________________________________________________
+CopyCNameRegs	reg			a1/a4/d2
+CopyCName:		proc
+	movem.l		CopyCNameRegs, -(sp)
+	andi.w		#$00ff, d2				; kill high byte of low word
+	move.b		d2, (a1)+				; set name length into string
+	beq.s		@done					; catch zero length strings
+	subq.b		#1, d2					; -1 for dbra
+@loop:
+	move.b		(a4)+, (a1)+			; copy the cname
+	dbra		d2, @loop
+	
+@done:
+	movem.l		(sp)+, CopyCNameRegs
+	rts
+	endproc
+
+;_______________________________________________________________________
+;
+; Routine:		ConsultCatalog
+;
+; Registers In:
+;	a2 		- VCB of volume to look on
+;	a3		- pointer to FSSpec to look up
+;	d7		- catalog hint or zero if none
+;
+; Registers Out:
+;	a2 		- VCB of volume to look on
+;	a3		- pointer to FSSpec to look up
+;	d7		- new catalog hint or zero if none
+;
+; All other registers preserved
+;
+;	FSSpec on a3:
+;		vRefNum		-	not used.  Use vcb on a2 instead
+;		parID		-	input/output
+;		CName		-	input/output
+;
+; Function:	
+;	Look up the parID/CName combo in the catalog.  Return the spelling of
+;	the CName as it is in the catalog.  If the CName is zero-length,
+;	treat the parID as a dirID and return its parID/CName.
+;
+; The FSSpec passed in here doesn't have to be a true FSSpec.  It just needs
+; to have a parID and a CName.
+;
+;_______________________________________________________________________
+ConsultCatalog:	proc
+ConsultCatalogRegs	reg		d2/a0/a1/a4
+
+	move.l		(SP)+,-(A6) 			; save return address on A6 stack		<SM2> pdw
+	movem.l		ConsultCatalogRegs,-(A6)	;									<SM2> pdw
+	lea.l		FSSpec.name(a3), a0		; a0 = ptr(CName)
+	tst.b		(a0)					; zero length name?
+	bne.s		@NotZeroLength
+	suba.l		a0,a0					; pass null to CMGetCN
+
+@NotZeroLength:	
+	move.l		FSSpec.parID(a3), d0	; move parID to input reg for GetCN
+	move.l		d7, d2					; move catalog hint to input reg for CMGetCN
+	jsrROM		CMGETCN   				; go consult with the expert
+	bne.s		@Exit					; errors are good cause to leave
+	
+	move.l		ckrParID(a0), FSSpec.parID(a3)	; set parID for directory name case
+	
+	lea.l		FSSpec.name(a3), a1		; a1 = ptr(name buffer in FSSpec)
+	lea.l		ckrCName(a0), a4		; a4 = correctly capitalized cname pstring
+	move.b		(a4)+, d2				; d2 = length of cname
+	bsr			CopyCName				; copy correctly capitalized name into FSSpec
+	
+@Exit:
+	move.l		d2, d7					; restore catalog hint
+	movem.l		(A6)+, ConsultCatalogRegs	;									<SM2> pdw
+	move.l		(A6)+,-(SP) 			; Restore the return address			<SM2> pdw
+	tst.w		d0						; set condition codes
+	rts
+	endproc
+	
+;_______________________________________________________________________
+;
+; Routine:		 MakeFSSpec
+;
+; Registers In:
+;	a0		-	user param block
+;			ioNamePtr - any pathname
+;			ioVRefNum - any legal vol/wd spec
+;			ioDirID	- (optional) dirID
+;			ioMisc - pointer to an FSSpec 
+;
+; Function: Munges the three input parameters into a friendly FSSpec for
+; 			caller consumption.  Tries to be as much like HFS parsing as
+;			possible.
+;
+;		Extensions to the "standard" HFS parsing rules:
+;
+;			When the leaf requested by the caller doesn't exist, return
+;			an FSSpec for that (nonexistent) leaf and return an fnfErr
+;			to indicate this condition.  
+;
+;			When there is no name (null or zero-length), return the name
+;			of the directory whose ID came in dirID.  If there is no
+;			dirID, use the dirID from a wdRef in ioVRefNum or use fsRtDirID.
+;
+;			Return the spelling of the leaf name directly from the catalog
+;
+;		Special cases:
+;
+; 			When FndFilName returns an fnfErr it certainly means that
+; 			the leaf doesn't exist.  However, if the cName is a single
+;			segment (no colons) and the directory id is to a non-existent
+;			directory, FndFilName still returns an fnfErr instead of a
+;			dirNFErr.  We need to check for the existence of the directory
+;			to distinguish the cases.
+;
+;			When FndFilName is given a zero-length name it returns a 
+;			bdNamErr.  We need to make sure that the bad name was caused
+;			by a zero-length input (as opposed to the other bad name cases)
+;			and return an FSSpec on the volume/directory (i.e. vRef or wdRef)
+;
+;			When FndFilName is given a pathname ending in a directory leaf name
+;			and a double colon (i.e "vol:dir1:dir2::") it returns a string length
+;			of zero, leaves d6 with the dirID of dir2 and a5 pointing to the
+;			directory record of dir1.  To get around this, whenever we see
+;			directory records returned from FndFilName, we'll check the path
+;			name to see if it ends in '::'.  If so, we'll substitute
+;			the catalog record's dir ID (dirDirID(a5)) for the dirID in d6.
+;			Note that if FndFilName is fixed a5 will still point to the 
+;			same record, so we'll still work.
+;
+; 			When FndFilName is given a nil name it returns just a volume
+;			spec.  We need to converted  this into an FSSpec on the
+;			volume/directory (i.e. vRef or wdRef).
+;
+;			Let the compatibility layer handle MFS volumes.
+;_______________________________________________________________________
+MakeFSSpec:	proc		export
+
+	jsrROM		FSQUEUE   
+
+	jsrROM		DTRMV3   				; get at least the volume
+	bne			@Exit
+
+	moveq.l		#wrgVolTypErr, d0		; assume the worst
+	jsrROM		TFSVCBTST   			; split HFS/MFS volumes
+	bne			@Exit					; go handle MFS in the compatibility layer
+
+	moveq.l		#0, d6					; no input dirID
+	move.l		d6, d7					; no catalog hint
+	
+	bset.b		#SkipPMSP,HFSFlags		; Don't bother with PMSP for this operation
+	jsrROM		FNDFILNAME   			; parse things up
+
+; After FndFilName, registers are:
+;	a2 - vcb ptr
+;	a4 - file name ptr
+;	a5 - catalog data record
+;	d2 - name length
+;	d6 - parent ID
+;	d7 - catalog hint
+	
+	move.w		d0, d5					; save the FndFilName error for later
+	beq.s		@NoFndFilNameErr		; keep going if there wasn't any
+	
+; Check out the error that we got
+	cmp.w		#fnfErr, d5				; file not found?
+	beq.s		@FileNotFoundErr 		; check this one more closely
+	cmp.w		#bdNamErr, d5			; bad name error?
+	beq.s		@BadNameErr				; check this one more closely
+	bra			@Exit					; pass other errors right on back
+
+; Separate the bad name cases.  The only one we rescue when the input name
+; is null but a valid volume is determined from the vRefNum.  Since we got
+; a bad name we have no idea whether the dirID is valid, so fall through
+; to the FileNotFoundErr case.
+@BadNameErr:
+	move.l		a4, d1					; get name pointer
+	beq			@AdjustErrExit			; null names have non-zero pointers
+	tst.b		(a4)					; zero-length name?
+	bne.s		@AdjustErrExit			; if not, must truly be a bad name
+	move.l		a2, d1					; do we have a good volume spec?
+	beq.s		@AdjustErrExit			; if not, leave
+	moveq.l		#noErr, d5				; cancel the bdNamErr; just a zero-length name
+	move.l		d5, d2					; set the name length to zero
+	suba.l		a4, a4					; clear the name pointer
+
+; Distinguish the real fnfErr cases from the dirNFErr cases.
+@FileNotFoundErr:
+	move.l		ioFSSpecPtr(a0), a3		; a3 = ptr(FSSpec)
+	move.l		d6, FSSpec.parID(a3)	; fill in the parent ID
+	clr.b		FSSpec.name(a3)			; set name length to zero
+	bsr			ConsultCatalog			; look up the name of the directory
+	cmp.w		#cmnotfound, d0			; directory not found?
+	beq.s		@DirNFErrExit			; go tell the caller
+	tst.w		d0						; some other catalog manager error?
+	beq.s		@PrepareFSSpec			; no? keep on trucking
+	bra.s		@Exit					; if so, that's real trouble
+	
+@NoFndFilNameErr:
+	cmpi.b		#cdrDirRec, cdrType(a5)	; a directory record?
+	bne.s		@PrepareFSSpec			; only directories have trouble with colons
+
+	move.l		ioNamePtr(a0), d0		; grab caller's pathname
+	beq.s		@PrepareFSSpec			; no colon problems on nil string ptrs
+	movea.l		d0, a1
+	moveq.l		#0, d0					; clear high bytes
+	move.b		(a1), d0				; get length byte
+	beq.s		@PrepareFSSpec			; no colon problems in null strings
+	lea.l		1(a1, d0.w), a1			; make a1 point after last character
+	cmp.b		#':', -(a1)				; did we end with a ':'?
+	bne.s		@PrepareFSSpec			; if not, we can't have colon trouble
+	cmp.b		#':', -(a1)				; did we end with a '::'?
+	bne.s		@PrepareFSSpec			; no? we're all set
+	
+; Bummer.  We have a leaf name that ended in '::'.  FndFileName
+; has unfortunately left d6 aimed at the offspring of the directory
+; in a5.  We can fix this by pulling the dirID out of the directory
+; record, and falling through to our regular case.  This will look
+; like a straight dirID-only lookup, since d2 is always zero from
+; FndFilName when there's a terminal ::.
+	move.l		dirDirID(a5), d6		; be a thread case
+	
+; 
+; Registers:
+;	d2	- length of leafname
+;	d5	- saved error code
+;	a0	- iopb
+;	a2	- vcb
+;	a4	- leafname ptr if d2 > 0
+
+@PrepareFSSpec:
+; Check for the cases where we have a dirID instead of a parID + cName
+	move.l		ioFSSpecPtr(a0), a3		; a3 = ptr (FSSpec)
+	move.w		vcbVRefNum(a2), FSSpec.vRefNum(a3)	; fill in the volume refnum
+	move.l		d6, FSSpec.parID(a3)	; fill in the dir ID
+	tst.w		d2						; zero-length name?
+	beq.s		@FollowThread			; yup.  Don't try to copy the leaf name
+	
+; Move the leaf name into the FSSpec
+	lea.l		FSSpec.name(a3), a1		; a1 = ptr(name buffer in FSSpec)
+	bsr			CopyCName				; copy name from a4/d2 to Pstring in a1
+	bra.s		@CorrectLeaf
+	
+@FollowThread:
+	clr.b		FSSpec.name(a3)			; set the spec's name length to 0
+	
+@CorrectLeaf:
+	tst.w		d5						; did we get an fnfErr from FndFilName?
+	bne.s		@AdjustErrExit			; if so, we can leave now
+	bsr			ConsultCatalog			; look up the name of the leaf
+	bra.s		@Exit					; pass errors straight back
+	
+@DirNFErrExit:
+	move.w		#dirNFErr, d5
+	
+@AdjustErrExit:
+	move.w		d5, d0					; set the correct error code
+	
+@Exit:
+	tst.w		d0						; do we have any errors?
+	beq.s		@1						; if not, we're done
+	cmp.w		#fnfErr, d0				; did we get an fnfErr?
+	beq.s		@1						; then don't clear the FSSpec
+	move.l		ioFSSpecPtr(a0), a1		; a1 = ptr (FSSpec)
+	clr.l		(a1)+					; clear the volume & high word of directory
+	clr.l		(a1)+					; clear the directory & length byte of string
+@1:
+	jmpROM		CMDDONE   
+
+	endproc
+	end

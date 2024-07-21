@@ -1,0 +1,1288 @@
+;
+;	File:		ADBMgrPatch.a
+;
+;	Contains:	Patches Gary Davidian's new ADB manager into MacII's and MacSE's
+;
+;	Written by:	Gary Davidian/Gary Rensberger
+;
+;	Copyright:	© 1989-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 11/9/93	KW		added some eieioSTP macros.  Only active for CygnusX1 ROM
+;		<13>	 2/12/92	JSM		Moved this file to ADBMgr folder, keeping all the old revisions.
+;		<12>	 10/4/91	JSM		Change PsychoticFarmerOrLater conditionals to TheFuture.
+;		<11>	 9/22/91	DTY		Change PsychoticFarmerAndLater to PsychoticFarmerOrLater.
+;		<10>	 8/29/91	JSM		Cleanup header.
+;		 <9>	 8/27/91	DTY		Conditionalized previous change for PsychoticFarmerAndLater.
+;		 <8>	 7/16/91	GMR		Fixed bug when ADB explicit command is going out just as
+;									autopoll data is being received (occurs very seldom).
+;		 <7>	 6/12/91	LN		added #include 'InternalOnlyEqu.a'
+;		 <6>	 8/10/90	DTY		Addded notAUX conditional to patches.
+;		 <5>	  8/7/90	DTY		Convert to a linked patch.
+;		 <4>	 7/11/90	gbm		Change HardwareEqu.a to HardwarePrivateEqu.a
+;		 <3>	 4/26/90	GMR		Now sets the mouse and keyboard bits in the DevMap by default
+;									during patch installation since the old ADB manager didn't use
+;									these and weren't set up.
+;		 <2>	  3/6/90	GMR		Fixed initing of FDBFlag, to set command queue empty bit.
+;	   <1.2>	11/29/89	GGD		NEEDED FOR 6.0.5: Forced the interrupt masking level to 7 to
+;									work correctly on all machines, instead of using HiIntMask which
+;									is level 3 by default in HardwareEqu. Deleted the initialization
+;									of TimeViaDB, since it was always using the MacII value (and was
+;									wrong for the SE), It is now initialized correctly in Rom78Fix
+;									and Rom76Fix. Changed the Auto/SRQ polling to only poll devices
+;									that are in the device table.
+;	   <1.1>	10/14/89	GMR		Modified ADBProc to save/restore keyboard and mouse CRA's
+;									(around _ADBReinit trap). Added KbdInstall to patch, instead of
+;									using ROM version. Installation code does not re-init the ADB
+;									bus, preserving original device entry table.
+;	   <1.0>	 10/3/89	GMR		Adding for first time to EASE
+;
+
+
+			PRINT		OFF
+PrNonPortable	EQU		1
+Debugging		EQU		0
+				INCLUDE	'SysEqu.a'
+				INCLUDE	'ToolEqu.a'
+				INCLUDE	'SysErr.a'
+				INCLUDE	'Private.a'
+				INCLUDE	'QuickEqu.a'
+				INCLUDE	'Traps.a'
+				INCLUDE 'HardwarePrivateEqu.a'
+				INCLUDE 'ApplDeskBus.a'
+				INCLUDE 'AppleDeskBusPriv.a'
+				INCLUDE	'LinkedPatchMacros.a'
+				INCLUDE	'InternalOnlyEqu.a'
+jADBReInit		EQU		OSTable+($7B*4)		; OS trap table entry for _ADBReInit
+NoIntMask		EQU		$0700				; all ints disabled on all machines			<1.2>
+			PRINT		ON
+
+
+GEmptyAddr		ROMBind	(SE,$03574),(II,$06FEE)
+KbdDrvr			ROMBind	(SE,$03AC0),(II,$0753A)
+ROMInitADBDrvr	ROMBind	(SE,$03C9E),(II,$07724)
+FindFDBInfo		ROMBind	(SE,$03D4C),(II,$077D2)
+
+;______________________________________________________________________
+; 
+;	_ADBReInit - ReInitialize the Front Desk Bus
+;		
+;______________________________________________________________________
+ADBReinit	PatchProc	_ADBReInit,(SE,II,notAUX)
+			IMPORT		ReInit
+			
+			MOVE.L	JADBProc,A0			; get hook to processing routine		<C931>
+			moveq.l	#0,D0				; set it as pre-processing routine		<C931>
+			JSR		(A0)				; call the routine						<C931>
+
+			MoveM.L	D0-D4/A0-A3,-(SP)
+			Move.L	ADBBase,A3			; A3 get local data address
+			BSR		ReInit
+IADB1		jsrROM	ROMInitADBDrvr
+
+			MoveM.L	(SP)+,D0-D4/A0-A3	; restore registers
+
+			Move.L	JADBProc,A0			; get hook to processing routine		<C931>
+			MoveQ	#1,D0				; set it as post-processing routine.	<C931>
+			JSR		(A0)				; call the routine						<C931>
+			RTS							; done									<C931>
+			ENDPROC
+
+;_______________________________________________________________________
+;
+;  Routine:		_ADBOp
+;  Inputs:		A0.L - pointer to ADBOpBlock paramater block
+;				D0.B - ADB command/address byte to send
+;
+;  Outputs:		D0 - Result Code (noErr, or -1 if queue full)
+;
+;  Destroys:	A0, A1, D0
+;  Calls:		RunADBRequest
+;  Called by:	OsTrap Dispatch Table
+;
+;  Function:	Asynchronously issues an ADB bus transaction, using the command
+;				and buffer specified.  When the transaction has completed,
+;				the completion routine will be called.
+;
+;_______________________________________________________________________
+
+patchADBOp	PatchProc	_ADBOp,(SE,II,notAUX)	; a0-a1/d1-d2 saved by OsTrap dispatch
+			IMPORT	RunADBRequest
+			with	ADBVars,ADBCmdQEntry
+@regs		reg		d3/a2/a3			; additional registers to preserve
+			movem.l	@regs,-(sp)			; save registers
+			movea.l	ADBBase,a3			; point to ADB private data structures
+			move.w	sr,-(sp)			; save interrupt mask
+			ori.w	#NoIntMask,sr		; disable ints while queueing					<1.2>
+			movea.l	fQEntPtr(a3),a1		; pointer to next free element
+			btst.b	#fDBQEmpty,fDBFlag(a3)	; see if anything in queue
+			bne.s	@notFull			; if was empty, plenty of room to add
+			cmpa.l	fQHeadPtr(a3),a1	; see if queue is full
+			beq.s	@queueFull			; if full, abort with error
+
+;	There is room in the queue, so insert the new request at the end of the queue
+
+@notFull								; a1 points to the ADBCmdQEntry
+			move.b	d0,(a1)+			; fill in fQCmd
+			addq.w	#1,a1				; skip over fQUnused
+			move.l	(a0)+,(a1)+			; copy dataBuffPtr to fQBuff
+			move.l	(a0)+,(a1)+			; copy opServiceRtPtr to fQComp
+			move.l	(a0)+,(a1)+			; copy opDataAreaPtr to fQData
+
+			cmpa.l	fQEndPtr(a3),a1		; see if queue pointer needs to wrap around
+			blo.s	@noWrap				; if didn't reach end, no wrap yet
+			movea.l	fQBegPtr(a3),a1		; if end reached, wrap back to begining
+@noWrap		move.l	a1,fQEntPtr(a3)		; update the queue entry pointer
+
+;	The new entry is queued.  If queue was previously empty run the new request.
+
+			bclr.b	#fDBQEmpty,fDBFlag(a3)	; indicate queue no longer empty
+			beq.s	@success			; if not at head of queue, just return success
+			bsr		RunADBRequest		; run the newly queued request
+
+@success	moveq.l	#noErr,d0			; indicate success
+@done		move.w	(sp)+,sr			; restore int mask
+			movem.l	(sp)+,@regs			; restore registers
+			rts							; all done
+
+@queueFull	moveq.l	#qErr,d0			; IM vol 5 says return -1 for queue full
+			bra.s	@done				; restore regs and return
+			endwith
+			ENDPROC
+			
+;_______________________________________________________________________
+;
+; InitADB - Initialize state variables
+;
+;_______________________________________________________________________
+InitADB		InstallProc	(SE,II,notAUX)
+			IMPORT	ADBProc, FDBTask, FDBShiftInt
+			IMPORT	StartReqVIA, MouseDrvr
+			IMPORT	RunADBRequest, DefaultDev
+			with	ADBVars,ADBDeviceEntry,ADBCmdQEntry
+			
+			movea.l	VIA,a1				; point to the VIA1 registers
+@wait		
+		eieioSTP
+			move.b	vBufB(a1),d0
+		eieioSTP
+			andi.b	#(1<<vFDesk2)|\
+					(1<<vFDesk1),d0		; look at state bits
+			cmpi.b	#(1<<vFDesk2)|\
+					(1<<vFDesk1),d0		; are we at state 3?
+			bne.s	@wait				; no, keep waiting...
+
+			ori.w	#NoIntMask,sr		; mask out interrupts							<1.2>
+		eieioSTP
+			move.b	vSR(a1),d0			; empty shift reg
+		eieioSTP
+
+			MOVE.L	ADBBase,A3			; point to ADB private data structures
+			
+			leaResident	ADBProc,A0					; Get the ADBProc								
+			move.l	A0,JADBProc						; install it into JAdbProc vector				
+			leaResident	FDBTask, A0 				; setup the FDB VBL task
+			move.l	A0,JKybdTask					; lomem vector
+
+			leaResident	FDBShiftInt,A0				; get addr of front desk bus handler			<4.6>
+			move.l  A0,Lvl1DT+8	        			; install as SR interrupt receiver
+			leaResident	StartReqVIA,a0				; get HW dependent proc to start ADB request
+			move.l	a0,StartReqProc(a3)				; setup proc pointer
+
+			moveq	#0,d1							; reset device table index
+@check		cmpi.b	#MouseAddr,FDBOAddr(a3,d1.w)	; is this a mouse device?
+			bne.s	@next							; no, try next one
+
+			leaResident	MouseDrvr,a0				; get address of new mouse driver
+			move.l	a0,FDBCRA(a3,d1.w)				; save as completion routine address
+
+@next		addi.b	#FRecSize,d1		; advance offset
+ 			cmpi.b	#numFDBAdr*FRecSize,d1 ; are we at the end of table?
+			bne.s	@check				; no, continue checking
+			
+			moveq	#(FQSize*8/4)-1,d1	; # of long words in command queue
+			lea		startCQ(a3),a0		; pt to start of command queue
+@clear		clr.l	(a0)+				; clear out command queue
+			dbra	d1,@clear
+
+			move.b	#(1<<FDBQEmpty),\	; the command queue is empty...					<2>
+					FDBFlag(A3)			; initialize the flags
+			clr.b	FDBAuFlag(A3)
+			Lea		StartCQ(A3),A0
+			Move.L	A0,FQBegPtr(A3)		; initialize command queue pointer
+			Move.L	A0,FQHeadPtr(A3)	; initialize command queue pointer
+			Move.L	A0,FQEntPtr(A3)		; initialize command queue pointer
+			Lea		EndCQ(A3),A0
+			Move.L	A0,FQEndPtr(A3)		; initialize command queue end pointer
+
+			ori.b	#(1<<mouseAddr)|\
+					 (1<<kbdAddr  ),DevMap+1(a3) ; make sure we poll keyboard and mouse	<3>
+
+			andi	#$F8FF,SR			; clear Interrupt mask
+
+			bsr		RunADBRequest		; start auto poll for the mouse
+			bsr		DefaultDev			; setup mouse & keyboard as default
+	
+			rts
+			ENDPROC
+
+;______________________________________________________________________
+;	Stack frame equates for InitADBDrvr and ADBProc
+
+ourLocals	RECORD	{endLocals},increment
+iDeviceTy	ds.b	1
+iOrigAddr	ds.b	1
+iCRAddr		ds.l	1
+iDataAddr	ds.l	1
+endLocals	
+			ENDR
+
+;______________________________________________________________________
+; 
+;	ADBProc - this routine lives in the JADBProc vector and is called
+;			  by ADBReInit before and after initialization
+;
+; D0 is 0 if pre-processing, non-0 if post-processing.
+; In addition to the standard pascal calling conventions.
+;______________________________________________________________________
+
+ADBProc		PROC	EXPORT				;										<1.1>
+			EXPORT	ReInit
+			EXPORT	FDBTask
+			EXPORT	FDBShiftInt
+			EXPORT	StartReqVIA
+			EXPORT	MouseDrvr
+			EXPORT	RunADBRequest
+			EXPORT	DefaultDev
+			
+			with 	ourLocals,ADBVars,ADBDeviceEntry,ADBCmdQEntry
+
+			tst.l	d0					; 0 = pre-processing
+			bne.s	PostInit			; Skip if not
+;_______________________________________________________________________
+; PreInit is called after the bus is initialized.  It saves 
+; keyboard/mouse driver ptrs, then disposes of keyboards storage.
+;_______________________________________________________________________
+			_CountADBs					; Get the number of ADB devices
+			move.w	d0, d2				; Save it in D2
+			beq.s	@exit				; Skip if none
+			link	a6,#iDeviceTy		; Make a stack frame
+@RemoveLoop
+			lea		iDeviceTy(a6), a0	; A0 is parameter block
+			move.w	d2, d0
+			_GetIndADB					; Get a device entry
+			bmi.s	@NextRec			; Skip if not valid
+
+			cmp.b	#kbdAddr,iOrigAddr(A6)	; Keyboard?
+			bne.s	@Mouse				; no, see if mouse
+			lea		KbdDriver,a0
+			move.l	iCRAddr(a6),(a0) 	; save ptr to keyboard driver
+			bra.s	@setIt
+
+@Mouse		cmp.b	#MouseAddr,iOrigAddr(A6) ; Mouse?
+			bne.s	@NextRec			; no, check next entry
+			lea		MseDriver,a0
+			move.l	iCRAddr(a6),(a0)	; save ptr to mouse driver
+			bra.s	@NextRec			; next entry
+			
+@setIt		MOVE.L	iDataAddr(a6), A1	; Save the data address pointer
+			CLR.L	iDataAddr(a6)		; Clear it out, so the keyboard won't trash memory
+			lea		iCRAddr(a6), A0
+			_SetADBInfo					; D0 already contains the ADB Address
+			move.l	a1, a0				; Get the data address pointer
+			_DisposPtr					; Throw away the block
+
+@NextRec	subq.w	#1, D2
+			bgt.s	@RemoveLoop
+			unlk	A6
+@exit
+			rts
+
+KbdDriver	DS.L	1					; saves ptr to keyboard driver
+MseDriver	DS.L	1					; saves ptr to keyboard driver
+;_______________________________________________________________________
+; PostInit is called after the bus is initialized.  It restores 
+; keyboard/mouse driver ptr in device entries.
+;_______________________________________________________________________
+PostInit
+			_CountADBs					; Get the number of ADB devices
+			move.w	D0, D2				; Save it in D2
+			beq.s	@exit				; Skip if none
+			link	A6, #iDeviceTy		; Make a stack frame
+@InstallLoop
+			lea		iDeviceTy(A6), A0	; A0 is parameter block
+			move.w	D2, D0
+			_GetIndADB					; Get a device entry
+			bmi.s	@NextRec			; Skip if not valid
+
+			cmp.b	#kbdAddr,iOrigAddr(A6)	; Keyboard?
+			bne.s	@Mouse				; no, see if mouse
+			move.l	KbdDriver,iCRAddr(A6) ; Restore ptr to keyboard driver
+			bra.s	@setIt
+
+@Mouse		cmp.b	#MouseAddr,iOrigAddr(A6); Mouse?
+			bne.s	@NextRec			    ; Skip if not
+			move.l	MseDriver,iCRAddr(A6)   ; Restore ptr to mouse driver
+@setIt		lea		iCRAddr(A6), A0
+			_SetADBInfo					; D0 already contains the ADB Address
+
+@NextRec	subq.w	#1, D2
+			bgt.s	@InstallLoop
+			unlk	A6
+@exit		rts
+
+			
+;_______________________________________________________________________
+;
+; ReInit - 	Initialize state variables, re-scan for devices
+;_______________________________________________________________________
+ReInit		
+			ori.w	#NoIntMask,sr		; mask out interrupts							<1.2>
+			move.w	#((endCQ/4)-1),D0	; n entries
+			move.l	A3,A0				; clear out device table and command queue
+@ClrLoop	clr.l	(A0)+
+			dbra	D0,@ClrLoop			; clear next entry
+
+			move.b	#(1<<FDBInit)|\
+					(1<<FDBQEmpty),FDBFlag(A3)	; initialize the flags
+			clr.b	FDBAuFlag(A3)
+			lea		StartCQ(A3),A0
+			move.l	A0,FQBegPtr(A3)		; initialize command queue pointer
+			move.l	A0,FQHeadPtr(A3)	; initialize command queue pointer
+			move.l	A0,FQEntPtr(A3)		; initialize command queue pointer
+			lea		EndCQ(A3),A0
+			move.l	A0,FQEndPtr(A3)		; initialize command queue end pointer
+			bsr		InitDevT			; go initialize the device table
+
+			andi	#$F8FF,SR			; clear Interrupt mask
+@wait		btst	#FDBInit,FDBFlag(A3); done with initialization?
+			bne.s	@wait				; no, keep in loop
+
+ 			jsr		DefaultDev			; setup mouse & keyboard as default
+			jsr		KbdInstall			; Install keyboard information
+			rts
+			endwith
+
+;______________________________________________________________________
+;
+;	DefaultDev - check mouse and keyboard in the device table, if they 
+;				 are not there, set them up as default device anyway.
+;
+;______________________________________________________________________
+
+DefaultDev
+			with	ADBVars,ADBDeviceEntry	;								<1.9>
+			MoveQ	#kbdAddr,D0				; first check keyboard
+FFI2		jsrROM	FindFDBInfo				; look for keyboard (FindFDBInfo)
+			TST.B	D0						; is it there?
+			BEQ.S	ChkMouse				; branch, keyboard is there
+			Move.B	#1,FDBDevTy(A1)			; assume handleID 1
+			Move.B	#kbdAddr,FDBOAddr(A1)	; set original address as 2
+			Move.B	#kbdAddr,FDBAddr(A1)	; set FDB address as 2
+KD1			leaROM	KbdDrvr,A0
+			move.l	a0,FDBCRA(A1)			; stuff completion routine address
+			bset.b	#kbdAddr,DevMap+1(a3)	; remember to poll it			<1.9>
+ChkMouse
+			MoveQ	#mouseAddr,D0			; now check mouse
+FFI3		jsrROM	FindFDBInfo				; look for mouse (FindFDBInfo)
+			BEQ.S	DefExit					; branch, mouse is there
+			Move.B	#1,FDBDevTy(A1)			; assume handleID 1
+			Move.B	#mouseAddr,FDBOAddr(A1)	; set original address as 3
+			Move.B	#mouseAddr,FDBAddr(A1)	; set FDB address as 3
+			Lea		MouseDrvr,A0			; get mouse address
+			Move.L	A0,FDBCRA(A1)			; set completion routine address
+			bset.b	#mouseAddr,DevMap+1(a3)	; remember to poll it			<1.9>
+DefExit	
+			RTS								; done
+			endwith
+
+			Title	'KbdADB - ADB Manager  -  RunADBRequest'
+
+;_______________________________________________________________________
+;
+;  Routine:		RunADBRequest
+;  Inputs:		A3 - pointer to ADBBase
+;
+;  Outputs:		D2 - length of transmit buffer data
+;				D3 - command byte / implicit flag (bit 31)
+;				A2 - pointer to buffer containing transmit data
+;				A3 - pointer to ADBBase
+;				
+;  Destroys:	
+;  Calls:		exits through StartReqProc (hardware dependent)
+;
+;  Function:	Determines what command should be sent to ADB next, and calls
+;				the hardware dependent routine to process the next request.
+;
+;_______________________________________________________________________
+
+RunADBRequest
+			with	ADBVars,ADBCmdQEntry
+			btst.b	#fDBQEmpty,fDBFlag(a3)	; see if any explicit commands to run
+			beq.s	@runFromQueue		; run an explicit command from the queue
+			moveq.l	#0,d2				; zero the send byte count
+			moveq.l	#-1,d3				; negative command to indicate resume polling
+			btst.b	#FDBInit,fDBFlag(a3); are we still initializing the bus
+			beq.s	@resumePolling		; if not, resume auto command polling
+			rts							; still initializing, just return
+
+@runFromQueue
+			movea.l	fQHeadPtr(a3),a0	; get pointer to element at head
+			moveq.l	#0,d3				; zero extend command byte, indicate explicit cmd
+			move.b	fQCmd(a0),d3		; D3 := command byte
+			movea.l	fQBuff(a0),a2		; get the buffer address (pascal string)
+			moveq.l	#maskADBCmd,d2		; mask talk/listen command bits
+			and.b	d3,d2				; isolate bits from copy of command
+			subq.b	#ListenCmd,d2		; see if it is a listen command
+			seq.b	d2					; $00FF if listen, $0000 if not (only listen sends data)
+			and.b	(a2)+,d2			; D2 := byte count, A2 := ptr to actual data
+@resumePolling
+			movea.l	StartReqProc(a3),a0	; get HW dependent proc to start ADB request
+			jmp		(a0)				; start the ADB request
+			endwith
+
+			Title	'KbdADB - ADB Manager  -  ExplicitRequestDone'
+
+;_______________________________________________________________________
+;
+;  Routine:		ExplicitRequestDone
+;  Inputs:		D2 - length of receive buffer data
+;				D3 - command byte / SRQ flag (bit 31)
+;				A2 - pointer to buffer containing receive data
+;				A3 - pointer to ADBBase
+;
+;  Outputs:		D2 - length of receive buffer data
+;				D3 - command byte / SRQ flag (bit 31)
+;				A0 - pointer to buffer to pass to completion routine
+;				A2 - pointer to buffer containing receive data
+;				A3 - pointer to ADBBase
+;				0(SP) - completion routine address
+;				4(SP) - optional data to pass in A2 to completion routine
+;				8(SP) - stack cutback address, after completion routine runs
+;				
+;  Destroys:	D0, D1, A0, A1
+;  Calls:		exits through RequestDone
+;
+;  Function:	Dequeues the paramaters to pass to the service routine.
+;
+;_______________________________________________________________________
+
+ExplicitRequestDone
+			with	ADBVars,ADBCmdQEntry
+			move.l	sp,-(sp)			; allocate an empty buffer on the stack
+			move.w	sr,d1				; save interrupt mask
+			ori.w	#NoIntMask,sr		; disable ints while dequeueing					<1.2>
+			movea.l	fQHeadPtr(a3),a0	; get pointer to element to dequeue
+		if Debugging then
+			btst.b	#fDBQEmpty,fDBFlag(a3)	; see if anything in queue
+			beq.s	@hasEntries			; if something to dequeue, we're ok
+			_Debugger					; if not, we're dead
+@hasEntries	cmp.b	(a0),d3				; check command sent against command received
+			beq.s	@cmdOK				; if match, we're ok
+			_Debugger					; if not, we're dead
+@cmdOK
+		endif
+			adda.w	#fQSize,a0			; point past end of element
+			movea.l	a0,a1				; save pointer to end of queue element
+			cmpa.l	fQEndPtr(a3),a0		; see if queue pointer needs to wrap around
+			blo.s	@noWrap				; if didn't reach end, no wrap yet
+			movea.l	fQBegPtr(a3),a0		; if end reached, wrap back to begining
+@noWrap		move.l	a0,fQHeadPtr(a3)	; update the queue head pointer
+			cmpa.l	fQEntPtr(a3),a0		; see if queue is now empty
+			bne.s	@notEmpty			; if not, don't need to change empty flag
+			bset.b	#fDBQEmpty,fDBFlag(a3)	; queue is now empty, set flag to remember it
+@notEmpty
+			move.l	-(a1),-(sp)			; copy fQData to A2 save area on stack
+			move.l	-(a1),-(sp)			; copy fQComp to A1 save area on stack
+			movea.l	-(a1),a0			; copy fQBuff to A0
+			move.w	d1,sr				; restore interrupt mask
+			bra.s	RequestDone			; copy buffer data, resume ADB, call handler
+			endwith
+			Title	'KbdADB - ADB Manager  -  ImplicitRequestDone'
+
+;_______________________________________________________________________
+;
+;  Routine:		ImplicitRequestDone
+;  Inputs:		D2 - length of receive buffer data
+;				D3 - command byte / SRQ flag (bit 31)
+;				A2 - pointer to buffer containing receive data
+;				A3 - pointer to ADBBase
+;
+;  Outputs:		D2 - length of receive buffer data
+;				D3 - command byte / SRQ flag (bit 31)
+;				A0 - pointer to buffer to pass to completion routine
+;				A2 - pointer to buffer containing receive data
+;				A3 - pointer to ADBBase
+;				0(SP) - completion routine address
+;				4(SP) - optional data to pass in A2 to completion routine
+;				8(SP) - stack cutback address, after completion routine runs
+;				
+;  Destroys:	D0, D1, A0, A1
+;  Calls:		exits through RequestDone
+;
+;  Function:	Locates the paramaters to pass to the service routine.
+;
+;_______________________________________________________________________
+
+			with	ADBDeviceEntry
+ImplicitRequestDone
+			tst.b	d2					; see if any data returned
+			beq.s	RunADBRequest		; if no data, ack the data, resume ADB operations
+			move.b	d3,d0				; get command that completed
+			lsr.b	#4,d0				; get the address from the command
+FFI1		jsrROM	FindFDBInfo			; get the info for this device (FindFDBInfo)
+			bne		RunADBRequest		; if unknown, ack the data, resume ADB operations
+			suba.w	#12,sp				; allocate a buffer (len byte, 8 data bytes, 3 slop)
+			movea.l	sp,a0				; save pointer to buffer
+			pea		12(sp)				; save stack restore address
+			move.l	fDBOpData(a1),-(sp)	; copy fDBOpData to A2 save area on stack
+			move.l	fDBCRA(a1),-(sp)	; copy fDBCRA to A1 save area on stack
+*Fall Into*	bra.s	RequestDone			; copy buffer data, resume ADB, call handler
+			endwith
+			Title	'KbdADB - ADB Manager  -  RequestDone'
+
+;_______________________________________________________________________
+;
+;  Routine:		RequestDone
+;  Inputs:		D2 - length of receive buffer data
+;				D3 - command byte / SRQ flag (bit 31)
+;				A0 - pointer to buffer to pass to completion routine
+;				A2 - pointer to buffer containing receive data
+;				A3 - pointer to ADBBase
+;				0(SP) - completion routine address
+;				4(SP) - optional data to pass in A2 to completion routine
+;				8(SP) - stack cutback address, after completion routine runs
+;
+;  Outputs:		none
+;				
+;  Destroys:	A0-A3/D0-D3
+;  Calls:		device handler completion routine
+;
+;  Function:	Copies the receive data into the proper buffer, resumes ADB
+;				operations, and calls the device handler completion routine.
+;
+;_______________________________________________________________________
+
+RequestDone	move.l	a0,-(sp)			; copy buffer address to A0 save area on stack
+			beq.s	@copyDone			; if no buffer, don't copy					<1.8>
+			move.b	d2,(a0)+			; copy length byte to form pascal string
+			beq.s	@copyDone			; if no data, don't copy
+
+			subq.w	#1,d2				; adjust count for dbra loop
+@copyLoop	move.b	(a2)+,(a0)+			; copy a byte at a time
+			dbra	d2,@copyLoop		; loop for all bytes
+
+@copyDone	move.l	d3,-(sp)			; copy command byte to D0 save area on stack
+
+			bsr.w	RunADBRequest		; acknowledge the data, resume ADB operations
+
+			movem.l	(sp)+,d0/a0/a1/a2	; setup cmd, buffer, handler, data
+			move.l	a1,d1				; test to see if handler address is valid
+			beq.s	@noHandler			; if not, don't call it
+			jsr		(a1)				; call the handler
+@noHandler
+			movea.l	(sp),sp				; deallocate the buffer (if implicit cmd)
+			rts							; return from the interrupt
+			
+			Title	'KbdADB - ADB Manager  -  StartReqVIA'
+
+;_______________________________________________________________________
+;
+;  Routine:		StartReqVIA
+;  Inputs:		D2 - length of transmit buffer data
+;				D3 - command byte / implicit flag (bit 31)
+;				A2 - pointer to buffer containing transmit data
+;				A3 - pointer to ADBBase
+;
+;  Outputs:		A1 - pointer to VIA1
+;				A3 - pointer to ADBBase
+;				
+;  Destroys:	
+;  Calls:		RunADBRequest, @sendCmd, @waitForInput, @getNextByte
+;				@sendFirstByte, @sendNextByte
+;
+;  Function:	Initiates an asynchronous ADB request, using the VIA interface
+;				to the ADB transceiver processor.
+;
+;_______________________________________________________________________
+
+StartReqVIA
+			with	ADBVars
+			movea.l	VIA,a1				; get pointer to VIA
+			bset.b	#fDBBusy,FDBAuFlag(a3)	; remember that we are busy
+			beq.s	@notBusy			; if not busy, proceed
+			rts							; if busy, do nothing and return
+
+@notBusy	tst.l	d3					; see if implicit
+			bpl.s	@explicit			; implicit is special case
+
+;	send an implicit command (auto / SRQ polling), no data needs to be sent
+
+@implicit	move.b	PollAddr(a3),d3		; get the auto/srq polling address
+			lsl.b	#4,d3				; position the address
+			ori.b	#talkCmd+0,d3		; make it a Talk R0 command
+			bsr.w	@sendCmd			; send out the command byte
+			beq.s	@autoReply			; see if prior auto poll data returned instead
+
+			move.b	fDBCmd(a3),pollCmd(a3)	; remember the command byte
+			bsr.s	@StartAutoPoll		; start auto polling
+			btst.b	#fDBQEmpty,FDBFlag(a3)	; see if anything queued
+			bne.s	@idle				; if not, just wait for auto poll data
+
+;	we have just changed from state 0 to state 3, if a command is in the queue, we will
+;	want to change back to state 0, and send a new command.  We have to give the xcvr
+;	processor time to recognize the state change into state 3, before we change back to
+;	state 0.  Otherwise it will be out of sync.
+
+			pea		RunADBRequest		; somthing in queue, run after a short delay
+			move.w	TimeViaDB,d0		; get 1ms VIA loop time constant
+
+	IF forSTP601 THENB
+		;•••• STP ••• eric -- let's double it??
+			lsr.w	#2,d0				; 1ms/8 = 125µs
+	ELSE
+
+			lsr.w	#4,d0				; 1ms/16 = 62.5µs
+	ENDIF
+@delay		
+		eieioSTP
+			btst.b	#0,vBufB(a1)		; timing base on BTST loop, we don't care
+		eieioSTP
+			dbra	d0,@delay			; wait at least 50µs for state change to occur
+@idle		bclr.b	#fDBBusy,FDBAuFlag(a3)	; allow explicit cmds to interrupt auto polling
+			rts							; if not, just let auto polling continue
+
+@StartAutoPoll
+			moveq.l	#(1<<vFDesk1)|\
+					(1<<vFDesk2),d1		; change from state 0 to state 3
+			bsr.w	@waitForInput		; start auto polling, wait for a reply
+			ori.b	#(1<<fDBAPoll)|\	; indicate that auto poll data returned
+					(1<<fDBBusy),FDBAuFlag(a3)	; auto poll found something, we're busy again
+			moveq.l	#(1<<vFDesk2),d1	; change from state 3 to state 1
+			bra.s	@getReply			; join common code to get reply
+
+@explicit	moveq.l	#maskADBCmd,d0		; setup to extract command
+			and.b	d3,d0				; clear addr and reg
+			subq.b	#listenCmd,d0		; check for listen command
+			beq.w	@listen				; explicit listen is special case
+
+			eject
+;	send an explicit command (other than listen), no data needs to be sent
+
+			bsr.s	@sendCmd			; send out the command byte
+			bne.s	@explicitReply		; see if auto poll data returned instead
+@autoReply	bset.b	#fDBAPoll,FDBAuFlag(a3)	; indicate that auto poll data returned
+			move.b	pollCmd(a3),fDBCmd(a3)	; poll command is command that is completing
+@explicitReply
+
+			moveq.l	#(1<<vFDesk1),d1	; change from state 0 to state 1
+@getReply	bsr.s	@waitForInput		; wait for the first byte
+			bne.s	@noTimeout			; see if timeout occured
+			bset.b	#fDBNoReply,FDBAuFlag(a3)	; indicate that no reply data was returned
+@noTimeout	clr.b	fDBCnt(a3)			; indicate buffer empty
+
+			bsr.s	@getNextByte		; wait for the second byte
+			bne.s	@noSRQ				; see if SRQ occured
+			bset.b	#fDBSRQ,FDBAuFlag(a3)	; indicate that no service request was returned
+@noSRQ
+
+@fetchLoop	bsr.s	@getNextByte		; wait for another byte
+			beq.s	@fetchDone			; exit if end of data reached
+			cmpi.b	#8,fDBCnt(a3)		; see if end of buffer reached
+			blo.s	@fetchLoop			; keep fetching until end of data
+@fetchDone	btst.b	#fDBNoReply,FDBAuFlag(a3)	; see if buffer data is valid
+			seq.b	d0					; $FF if data is valid, $00 if no reply
+			and.b	d0,fDBCnt(a3)		; set count to zero if timeout
+			bra.w	ReqDoneVIA
+
+
+@sendCmd	andi.b	#$FF-(\
+					(1<<fDBAPoll)|\		; clear auto poll reply flag
+					(1<<fDBSRQ)|\		; clear SRQ active in reply flag
+					(1<<fDBNoReply)),\	; clear reply timeout flag
+					FDBAuFlag(a3)		; clear the flags
+			move.w	sr,d0				; save int mask
+			ori.w	#NoIntMask,sr		; disable all interrupts						<1.2>
+
+;
+; This change (8) will take effect for TheFuture.  Don’t use it for anything
+; earlier.
+;
+
+	if TheFuture then					;												<9>
+
+		eieioSTP
+			move.b	vBufB(a1),d1		; get current state								<8>
+		eieioSTP
+			andi.b	#(1<<vFDesk2)+\
+					(1<<vFDesk1),d1		;												<8>
+			cmpi.b	#(1<<vFDesk2)+\
+					(1<<vFDesk1),d1		; are we in state 3?							<8>
+			bne.s	@sendCont			; no, procede as usual							<8>
+		eieioSTP
+			btst.b	#vFDBInt,vBufB(a1)	; yes, test the FDBInt~ status					<8>
+		eieioSTP
+			beq.s	@sendExit			; asserted, xcvr already clocking autopoll data,<8>
+										; exit (wait for autopoll to complete)			<8>
+	endif								;												<9>
+	
+@sendCont	
+		eieioSTP
+			ori.b	#$1C,vACR(a1)		; set SR to shift-out with ext clk
+		eieioSTP
+			move.b	d3,vSR(a1) 			; load shift reg with cmd, start shifting
+		eieioSTP
+			move.b	d3,fDBCmd(a3)		; save the command
+		eieioSTP
+			andi.b	#-1-(1<<vFDesk2)-\
+					(1<<vFDesk1),vBufB(a1)	; force state bits to zero
+		eieioSTP
+@sendExit	move.l	(sp)+,ShiftIntResume(a3); save resume address
+			move.w	d0,sr				; restore interrupt mask
+			rts							; return to callers caller, wait for interrupt
+
+
+@waitForInput
+		eieioSTP
+			bclr.b	#4,vACR(a1)			; change to shift-in mode
+		eieioSTP
+			tst.b	vSR(a1) 			; empty shift reg to start shifting
+		eieioSTP
+			eor.b	d1,vBufB(a1)		; change the state
+		eieioSTP
+			move.l	(sp)+,ShiftIntResume(a3)	; save resume address
+			rts							; return to callers caller, wait for interrupt
+
+
+@getNextByte
+			lea		fDBCnt(a3),a0		; point to the length byte of the buffer
+			moveq.l	#1,d0				; zero extend the index
+			add.b	(a0),d0				; get, and increment the index
+			move.b	d0,(a0)				; update the index
+		eieioSTP
+			move.b	vSR(a1),(a0,d0.w)	; save the new byte in the buffer
+		eieioSTP
+			eori.b	#(1<<vFDesk1)|\
+					(1<<vFDesk2),vBufB(a1)	; alternate between state 1 and state 2
+		eieioSTP
+			move.l	(sp)+,ShiftIntResume(a3)	; save resume address
+			rts							; return to callers caller, wait for interrupt
+
+			eject
+;	send an explicit Listen command, send data buffer.
+;  Inputs:		D2 - length of transmit buffer data
+;				D3 - command byte / implicit flag (bit 31)
+;				A2 - pointer to buffer containing transmit data
+;				A3 - pointer to ADBBase
+
+@listen		subq.b	#2,d2				; check for min length of 2
+			bhs.s	@minOK				; if >= 2, use it
+			moveq.l	#0,d2				; otherwise use 0, which will become 2
+@minOK		subq.b	#8-2,d2				; check for max length of 8
+			bls.s	@maxOK				; if <= 8, use it
+			moveq.l	#0,d2				; otherwise use 0, which will become 8
+@maxOK		addq.b	#8,d2				; restore count
+			move.b	d2,fDBCnt(a3)		; update buffer length
+			move.l	a2,ListenBuffPtr(a3); save buffer starting address
+
+			bsr.s	@sendCmd			; send out the command byte
+			beq.w	@autoReply			; see if auto poll data returned instead
+
+			bsr.s	@sendFirstByte		; send the first byte
+			bne.s	@noListenTimeout	; see if timeout occured
+			bset.b	#fDBNoReply,FDBAuFlag(a3)	; indicate that no reply data was returned
+@noListenTimeout
+			bsr.s	@sendNextByte		; send the second byte
+			bne.s	@sendLoop			; if no SRQ, send the data
+			bset.b	#fDBSRQ,FDBAuFlag(a3)	; remember that a service request was returned
+
+@sendLoop	tst.b	fDBCnt(a3)			; see if end of buffer reached
+			beq.s	ReqDoneVIA			; leave when count is zero, no reply data
+			bsr.s	@sendNextByte		; send another byte
+			bra.s	@sendLoop			; loop until count exhausted
+
+
+
+@sendFirstByte
+			moveq.l	#(1<<vFDesk1),d1	; change from state 0 to state 1
+			bra.s	@sendByte			; join common code
+
+@sendNextByte
+			moveq.l	#(1<<vFDesk1)|\
+					(1<<vFDesk2),d1		; alternate between state 1 and state 2
+@sendByte	movea.l	ListenBuffPtr(a3),a0; get the buffer pointer
+		eieioSTP
+			move.b	(a0)+,vSR(a1)		; send the byte
+		eieioSTP
+			move.l	a0,ListenBuffPtr(a3); update the buffer pointer
+			subq.b	#1,fDBCnt(a3)		; decrement the send count
+		eieioSTP
+			eor.b	d1,vBufB(a1)		; change the state
+		eieioSTP
+			move.l	(sp)+,ShiftIntResume(a3)	; save resume address
+			rts							; return to callers caller, wait for interrupt
+			
+;_______________________________________________________________________
+;  Routine:		FDBShiftInt
+;  Inputs:		A1 - base address of VIA1 (setup by IntHnd)
+;  Outputs:		A1 - base address of VIA1
+;				A3 - pointer to ADBBase
+;				ccr.z - result of BTST #vFDBInt,vBufB(a1)
+;
+;  Function:	handles shift interrupt, resumes asynchronous processing
+;_______________________________________________________________________
+
+FDBShiftInt
+			movea.l	ADBBase,a3			; point to ADB globals in low memory
+			movea.l	ShiftIntResume(a3),a0	; get address to resume at
+		eieioSTP
+			btst.b	#vFDBInt,vBufB(a1)	; test the FDBInt~ status
+		eieioSTP
+			jmp		(a0)				; resume async processing
+			
+			Title	'KbdADB - ADB Manager  -  ReqDoneVIA'
+
+;_______________________________________________________________________
+;
+;  Routine:		ReqDoneVIA
+;  Inputs:		none
+;
+;  Outputs:		D2 - length of receive buffer data
+;				D3 - command byte / SRQ flag (bit 31)
+;				A2 - pointer to buffer containing receive data
+;				A3 - pointer to ADBBase
+;
+;				
+;  Destroys:	
+;  Calls:		ImplicitRequestDone, ExplicitRequestDone
+;
+;  Function:	Completion routine for servicing replies from the ADB xcvr.
+;
+;_______________________________________________________________________
+
+ReqDoneVIA
+			with	ADBVars
+			move.b	FDBAuFlag(a3),d0	; get the flags
+			move.b	fDBCmd(a3),d1		; get the command
+			moveq.l	#(1<<fDBSRQ),d3		; mask to test for SRQ pending
+			and.b	d0,d3				; isolate the bit
+			neg.l	d3					; set bit 31 if SRQ pending
+			move.b	d1,d3				; insert the command byte
+
+			move.w	DevMap(a3),d2		; list of possible address to search			<1.2>
+			lsr.b	#4,d1				; isolate the device address
+			tst.l	d3					; was there an SRQ?
+			bpl.s	@noSRQ				; if not, don't advance poll address
+
+			bset.l	d1,d2				; if no other bits set, come back to this one
+@SRQloop	addq.b	#1,d1				; try the next address
+			andi.b	#$0F,d1				; wrapping around if needed						<1.2>
+			btst.l	d1,d2				; see if there is a device with that address
+			beq.s	@SRQloop			; if not, try the next address
+
+@updateAddr	move.b	d1,PollAddr(a3)		; remember where to auto/SRQ poll next			<1.2>
+
+@skipUpdate	lea		fDBCnt(a3),a0		; point to the length byte of the buffer		<1.2>
+			moveq	#0,d2				; zero extend the length
+			move.b	(a0)+,d2			; get length of receive data
+			movea.l	a0,a2				; point to the data buffer
+
+			clr.b	FDBAuFlag(a3)		; clear the flags, especially fDBBusy
+			btst.l	#fDBAPoll,d0		; see what kind of request completed
+			bne.w	ImplicitRequestDone	; auto poll data returned, call handler
+			bra.w	ExplicitRequestDone	; if explicit, call the completion routine
+
+@noSRQ		btst.l	d1,d2				; see if there is a device with this address	<1.2>
+			beq.s	@skipUpdate			; if not, don't make it the active device		<1.2>
+			bra.s	@updateAddr			; if so, update the poll address				<1.2>
+			
+			Title	'KbdADB - ADB Manager  -  Initialization'
+;_______________________________________________________________________
+;
+; BusReset - issue a Reset command
+;
+;   On entry, (SP) has completion routine address										<1.6>
+;
+;_______________________________________________________________________
+
+BusReset	moveq.l	#0,d0				; address zero
+			moveq.l	#resetCmd,d1		; reset command
+			moveq.l	#0,d2				; no data to send
+			bra.s	MakeAsyncRequest	; start the command asynchronously
+
+;_______________________________________________________________________
+;
+; Talk R3 - issue a Talk R3 command
+;
+;   On entry, D0 has device address
+;             (SP) has completion routine address										<1.6>
+;
+;_______________________________________________________________________
+
+TalkR3		moveq.l	#talkCmd+3,d1		; talk command, register 3
+			moveq.l	#0,d2				; no data to send
+			bra.s	MakeAsyncRequest	; start the command asynchronously
+
+;_______________________________________________________________________
+;
+; ListenR3 - issue a listen R3 command
+;
+;   On entry, D0 has device address to send the command
+;			  D1 has new device address to change to
+;             (SP) has completion routine address										<1.6>
+;
+;_______________________________________________________________________
+
+ListenR3	move.b	d1,FDBByte0(a3)		; set up new address for R3
+			move.b	#$FE,FDBByte1(a3)	; setup handle ID
+			moveq.l	#listenCmd+3,d1		; listen command, register 3
+			moveq.l	#2,d2				; 2 bytes of data to send
+
+MakeAsyncRequest
+			lsl.b	#4,d0				; shift address by 4 bits to correct position
+			or.b	d1,d0				; insert the command and register number
+			move.b	d2,FDBCnt(a3)		; setup the send byte count
+			pea		FDBCnt(a3)			; push the buffer address
+			movea.l	sp,a0				; setup param block pointer
+			movea.l	jADBop,a1			; get address of _ADBop
+			jsr		(a1)				; start the request
+			addq.w	#8,sp				; pop buffer addr and return address
+			rts							; return to callers caller
+			
+;_______________________________________________________________________
+;
+; FDBTask - FDB VBL Task
+;
+;_______________________________________________________________________
+
+FDBTask
+			RTS							; just return for now
+
+;_______________________________________________________________________
+;
+; InitDevT - Initialize the Device Table
+;
+;_______________________________________________________________________
+
+InitDevT
+			with	ADBVars,ADBDeviceEntry
+			bsr.s	BusReset			; reset all devices on the bus
+
+			
+			clr.b	DevTOffset(a3)		; initialize the table offset
+			clr.w	HasDev(a3)			; initialize the device map
+			moveq.l	#0,d0				; start with address zero
+PollNext	move.b	d0,InitAddr(a3)		; save device address
+			bsr.s	TalkR3				; issue a Talk R3 command (asynchronously)
+			move.b	InitAddr(a3),d0		; restore poll address
+			tst.b	(a0)+				; test reply length, see if device returned data
+			beq.s	NoDevice			; no, nothing to install 
+
+; there is a response from the device in the address, so update the
+; device table according to the device
+
+			moveq.l	#0,d1				; zero extend for indexing
+			move.b	DevTOffset(a3),d1	; get offset to devicetable
+			move.b	1(a0),FDBDevTy(a3,d1.w)	; copy device handler ID into table
+			move.b	d0,FDBOAddr(a3,d1.w); save device address
+			move.b	d0,FDBAddr(a3,d1.w)	; save device address
+
+			addi.b	#FRecSize,d1		; advance offset
+			move.b	d1,DevTOffset(a3)	; save device table offset
+			move.w	HasDev(a3),d2		; get value in HasDev
+			bset.l	d0,d2				; remember which address has device
+			move.w	d2,HasDev(A3)		; save it
+NoDevice
+			addq.b	#1,d0				; advance device address
+			cmpi.b	#NumFDBAdr,d0		; has it polled all addresses yet?
+			bne.s	PollNext			; no, go to poll next device
+
+; ChgAddr - check the device address to identify multiple devices on 
+; the same address
+
+			move.b	#MoveTime+1,FDBMvCnt(A3); initialize move retry count
+			move.w	HasDev(a3),DevMap(a3)	; initialize device map
+			Bne.S	movLoop					; branch, if there is no device
+ChgExit
+; now setup auto poll for the mouse
+			BClr	#FDBInit,FDBFlag(A3); done with initialization
+			JSR		RunADBRequest		; start auto poll for the mouse
+			RTS
+
+movLoop
+			ST		InitAddr(A3)		; clear poll address
+			subq.b	#1,FDBMvCnt(A3)		; has it loop 50 times yet?
+			Beq.S	ChgExit				; yes, exit
+
+; ChgNext is another entry point for this routine
+ChgNext
+			AddQ.B	#1,InitAddr(A3)		; advance poll address
+			BSR		GNextAddr			; get next address to change
+			Bmi.S	MovLoop				; exit when end of address range
+
+GE1			jsrROM	GEmptyAddr			; get empty address space, D0 gets address (GEmptyAddr)
+			BMI.S	ChgExit				; no more empty address space, exit
+; D0 has an address that can be moved to
+			Move.B	D0,NewAddr(A3)		; save address in NewAddr
+			Move.B	D0,D1				; D1 get new address to change to 
+			Move.B	InitAddr(A3),D0		; D0 get address to issue command
+			BSR		ListenR3			; issue a Listen R3 command
+
+; MovAddr - a Listen R3 command has just been issued, the device is moved to 
+;   a new address. Now issue a Talk R3 to the old address. A timeout would
+;   indicate no more device in the old address, we will move the device back 
+;   to the old address by issuing a Listen R3.
+
+			Move.B	InitAddr(A3),D0		; get address
+			BSR		TalkR3				; issue a Talk R3 command					<1.6>
+
+; MovBack - A Talk R3 has just been issued, a timeout in S1 indicates no
+;   more device in original address, we want to move the device back to 
+;   original address.
+
+		eieioSTP
+			tst.b	(a0)				; did the device return data
+		eieioSTP
+			beq.S	@1					; no, branch 
+; no timeout indication, 
+			bsr.s	CopyEntry			; copy entry into device table
+			Move.B	FDBByte1(A3),FDBDevTy(A3,D1.W)	; get new handle ID into table
+			BRA.S	ChgNext				; go to change next devi]
+; there is timeout indication
+@1
+			Move.B	InitAddr(A3),D1		; get address to change back to
+			Move.B	NewAddr(A3),D0		; get address to talk to
+			bsr		ListenR3			; send a listen R3 command					<1.6>
+
+; CKNewAdr - check the new address by issuing a Talk R3, to see if
+;   there is still any device left.  If yes, add entry into device 
+;   table, but if not, just go to change next device address
+
+			Move.B	NewAddr(A3),D0		; get address
+			BSR		TalkR3				; issue a talk R3							<1.6>
+
+; AddEntry - a Talk R3 command has just been issed to the new address, 
+;   if there is no timeout in S1, one or more device is still in that
+;   address, so, add device to device table.  If there is timeout, no 
+;   device is in that address, so, just go to change next device address
+
+			tst.b	(a0)				; did the device return data
+			Beq.S	ExitEntry			; no, branch
+; no timeout indication, thus, add entry of the new address into the
+; device table.
+			bsr.s	CopyEntry			; copy entry into device table
+			Move.B	FDBByte1(A3),FDBDevTy-FRecSize(A3,D2.W)	; get new handle ID into table
+ExitEntry
+			bra.s	ChgNext				; go to change next device
+			
+;_______________________________________________________________________
+;
+; CopyEntry - copy the device entry from the original address to the 
+;   new address, a Talk R3 had just been issued 
+;		
+;		Called by:  MoveBack and AddEntry
+;		on exit:	D1 - has record address of old device
+;					D2 - points to new table entry 
+;_______________________________________________________________________
+
+CopyEntry
+			MoveQ	#0,D0	
+			MoveQ	#0,D1
+			Move.B	NewAddr(A3),D0		; get new address
+			Move.W	DevMap(A3),D1		; get device map
+			BSet	D0,D1				; set device address
+			Move.W	D1,DevMap(A3)		; update device map
+
+			MoveQ	#0,D1				; set D1 as offset to table
+			Move.B	InitAddr(A3),D0		; D0 get address
+@1
+			CMP.B	FDBADDR(A3,D1.W),D0	; same address?
+			BEQ.S	@2					; yes, branch
+			Add	 	#FRecSize,D1		; advance
+			BRA.S	@1
+@2
+			MoveQ	#0,D2
+			Move.B	DevToffset(A3),D2	; set D2 to new entry offset
+			Move.L	FDBDevTy(A3,D1.W),\	; get first 4 byte
+					FDBDevTy(A3,D2.W)	; save it
+			Move.L	FDBCRA(A3,D1.W),\	; get completion routine address
+					FDBCRA(A3,D2.W)		; save it
+			Move.B	NewAddr(A3),\		; get new address
+					FDBAddr(A3,D2.W)	; update address
+			Add		#FRecSize,D2		; advance device table offset
+			Move.B	D2,DevToffset(A3)	; save it
+			RTS
+
+;_______________________________________________________________________
+;
+; GNextAddr - get next address to change 
+;
+;_______________________________________________________________________
+
+GNextAddr
+			MoveQ	#0,D0
+			MoveQ	#0,D1
+			Move.B	InitAddr(A3),D0		; get address
+			Move.W	DevMap(A3),D1		; get device map
+@1
+			BTst	D0,D1				; is there a device there?
+			BNE.S	@2					; branch, if there is device
+			AddQ	#1,D0				; advance to next address
+			CMP		#numFDBAdr,D0		; end of address yet?
+			BLT.S	@1					; no, branch
+			MoveQ	#-1,D0				; return -1 if no more address
+			RTS	
+@2
+			Move.B	D0,InitAddr(A3)		; remember the address
+			RTS
+
+;_______________________________________________________________________
+;			
+; Mouse Driver -- generate mouse button events when appropriate and updates
+;	mouse temporary position vars.
+;
+;  Inputs:		A0 - pointer to buffer containing receive data (Pascal string)
+;				A2 - Optional data (not used)
+;				D0 - command byte (not used)
+;
+;_______________________________________________________________________
+
+
+MouseDrvr
+			lea		1(a0),a1			; skip over length byte, free up A0
+		eieioSTP
+			move.b	(a1)+,d2			; get first data byte (button, ∆ Vert)
+		eieioSTP
+
+;	Update the mouse button state
+
+			move.b  MBState,d1			; get copy of last state
+			eor.b   d2,d1				; did it change?
+			bpl.s   @ButtonDone			; if it didn't, no event
+
+;	If the mouse button bounces, we don't want it to look like a double click, so if we see
+;	a mouse down less than 2 VBLs after a mouse up, we will ignore it, and consider the mouse
+;	to still be up.  We will never ignore a mouse up event, which could lead to menus hanging
+;	and continuous scrolling.
+
+			move.l	Ticks,d1			; get current system ticks
+			sub.l	MBTicks,d1			; compute time since last change
+			movea.w	#mButUpEvt,a0		; A0 holds the event (2 = mouse button up)
+			moveq.l	#-1<<7,d0			; mask for mouse button bit
+			and.b  	d2,d0				; just store high bit
+			bmi.s	@postButton			; if up, post it
+
+			subq.l	#2,d1				; see if less than 2 VBLs since last mouse up
+			blt.s	@ButtonDone			; if too short, must be a down bounce, ignore it
+			addq.l	#2,d1				; restore change time
+			subq.w	#mButUpEvt-mButDwnEvt,a0	; if down, update event number and post it
+
+@postButton	move.b 	d0,MBState			; also update the state
+			add.l	d1,MBTicks			; remember that it just changed
+			add.l	d1,RndSeed			; randomize our seed
+			moveq.l	#0,d0				; no message for PostEvent
+			_PostEvent					; post the mouse button event
+@ButtonDone
+
+;	Update the mouse vertical position
+
+		 	add.b	d2,d2				; shift high bit of ∆ into sign
+			beq.s	@virtDone			; if no change, nothing to update
+			asr.b	#1,d2				; shift ∆ back, sign extended
+			ext.w	d2					; extend it to a word
+			add.w	d2,mTemp+v			; update the virtical position
+			move.b	CrsrCouple,CrsrNew	; note the change
+@virtDone		
+
+;	Update the mouse horizontal position
+
+		eieioSTP
+			move.b	(a1),d2				; get the ∆ Horiz (low 7 bits)
+		eieioSTP
+		 	add.b	d2,d2				; shift high bit of ∆ into sign
+			beq.s	@horizDone			; if no change, nothing to update
+			asr.b	#1,d2				; shift ∆ back, sign extended
+			ext.w	d2					; extend it to a word
+			add.w	d2,mTemp+h			; update the horizontal position
+			move.b	CrsrCouple,CrsrNew	; note the change
+@horizDone		
+			rts							; mouse driver done
+			
+;______________________________________________________________________
+;
+;	KbdInstall - allocate memory for keyboard information and put in ADB record,
+;				 loading resources as necessary.
+;
+;______________________________________________________________________
+
+; Keyboard driver data
+KBufCount	EQU		2
+KBufLen		EQU		10				; 8 bytes + length + inuse
+
+KMAPPtr		EQU		$00
+KeyBits		EQU		KMAPPtr+4
+KCHRPtr		EQU		KeyBits+(128/8)
+DeadKey		EQU		KCHRPtr+4
+KNoADBOp	EQU		DeadKey+4
+KNumBufs	EQU		KNoADBOp+1
+KFirstBuf	EQU		KNumBufs+1
+KbdDSize	EQU		KFirstBuf+(KBufCount*KBufLen)
+
+; KMAP offsets
+KMid		EQU		$00
+KMtype		EQU		$01
+KMvers		EQU		KMid+2
+KMstart		EQU		KMvers+2
+KMnumEx		EQU		KMstart+128
+KMstEx		EQU		KMnumEx+2
+
+KbdInstall
+			with	ADBDeviceEntry
+			MOVEQ	#numFDBAdr, D1			; Number of table entries
+			MOVE.L	ADBBase, A1				; Put Base in A1
+			BRA.S	FirstInstall			; Skip past record increment
+InstallLoop
+			ADD		#FRecSize, A1			; Get to next record
+FirstInstall
+			MOVEQ	#kbdAddr, D0			; We're looking for keyboards
+			CMP.B	FDBOAddr(A1), D0		; Is this one?
+			BNE.S	NotKbd					; Nope, skip around
+
+			MOVEQ	#KbdDSize, D0			; Amount of space needed for keyboard data
+			_NewPtr	,SYS,CLEAR				; get a pointer
+			MOVE.L	A0, A2					; Save it in A2
+
+			MOVE.B	#KBufCount, KNumBufs(A2)
+
+			SUBQ.L	#4, SP					; Make room for result
+			MOVE.L	#'KCHR', -(SP)			; ResType = KCHR
+			CLR.W	-(SP)					; theID = 0
+			MOVE.W	#mapTrue, RomMapInsert	; Load it from ROM
+			_GetResource
+			MOVE.L	(SP)+, D0				; Get the handle
+			BEQ.S	NotKbd					; Skip if NIL
+			MOVE.L	D0, A0
+			MOVE.L	(A0), KCHRPtr(A2)		; Dereference and put away
+
+			SUBQ.L	#4, SP					; Make room for result
+			MOVE.L	#'KMAP', -(SP)			; ResType = KCHR
+			CLR.W	-(SP)					; theID = 0
+			MOVE.W	#mapTrue, RomMapInsert	; Load it from ROM
+			_GetResource
+			MOVE.L	(SP)+, D0				; Get the handle
+			BEQ.S	NotKbd					; Skip if NIL
+			MOVE.L	D0, A0
+			MOVE.L	(A0), KMAPPtr(A2)		; Dereference and put away
+
+			MOVE.L	A2, FDBOpData(A1)		; Save pointer in ADB record
+			MOVE.B	FDBDevTy(A1), KbdType	; Save the keyboard type
+			MOVE.B	FDBAddr(A1), KbdLast	; Save the ADB address
+
+NotKbd
+			DBRA	D1, InstallLoop			; Loop until no more
+			RTS
+			endwith
+			ENDPROC
+			END
+

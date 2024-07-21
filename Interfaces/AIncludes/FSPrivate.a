@@ -1,0 +1,532 @@
+; Version: 2.96
+; Created: Friday, October 20, 1989 at 9:18:00 PM
+;
+; File: FSPrivate.a
+;
+; Assembler Interface to the Macintosh Libraries
+; Copyright Apple Computer, Inc. 1984-1990
+; All Rights Reserved
+;
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 4/14/92	kc		Change LenBTCB from 54 to 74. Change hfsStkLen from 1280 to
+;									1792.
+;		<13>	 1/30/91	gbm		sab, #38: Change the ‘already including this file’ variable to
+;									all uppercase (for security reasons)
+;		<12>	 8/28/90	KST		Make FCFree work as FCtrash on 6.0 RamCache
+;		<11>	 8/27/90	KST		Adding new FlushCache and RelBlock option flags for the new
+;									DiskCache interface.
+;		<10>	 7/18/90	KST		Adding a bit EQU for RamCache.
+;		 <7>	 4/11/90	KST		Revoke change in (6), btMaxDepth is reset to 8 so that we will
+;									not screw up ROM in patches to the ROM. RAM B*tree Manager will
+;									use its own set of EQUs in BtreePrivate.a.
+;		 <6>	  4/4/90	KST		btMaxDepth has been changed from 8 to 16.
+;		 <4>	  2/4/90	DNF		Move new private information into FileMgrPrivate.a
+;	   <1.2>	11/15/89	EKN		Minor twiddles to fidSwapVars offsets.
+;	   <1.1>	 9/29/89	EKN		Added File threads and errors for it
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	  <•1.1>	 9/14/88	CCH		Updated EASE with the current rev of this file.
+;
+;--------------------------------------------------------------------
+;
+; The following information was formerly in "private" files that were
+; not released to the general developer community.
+;
+; The information in this file is not needed for normal application
+; development. These equates and macros were necessary for development
+; of the Macintosh ToolBox and Operating System, and are likely to be
+; dependent on their current implementation. Use of any information
+; in this file is likely to cause your software to fail on future
+; versions of Macintosh system software or hardware.
+;
+; Apple Developer Support will not support any use of the following
+; information.
+;
+; In order to prevent any "accidental" use of this information, it has
+; been disabled using the conditional-assembly variable defined below.
+; If you change this to a non-zero value, you're on your own.
+;--------------------------------------------------------------------
+
+	IF &TYPE('__INCLUDINGFSPRIVATE__') = 'UNDEFINED' THEN
+__INCLUDINGFSPRIVATE__	SET	1
+
+
+  				IF  		(&TYPE('FSPNonPortable') = 'UNDEFINED') THEN
+FSPNonPortable	EQU 		0
+  				ENDIF
+HFSDebug  		EQU 		0         				; include HFS debug traps if 1
+
+
+  				IF  		FSPNonPortable THEN   	;begin exclusion of private information
+; Function: This file contains the complete File System equates for MFS and HFS. It is
+; an extension of the equates defined by old FSEQU.a
+
+;
+; Constant definitions
+;
+btsPrBlk  		EQU 		12        				; bits per block in volume map (FS volume)
+; ExtendFile option flags
+
+EFContig  		EQU 		1         				; force contiguous allocation
+EFAll 			EQU 		0         				; allocate all requested bytes or none
+kEFContig 		EQU 		2         				; corresponding constants for MOVEQ
+kEFAll			EQU 		1
+
+; TruncateFile option flags
+
+TFTrunExt 		EQU 		0         				; truncate to the extent containing new PEOF
+kTFTrunExt		EQU 		1         				; corresponding constants for MOVEQ
+  				MACRO 								; HFS debugging halt trap
+  				_HFSDebug
+  				IF  		HFSDebug THEN     		; only included when actually debugging
+  				IF  		&Syslst[1]<>'' THEN
+  				DC.W		($F000+&Syslst[1])    	; in case a trap sub-code is specified
+  				ELSE
+  				DC.W		($A9FF)       			; User break
+  				ENDIF
+  				ENDIF
+  				ENDM
+
+  				MACRO 								; HFS error halt trap
+  				_HFSDSErr
+  				_HFSDebug   &Syslst[1]    			; Pause first if debugging
+  				MOVEQ   	#DSFSErr,D0       		; Error code = 27, Fatal File System Error
+  				_SysError 							; Stop the engines
+  				ENDM
+
+  				ENDIF 								;end exclusion of private information
+
+strtDir   		EQU 		2         				; directory master block location (block #)
+bufSiz			EQU 		512       				; standard file system buffer size in bytes
+hdrSiz			EQU 		10        				; size of header prefixed to buffer
+bufModBit 		EQU 		7         				; dirty bit in high byte of buf tag word
+bufFNum   		EQU 		-10       				; offset from buf start to file number longword
+bufFlags  		EQU 		-6        				; offset from buf start to file flags word
+bufFBlk   		EQU 		-4        				; offset from buf start to file block word
+bufTag			EQU 		-2        				; offset from buf start to tag word
+nxFreeFN  		EQU 		16        				; next free file number
+nxFreeDID 		EQU 		3         				; next free directory id
+alBlkSize 		EQU 		512       				; default allocation block size (1 sector, in bytes)
+clpSize   		EQU 		4*512     				; default allocation clump size (in bytes)
+
+
+maxHFSTrap		EQU 		17        				; Highest TFS trap dispatch index
+
+
+;_______________________________________________________________________
+
+; fixed location labels: (equivalent of zero page)
+
+
+hfsVars   		EQU 		$36A      				; Start of TFS variables in RAM version
+; (previously RgSvArea)
+hfsTmpSize		EQU 		16        				; Additional temporary space for TFS
+hfsStkLen 		EQU 		1792      				; Allocate a decent-sized chunk of memory	<SM2>
+HFSStkTop 		EQU 		$36A      				; Temporary location of pointer to top of Stack
+HFSStkPtr 		EQU 		$36E      				; Temporary location of TFS Stack pointer
+WDCBsPtr  		EQU 		$372      				; Working Directory queue header
+HFSFlags  		EQU 		$376      				; Internal TFS flags
+DefVRefNum		EQU 		$384      				; Default volume's VRefNum (COULD BE WDRefNum!)
+
+;
+; Flag bits in HFSFlags byte:
+;
+hfsReq			EQU 		0         				; Set if request is specific to TFS
+dirCN 			EQU 		1         				; Set if a CNode is a directory
+hfsContd  		EQU 		7         				; Set if Async trap is continued
+noPMSP			EQU 		6         				; Set to disable PMSP completely (status flag)
+skipPMSP  		EQU 		5         				; Set to skip PMSP setup (one-shot)
+SysCRefCnt		EQU 		$377      				; Usage count byte for system caches (number of vols)
+CacheFlag 		EQU 		$377      				; cache usage count now used as cache flag
+CacheVars 		EQU 		$394
+cacheCom  		EQU 		$39C
+noRWIPBit 		EQU 		7
+diskRdBit 		EQU 		6
+dontInstRC		EQU			5			; set if don't load ramcache in the boot process.	<22May90>
+										; so the RamCache INIT supercedes System's.			<22May90>
+SysBMCPtr 		EQU 		$378      				; System-wide bitmap cache pointer
+SysVolCPtr		EQU 		$37C      				; System-wide volume cache pointer
+SysCtlCPtr		EQU 		$380      				; System-wide control cache pointer
+PMSPPtr   		EQU 		$386      				; Pointer to list of directories on PMSP
+HFSDSErr  		EQU 		$392      				; Final gasp - error that caused IOErr.
+HFSVarEnd 		EQU 		$394      				; End of hfs variable area
+hfsStkOvf 		EQU 		99        				; Deep trouble alert - HFS stack overflowed.
+CurDB 			EQU 		$340      				; current directory block
+FSCallAsync   	EQU 		$342      				; ONE BYTE FREE
+NewMount  		EQU 		$34A      				; (1) used by MountVol to flag new mounts
+NoEject   		EQU 		$34B      				; used by Eject and Offline
+DrMstrBlk 		EQU 		$34C      				; master directory block in a volume
+ErCode			EQU 		$3A2      				; use this loc to report errors during async
+; routines
+FSIOErr   		EQU 		$3DE      				; last I/O error (NEXT WORD FREE)
+FSQueueHook   	EQU 		$3E2      				; hook to capture all FS calls
+ExtFSHook 		EQU 		$3E6      				; command done hook
+DskSwtchHook  	EQU 		$3EA      				; hook for disk-switch dialog
+ReqstVol  		EQU 		$3EE      				; ptr to VCB of off-line or ext fs volume
+FSVarEnd  		EQU 		$3F6      				; end of file system variables
+fsVarLth  		EQU 		$B6
+fsClrWDLen		EQU 		$A2       				;length to clear in boot blocks
+
+
+; Internal File System Error codes
+;
+; Cache errors
+
+chNoBuf   		EQU 		1         				; no free cache buffers (all in use)
+chInUse   		EQU 		2         				; requested block in use
+chnotfound		EQU 		3         				; requested block not found
+chNotInUse		EQU 		4         				; block being released was not in use
+
+; FXM Internal error codes:
+
+fxRangeErr		EQU 		16        				; file position beyond mapped range
+fxOvFlErr 		EQU 		17        				; extents file overflow
+
+; TFS internal errors
+
+fsDSIntErr		EQU 		-127      				; Internal file system error
+
+; BTree error codes
+
+btnotfound		EQU 		32        				; record not found
+btexists  		EQU 		33        				; record already exists
+btnospace 		EQU 		34        				; no available space
+btnoFit   		EQU 		35        				; record doesn't fit in node 
+btbadNode 		EQU 		36        				; bad node detected
+btbadHdr  		EQU 		37        				; bad BTree header record detected
+dsBadRotate   	EQU 		64        				; bad BTree rotate
+
+; CM result codes
+
+cmnotfound		EQU 		48        				; CNode not found
+cmexists  		EQU 		49        				; CNode already exists
+cmnotempty		EQU 		50        				; directory CNode not empty (valence = 0)
+cmRootCN  		EQU 		51        				; invalid reference to root CNode
+cmbadnews 		EQU 		52        				; detected bad catalog structure
+
+; File IDs result codes
+
+cmFThdDirErr  	EQU 		53        				; thread belongs to a directory not a file
+cmFThdGone		EQU 		54        				; file thread doesn't exist
+
+;
+; extent key record (prefix xkr)
+;
+
+dataFk			EQU 		$00           			; data fork type
+rsrcFk			EQU 		$FF           			; resource fork type
+
+xkrKeyLen 		EQU 		0         				; key length (byte)
+xkrFkType 		EQU 		1         				; fork type (byte)
+xkrFNum   		EQU 		2         				; file number (long)
+xkrFABN   		EQU 		6         				; starting file allocation block number (word)
+lenxkr			EQU 		8         				; length of a xkr
+
+;
+; extent data record (prefix xdr)
+;
+numExts   		EQU 		3         				; number of extents per record
+lenExt			EQU 		4         				; length of an extent entry
+maxExtOff 		EQU 		lenExt*numExts-lenExt 	; max extent entry offset
+xdrStABN  		EQU 		0         				; starting physical allocation block number (word)
+xdrNumABlks   	EQU 		2         				; number of allocation blocks (word)
+lenxdr			EQU 		12        				; length of a xdr (3 extent entries)
+
+;
+; FXM variables (FXVars) storage layout
+;
+fxvFlags  		EQU 		0         				; FXM Flags (byte)
+fxvTContig		EQU 		6         				; ...try contiguous allocation first
+fxvFContig		EQU 		7         				; ...force contiguous allocation
+fxvResrv  		EQU 		1         				; reserved (byte)
+fxvxkrOff 		EQU 		2         				; offset to extent key record
+fxvxdrOff 		EQU 		fxvxkrOff+lenxkr  		; offset to extent data record
+lenFXVars 		EQU 		fxvxdrOff+lenxdr  		; length of FXM vars
+
+
+
+;
+; Cache Queue header (prefix cqh)
+;
+cqhFlink  		EQU 		0         				; (long) forward link pointer
+cqhBlink  		EQU 		4         				; (long) backward link pointer
+cqhNumBuf 		EQU 		8         				; (word) number of buffers
+cqhBufSize		EQU 		10        				; (word) buffer size
+LenCQH			EQU 		12        				; length of CQH
+;
+; Cache Buffer Header definition (prefix cbh)
+;
+cbhFlink  		EQU 		0         				; (long) forward link
+cbhBlink  		EQU 		4         				; (long) backward link
+cbhVCBPtr 		EQU 		8         				; (long) VCB pointer
+cbhFlNum  		EQU 		12        				; (long) file number
+cbhFRefNum		EQU 		16        				; (word) file refnum
+cbhDBlk   		EQU 		18        				; (long) disk block number (-1 = empty)
+cbhFlBlk  		EQU 		22        				; (long) file block number
+cbhFlags  		EQU 		26        				; (byte) flags
+cbhdirty  		EQU 		7         				; ...buffer dirty flag
+cbhinuse  		EQU 		6         				; ...buffer in use flag
+cbhempty  		EQU 		5         				; ...buffer is empty
+cbhFkType 		EQU 		27        				; (byte) fork type
+; ...$00 = data fork
+; ...$FF = resource fork
+cbhData   		EQU 		28        				; start of buffer data area
+lenCBH			EQU 		28        				; length of cbh
+
+; Local buffer equates
+
+cobDBlk   		EQU 		cbhDBlk       			; (long) disk block
+cobFlBlk  		EQU 		cbhFlBlk      			; (long) file block
+cobFlags  		EQU 		cbhFlags      			; (byte) flags (only dirty bit is used)
+
+; FlushCache option flags
+fCfreeBit		EQU			1         				; free buffers after flush (save in the hash)	<27Aug90>
+fCtrash   		EQU 		0         				; trash buffer contents after flush
+;; kFCfree works as kFCtrash on pre-7.0 RamCache	; on 7.0, kFCfree overrides kFCtrash			<28Aug90>
+kFCfree			EQU			3						; corresponding constant for MOVEQ load			<27Aug90>
+kFCtrash  		EQU 		1         				;
+
+; GetBlock option flags
+
+gbrelease 		EQU 		3         				; release block immediately after get
+gbnoRead  		EQU 		2         				; don't read block from disk
+gbexist   		EQU 		1         				; get existing cache block
+gbRead			EQU 		0         				; read block from disk (forced read)
+kGBrelease		EQU 		8         				; corresponding constants for MOVEQ load
+kGBnoRead 		EQU 		4         				;
+kGBexist  		EQU 		2         				;
+kGBRead   		EQU 		1         				;
+
+; RelBlock option flags
+rbfreeBit 		EQU 		3         				; free the buffer (save in the hash)			<27Aug90>
+rbdirty   		EQU 		2         				; mark buffer dirty
+rbtrash   		EQU 		1         				; trash buffer contents after release
+rbwrite   		EQU 		0         				; force write buffer to disk
+;; kRBfree works as kRBtrash on pre-7.0 RamCache	; on 7.0, kRBfree overrides kRBtrash			<28Aug90>
+kRBfree  		EQU 		10         				; corresponding constants for MOVEQ load		<27Aug90>
+kRBdirty  		EQU 		4         				; corresponding constants for MOVEQ load
+kRBtrash  		EQU 		2         				;
+kRBwrite  		EQU 		1         				;
+
+
+
+;
+; BTree constants
+;
+btNodeSize		EQU 		512       				; default node size
+btMaxDepth		EQU 		8         				; max tree depth (don't change this)
+
+;
+; Tree Path Record (TPR)
+;
+tprNodeN  		EQU 		0         				; node number (long)
+tprRIndx  		EQU 		4         				; record index (word)
+lenTPR			EQU 		6         				; length of TPR
+lenTPT			EQU 		lenTPR*btMaxDepth     	; length of Tree Path Table
+
+;
+; Node Descriptor (prefix nd)
+;
+ndFlink   		EQU 		0         				; forward link (long)
+ndBlink   		EQU 		4         				; backward link (long)
+ndType			EQU 		8         				; node type (byte)
+ndHdrNode 		EQU 		1         				; ...header node
+ndMapNode 		EQU 		2         				; ...map node
+ndIndxNode		EQU 		0         				; ...index node
+ndLeafNode		EQU 		$FF       				; ...leaf node
+ndNHeight 		EQU 		9         				; node height
+ndNRecs   		EQU 		10        				; number of records (word)
+ndResv2   		EQU 		12        				; reserved (word)
+lenND 			EQU 		14        				; length of node descriptor
+
+;
+; BTree Header (bth) on disk
+;
+bthDepth  		EQU 		0         				; current depth of tree (word)
+bthRoot   		EQU 		2         				; root node number (long)
+bthNRecs  		EQU 		6         				; number of leaf records in BTree (long)
+bthFNode  		EQU 		10        				; node number of 1st leaf node (long)
+bthLNode  		EQU 		14        				; node number of last leaf node (long)
+bthNodeSize   	EQU 		18        				; BTree node size in bytes (word)
+bthKeyLen 		EQU 		20        				; Max. key length (word)
+bthNNodes 		EQU 		22        				; total number of nodes (long)
+bthFree   		EQU 		26        				; number of free nodes (long)
+lenMemBTH 		EQU 		30        				; length of memory resident portion of BTH
+;
+bthResv   		EQU 		30        				; reserved (76 bytes)
+LenBTH			EQU 		106       				; length of a BTH
+;
+; BTree Control Block (btcB) in memory
+;
+btcFlags  		EQU 		0         				; flags (byte)
+btcDirty  		EQU 		7         				; ...dirty flag
+btcKeyUpd 		EQU 		6         				; ...index key update required
+btcNewIRec		EQU 		5         				; ...new index record required
+btcDelIRec		EQU 		4         				; ...index record delete required
+btcResv   		EQU 		1         				; reserved (byte)
+btcRefNum 		EQU 		2         				; file refnum (word)
+btcKeyCR  		EQU 		4         				; pointer to ext key compare routine (long)
+btcCQPtr  		EQU 		8         				; pointer to cache queue (long)
+btcVarPtr 		EQU 		12        				; pointer to BTree variables (long)
+btcLevel  		EQU 		16        				; current level (word)
+btcNodeM  		EQU 		18        				; current node mark (long)
+btcIndexM 		EQU 		22        				; current index mark (word)
+;
+; this part of a btcB is the memory resident portion of the BTH
+;
+btcDepth  		EQU 		24        				; current depth of tree (word)
+btcRoot   		EQU 		26        				; root node number (long)
+btcNRecs  		EQU 		30        				; number of leaf records in BTree (long)
+btcFNode  		EQU 		34        				; node number of 1st leaf node (long)
+btcLNode  		EQU 		38        				; node number of last leaf node (long)
+btcNodeSize   	EQU 		42        				; BTree node size in bytes (word)
+btcKeyLen 		EQU 		44        				; max key length (word)
+btcNNodes 		EQU 		46        				; total number of nodes (long)
+btcFree   		EQU 		50        				; number of free nodes (long)
+LenBTCB   		EQU 		74        				; length of a BTCB		<SM2>
+
+;
+; BTree Variables (btVars) layout
+;
+btVTPTable		EQU 		0         				; Tree Path Table
+btVRecord 		EQU 		btVTPTable+lenTPT     	; record buffer
+
+
+
+;
+; constants
+;
+cmMaxKey  		EQU 		37        				; max catalog key length
+cmMaxCName		EQU 		31        				; max CName length
+cmClpSize 		EQU 		20        				; catalog clump size
+;
+; CNode types
+;
+cmDirCN   		EQU 		1         				; directory CNode
+cmFilCN   		EQU 		2         				; file CNode
+;
+; catalog key record (prefix ckr)
+;
+ckrKeyLen 		EQU 		0         				; key length (byte)
+ckrResrv1 		EQU 		1         				; reserved (byte)
+ckrParID  		EQU 		2         				; parent directory ID (long)
+ckrCName  		EQU 		6         				; CNode name (str31)
+lenckr			EQU 		38        				; length of a ckr
+
+;
+; catalog data record (prefix cdr)
+;
+cdrType   		EQU 		0         				; record type (byte)
+cdrResrv2 		EQU 		1         				; reserved (byte)
+cdrData   		EQU 		2         				; start of catalog record data
+
+;
+; catalog data record types (variants)
+;
+cdrDirRec 		EQU 		cmDirCN       			; directory record (directory CNode type)
+cdrFilRec 		EQU 		cmFilCN       			; file record (file CNode type)
+cdrThdRec 		EQU 		3         				; thread record
+cdrFThdRec		EQU 		4         				; file thread record
+
+;
+; catalog directory record (prefix dir)
+;
+dirFlags  		EQU 		2         				; flags(word)
+dirVal			EQU 		4         				; valence (word)
+dirDirID  		EQU 		6         				; DirID for this directory (long)
+dirCrDat  		EQU 		10        				; date/time created (long)
+dirMdDat  		EQU 		14        				; date/time last modified (long)
+dirBkDat  		EQU 		18        				; date/time last backed up (long)
+dirUsrInfo		EQU 		22        				; User info bytes (16 bytes)
+dirFndrInfo   	EQU 		38        				; Finder Info bytes (16 bytes)
+dirResrv  		EQU 		54        				; reserved (16 bytes)
+lendir			EQU 		70        				; length of a directory record
+
+;
+; catalog thread record (prefix thd)
+;
+thdResrv  		EQU 		2         				; reserved (8 bytes)
+thdParID  		EQU 		10        				; Parent ID for this directory (long)
+thdCName  		EQU 		14        				; CName for this directory (str31)
+lenthd			EQU 		46        				; length of a thread record
+
+;
+; catalog file record (prefix fil)
+;
+fThreadFlag   	EQU 		1         				; bit offset into filFlags (set if thd exists)
+
+filWrtFlag		EQU 		0         				; write-allowed bit in flags byte (0 if allowed)
+filTypMask		EQU 		$FE       				; (user file-type in bits 1-7)
+filFlags  		EQU 		2         				; bit 7=1 (used), bit 0=file lock flag, bit 1=fthread
+filTyp			EQU 		3         				; file type (used as a name extension)
+filUsrWds 		EQU 		4         				; user words for file. (16 bytes)
+filFlNum  		EQU 		20        				; file number
+filStBlk  		EQU 		24        				; Start file block (alloc blk size)(0000 if none)
+filLgLen  		EQU 		26        				; File logical length in bytes (EOF)
+filPyLen  		EQU 		30        				; File physical length in bytes
+filRStBlk 		EQU 		34        				; Start file block, resource fork (0000 if none)
+filRLgLen 		EQU 		36        				; File logical length (EOF), resource fork
+filRPyLen 		EQU 		40        				; File physical length, resource fork
+filCrDat  		EQU 		44        				; date/time created (long)
+filMdDat  		EQU 		48        				; date/time last modified (long)
+filBkDat  		EQU 		52        				; date/time last backed up (long)
+filFndrInfo   	EQU 		56        				; Additional finder info for file (16 bytes)
+filClpSize		EQU 		72        				; file clump size (word)
+filExtRec 		EQU 		74        				; First 3 data fork extents (12 bytes)
+filRExtRec		EQU 		86        				; First 3 resource fork extents (12 bytes)
+filResrv  		EQU 		98        				; reserved (4 bytes)
+lenfil			EQU 		102       				; length of a file record
+lencdr			EQU 		lenfil        			; max length of a catalog data record
+
+;
+; CM variables (CM vars) storage layout
+;
+ckrOff			EQU 		0         				; offset to catalog key record buffer
+cdrOff			EQU 		ckrOff+lenckr     		; offset to catalog data record buffer
+lenCMVars 		EQU 		lencdr+lenckr     		; length of CM vars
+
+;
+; FileIDs variables 
+;
+fidBogusExtID 	EQU 		15        				; use this for exchanging extents in extents file
+
+lenCID			EQU 		4         				; length of a cnode id
+numExtToCache 	EQU 		4         				; just guessing for ExchangeFiles
+destExt   		EQU 		0         				; offset into extFlgsOff if destination has extents
+srcExt			EQU 		1         				; offset into extFlgsOff if source has extents
+
+; fid vars storage layout
+tempKeyOff		EQU 		0         				; BEST BE FIRST, SO LOCCREC CAN BE CALLED ALSO!
+extOff			EQU 		lenCMVars     			; set up 4 extents
+srcDIDOff		EQU			extOff+(numExtToCache*lenxdr)+(numExtToCache*lenxkr); 
+destDIDOff		EQU 		srcDIDOff+lenCID
+extFlgsOff		EQU 		destDIDOff+lenCID     	; flags for existance of extents in extents file
+srcCNode  		EQU 		extFlgsOff+2      		; cnode of source
+destCNode 		EQU 		srcCNode+lencdr   		; dest cnode
+
+lenFIDSwapVars	EQU 		lenCMVars+(numExtToCache*lenxdr)+(numExtToCache*lenxkr)+(2*lenCID)+2+(2*lencdr) 
+														; some catalog variables + the extents +
+														; the directory ids of source and dest +
+														; a word for flagging extents in extent file +
+														; the cnode records of source and dest
+
+
+; further file system equates
+
+CkdDB 			EQU 		$340      				; (2) used when searching the directory
+NxtDB 			EQU 		$342
+MaxDB 			EQU 		$344
+FlushOnly 		EQU 		$346      				; (1) flag used by UnMountVol,FlushVol,
+RegRsrc   		EQU 		$347      				; (1) flag used by OpenRF, FileOpen
+FLckUnlck 		EQU 		$348      				; (1) flag used by SetFilLock,RstFilLock
+FrcSync   		EQU 		$349      				; (1) when set, all fs calls are sync'ed
+RgSvArea  		EQU 		$36A      				; reg save during async calls.
+Params			EQU 		$3A4      				; 50 bytes long. For I/O parameter blocks.
+FSTemp8   		EQU 		$3D6      				; used by rename
+FSTemp4   		EQU 		$3DE      				; used by rename, ckfilmod
+fsVrsn			EQU 		'1.2A'        			; Current file system version
+
+
+
+	ENDIF	; ...already included 

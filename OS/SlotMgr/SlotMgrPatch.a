@@ -1,0 +1,618 @@
+;_______________________________________________________________________________________
+;
+;	File:		SlotMgrPatch.a
+;
+;	Contains:	Routines in this file install the slot manager as a RAM patch.  This file
+;				currently supports 3 different patches: a 'ptch' as part of the 32 bit
+;				QuickDraw INIT, a system patch, and an object module for A/UX.  There are
+;				3 conditional assembly flags which apply: forAUX, SeparateFile, and forROM.
+;				The following table shows how the flags should be set for the different
+;				builds:
+;
+;							forAUX		SeparateFile	forROM
+;							------		------------	------
+;				ROM										  x
+;				A/UX		  x							  x
+;				32 bit CQD					 x
+;
+;	Written by:	David J. Wong, September 17, 1989
+;
+;	Copyright:	© 1989-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 5/16/92	kc		Remove ROMPrivateEqu include.
+;		<14>	 9/16/91	JSM		Cleanup header.
+;		<13>	 6/12/91	LN		added #include 'ROMPrivateEqu.a'
+;		<12>	 6/12/91	LN		Removed #includes for private interfaces from public interfaces.
+;									Changed #include 'HardwareEqu.a' to 'HardwarePrivateEqu.a'
+;		<11>	  3/8/91	djw		<dnf>(BRC #83516) Add linked patch on IIci to fix GetCString
+;									where in 32 bit mode reg d0 was set to 1 and caused an
+;									off-by-one count to be returned.
+;		<10>	 12/8/90	dba		<djw> Get rid of SlotMgrPatchHead.a.o completely for linked
+;									patches, by installing the Slot Manager patch completely with
+;									this file.
+;		 <9>	 8/29/90	KON		fix 32BitQD build
+;		 <8>	 8/17/90	DTY		Converted to a linked patch.  (Greg said that Darin said I could
+;									check it in.)
+;		 <7>	 7/11/90	gbm		get rid of multiply defined stuff
+;		 <6>	 6/29/90	djw		Modify how SecondaryInit's are executed to support A/UX, and the
+;									new boot block scheme. Moved ReconfigVideo to SlotMgrInit.a. If
+;									7.0 patch, copy SecondaryInit code into handle block.
+;		 <5>	 3/15/90	djw		Moved some InitJmpTbl code toInstallSlot since it is only needed
+;									for installing the patch.  Added support for A/UX patch.
+;		 <4>	 2/20/90	djw		Removed patch macros I screwed up for JSR to FROVideo. Just JSR
+;									to hard address.
+;		 <3>	 1/17/90	djw		Modifications to build slot mgr with 32bit QD INIT using BBS
+;									sources. Deleted MapUnit routine (no longer used)
+;		 <2>	  1/4/90	DF		Corrected a ScrnBase calculation in ReConfigVideo
+;	   <1.0>	10/10/89	djw		slot manager patch for system 7.0
+;
+;_______________________________________________________________________________________
+
+; separateFile indicates whether we are building for 32-Bit QD INIT or as a system patch
+; forAUX indicates whether we are building for an A/UX patch
+
+  			If &Type('separateFile') = 'UNDEFINED' Then
+				separateFile: Equ 0
+  			Endif
+
+  			If &Type('forAUX') = 'UNDEFINED' Then
+				forAUX: Equ 0
+  			Endif
+
+			Machine	MC68020
+			String	Asis
+			load	'StandardEqu.d'
+			Include	'HardwarePrivateEqu.a'
+			Include	'RomEqu.a'
+			Include	'UniversalEqu.a'
+			Include	'SlotMgrEqu.a'
+			Include	'LinkedPatchMacros.a'
+
+	if Not forAUX and separateFile then
+
+			include 'PatchMacros.a'			;for 32-bit QD INIT
+
+;_______________________________________________________________________________________
+;	Tail  -  patch mechanism tail section
+;
+;	This section contains the slot manager's patch installation code.  The slot manager's
+;	initialization code is cutback in the RAM patch.
+
+			Proc
+			Export	CutBackPt
+CutBackPt
+			EntryTable	0					; install slot mgr trap ourselves				<3>
+			EndProc
+
+	EndIf									; Not forAUX									<4>
+
+;_______________________________________________________________________________________
+;	InstallSlot  -  main installation routine for slot mgr patch
+;
+;	Input:	none
+;	Output:	reg D0 = negative if error
+;
+;	Registers are not preserved
+
+InstallSlot	InstallProc (II,notAUX)				; Remove this name when we get a new assembler
+			Import	SlotManager
+			Import	InitJmpTbl
+			Import	RestartSlotMgr
+			Import	Secondary_Init
+			Import	SecondaryEnd
+
+			With	spBlock
+
+			move.w	sr,-(sp)					; save current interrupt level
+			ori.w	#hiIntMask,sr				; mask out all interrupts
+
+;	Copy all the current slot manager data structures into high RAM.  This frees up low
+;	system heap space.  Get the sInfo array and SRT.  Leave all the slot interrupt queues
+;	for now.
+
+			movea.l	sInfoPtr,a0					; get a0 = ptr to sInfo array
+			bsr		CopyBlock					; copy sinfo array to app heap - return A0 = handle
+			movea.l	a0,a2						; save reg a2 = handle to copied sInfo array
+
+			movea.l	SRsrcTblPtr,a0				; get a0 = ptr to slot resource table
+			bsr.s	CopyBlock					; copy to app heap
+			movea.l	a0,a3						; save reg A3 = handle to copied SRT
+
+;	Now that the old data structures are copied, free the memory
+
+			MOVEA.L	sInfoPtr,A0							; free sInfo array
+			_DisposPtr
+			MOVE.L	MinusOne,sInfoPtr					; null out low mem ptr
+			MOVEA.L	SRsrcTblPtr,A0						; free slot resource table
+			_DisposPtr
+			MOVE.L	MinusOne,SRsrcTblPtr
+			MOVEA.L	SDMJmpTblPtr,A0						; free slot manager dispatch jump table
+			_DisposPtr
+
+;  Free the existing slot manager jump table and re-initialize the jump table
+
+			movea.l	SDMJmpTblPtr,a0
+			_DisposPtr									; free jmp tbl
+			bsr		InitJmpTbl							; initialize a new jump table
+
+;	Install the new slot manager trap
+
+			leaResident SlotManager,a0					; addr of slot mgr dispatch routine		<10>
+			move.w	#$6e,d0								; trap number
+			_SetTrapAddress	newOS
+
+;	Re-run the slot manager initialization, but skip over the cards which were initialized
+;	by the old slot manager.
+;	Reg A2 = handle to old sInfo array, reg A3 = handle to old slot resource table
+
+			bsr		RestartSlotMgr
+
+			MOVE.W	(SP)+,SR							; restore interrupts
+
+	if separateFile or forAUX then						; 										<6>
+
+;	Now execute the secondary init records with interrupts enabled
+
+			SUBA.W	#spBlockSize,SP
+			MOVEA.L	SP,A0								; A0 = ptr to spBlock
+			BSET	#fWarmStart,spFlags(A0)				; Set Warm Start flag
+			_SecondaryInit								; no errors possible
+			ADDA.W	#spBlockSize,SP						; free spBlock
+
+	endif												; 										<6>
+
+			RTS											; installation complete
+
+;__________________________________________________________________________________
+;	CopyBlock  -  Copy a ptr block to a handle block
+;
+;	Given a pointer to a block, get the size of the block, allocate a handle on the
+;	app heap, copy the contents of the ptr block to the handle block.
+;
+;	Input:	reg A0 = source pointer
+;	Output:	reg A0 = handle to moved block
+
+CopyBlock
+
+		If Not forAUX Then				; not needed under a/ux									<4>
+			MOVEM.L	D1/A1-A3,-(SP)
+			_GetPtrSize							; get size of source block
+			MOVE.L	D0,D1						; save reg D1 = size of source block
+			MOVE.L	A0,A3						; save reg A3 = ptr to source block
+			_NewHandle	,SYS,CLEAR				; alloc new block to copy source block to
+			_HLock								; let's lock it since we will be using a ptr to it
+			MOVE.L	D1,D0						; restore D0 = size of source
+			MOVEA.L	A0,A2						; save reg A2 = handle to destination block
+			MOVEA.L	A3,A0						; get source ptr in A0
+			MOVEA.L	(A2),A1						; deref handle - A1 = ptr to destination
+			_BlockMove							; copy source block data to high in heap
+			MOVEA.L	A2,A0						; return A0 = handle to moved block
+@Error		MOVEM.L	(SP)+,D1/A1-A3				; done
+		Endif							; <Not forAUX>											<4>
+
+			RTS
+
+			EndProc
+
+;_______________________________________________________________________________________
+;	RestartSlotMgr  -  re-initialize the slot declaration manager
+;
+;	Go through the slot manager initialization again and re-allocate all the data
+;	structures.  Skip over the cards that have been initialized by the old slot
+;	manager, but convert all their addresses to 32 bit.  Merge the information in
+;	the old sInfo array and old SRT into the new sInfo array and new SRT.
+;;
+;	Input	:	reg A2 = handle to old sInfo array
+;					A3 = handle to old SRT
+;	Output	:	none
+;
+;	Registers are not preserved
+;
+
+			PROC
+			EXPORT	RestartSlotMgr
+			Import	InitSlotMgr,InitsRsrcTable,InitPRAMRecs,Primary_Init
+			IMPORT	SRTMerge,ChkSlotZero
+			WITH	spBlock,sInfoRecord
+
+RestartSlotMgr
+
+			suba.w	#spBlockSize,sp
+			movea.l	sp,a0						; a0 = ptr to spBlock
+
+;	Initialize the new slot manager data structures - scan the slots again and verify
+;	their configuration ROM's (makes all the addresses 32 bit addresses).
+
+			bsr		InitSlotMgr
+
+;	If there is a bad slot zero at this point, then copy the default slot zero
+;	configuration ROM.  Copy it into the system heap and do the sInfoRecord intialization
+;	again.  This covers 1.0 ROMs, which have no config ROM.
+
+			bsr		ChkSlotZero
+
+;	Copy the status and state fields from the old sInfo array to the new sInfo
+;	data structures.
+
+			bsr.s	sInfoMerge					; reg A2 = hdl to old sInfo array, ret D1 = bitmask
+
+;	Rebuild the slot resource table
+
+			bsr		InitsRsrcTable
+
+;	Restore info from the old SRT back into the new SRT
+
+			bsr		SRTMerge					; reg A3 = hdl to old SRT
+
+;	Init the sPRAM records
+
+			bsr		InitPRAMRecs
+
+;	Execute the primary init records
+
+		If forAUX Then							; a/ux needs primaryInits run at cold start		<4>
+			bclr.b	#fWarmStart,spFlags(a0)		; execute as cold start							<4>
+		Else									;												<4>
+			bset.b	#fWarmStart,spFlags(A0)		; Set Warm Start flag
+		Endif									; <forAUX>										<4>
+			bsr		Primary_Init				; no errors possible
+
+@Error		adda.w	#spBlockSize,SP
+			rts									; done
+
+;_______________________________________________________________________________________
+;	sInfoMerge  -  merge old sInfo array information with new sInfo records
+;
+;	Merge information from the old sInfo array into the new sInfo records.  Specifically,
+;	for all old sInfo array records with a zero, positive, or temporarily disabled
+;	status field, copy the siInitStatusA, siInitStatusV, siState, and siStatusFlags fields.
+;
+;
+;	Input	:	reg A2 = handle to old sInfo array
+;	Output	:	none
+;
+;
+sInfoMerge
+		If Not forAUX Then				; not needed under a/ux									<4>
+			MOVEM.L	D2/A1/A3-A4,-(SP)			; save registers
+
+;	Loop through old sInfo array (6 entries), and copy data from good slots
+
+			MOVEA.L	(A2),A4						; dereference handle to old sInfo array
+			ADDA.W	#sInfoRecSize,A4			; first entry in old sInfo array used for bus errors
+			MOVE.B	#sFirstSlot,D2				; D2 = slot cntr (starting at slot 9 for Mac II)
+@Loop
+			MOVE.W	siInitStatusA(A4),D0		; get D0 = card status
+			BPL.S	@GoodSlot					; zero or positive status means good slot
+			CMP.W	#smInitStatVErr,D0			; error from primary init?
+			BNE.S	@EndLoop					; no - slot status must be bad, go to next slot
+			CMP.W	#svDisabled,siInitStatusV(A4)	; vendor temp slot disable error range?
+			BGT.S	@EndLoop					; no - slot status bad, go to next slot
+
+;	The slot has what seems to be a "temporarily disabled" error from when the old slot
+;	manager ran its primary init.  Because so many slot manager routines check a slot's
+;	error status before doing anything, we will clear the error in the siInitStatusA field,
+;	but leave the error in the siInitStatusV field.  We will also set a flag in the
+;	siFlags field to indicate that this card is was "temporarily bad".  If there is no
+;	secondary init to clear this error, then the card will be marked bad again.
+
+			clr.w	siInitStatusA(a4)			; clear in old slot manager sInfo entry
+			bset.b	#fTempEnabled,siStatusFlags(a4)	; set flag indicating temp enabled state
+
+@GoodSlot	MOVE.B	D2,spSlot(A0)				; set slot number
+			_sFindsInfoRecPtr					; get pointer to sInfo record
+			MOVEA.L	spResult(A0),A1				; A1 = ptr to new sInfo record
+			cmpi.w	#smEmptySlot,siInitStatusA(a1)	; new slotmgr think its an empty slot ?
+			beq.s	@EndLoop					; empty - do not update status
+			tst.w	siInitStatusA(a1)			; new slot mgr think slot is bad ?
+			bmi.s	@EndLoop					; yes - do not update
+			MOVE.W	siInitStatusA(A4),siInitStatusA(A1)	; not empty - copy data from old slot mgr
+			move.w	siInitStatusV(a4),siInitStatusV(A1)
+			MOVE.B	siState(A4),siState(A1)
+			MOVE.B	siStatusFlags(A4),siStatusFlags(A1)
+
+@EndLoop	ADDA.W	#sInfoRecSize,A4			; inc to next record in old sInfo array
+			ADDQ.B	#1,D2						; inc slot cntr
+			CMPI.B	#sLastSlot,D2				; done all slots yet?
+			BLE.S	@Loop						; not yet - continue
+
+			MOVEM.L	(SP)+,D2/A1/A3-A4			; restore registers
+		Endif									; <Not forAUX>									<4>
+			RTS									; done
+
+;_______________________________________________________________________________________
+;	SRTMerge  -  merge the old SRT with the new one
+;
+;	Merge the old SRT with the new SRT.  The new SRT has been built by executing
+;	_InitsRsrcTable again.  This had the effect of destroying fields in the srrBlock
+;	which may have been updated after being built by the old slot manager.  So this
+;	routine calls _sUpdateSRT with the old SRT entry's srrRefNum and srrIOReserved
+;	fields to restore them.  The other fields in the srrBlock cannot be modified
+;	after being initially added into the SRT.
+;
+;	If a slot number has sResources in the old SRT, then they completely replace the
+;	new SRT entries for that slot, unless the new entry is marked disabled.
+;
+;	***** There may be a problem with SRT entries with non-zero extdev fields.  It may
+;	***** be possible to have more than one SRT entry with the same <slot><id>, but
+;	***** different <extdev> fields.  I don't know how to deal with those yet.
+;	***** Currently, these would cause unmatched entry errors.
+;
+;	Input	:	reg A0 = ptr to spBlock
+;					A3 = hdl to old SRT
+;	Output	:	none
+;
+
+			proc
+			export	SRTMerge
+
+;	Partial definition of old SRT entry definition
+
+oldsrrBlock	 	RECORD	0		;Slot Resource Table Record.
+oldsrrHWDev		DS.B	1		;  Hardware device id
+oldsrrSlot		DS.B	1		;  Slot
+oldsrrId		DS.B	1		;  Id
+oldsrrExtDev	DS.B	1		;  External Device
+oldsrrRefNum	DS.W	1		;  RefNum of driver
+oldsrrIOReserved DS.W	1		;  Reserved
+oldpadding		DS.L	3		;  rest of old srr block - not interesting for this routine
+oldSRTRecSize	EQU		*		;  Size
+			    ENDR
+
+			with	spBlock,srrBlock,oldsrrBlock
+
+SRTMerge
+		If Not forAUX Then					; not needed under a/ux								<4>
+			MOVEM.L	D1-D3/A3,-(SP)
+			MOVEA.L	(A3),A3							; deref hdl to SRT - reg A3 = ptr to old SRT
+			MOVEQ	#0,D3							; set a good return status
+			MOVEQ	#0,D2							; clear current slot number
+
+;	Walk down the old SRT and match entries to the new SRT.  When the slot number
+;	changes in the old SRT, start searching the new SRT entries from id=0.
+
+@NextSlot	CMP.B	#$FF,oldsrrSlot(A3)				; end of old SRT ?
+			BEQ.S	@Done							; done
+
+;	If there is an unmatched entry in the old SRT, then for some reason, the new slot
+;	manager did not see it (perhaps the declaration ROM only appears in the
+;	24 bit addr space).  Ignore them.
+
+@ChkOld		CMP.B	oldsrrSlot(A3),D2				; is there an unmatched old entry ?
+			bne.s	@NewSlot						; no - inc slot number
+			adda.w	#oldSRTRecSize,a3				; inc old SRT pointer to next old entry
+			bra.s	@ChkOld							; skip any unmatched entries
+
+@NewSlot	MOVE.B	oldsrrSlot(A3),D2				; set D2 = new current slot number
+			MOVE.W	oldsrrSlot(A3),D1				; set D1 = new current <slot><id>
+			MOVE.B	D2,spSlot(A0)					; set slot number to search for to current slot
+			CLR.B	spId(A0)						; clear the sRsrc id to start from the beginning
+
+;	For the current slot, update entries in the new SRT which match entries in the
+;	old SRT.  New SRT entries which do not match, are deleted.
+
+@Loop		BSET.B	#fall,spParamData+3(A0)			; search all SRT entries
+			BSET.B	#fnext,spParamData+3(A0)			; get "next" entry
+			BSET.B	#foneslot,spParamData+3(A0)		; only look in one slot
+			_FindSRTRec								; get an entry from the new SRT
+			BNE.S	@NextSlot						; no more new entries for this slot - try next
+			MOVEA.L	spsPointer(A0),A1				; A1 = ptr to SRT entry to update
+			MOVE.B	srrSlot(A1),spSlot(A0)			; update <slot><id> - FindSRTRec does not
+			MOVE.B	srrId(A1),spId(A0)
+			CMP.W	srrSlot(A1),D1					; compare new <slot><id> to old
+			BEQ.S	@Update							; new matches old entry - update info in new
+			_sDeleteSRTRec							; new <> old - delete the new entry
+			BRA.S	@Loop							; continue looping
+
+;	Found a match between an old and new SRT entry.  Update the new entry and increment
+;	the old SRT pointer to the next entry.  ***** If the <slot><id> are the same as the
+;	last old entry, but the <extdev> field is different, we should do an InsertSRT to
+;	the new SRT. *****
+
+@Update		MOVE.W	oldsrrRefNum(A3),srrRefNum(A1)			; restore refnum
+			MOVE.W	oldsrrIOReserved(A3),srrIOReserved(A1)	; restore ioReserved field
+			ADDA.W	#oldSRTRecSize,A3				; inc old SRT pointer to next old entry
+			CMP.B	#$FF,oldsrrSlot(A3)				; end of old SRT ?
+			BEQ.S	@Loop							; continue deleting any more new entries
+			CMP.B	oldsrrSlot(A3),D2				; still in the same slot ?
+			BNE.S	@Loop							; not same slot - continue deleting new entries
+			MOVE.B	oldsrrId(A3),D1					; same slot - update sRsrc id in <slot><id>
+			BRA.S	@Loop							; try to match this one
+
+@Done		MOVE.W	D3,D0							; return status in D0
+			MOVEM.L	(SP)+,D1-D3/A3
+		Endif								; <Not forAUX>										<4>
+			RTS
+			Endp
+
+
+;_______________________________________________________________________________________
+;	Default declaration rom
+;
+				Proc
+				STRING 	C
+
+;*************************************************************
+;Macros
+;*************************************************************
+
+				MACRO						; <1.1>
+				DateStr
+				dc.b	'&SYSDATE'
+				ENDM
+
+;*************************************************************
+;Constants
+;*************************************************************
+sRsrc_Board		EQU		1						;Board sResource
+
+;*************************************************************
+;Data Structure
+;*************************************************************
+
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;			Directory
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;								<ID>	<OFFSET/DATA>			<ID>				<OFFSET/DATA>
+_sRsrcDir		OSLstEntry	sRsrc_Board,_sRsrc_Board		;<sRsrc_Board>  <Board sRsrc List offset>
+				DatLstEntry	EndOfList,0						;<EndOfList>    <0>
+
+
+;=============================================================
+;			sRsrc_Board List
+;=============================================================
+;								<ID>	<OFFSET/DATA>			<ID>				<OFFSET/DATA>
+_sRsrc_Board	OSLstEntry	sRsrcType,_BoardType			;<sRsrc_Type>  <Board Type offset>
+				OSLstEntry	sRsrcName,_BoardName			;<sRsrc_Name>  <Name of Board offset>
+				DatLstEntry	BoardId,MIIBoardId				;<BoardId>     <MIIBoardId>
+				OSLstEntry	VendorInfo,_VendorInfo			;<VendorInfo>  <_VendorInfo record offset>
+				DatLstEntry	EndOfList,0						;<EndOfList>    <0>
+
+_BoardType		DC.W	CatBoard							;Board sResource :	<Category>	<C742>
+				DC.W	TypBoard							;					<Type>		<C742>
+				DC.W	0									;					<DrvrSw>	<C742>
+				DC.W	0									;					<DrvrHw>	<C742>
+_BoardName		DC.B	'Macintosh II'						;Name of Board					<1.1>
+
+
+
+;-------------------------------------------------------------
+;			Vendor Info record
+;-------------------------------------------------------------
+_VendorInfo		OSLstEntry	VendorId,_VendorId				;<VendorId>  <VendorId offset>
+				OSLstEntry	RevLevel,_RevLevel				;<RevLevel>  <RevLevel offset>
+				OSLstEntry	Date,_Date						;<ROMDate>	 <Date offset>
+				DatLstEntry	EndOfList,0						;<EndOfList>  <0>
+
+_VendorId		DC.B	'Apple Computer'					;Vendor Id						<1.1>
+_RevLevel		DC.B	'Rev 1.4'							;Revision Level					<1.1>
+_Date			DateStr										;Date							<1.1>
+
+
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;			Format/Header Block
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+				DC.L	(_sRsrcDir-*)**$00FFFFFF			;Offset to sResource directory
+				DC.L	DeclSize							;Length of declaration data
+				DC.L	0									;CRC {Patched by crcPatch}
+				DC.B	1									;Revision level
+				DC.B	AppleFormat							;Format
+				DC.L	TestPattern							;Test pattern
+				DC.B	0									;Reserved byte
+				DC.B	$0F									;ByteLanes: 0000 1111
+
+DataSize
+DeclSize		equ		*-_sRsrcDir		; size of cnfg data
+
+			align
+			String	asis
+
+;_______________________________________________________________________________________
+;	ChkSlotZero  -  check if slot zero config rom is good
+;
+;	Check if the slot zero configuration rom is good.  If not, then copy a default
+;	declaration rom into the system heap and fixup the sInfoRecord.  Mac II 1.0 roms
+;	didn't have a declaration rom for slot zero.  One is needed to do RAM sResources.
+;
+
+			Export	ChkSlotZero
+			With	spBlock,sInfoRecord
+
+
+ChkSlotZero
+			movem.l	d1/a0-a3,-(sp)
+			suba.w	#spBlockSize,sp
+			movea.l	sp,a0							; a0 = ptr to spblock
+
+			clr.b	spSlot(a0)						; set slot number
+			_sFindsInfoRecPtr						; get ptr to slot 0 sInfo record
+			movea.l	spResult(a0),a1
+			tst.w	siInitStatusA(a1)				; test slot status
+			beq.s	@Done							; slot cnfg rom is good
+
+;	The declaration rom is bad - allocate space on the system heap and copy a new one
+
+			move.l	#DeclSize,d0					; size of cnfg rom
+			_NewPtr	,sys
+			movea.l	a0,a3							; save ptr to beginning of blk
+			lea		_sRsrcDir,a2					; a2 = beginning of decl rom
+			move.w	#DeclSize-1,d0					; size adjusted for debra
+@Loop		move.b	(a2)+,(a0)+						; copy cnfg rom to sys heap
+			dbra	d0,@Loop
+
+;	Setup sInfoRecord
+
+			clr.w	siInitStatusA(a1)				; clear the error status
+			suba.l	#1,a0							; dec a0 back to end of decl rom
+			move.l	a0,siROMAddr(a1)				; set addr to top of "rom"
+			move.l	a3,siDirPtr(a1)					; set ptr to directory
+			move.b	#$0F,siCPUByteLanes(a1)			; set byte lanes field to all
+
+@Done		adda.w	#spBlockSize,sp
+			movem.l	(sp)+,d1/a0-a3
+			rts
+			Endp
+
+;_______________________________________________________________________________________
+
+;_______________________________________________________________________________________	<11> djw
+;	PatchGetCString  -  install GetCString patch on IIci
+;
+;	In 32 bit mode, GetCString was doing a "slotjsr InstallBus" which trashed d0 (it was
+;	set to the returned mmu mode).  In 32 bit mode, instead on d0=0, d0=1.  This caused
+;	an off by one error on names returned by sReadDrvrName.
+;
+
+PatchGetCString	InstallProc (IIci,notAUX)
+			Import	GetCStringPatch
+
+			leaResident	GetCStringPatch,a0
+			move.l	a0,	([SDMJmpTblPtr],sGetCString*4)	; patch into vector table
+			rts
+
+			endp
+
+;	Here is the routine to replace until we jump back to ROM
+
+
+BackToGetCString	ROMBind		(IIci,$0592c)
+TheDoneLabel		ROMBind		(iiCi,$05972)
+
+			Proc
+			Export	GetCStringPatch
+			with	spBlock
+
+GetCStringPatch
+			movem.l	a2-a3,-(sp)
+			move.l	spsPointer(a0),-(sp)			; save ptr to the sList
+			move.b	spSlot(a0),-(sp)				; save the slot
+
+			_sFindStruct							; get the ptr to the string
+			bne.s	@Done
+			movea.l	spsPointer(a0),a3				; a3 = ptr to the string
+
+;  Calculate the step register
+
+			bset.b	#fConsecBytes,spFlags(a0)		; calc for consecutive bytes
+			_sCalcStep
+			bne.s	@Done
+			move.l	spResult(a0),d1					; d1 = step register
+
+;	Loop and count all the chars in the string so we know how big a block to allocate. 
+
+			moveq	#0,d2							; clear temp reg for NextStep macro
+			movea.l	a3,a1							; a1 = ptr to the string in the decl rom
+			lea		@Done,a2						; set address to jump to if bus error
+			slotjsr	InstallBus						; replace sys bus excptn and 32 bit mode
+			moveq	#0,d0							; d0 = length cntr *** THE FIX ***
+			jmpROM	BackToGetCString				; continue in ROM
+
+;	This jumps back to the @Done label in ROM
+
+@Done
+			jmpROM	TheDoneLabel					; continue in ROM
+
+
+			End

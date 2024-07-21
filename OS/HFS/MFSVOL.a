@@ -1,0 +1,488 @@
+;
+;	File:		MFSVOL.a
+;
+;	Contains:	This file contains MFS-specific volume-level routines.
+;
+;	Copyright:	© 1984-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <2>	 9/12/91	JSM		Add a header.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				10/20/85	LAK		Don't call MarkVCB if volume is locked. Fail to mount if a
+;									catalog-volume map inconsistency problem is found and the volume
+;									is locked (we can't fix the inconsistency).
+;				10/14/85	PWD		Changed Mountvol to rejoin common TFS thread of execution for
+;									remount check.
+;				10/14/85	PWD		Changed to rejoin common TFS thread of execution for remount
+;									check.
+;				 10/2/85	LAK		Trash blocks in MountVol directory scan which have no entries so
+;									they don't displace more useful directory blocks.
+;				 10/1/85	LAK		Changed to use TFS cache. MFSMount shares more code with TFS.
+;									Added loop detection for MFS mount consistency check.
+;				 10/1/85	LAK		Changed to use TFS cache. MFSMount shares more code with TFS.
+;									Shrink VCB for MFS volumes to old size.
+;				 8/29/85	LAK		Share actual eject code with TFS.
+;				 7/24/85	PWD		Added code to transfer vital VCB info from new VCB on re-mount
+;				 7/23/85	PWD		Changed disk recognition algorithm to use only SigWord, CrDate,
+;									and volume name.
+;				 7/12/85	PWD		Changed to set up and maintain default WDCB and DefVRefNum
+;				 2/12/85	PWD		Adapted from FS MountVol code
+;				 2/12/85	PWD		Adapted from FSVol for use as adjunct to TFSVol. Transferred
+;									most internal routines, pruned entry code. Remainder is all
+;									MFS-specific, executed when TFSVol entry points detect an MFS
+;									volume.
+;				 1/25/85	LAK		Uncommented above call for Mac.
+;				 1/25/85	LAK		Uncommented status call in MountVol. Use EnQueue, DeQueue
+;									routines directly.
+;				10/26/84	RFA		Commented out Status call since Ron's driver doesn't support it
+;				  8/7/84	GSS		New today.
+;				  8/7/84	GSS		New today
+;
+
+;_______________________________________________________________________
+;
+; External Routines:	MFSMount,MFSUnMount
+;						GetVol,SetVol,FlushVol,GetVolInfo,Eject,Offline
+;
+; Internal Routines:	MDspsBuf,MDspsMap
+;
+;_______________________________________________________________________
+
+;_______________________________________________________________________
+;
+; Routine:		MFSMount
+;
+; Arguments:	  A2 (input)  -- pointer to partially filled in VCB
+;				  D0 (output) -- error code
+;				  This call is executed synchronously after control is transferred
+;				  here from MountVol.
+;
+; Calls:		GetVCBDrv,GetVCBRfn,FindDrive,CmdDone,
+;				MyRead (via RdMstDirBlk)
+;
+; Function: 	Allocates memory for volume buffer and allocation map, and reads
+;				in the directory master block and block. The VCB is added to the
+;				VCB queue.	(For remounts, VCB is not reallocated or requeued).
+;
+;  Modification History:
+;
+; 07 Aug 84   GSS	New today
+; 26 Oct 84   RFA	Commented out Status call since Ron's driver doesn't support it
+; 25 Jan 85   LAK	Uncommented above call for Mac.
+; 12 Feb 85   PWD	Adapted from FS MountVol code
+; 12-Jul-85   PWD	Changed to set up and maintain default WDCB and DefVRefNum
+; 23-Jul-85   PWD	Changed disk recognition algorithm to use only SigWord,
+;					CrDate, and volume name.
+; 24-Jul-85   PWD	Added code to transfer vital VCB info from new VCB on re-mount
+; <01Oct85>  LAK	Changed to use TFS cache.  MFSMount shares more code with TFS.
+;					 Shrink VCB for MFS volumes to old size.
+; <02Oct85>  LAK	Trash blocks in MountVol directory scan which have no entries
+;					 so they don't displace more useful directory blocks.
+; <14Oct85>  PWD	Changed to rejoin common TFS thread of execution for remount check.
+;_______________________________________________________________________
+
+MV_GetMFSMap
+
+; Control is transferred here when MountVol encounters a disk whose MDB signature
+; inidicates it's an MFS volume.  By that time, memory for a VCB has already been
+; allocated and filled in (DrvRefNum and DrvNum are valid, a VRefNum
+; has been assigned). MFS master directory info has been transferred into VCB.
+
+
+			BLANKS		ON
+			STRING		ASIS
+
+			MOVEQ	#MFSVCBLen,D0		; shrink the VCB since our needs are	<01Oct85>
+			MOVE.L	A2,A0				;  more modest . . .					<01Oct85>
+			_SetPtrSize 				;										<01Oct85>
+
+			MOVEQ	#BtsPrBlk/4,D2		; # bits per block in map table/4
+			MULU	VCBNmBlks(A2),D2	; compute number of bytes in table
+			ADDQ.L	#1,D2				; first add 1 to round up for odd blks
+			LSR.L	#1,D2				; #bytes=#bits/2 (D2 was # of bits/4)
+			MOVE.W	D2,VCBMLen(A2)		; save in our volume structure
+			MOVEQ	#MpTblStr,D7		; index into directory block
+
+			MOVE.L	D2,D0				; request bytes
+			_NewPtr ,SYS				; get it
+			BNE		MtVolEr1			; exit if there's not enough memory (shared MFS/TFS exit)
+			MOVE.L	A0,VCBMAdr(A2)		; put addr into VCB
+			MOVEQ	#StrtDir,D3 		; current MDB disk block					<01Oct85>
+
+; at this point:
+;  A0 points to where map table starts
+;  A5 points to disk buffer
+;  D3 is current master directory disk block
+;  D2 is # bytes in map table
+;  D7 is index to map table in disk buffer
+
+moveMapIn	MOVE.W	0(A5,D7),(A0)+		; move the map in.
+			ADDQ.W	#2,D7				; next word
+			SUBQ.W	#2,D2				; only move this many bytes
+			BLE.S	mpTblIn 			; br if table moved in
+			CMP.W	#512,D7 			; have we moved this whole block?
+			BCS.S	moveMapIn			; no, keep moving
+
+; read next block of map in from disk--
+
+			ADDQ.W	#1,D3
+			BSR 	MFSVolRead			; get next volume block
+			BNE.S	MFSMtErr			; exit on master directory read errors
+			MOVEQ	#0,D7				; start at beginning of this block
+			BRA.S	moveMapIn
+
+; the map table is in, so verify it by comparing the number of free blocks
+; against the value in the master directory block . . .
+
+mpTblIn
+			BSR.S	CkMFSMap			; see if map looks ok					<01Oct85>
+			BEQ.S	CkMFSVol			; br if so (check the catalog for consistency)
+										; exit if not (bad problem since VCB and map are
+										;  flushed together)
+MFSMDBErr	MOVEQ	#BadMDBErr,D0		; report BadMDBErr to force 'disk damaged'
+										;  message from format pack.
+MFSMtErr	BSR.S	MDspsMap			; get rid of map storage				<29Sep85>
+			BRA 	MtVolEr1			; and share TFS cleanup for rest		<29Sep85>
+
+MDspsMap	MOVEM.L D0/A0,-(SP) 		; preserve all regs
+			MOVE.L	VCBMAdr(A2),A0		; return map table memory
+			_DisposPtr
+			CLR.L	VCBMAdr(A2) 		; (for MFSEject path)
+			MOVEM.L (SP)+,D0/A0 		; restore regs
+			RTS
+
+; Check routine shared by Flush/Unmount
+; Blows D1/D3/D5 - CCR set on result bt not D0
+
+CkMFSMap:								;										<01Oct85>
+			MOVEQ	#2,D3				; first alloc block is block 2
+			MOVEQ	#0,D1				; start with 0 free blocks
+
+@1			BSR 	GtNxBlk
+			BNE.S	@2					; loop if unavailable
+			ADDQ.W	#1,D1				; one more available
+@2			CMP.W	VCBNmAlBlks(A2),D3
+			BHI.S	@3					; end if we looked at them all
+			ADDQ.W	#1,D3				; look at next block
+			BRA.S	@1
+
+@3			CMP.W	VCBFreeBks(A2),D1	; is the free block count as advertised?
+			RTS
+
+; now make sure we are consistent with the number of files and next free
+;  file number by scanning the directory blocks
+
+CkMFSVol:
+			MOVEQ	#0,D1				; number of entries
+			MOVEQ	#0,D2				; max used file number
+			MOVEQ	#0,D7				; inconsistency tab (->VCBAttrib+1)
+			BSR 	MFSRd1stDB			; get the first directory block
+			BNE.S	MFSMtErr			; exit if we can't read the first one . . .
+
+conChkLoop
+			TST.B	FlFlags(A5) 		; flags=0 means end of entries this blk <02Oct85>
+			BNE.S	@0					; br if any entries this block			<02Oct85>
+			MOVE.L	A5,A0				; A0 has already been trashed			<02Oct85>
+			EXG 	D1,D6				; preserve D1 over call 				<02Oct85>
+			MOVEQ	#kRBtrash,D1		; rerelease this block trashed . . .	<02Oct85>
+			JSR 	RelBlock			;  to keep it from displacing more		<02Oct85>
+			EXG 	D1,D6				;  important cache buffers				<02Oct85>
+
+@0			MOVEQ	#0,D0				; init index into directory block
+
+@1			TST.B	FlFlags(A5,D0)		; flags=0 means end of entries this blk
+			BEQ.S	@3					; br if no more entries this block
+			ADDQ.W	#1,D1				; incr number of files
+			CMP.L	FlFlNum(A5,D0),D2	; check the file number for this file
+			BHI.S	@2					; br if less than current max
+			MOVE.L	FlFlNum(A5,D0),D2	; otherwise it becomes the new max
+
+@2			LEA 	FlStBlk(A5,D0),A3
+			BSR.S	CkFilLen			; check file length against map table
+			BNE.S	MFSMDBErr			; exit if loop detected . . .			<01Oct85>
+
+			LEA 	FlRStBlk(A5,D0),A3
+			BSR.S	CkFilLen			; and resource fork, too
+			BNE.S	MFSMDBErr			; exit if loop detected . . .			<01Oct85>
+
+			BSR 	GtNxEntry			; (A5,D0) point to next entry, D6 trashed
+			BCS.S	@1					; br if not finished with this block
+
+@3			BSR 	MFSRdNxtDB			; get next directory block
+			BEQ.S	conChkLoop
+
+dScanDone	CMP.W	#DirFulErr,D0		; was it really the end we reached?
+			BNE		MFSMtErr			; exit if not . . .
+
+			CMP.L	VCBNxtFNum(A2),D2	; is VCB next file number greater?
+			BCS.S	@1					; br if so . . .
+			ADDQ.L	#1,D2
+			MOVE.L	D2,VCBNxtFNum(A2)	; otherwise, use next number
+			ADDQ.B	#1,D7				; bit 0 of attributes notes this problem
+
+@1			CMP.W	VCBNmFls(A2),D1 	; how about the file count?
+			BEQ.S	@2
+			MOVE.W	D1,VCBNmFls(A2) 	; make it consistent
+			ADDQ.B	#2,D7				; bit 1 of attributes notes this problem
+
+@2			TST.B	D7					; found any inconsistencies?
+			BEQ.S	@5					; If not, continue along our merry way
+			BSR 	CVFlgs				; Volume locked?						<20Oct85>
+			BNE.S	@5					; Br if so. 							<20Oct85>
+			BSR 	MarkVCB 			; Otherwise, set the VCB dirty
+
+; now get the write protect status . . .
+
+@5			OR.B	D7,VCBAtrb+1(A2)	; add consistency status
+			BRA 	CheckRemount		; New VCB is ready: re-join TFS code to <14Oct85>
+										; check for remounts.					<14Oct85>
+
+; A short routine to follow the allocation thread of a file and check its PEOF/LEOF.
+
+CkFilLen:
+			MOVEM.L D0-D6,-(SP) 		; preserve all regs 					<20Oct85>
+			MOVE.W	VCBNmAlBlks(A2),D1	; maximum loop count					<01Oct85>
+			MOVEQ	#0,D6				; will contain phys len of file via map
+			MOVE.L	VCBAlBlkSiz(A2),D2	; disk alloc block size
+
+			MOVE.W	(A3),D3
+			BEQ.S	@2					; br if no start block
+
+@1			BSR 	GtNxBlk
+			SUBQ	#1,D1				; decrement loop count.
+			BCS.S	@6					; exit with loop error if we hit -1
+
+			MOVE.W	D5,D3				; next block
+			BEQ.S	@2					; if it points to 0, don't count it
+			ADD.L	D2,D6				; otherwise, add an alloc block
+			CMP.W	#$001,D3			; last entry?
+			BNE.S	@1					; go again if not . . .
+
+@2			MOVE.W	(A3)+,D3			; entry start block
+			MOVE.L	(A3)+,D4			; entry logical length
+			MOVE.L	(A3)+,D5			; entry physical length
+			CMP.L	D5,D6				; does entry info jive with map table?
+			BEQ.S	@5					; exit if so
+
+			MOVE.L	D6,-(A3)			; otherwise, use the len from map table
+			BNE.S	@3					; br if length is non-zero
+			CLR.W	D3					; zero start blk if zero length
+@3			CMP.L	D6,D4				; logical length greater than phys?
+			BLS.S	@4					; br if not
+			MOVE.L	D6,D4				; otherwise, pin it at the phys len
+@4			MOVE.L	D4,-(A3)			; adjusted logical length
+			MOVE.W	D3,-(A3)			; and file start block
+
+			BSR 	CVFlgs				; Is the volume write-protected?		<20Oct85>
+			BNE.S	@6					; exit if so (report MDB error) 		<20Oct85>
+			JSR 	MarkA5Block 		; mark this block dirty 				<01Oct85>
+			BSET	#2,D7				; bit 2 notes we found a file length prob
+
+@5			MOVEQ	#0,D1				; alles gut (set CCR)					<01Oct85>
+@6			MOVEM.L (SP)+,D0-D6 		; restore registers 					<20Oct85>
+			RTS 						; exit with CCR set (BNE for loop error)
+
+;_______________________________________________________________________
+;
+; Routine:		MFSFlush
+; Arguments:	  A2 (input)  -- VCB pointer to volume to flush
+;				  D0 (output) -- error code
+; Calls:		FClose,MyWriteDB
+; Called By:	UnMountVol
+; Function: 	All file buffers on the volume are flushed and any changed
+;				directory information is written out to the diskette.
+;
+; Modification History:
+; 20 Nov 82   LAK	Clears the modified bit after writing out the VCB.
+;					Removed logic to get rid of a file's own buffer after closing
+;					it (should be done by close routine; also changing open to
+;					get a pointer to a buffer from the user -> so user would
+;					deallocate after a close or an eject . . .
+;					Removed logic to deallocate the VCB buffers: this is now done
+;					by unmount volume . . .
+; 06 Dec 82   LAK	Modified for new file system data structures . . .
+; 07 Dec 82   LAK	Made into an external procedure.
+; 21 Dec 82   LAK	Changed to flush file buffers but not close the files; now
+;					combines code of both unmountvol and flushvol.
+; 13 Jan 83   LAK	Zeros rest of last block map block before writing it out;
+;					some cosmetic and minor changes. Fills in IODrvNum field.
+; 26 Jan 83   LAK	Doesn't read in the master block first anymore; always
+;					flushes dirty volume buffer.
+; 02 Jun 83   LAK	Made flush of off-line volume a no-op; also allows unmount
+;					of an off-line volume.
+; 12 Feb 85   PWD	Adapted from FSVol for use with TFSVol; left only MFS-specific
+;					code.
+; <11Sep85>   LAK	Made into a routine.
+;_______________________________________________________________________
+
+MFSFlush
+			MOVE.L	(SP)+,-(A6) 		; Save return address for ,ASYNC calls	<11Sep85>
+			MOVEM.L A0-A5/D1-D7,-(A6)	; Save all regs except D0				<11Sep85>
+
+; All files on this volume are flushed now.  See if volume's info should be
+;  updated. (map table, number of files)
+
+			TST.W	VCBDrvNum(A2)		; is this volume off-line?
+			BEQ.S	MFSFlDone			; then no need to flush
+
+			TST.B	VCBFlags(A2)		; VCB dirty bit set?
+			BPL.S	MFSFlCaches 		; if not, just flush the caches . . .	<01Oct85>
+
+			BSR 	CkMFSMap			; check map (blows D1,D3,D5)			<01Oct85>
+			BNE.S	MFSFlCaches 		; don't write map if it looks bad       <01Oct85>
+
+			MOVEQ	#StrtDir,D3 		; start master block					<01Oct85>
+			BSR 	MFSMapRead			; get a buffer w/o reading it			<01Oct85>
+			BNE.S	MFSFlExit			; exit on errors . . .					<01Oct85>
+			JSR 	MarkA5Block 		; mark it dirty now 					<01Oct85>
+
+; We need to write out the block map and relevant VCB info: first
+;  transfer all directory info from VCB
+
+			MOVEQ	#(VCBDILen/2)-1,D0	; number of words to transfer
+			MOVE.L	A5,A1				; destination is the buffer
+			LEA 	VCBDInfoSt(A2),A0	; source is VCB start of directory info
+			MOVE.L	Time,VCBLsMod(A2)	; use time global var for mod time
+
+@1			MOVE.W	(A0)+,(A1)+ 		; move it
+			DBRA	D0,@1
+
+; now write out the block map: first compute the number of bytes in the table
+
+			MOVE.L	VCBMAdr(A2),A0		; map address
+			MOVE.W	VCBMLen(A2),D2		; map length
+			MOVEQ	#MpTblStr,D7		; index into directory block
+
+mvMpOut 	MOVE.W	(A0)+,0(A5,D7)		; transfer into buffer area.
+			ADDQ.W	#2,D7				; next word
+			SUBQ.W	#2,D2				; count of how many to go
+			BLE.S	mpTblOut			; all done.
+			CMP.W	#512,D7 			; at end of disk block?
+			BCS.S	mvMpOut 			; if not, keep movin'
+
+; write out this block before continuing with rest of map.
+
+			ADDQ.W	#1,D3				; next block for table
+			BSR 	MFSMapRead			; get a buffer w/o reading it			<01Oct85>
+			BNE.S	MFSFlExit			; exit on errors . . .					<01Oct85>
+			JSR 	MarkA5Block 		; mark it dirty now 					<01Oct85>
+
+			MOVEQ	#0,D7				; start at beginning of block
+			BRA.S	MvMpOut 			; move it out
+
+; map is almost out. just need to write this last block (may be the only block)
+
+mpTblOut
+			CMP.W	#512,D7 			; at end of disk block?
+			BCC.S	MFSFlCaches 		; if so, write it out					<01Oct85>
+			CLR.W	0(A5,D7)			; zero to the end of the block for looks
+			ADDQ.W	#2,D7				; next word
+			BRA.S	mpTblOut			; if not, keep movin'
+
+MFSFlCaches
+			BSR 	FlushBuffers		; flush all cache blks for this volume	<01Oct85>
+			BNE.S	MFSFlExit			;  and trash them for unmount . . .
+
+MFSFlDone
+			CLR.B	VCBFlags(A2)		; VCB and block map are no longer dirty
+			TST.B	FlushOnly			; only flushing?
+			BNE.S	MFSFlOK 			; br if so
+
+; dispose the block map, VCB, and volume buffer memory
+
+			TST.W	VCBDrvNum(A2)		; are we off-line?
+			BEQ.S	@1					; br if so (just deallocate VCB)
+
+			BSR 	MDspsMap			; dispose the block map memory
+
+; For UnMountVol, dequeue the VCB and trash any WDCBs for this volume . . .
+
+@1			BSR 	DsposVCB			; share code with MountVol error routine <29Sep85>
+
+MFSFlOK 	MOVEQ	#0,D0				; it's cool                             <11Sep85>
+MFSFlExit	MOVEM.L (A6)+,A0-A5/D1-D7	; Restore regs							<11Sep85>
+			MOVE.L	(A6)+,-(SP) 		; Restore the return address			<11Sep85>
+			TST.W	D0					;										<11Sep85>
+			RTS 						;										<11Sep85>
+
+;_______________________________________________________________________
+;
+; Routine:		GetMFSVolInfo
+; Arguments:	  A0.L (input)	--	I/O volume parameter block: uses all volume
+;									 fields.
+;				  D0.W (output) -- error code
+; Calls:		FSQueue,CmdDone
+;
+; Function: 	Return information about the volume in a mounted drive.
+;				If the IOVolIndex field is 0,
+;				the name of the default volume is returned; if non-zero, the
+;				name of the nth mounted volume is returned. The maximum length
+;				of a volume name is 27 bytes.  The drive number for the volume
+;				is also returned.
+;
+; Modification History:
+;  07 Dec 82  LAK  Changed to support new file system data structures.
+;  16 Dec 82  LAK  Removed backup file lgth subtract in free blk determination.
+;  21 Dec 82  LAK  Changed to call DtrmVol to figure the volume name. Free
+;					 blocks comes from VCB info already stored.
+;  14 Jan 83  LAK  The latest changes.
+;  23 Jan 83  LAK  Changed to use the volindex field, call XferVName.
+;  03 Jun 83  LAK  Added in-use bit: true if any files on the volume are open;
+;					returns volume refnum now instead of drive number.
+;
+; - if this was the twin of GetFileInfo, the volume really shouldn't have to
+;	be mounted . . . if it is, get the info from the VCB and block map: if
+;	not, read the drive's master block into a stack buffer (would have to
+;	read the block map, tho, to determine the number of free blocks) . . .
+;
+; - set a bit somewhere if this volume is the default?
+;_______________________________________________________________________
+
+GetMFSVolInfo
+			BSR 	FSQueue 			; queue up the request
+
+			MOVE.W	IOVolIndex(A0),D2	; if positive,
+			BGT.S	@3					;  go search by index
+			BEQ.S	@1					; if zero, go by drive number/default
+
+			BSR 	DtrmV3				; if negative, go by name
+			BRA.S	@2
+
+@1			BSR 	DtrmV1				; figure by drvnum, vrefnum, or default
+@2			BNE.S	GMVIDone
+			BRA.S	RetMFSVolInfo
+
+@3			MOVE.L	VCBQHdr+QHead,D1	; we want nth VCB in queue
+@4			BEQ		NSVErrXit			; exit with err at end of queue
+			SUBQ.W	#1,D2				; the one we want?
+			MOVE.L	D1,A2
+			BEQ.S	RetMFSVolInfo		; br if so
+			MOVE.L	QLink(A2),D1		; if not, keep traversing the queue
+			BRA.S	@4
+
+; first copy the heart of the VCB into the parameter block
+
+RetMFSVolInfo
+			BSET	#6,VCBAtrb+1(A2)	; set if any files are opened
+			BSR.S	Gt1stFCB			; get (A1,D1) pointing to first FCB
+@1			CMP.L	FCBVPtr(A1,D1),A2	; file open on this volume?
+			BEQ.S	@2					; br if so
+			BSR.S	GtNxtFCB			; get next one until we run out
+			BCS.S	@1
+			BCLR	#6,VCBAtrb+1(A2)	; 0 if no open files match
+
+@2			MOVEQ	#IOVDirLen-2,D0 	; number of bytes to straight copy
+
+@3			MOVE.W	VCBCrDate(A2,D0.W),IOVCrDate(A0,D0.W)
+			SUBQ	#2,D0
+			BPL.S	@3
+
+; next, copy the name into the name buffer and get drive number
+
+			BSR		XferVName
+GMVIDone	BRA 	CmdDone
+
+

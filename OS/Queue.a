@@ -1,0 +1,211 @@
+;
+;	File:		Queue.a
+;
+;	Contains:	Macintosh Core Utility Routines -- Enqueue, Dequeue, InitQueue
+;
+;	Written by:	Andy Hertzfeld  23-APR-81
+;
+;	Copyright:	© 1982-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 9/12/93	pdw		Added EnqueueHead routine.
+;	   <SM2>	 5/21/92	kc		Append "Trap" to the names of Enqueue and Dequeue to avoid name
+;									conflict with the glue.
+;		 <3>	 8/30/91	JSM		Cleanup header.
+;		 <2>	 6/12/91	LN		Changed #include 'HardwareEqu.a' to 'HardwarePrivateEqu.a'
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	  <¥1.1>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.0>	 2/10/88	BBM		Adding file for the first time into EASEÉ
+;	  <C206>	 10/9/86	bbm		Modified to mpw aincludes.
+;				 2/19/86	BBM		Made some modifications to work under MPW
+;				 7/24/85	RDC		Changed interrupt level settings to use equate Added spearate
+;									include statement for HWequ file (no longer in systlqk.sym)
+;				 1/31/85	LAK		Removed unsightly RTE's (for 68020 compatibility).
+;				 1/23/85	LAK		Adapted for new equate files.
+;				  8/8/83	LAK		made code-savings changes suggested in walkthru.
+;				 2/23/83	LAK		changed a Move to a MoveQ, a Cmp to a Cmp.L.
+;				  5/2/82	LAK		removed set and reset of queue-in-use flags since disabling
+;									interrupts already guaranteed exclusion.
+;
+
+				BLANKS			ON
+				STRING			ASIS
+
+
+				LOAD		'StandardEqu.d'
+				INCLUDE		'HardwarePrivateEqu.a'
+
+;
+;-----------------------------------------------------------------------
+;
+; ENQUEUE -- add a queue element to a queue.  
+;	On entry, 
+;		A0 points to the queue element
+;		A1 points to the queue header
+;
+;	All registers are preserved; there are no error conditions.
+;
+;	The element is inserted at the end of the list.
+;
+;	We don't check to see if the element is already in the queue because
+;	this would be slow and if the caller needs such functionality, it should
+;	do it itself.
+;	
+;-----------------------------------------------------------------------
+;
+ENQUEUETRAP		PROC	EXPORT
+
+				MOVE	SR,-(SP)				;preserve status
+				ADDQ	#2,A1					;point to QHead
+				ORI 	#HiIntMask,SR			;disable interrupts for exclusion		<24Jul85>
+
+				CLR.L	QLINK(A0)				;clear the link of the element
+				TST.L	(A1)+					;anything in the queue? (QHead)
+				BNE.S	DOQINSERT				;if so, skip ahead
+;
+; the queue is empty so make the head and tail point to the new element
+;
+				MOVE.L	A0,(A1) 				;QTail
+				MOVE.L	A0,-(A1)				;QHead
+				BRA.S	ENQDONE
+;
+; insert the element at the end of the list
+;
+DOQINSERT		MOVE.L	A2,-(SP)				;preserve A2
+				MOVE.L	(A1),A2 				;get ptr to old QTail
+				MOVE.L	A0,QLINK(A2)			;update its link
+				MOVE.L	A0,(A1) 				;update QTail
+				MOVE.L	(SP)+,A2				;restore A2
+				SUBQ	#4,A1					;point to QHead
+;
+ENQDONE 		SUBQ	#2,A1					;restore A1
+				MOVE	(SP)+, SR				;restore status and go home
+				RTS
+
+				ENDP
+
+
+;-----------------------------------------------------------------------
+; EnqueueHead -- add a queue element to the head of a queue.  
+;-----------------------------------------------------------------------
+;
+;	Entry:
+;		A0 - points to the queue element
+;		A1 - points to the queue header
+;		All registers are preserved; there are no error conditions.
+;
+; The element is inserted at the beginning of the list.
+;
+;-----------------------------------------------------------------------
+;
+ENQUEUEHEAD		PROC	EXPORT
+				
+				MOVE	SR, -(SP)				;preserve status
+				ADDQ	#2, A1					;point to qHead
+				ORI 	#$0700, SR				;disable interrupts for exclusion
+
+				TST.L	(A1)+					;anything in the queue? (qHead)
+				BNE.S	@doQinsert				;if so, skip ahead
+;
+; the queue is empty so make the head and tail point to the new element
+;
+				MOVE.L	A0, (A1) 				;qTail
+				MOVE.L	A0, -(A1)				;qHead
+				CLR.L	qLink(A0)				;clear the link of the element
+				BRA.S	@enQdone
+;
+; insert the element at the head of the list
+;
+@doQinsert		MOVE.L	A2, -(SP)				;preserve A2
+				MOVE.L	-(A1), A2 				;get ptr to old qHead
+				MOVE.L	A2, qLink(A0)			;update new link to old head
+				MOVE.L	A0, (A1) 				;update qHead
+				MOVE.L	(SP)+, A2				;restore A2
+;
+@enQdone 		SUBQ	#2, A1					;restore A1
+				MOVE	(SP)+, SR				;restore status and go home
+				RTS
+		
+				ENDP
+
+;
+;-----------------------------------------------------------------------
+;
+; DEQUEUE -- delete an element from a queue. On entry, A0 points to the queue
+; element while A1 points to the queue header.	On exit, D0 contains an error
+; code.  The only possible error is if the queue element is not present in the
+; queue.  All registers except D0 are preserved.
+;
+;-----------------------------------------------------------------------
+;
+DEQUEUETRAP		PROC	EXPORT
+
+				MOVE	SR,-(SP)				;preserve status
+				MOVEM.L A2-A3,-(SP) 			;preserve work registers
+				ORI 	#HiIntMask,SR			;disable interrupts for exclusion		<24Jul85>
+;
+				MOVE.L	QHEAD(A1),A2			;start searching at the head
+				MOVE.L	A2,A3
+;
+QDELSRCH		CMP.L	A3,A0					;is this the one?
+				BEQ.S	GODEL					;(Escher and Bach)if so, go delete it
+;
+				MOVE.L	A3,A2					;update previous pointer
+				MOVE.L	QLINK(A2),A3			;follow the link
+				CMP.L	QTAIL(A1),A2			;have we reached the tail?
+				BNE.S	QDELSRCH
+;
+; the queue element can't be found so it's an error
+;
+				MOVEQ	#QERR,D0
+				BRA.S	QDONE1
+;
+; we found the element so delete it
+;
+GODEL			CMP.L	A2,A3					;deleting the first element?
+				BNE.S	QUNLINK 				;if not, skip
+;
+; special case to delete the first element in the queue
+;
+				MOVE.L	QLINK(A2),QHEAD(A1)
+				BNE.S	QDELDONE				;was it the only element?
+				CLR.L	QTAIL(A1)				;if so, clear the tail too
+;
+QDELDONE		MOVEQ	#0,D0					;clear the error code
+QDONE1			MOVEM.L (SP)+,A2-A3 			;restore work registers
+				MOVE	(SP)+, SR				;restore status and go home
+				RTS
+;
+; delete for the general case
+;
+QUNLINK 		MOVE.L	QLINK(A3),QLINK(A2) 	;unlink it from the chain
+				CMP.L	QTAIL(A1),A3			;was it the tail?
+				BNE.S	QDELDONE				;if not we're done
+				MOVE.L	A2,QTAIL(A1)			;update tail pointer
+				BRA.S	QDELDONE
+
+				ENDP
+
+
+;------------------------------------------------------------------
+;
+;  INITQUEUE -- initialize the queue header pointed to by A1
+;
+;------------------------------------------------------------------
+
+INITQUEUE		PROC	EXPORT
+
+				CLR.W	(A1)+					;QFlags
+				CLR.L	(A1)+					;qHead
+				CLR.L	(A1)					;qTail
+				SUBQ	#6,A1					;preserve A1
+				RTS
+				
+				ENDP
+
+				END 
+
+
+

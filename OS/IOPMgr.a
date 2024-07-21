@@ -1,0 +1,1462 @@
+;__________________________________________________________________________________________________
+;
+;	File:		IOPMgr.a
+;
+;	Contains:	This module provides the message passing interface between the 680XX and the
+;				drivers running on the IOPs.  It also provides the routines to download code
+;				and to initialize the IOPs.
+;
+;				NOTE: The IOP hardware is called a "Peripheral Interface Controller" or "PIC",
+;					  which can cause some confusion with other names already in the vocabulary
+;					  of Macintosh developers ("PICT" for example), so from the software side,
+;					  we will call them "Input / Output Processors" or "IOP" to avoid (or create)
+;					  confusion.
+;
+;	Written by:	Gary G. Davidian
+;
+;	Copyright © 1987-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM9>	11/10/93	KW		fix localtalk for iop based machines on STP card use forSTP601v1
+;	   <SM8>	 11/9/93	KW		BTU on the STP card doesn't handle bytereads very well so
+;									changed IOP stuff.  Changes are only made when forSTP601=TRUE
+;	   <SM7>	 8/20/93	chp		References to SCCIOPBypassInt have been resolved to the more
+;									general and historically accepted SccDecode entry point in
+;									InterruptHandlers.a. It wasn't necessary to have two names for
+;									the same thing.
+;	   <SM6>	11/19/92	RB		When looking for iop code, look in ROM first.
+;	   <SM5>	 9/10/92	kc		Fix booting problem on Eclipse. (The last  change was trashing a
+;									register in IOPInterrupt)
+;	   <SM4>	 6/11/92	PN		Roll in Cmd-Shift-Esc patch from PatchIIci.a
+;	   <SM3>	 5/21/92	kc		Append "Trap" to the names of Enqueue and Dequeue to avoid name
+;									conflict with the glue.
+;		 <9>	 4/27/92	JSM		Get rid of conditionals: isUniversal, hasIOPSCC, and hasIOPSWIM
+;									are always true, left in the padForOverpatch conditional for
+;									now.
+;		 <8>	12/30/91	RB		Made a beq instruction use the long format in order to link. The
+;									SCCIOPByPassInt routine cannot be accessed with a 16 bit
+;									reference from ROM.
+;		 <7>	 10/1/91	JSM		Don’t use eclipseDebug.
+;		 <6>	 8/30/91	JSM		Cleanup header.
+;		 <5>	 6/12/91	LN		removed #include 'HardwareEqu.a'
+;		 <4>	  9/1/90	BG		Added a check to leave Eclipses in Bypass Mode if we are running
+;									from RAM so that ReAnimator doesnt have its SCC communications
+;									path kicked out from under itself.
+;		 <3>	 1/11/90	CCH		Added include of “HardwarePrivateEqu.a”.
+;		 <2>	 1/11/90	SWC		Set the bypass mode bit in SCCIOPFlag if we can't put the SCC
+;									IOP into enhanced mode so that the serial and AppleTalk drivers
+;									will at least configure correctly. Changed the initialization of
+;									the SCC IOP SccIOCtlReg from $44 to $23 (per Bob Hollyer).
+;	   <2.2>	 12/1/89	GGD		Cleaned up after BAD DOG (SWC), don't include Private.a twice,
+;									It was already included by Inc.Sum.a.
+;	   <2.1>	 12/1/89	SWC		Oops! Forgot to INCLUDE Private.a since that's where SCCIOPFlag
+;									is defined.
+;	   <2.0>	 12/1/89	SWC		Changed the polarity of the mode bit (0) in SCCIOPFlag so that a
+;									zero means we use IOP mode and a 1 means we use bypass so that
+;									if PRAM is reset, Zone 5 will use IOP mode as its default state.
+;	   <1.9>	11/29/89	SWC		Copied the PRAM byte controlling SCC IOP state to new low mem
+;									variable SCCIOPFlag ($BFE) so that we can change the PRAM value
+;									without hosing current IOP clients.
+;	   <1.8>	 11/2/89	GGD		NEEDED FOR ZONE-5 Changed the rules pertaining to the usage of
+;									the IOP Ram Address Pointer register, The old convention was
+;									that interrupts could trash it, the new convention is that
+;									interrupts must save/restore it. Modified all routines to
+;									preserve it, and improved the cross processor data transfer
+;									performance by not having to mask interrupts and save/restore
+;									the addr reg within the xfer loop. Added Vectoring of the
+;									interrupt handler, and change internal calls of IOPMgr trap
+;									routines to jump through the OS Dispatch table, to make future
+;									patching easier.
+;	   <1.7>	 7/25/89	GGD		Fixed interrupt masking bug in Deferred Task queueing which
+;									caused a circular queue if the SCC IOP interrupted the SWIM IOP
+;									interrupt processing at the wrong time. NEEDED FOR F19, Code
+;									size doesn't change.
+;	   <1.6>	 7/14/89	GGD		Added conditionals around the overpatch padding so that it can
+;									be easily located. Turned off the Debugging VBL task. Improved
+;									the handling of interrupts from unknown IOPs to check for the
+;									SCC IOP, and pass the interrupt on to SCCIOPBypassInt if it was
+;									from the SCC.
+;	   <1.5>	 6/30/89	GGD		Modified SCCIOPByPass to not hang waiting for a reply if the
+;									Send failed. Added padding in preparation for the F19 overpatch.
+;	   <1.4>	 5/29/89	GGD		Added new routine SCCIOPHwInit which resets the SCC IOP, puts it
+;									into bypass mode, and initializes the IOControl register holdoff
+;									and wait delays.
+;	   <1.3>	 5/20/89	GGD		Removed IOP register equates, and moved them into HardwareEqu,
+;									converted to use new names for registers and bits. Made the VBL
+;									debugging task support code conditionally assembly so that it
+;									can be easily turned off in the future. Re-wrote initialization
+;									code to make it universal.
+;	   <1.2>	  2/8/89	SGS		Added support for SCC IOP
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.1>	 11/6/88	GGD		Modified interrupt handler to allow for non-deferrable message
+;									handling (needed for MacsBug/ADB support). Fixed a few
+;									un-noticed bugs. Changed interrupt handler to service all
+;									interrupt sources before returning because on IoMac the SWIM IOP
+;									interrupt line is an edge-triggered VIA input and not a level
+;									triggered interrupt. Changed install IOP code to use
+;									_RGetResource to find the 'iopc' resource so that a system file
+;									can override it.
+;	   <1.0>	 10/7/88	rwh		New to EASE today.
+;				  6/6/88	GGD		Re-Written to allow queued xmt requests, and more flexible data
+;									structures to allow IOPs to be added dynamicaly.
+;				 7/31/87	GGD		Created today.
+;__________________________________________________________________________________________________
+
+			TITLE	'IOPmgr - Input / Output Processor Manager'
+
+			BLANKS	ON
+			STRING	ASIS
+			PRINT	OFF
+			LOAD	'StandardEqu.d'
+			INCLUDE	'HardwarePrivateEqu.a'
+			INCLUDE	'UniversalEqu.a'
+			PRINT	ON
+			INCLUDE	'IOPequ.a'
+			MACHINE	MC68020
+			PRINT	NOMDIR
+
+			macro
+			assert	&boolExpr
+			if	not(&Eval(&boolExpr)) then
+			aerror	&concat('Assertion Failed - ',&boolExpr)
+			endif
+			endm
+
+JIOPMoveData EQU	($88*4)+OSTable			; OS trap table entry for _IOPMoveData
+
+Debugging	equ		0						; use debugging VBL task				<1.3><1.6>
+
+IOPPRAM		equ		$00000089				; IOP PRAM index						<1.2>
+Active		equ		$FF						; dummy value for active
+ReplyLen	equ		$01						; bypass message reply length
+MsgLen		equ		$03						; bypass message length
+KernMsg		equ		$01						; kernel message box number
+ByPassCmd	equ		$04						; bypass command
+
+
+MaxIOPRamAddr	equ		$7FFF				; IOP has 32KB RAM
+IOPMsgPage		equ		$02
+IOPXmtMsgBase	equ		$0200
+IOPRcvMsgBase	equ		$0300
+PatchReqAddr	equ		$021F				; Shared Loc to sync patching
+IOPAliveAddr	equ		$031F				; IOP sets to $FF when idle
+
+AliveVBLrate equ	127						; 127 ticks = 2.1166666 seconds
+
+; Message State encodings
+MsgIdle		equ		0						; message buffer idle
+NewMsgSent	equ		1						; new message just sent
+MsgReceived	equ		2						; message received, and being processed
+MsgCompleted equ	3						; message processing complete, reply available
+
+
+; Internal IOP Manager data structures (IOPmgrVars is the root pointer)
+
+IOPMgrGlobals	record	{IOPInfoPtrs},increment	; miscellaneous globals used by the IOP manager
+			if Debugging then				;										<1.3>
+				ds.w	1					; force nice long word alignments
+VTask			ds.b	vblPhase+2			; Virtical Retrace Task info
+			endif							;										<1.3>
+DTask			ds.b	dtQElSize			; Deferred task Manager task info
+				ds.b	1					; filler
+DTaskQueued		ds.b	1					; $FF if task queued or running, $00 when done
+CompleteQHdr	ds.b	qHeadSize			; queue of completed requests
+IntHandlerPtr	ds.l	1					; [long] ptr to IOP interrupt handler
+IOPInfoPtrs		ds.l	NumberOfIOPs		; [long] ptrs to IOP info for each IOP
+
+IOPInfos		ds.b	0					; start of IOPInfo records for installed IOPs
+
+GlobalsSize		equ		*-IOPMgrGlobals		; size of IOPMgrGlobals
+				endr
+
+
+IOPmgr		PROC	EXPORT
+			EXPORT	InitIOPMgr
+			EXPORT	IOPInfoAccess
+			EXPORT	IOPMsgRequest
+			EXPORT	IOPMoveData
+			EXPORT	IOPInterrupt
+			EXPORT	MoveReqHandler
+			EXPORT	SCCIOPByPass			;<1.2>
+			EXPORT	SCCIOPHwInit			;<1.4>
+			IMPORT	SccDecode
+			IMPORT	EnqueueTrap
+			IMPORT	DequeueTrap
+
+			TITLE	'IOPmgr - IOP Info Access'
+
+;_______________________________________________________________________
+;
+;  Routine:		IOPInfoAccess
+;  Inputs:		A0 - pointer to IOPAccessInfo paramater block
+;  Outputs:		D0 - Result Code (NoErr/paramErr)
+;  Destroys:	A0, A1, D0, D1, D2
+;  Calls:		none
+;  Called by:	OsTrap Dispatch Table
+;
+;  Function:	Performs various access operations on an IOP.
+;
+;_______________________________________________________________________
+
+			with	IOPAccessInfo,IOPInfo,IOPRequestInfo,IOPMoveInfo
+IOPInfoAccess								; a0-a1/d1-d2 saved by OsTrap dispatch
+@SavedRegs	reg		a2-a4/d3-d4
+			movem.l	@SavedRegs,-(sp)		; save registers
+			moveq.l	#NoErr,d0				; assume success
+			moveq.l	#0,d1					; zero extend
+
+			move.b	iaAccessKind(a0),d1		; get the access kind
+			cmpi.b	#iaRemoveIOP,d1			; range check it
+			bhi.s	@paramError				; if out of range
+			move.w	@JumpTable(d1.w*2),d2	; get the routine offset
+
+			move.b	iaIOPNumber(a0),d1		; get the IOP number
+			cmpi.b	#MaxIopNum,d1			; range check it
+			bhi.s	@paramError				; if out of range
+			lea		([IOPmgrVars],d1.w*4,\	; a1 := pointer into IOPInfoPtrs table
+					IOPMgrGlobals.IOPInfoPtrs),a1
+		
+			jmp		@JumpTable(d2.w)		; process the request
+
+@JumpTable	assert	iaInstallIOP=((*-@JumpTable)/2)
+			dc.w	@InstallIOP-@JumpTable
+
+			assert	iaGetIOPInfo=((*-@JumpTable)/2)
+			dc.w	@GetIOPInfo-@JumpTable
+
+			assert	iaRemoveIOP=((*-@JumpTable)/2)
+			dc.w	@RemoveIOP-@JumpTable
+
+@paramError	moveq.l	#paramErr,d0			; indicate failure
+			bra.s	@Done					; restore registers and return
+
+
+@GetIOPInfo	move.l	(a1),iaIOPInfoPtr(a0)	; return the pointer to IOP Info
+@Done		movem.l	(sp)+,@SavedRegs		; restore registers
+			rts								; and return
+
+
+@RemoveIOP	move.l	(a1),iaIOPInfoPtr(a0)	; return the old pointer to IOP Info
+			clr.l	(a1)					; and remove it from the table
+			bra.s	@Done					; return with success
+
+
+@InstallIOP	tst.l	(a1)					; see if it is already installed
+			bne.s	@paramError				; if so, it's an error
+			movea.l	iaIOPInfoPtr(a0),a4		; save IOPInfo pointer
+			move.l	d1,d3					; save IOP number
+			subq.l	#4,sp					; allocate function result
+			move.l	#'iopc',-(sp)			; ResType = 'iopc' (IOP code)
+			move.w	d3,-(sp)				; theID = IOP number
+			move.w	#MapTrue,RomMapInsert	; look in ROM first								<SM6> rb
+			_GetResource					; top of stack <- IOP code resource handle		<SM6> rb
+			move.l	(sp)+,d0				; d0 <- resource handle
+			beq.s	@paramError				; error if neither found
+			movea.l	d0,a0					; a0 <- resource handle
+			movea.l	(a0),a0					; a0 <- resource pointer
+
+;	Note that this routine will destroy the old contents of the IopAddrReg, but
+;	since we are also destroying all of it's RAM contents, it isn't worth the
+;	trouble to save it.
+			move.w	sr,-(sp)				; save interrupt priority
+			ori.w	#HiIntMask,sr			; disable interrupts
+			assert	IopAddrRegPtr=0
+			movea.l	(a4)+,a2				; a2 <- IOP Ram Address Reg pointer
+			assert	IopDataRegPtr=(IopAddrRegPtr+4)
+			movea.l	(a4)+,a3				; a3 <- IOP Ram Data Reg pointer
+			assert	IopCtlRegPtr=(IopDataRegPtr+4)
+			movea.l	(a4),a1					; a1 <- IOP Status/Ctl Reg pointer
+			move.b	#resetIopRun,(a1)		; init the Status/Ctl reg, hold IOP reset
+
+;	Fill all of IOP memory with $FF
+
+			move.w	#MaxIOPRamAddr,d0		; d0 <- fill addr / loop counter
+			moveq.l	#-1,d1					; d1 <- fill data ($FF)
+@Fill_FF_Loop
+			move.w	d0,(a2)					; load the address register
+			move.b	d1,(a3)					; write the data to the data reg
+			dbra	d0,@Fill_FF_Loop		; fill all of IOP memory with $FF
+
+;	Complement all of IOP memory. $FF -> $00
+
+			move.w	#MaxIOPRamAddr,d0		; d0 <- Complement addr / loop counter
+@ComplementLoop	move.w	d0,(a2)				; load the address register
+			move.b	(a3),d1					; read the data byte
+			not.b	d1						; complement the data
+			move.w	d0,(a2)					; reload the address register
+			move.b	d1,(a3)					; write the data to the data reg
+			dbne	d0,@ComplementLoop		; Complement all of IOP memory
+			bne.s	@InitError				; if didn't read back $FF (HW error)
+
+;	Check all of IOP memory for $00
+
+			move.w	#MaxIOPRamAddr,d0		; d0 <- Check addr / loop counter
+@Check_00_Loop	move.w	d0,(a2)				; load the address register
+			move.b	(a3),d1					; read the data byte
+			dbne	d0,@Check_00_Loop		; Check all of IOP memory for $00
+			bne.s	@InitError				; if didn't read back $00 (HW error)
+
+;	Download and Verify the IOP code
+
+			movea.l	a0,a1					; a1 <- copy of code start
+@SegLoop	move.b	(a0)+,d0				; get the size of the segment
+			beq.s	@LoadDone				; size of zero terminates segment list
+			move.w	(a0)+,(a2)				; setup the code load address
+
+@LoadLoop	move.b	(a0)+,(a3)				; download a byte
+			subq.b	#1,d0					; decrement the loop count
+			bne.s	@LoadLoop				; load all of the bytes
+
+			move.b	(a1)+,d0				; get size of the segment
+			move.w	(a1)+,(a2)				; setup the code check address
+
+@CheckCodeLoop	move.b	(a3),d1				; read a byte from the IOP
+		IF forSTP601v1 THEN
+			subq.w	#3, (a2)				;ZZZ 
+		ENDIF
+			cmp.b	(a1)+,d1				; compare it to what was loaded
+			bne.s	@InitError				; if download verify error (HW error)
+			subq.b	#1,d0					; decrement the loop count
+			bne.s	@CheckCodeLoop			; check all of the bytes
+
+			bra.s	@SegLoop				; load the next segment
+@LoadDone
+
+;	Start IOP execution
+
+			move.w	#IOPAliveAddr,(a2)		; Address the ALIVE flag
+			clr.b	(a3)					; clear ALIVE
+			assert	IopCtlRegPtr=(IopDataRegPtr+4)
+			movea.l	(a4),a1					; a1 <- IOP Status/Ctl Reg pointer
+			move.b	#setIopRun,(a1)			; release IOP reset
+			moveq.l	#-1,d0					; timeout loop counter
+@AliveWaitLoop
+			move.w	#IOPAliveAddr,(a2)		; Address the ALIVE flag
+			cmpi.b	#$FF,(a3)				; check for alive
+			dbeq	d0,@AliveWaitLoop		; loop until alive
+			beq.s	@Alive					; error if time out (HW error)
+@InitError	move.w	(sp)+,sr				; restore interrupt priority
+			bra.w	@paramError				; return with error
+@Alive
+
+;	Update the Max Xmt / Rcv messages supported
+
+			move.w	#IOPXmtMsgBase,(a2)		; address Xmt MAX
+			addq.l	#MaxXmt-IopCtlRegPtr,a4	; point to MaxXmt in IOPInfo
+			move.b	(a3),(a4)+				; get the Xmt MAX
+
+			move.w	#IOPRcvMsgBase,(a2)		; address Rcv MAX
+			assert	MaxRcv=(MaxXmt+1)
+			move.b	(a3),(a4)				; get the Rcv MAX
+
+			suba.w	#MaxRcv,a4				; point to start of IOPInfo record
+			move.l	a4,([IOPmgrVars],d3.w*4,\	; install pointer into IOPInfoPtrs table
+					IOPMgrGlobals.IOPInfoPtrs)
+
+			lea		MoveReqInfo(a4),a0		; a0 := pointer to IOPRequestInfo
+			lea		irIOPNumber(a0),a1		; a1 := initialization pointer
+			move.b	d3,(a1)+				; initialize the irIOPNumber field
+			assert	irRequestKind=(irIOPNumber+1)
+			move.b	#irWaitRcvMessage,(a1)+	; initialize the irRequestKind field
+
+			assert	irMsgNumber=(irRequestKind+1)
+			assert	irMessageLen=(irMsgNumber+1)
+			assert	irReplyLen=(irMessageLen+1)
+			assert	irReqActive=(irReplyLen+1)
+			move.l	#(1<<24)+\				; irMsgNumber := 1
+					(imMoveInfoSize<<16)+\	; irMessageLen := imMoveInfoSize
+					(imMoveInfoSize<<8)+\	; irReplyLen := imMoveInfoSize
+					(0),(a1)+				; irReqActive := 0
+
+			lea		MoveReqBuffer(a4),a2	; a2 := pointer to IOPMoveInfo
+			assert	irMessagePtr=(irReqActive+1)
+			move.l	a2,(a1)+				; irMessagePtr := MoveReqBuffer
+			assert	irReplyPtr=(irMessagePtr+4)
+			move.l	a2,(a1)+				; irReplyPtr := MoveReqBuffer
+
+			lea		MoveReqHandler,a2		; a2 := completion routine address
+			assert	irHandler=(irReplyPtr+4)
+			move.l	a2,(a1)+				; irHandler := MoveReqHandler
+			_IOPMsgRequest					; install the message handler
+
+			move.w	(sp)+,sr				; restore interrupt priority
+			bra.w	@Done					; return with success
+			endwith
+			TITLE	'IOPmgr - IOP Message Request'
+
+;_______________________________________________________________________
+;
+;  Routine:		IOPMsgRequest
+;  Inputs:		A0 - pointer to IOPRequestInfo paramater block
+;  Outputs:		D0 - Result Code (NoErr/paramErr)
+;				irReqActive - set to $FF, until request completed
+;  Destroys:	A0, A1, D0, D1, D2
+;  Calls:		CopyToIOP, Enqueue
+;  Called by:	OsTrap Dispatch Table
+;
+;  Function:	
+;
+;_______________________________________________________________________
+
+			with	IOPRequestInfo
+IOPMsgRequest
+@SavedRegs	reg		a2/a3/d3/d4				; a0-a1/d1-d2 saved by OsTrap dispatch
+			movem.l	@SavedRegs,-(sp)		; save registers
+
+			moveq.l	#paramErr,d0			; assume Parameter Error status
+			moveq.l	#0,d2					; prepare to zero extend
+
+			lea		irIOPNumber(a0),a1		; a1 <- pointer to parameters
+			move.b	(a1)+,d2				; d2 <- zero extended IOP number
+			cmpi.w	#MaxIopNum,d2			; range check the iop number
+			bhi.s	@toParamError			; if out of range
+
+			movea.l	IOPmgrVars,a2			; get message table base
+			movea.l	IOPMgrGlobals.IOPInfoPtrs(a2,d2.w*4),a2	; a2 <- iop info ptr
+			move.l	a2,d3					; test for zero
+			beq.s	@toParamError			; IOP isn't initialized
+			move.b	IOPInfo.MaxXmt(a2),d3	; d3 := max message number
+
+			assert	irRequestKind=(irIOPNumber+1)
+			move.b	(a1)+,d2				; d2 <- zero extended request Kind
+			assert	irSendXmtMessage=0
+			beq.s	@CheckReqKind			; if for Xmt Msg, max is correct
+			move.b	IOPInfo.MaxRcv(a2),d3	; d3 := max message number
+@CheckReqKind
+			cmpi.w	#irRemoveRcvWaiter,d2	; range check the request Kind
+			bhi.s	@toParamError			; if out of range
+			move.w	@JumpTable(d2.w*2),d1	; d1 := offset to routine
+
+			assert	irMsgNumber=(irRequestKind+1)
+			move.b	(a1)+,d2				; d2 <- zero extended Msg number
+			beq.s	@paramError				; Message zero is reserved
+			cmp.b	d3,d2					; compare to max
+			bhi.s	@paramError				; if out of range
+			move.w	d2,d3					; d3.w := iop state address
+			assert	IOPMsgEntry.IOPMsgEntrySize=(1<<4)
+			lsl.w	#4,d2					; d2 := index into MsgTable
+
+			moveq.l	#MaxIopMsgLen,d4		; prepare to check message lengths
+			assert	irMessageLen=(irMsgNumber+1)
+			cmp.b	(a1)+,d4				; check the message length
+			blo.s	@paramError				; if out of range
+			assert	irReplyLen=(irMessageLen+1)
+			cmp.b	(a1)+,d4				; check the reply length
+			blo.s	@paramError				; if out of range
+
+			lea		IOPInfo.MsgTable+IOPMsgEntry.RcvMsgInfoPtr(a2,d2.w),a3
+			jmp		@JumpTable(d1.w)		; process the request
+@JumpTable	assert	irSendXmtMessage=((*-@JumpTable)/2)
+			dc.w	@SendXmtMessage-@JumpTable
+
+			assert	irSendRcvReply=((*-@JumpTable)/2)
+			dc.w	@SendRcvReply-@JumpTable
+
+			assert	irWaitRcvMessage=((*-@JumpTable)/2)
+			dc.w	@WaitRcvMessage-@JumpTable
+
+			assert	irRemoveRcvWaiter=((*-@JumpTable)/2)
+			dc.w	@RemoveRcvWaiter-@JumpTable
+
+@toParamError
+			bra.s	@paramError				; allow short branches
+
+@SendXmtMessage
+			assert	irReqActive=(irReplyLen+1)
+			st		(a1)					; mark it as active now
+			lea		IOPMsgEntry.XmtMsgQHdr-IOPMsgEntry.RcvMsgInfoPtr(a3),a1
+			move.w	sr,d2					; d2 := saved interrupt priority
+			ori.w	#HiIntMask,sr			; no interrupts while checking queue
+			cmpa.l	qHead(a1),a0			; see if already the head of the queue
+			beq.s	@SkipEnqueue			; if so, don't enqueue it
+			jsr		EnqueueTrap				; enqueue the request
+			cmpa.l	qHead(a1),a0			; see if at the head of the queue
+			bne.s	@notAtHead				; exit with request queued
+@SkipEnqueue
+			move.w	d2,sr					; restore interrupt priority
+			moveq.l	#0,d0					; zero extend message length
+			move.b	irMessageLen(a0),d0		; get the message buffer length
+			movea.l	irMessagePtr(a0),a1		; get the message buffer pointer
+			move.b	#NewMsgSent,-(sp)		; save new message state
+			ori.w	#IOPXmtMsgBase,d3		; d3 := iop message state address
+@SendAndInterrupt
+			move.w	d3,-(sp)				; save state address for later
+			assert	MaxIOPMsgLen=(1<<5)
+			lsl.b	#5,d3					; d3 := iop message address
+			move.l	IOPInfo.IopCtlRegPtr(a2),-(sp)	; save ctl/status reg ptr for later
+			movea.l	IOPInfo.IopDataRegPtr(a2),a3	; (a3) := IOPRamDataReg
+			movea.l	IOPInfo.IopAddrRegPtr(a2),a2	; (a2) := IOPRamAddrReg
+			move.w	(a2),-(sp)				; save the IOPRamAddrReg
+			move.w	d3,(a2)					; setup iop ram address
+			bsr.w	CopyToIop				; copy the message to the IOP
+			move.w	(sp)+,d0				; get the saved IOPRamAddrReg
+			movea.l	(sp)+,a1				; (a1) := IopCtlReg
+			move.w	(sp)+,(a2)				; setup iop ram address of message state
+			move.b	(sp)+,(a3)				; set new state
+			move.w	d0,(a2)					; restore the IOPRamAddrReg
+			move.b	#setIopGenInt,(a1)		; interrupt the IOP		
+@success	moveq.l	#noErr,d0				; report success
+@paramError	movem.l	(sp)+,@SavedRegs
+			rts								; all done
+@notAtHead	move.w	d2,sr					; restore interrupt priority
+			bra.s	@success				; return with success
+
+@SendRcvReply
+			cmpa.l	(a3),a0					; see if we are the waiter
+			bne.s	@paramError				; return with error if not
+			assert	irReqActive=(irReplyLen+1)
+			tst.b	(a1)					; see if the request is already active
+			bne.s	@paramError				; return with error if active
+			st		(a1)					; mark it as active now
+			moveq.l	#0,d0					; zero extend reply length
+			move.b	irReplyLen(a0),d0		; get the reply buffer length
+			movea.l	irReplyPtr(a0),a1		; get the reply buffer pointer
+			move.b	#MsgCompleted,-(sp)		; save new message state
+			ori.w	#IOPRcvMsgBase,d3		; d3 := iop message state address
+			bra.s	@SendAndInterrupt		; send the reply and interrupt the IOP
+
+
+@WaitRcvMessage
+			tst.l	(a3)					; see if waiter already exists
+			bne.s	@paramError				; return with error if so
+			assert	irReqActive=(irReplyLen+1)
+			st		(a1)					; mark the request as active
+			move.l	a0,(a3)					; setup waiter
+			bra.s	@success				; return with success
+
+
+@RemoveRcvWaiter
+			cmpa.l	(a3),a0					; see if we are the waiter
+			bne.s	@paramError				; return with error if not
+			assert	irReqActive=(irReplyLen+1)
+			clr.b	(a1)					; mark the request as complete
+			clr.l	(a3)					; setup waiter
+			bra.s	@success				; return with success
+
+			endwith
+			TITLE	'IOPmgr - IOP Move Data'
+
+;_______________________________________________________________________
+;
+;  Routine:		IOPMoveData
+;  Inputs:		A0 - pointer to IOPMoveInfo paramater block
+;  Outputs:		D0 - Result Code (NoErr/paramErr)
+;  Destroys:	A0, A1, D0, D1, D2
+;  Calls:		CopyToIOP, CopyFromIOP, CompareWithIop
+;  Called by:	OsTrap Dispatch Table
+;
+;  Function:	Moves, or compares data between the IOP and the Host
+;				memories, using the parameters inthe IOPMoveInfo parameter
+;				block.  Also has a special mode to apply patches to IOP
+;				memory as an atomic operation.
+;
+;_______________________________________________________________________
+
+			with	IOPMoveInfo
+IOPMoveData
+@SavedRegs	reg		a2/a3					; a0-a1/d1-d2 saved by OsTrap dispatch
+			movem.l	@SavedRegs,-(sp)		; save registers
+			moveq.l	#paramErr,d0			; assume Parameter Error status
+			moveq.l	#0,d2					; prepare to zero extend
+
+			assert	imCopyKind=0
+			move.b	(a0)+,d2				; d2 <- zero extended Copy Kind
+			cmpi.w	#imPatchIop,d2			; range check the copy kind
+			bhi.s	@paramError				; if out of range
+			move.w	@JumpTable(d2.w*2),d1	; d1 := offset to copy routine
+
+			assert	imIOPNumber=(imCopyKind+1)
+			move.b	(a0)+,d2				; d2 <- zero extended IOP number
+			cmpi.w	#MaxIopNum,d2			; range check the iop number
+			bhi.s	@paramError				; if out of range
+
+			movea.l	IOPmgrVars,a1			; get message table base
+			movea.l	IOPMgrGlobals.IOPInfoPtrs(a1,d2.w*4),a2	; get iop info base address
+			move.l	a2,d2					; test for zero
+			beq.s	@paramError				; IOP isn't initialized
+
+			movea.l	IOPInfo.IopDataRegPtr(a2),a3	; (a3) := IOPRamDataReg
+			movea.l	IOPInfo.IopAddrRegPtr(a2),a2	; (a2) := IOPRamAddrReg
+
+			moveq.l	#0,d0					; zero extend to long
+			assert	imByteCount=(imIOPNumber+1)
+			move.w	(a0)+,d0				; d0 := byte count
+
+			assert	imHostAddr=(imByteCount+2)
+			movea.l	(a0)+,a1				; a1 := host buffer address
+			move.w	(a2),-(sp)				; save the IOPRamAddrReg
+			assert	imIopAddr=(imHostAddr+4)
+			move.w	(a0)+,(a2)				; setup iop ram address
+			assert	imCompRel=(imIopAddr+2)	; a0 pointer to imCompRel for CompareWithIop
+			jsr		@JumpTable(d1.w)		; do the copy
+			move.w	(sp)+,(a2)				; restore the IOPRamAddrReg
+			moveq.l	#noErr,d0				; return No Error status
+
+@paramError
+@return		movem.l	(sp)+,@SavedRegs		; restore registers
+			rts
+
+@JumpTable	assert	imIopToHost=((*-@JumpTable)/2)
+			dc.w	CopyFromIop-@JumpTable
+
+			assert	imHostToIop=((*-@JumpTable)/2)
+			dc.w	CopyToIop-@JumpTable
+
+			assert	imCompare=((*-@JumpTable)/2)
+			dc.w	CompareWithIop-@JumpTable
+
+			assert	imPatchIop=((*-@JumpTable)/2)
+			dc.w	@Patch-@JumpTable
+
+
+@Patch		move.w	sr,d2					; d2 := saved interrupt priority
+			ori.w	#HiIntMask,sr			; disable interrupts
+			move.w	#PatchReqAddr,d1		; address of Patch Request Byte
+			move.w	d1,(a2)					; setup the IOP address
+			moveq.l	#NewMsgSent,d0			; patch request state byte
+			move.b	d0,(a3)					; issue the patch request
+
+@PatchSync	move.w	d1,(a2)					; setup the IOP address
+			cmp.b	(a3),d0					; see if patch request was accepted
+			beq.s	@PatchSync				; wait until it is accepted
+
+@PatchSegLoop
+			move.b	(a1)+,d0				; get the size of the segment
+			beq.s	@PatchDone				; size of zero terminates segment list
+			move.w	(a1)+,(a2)				; setup the patch load address
+
+@PatchLoadLoop
+			move.b	(a1)+,(a3)				; patch a byte
+			subq.b	#1,d0					; decrement the loop count
+			bne.s	@PatchLoadLoop			; load all of the bytes
+			bra.s	@PatchSegLoop			; load the next segment
+
+@PatchDone	move.w	d1,(a2)					; setup the IOP address
+			move.b	#MsgIdle,(a3)			; tell the IOP that patching is done
+			move.w	d2,sr					; restore interrupt priority
+			rts								; patching is complete
+
+			endwith
+			TITLE	'IOPmgr - Copy From IOP'
+
+;_______________________________________________________________________
+;
+;  Routine:		CopyFromIop
+;  Inputs:		A1 - pointer to Host RAM buffer (dest addr)
+;				A2 - pointer to IOPRamAddrReg
+;				(A2) - IOP data address (source addr)
+;				A3 - pointer to IOPRamDataReg
+;				D0 - (word) transfer byte count (zero extended to long)
+;  Outputs:		none
+;  Destroys:	A1, D0, D1
+;  Calls:		none
+;  Called by:	IOPInterrupt, IOPMoveData
+;
+;  Function:	Moves data from the IOP to the Host memory.
+;
+;_______________________________________________________________________
+
+CopyFromIop	cmpi.w	#3,d0					; check for very short copy
+			bls.s	@veryShort				; skip alignment if very short
+			move.l	a1,d1					; get the Host Address
+			andi.w	#$0003,d1				; check for long word alignment
+			beq.s	@Aligned				; if no alignment needed
+			subq.w	#4,d1					; get byte count bias
+			add.w	d1,d0					; adjust the byte count
+		IF forSTP601v1 THEN
+			jmp		@Aligned(d1.w*4)		; ZZZdo the alignment
+		ELSE
+			jmp		@Aligned(d1.w*2)		; do the alignment
+		ENDIF
+			move.b	(a3),(a1)+				; move a byte
+		IF forSTP601v1 THEN
+			subq.w	#3, (a2)				;ZZZ 
+			move.b	(a3),(a1)+				; move a byte
+			subq.w	#3, (a2)				;ZZZ 
+			move.b	(a3),(a1)+				; move a byte
+			subq.w	#3, (a2)				;ZZZ 
+		ELSE
+			move.b	(a3),(a1)+				; move a byte
+			move.b	(a3),(a1)+				; move a byte
+		ENDIF
+@Aligned	ror.l	#2,d0					; save tail byte count in high 2 bits
+			moveq.l	#7,d1					; mask for starting index
+			and.w	d0,d1					; number of long words to move first
+			neg.w	d1						; negate to index backwards
+			lsr.w	#3,d0					; number of 32 byte blocks to move
+			jmp		@CopyStart(d1.w*2)		; jump into the loop
+
+@CopyLoop	move.l	(a3),(a1)+				; move a 32 byte block of data....
+			move.l	(a3),(a1)+				; ... 4 bytes at a time
+			move.l	(a3),(a1)+
+			move.l	(a3),(a1)+
+			move.l	(a3),(a1)+
+			move.l	(a3),(a1)+
+			move.l	(a3),(a1)+
+			move.l	(a3),(a1)+
+@CopyStart	dbra	d0,@CopyLoop			; loop through all of the blocks
+
+			add.l	d0,d0					; load c and n with remaining 2 bits
+			bcs.s	@Copy2or3bytes
+@Copy0or1byte
+			bpl.s	@exit					; if no bytes left
+			move.b	(a3),(a1)				; copy the last byte
+		IF forSTP601v1 THEN
+			subq.w	#3, (a2)				;ZZZ 
+		ENDIF
+@exit		rts								; all done
+
+@veryShort	roxr.l	#2,d0					; load c and n with remaining 2 bits
+			bcc.s	@Copy0or1byte
+@Copy2or3bytes
+			bpl.s	@Copy2bytes				; if only 2 bytes left
+			move.b	(a3),(a1)+				; copy 1 byte, 2 still remaining
+		IF forSTP601v1 THEN
+			subq.w	#3, (a2)				;ZZZ 
+		ENDIF
+@Copy2bytes	move.w	(a3),(a1)				; copy the last 2 bytes
+		IF forSTP601v1 THEN
+			subq.w	#2, (a2)				;ZZZ 
+		ENDIF
+			rts								; all done
+			TITLE	'IOPmgr - Copy To IOP'
+
+;_______________________________________________________________________
+;
+;  Routine:		CopyToIop
+;  Inputs:		A1 - pointer to Host RAM buffer (source addr)
+;				A2 - pointer to IOPRamAddrReg
+;				(A2) - IOP data address (dest addr)
+;				A3 - pointer to IOPRamDataReg
+;				D0 - (word) transfer byte count (zero extended to long)
+;  Outputs:		none
+;  Destroys:	A1, D0, D1
+;  Calls:		none
+;  Called by:	IOPMsgAccess, IOPMoveData
+;
+;  Function:	Moves data from the Host to the IOP memory.
+;
+;_______________________________________________________________________
+
+CopyToIop	cmpi.w	#3,d0					; check for very short copy
+			bls.s	@veryShort				; skip alignment if very short
+			move.l	a1,d1					; get the Host Address
+			andi.w	#$0003,d1				; check for long word alignment
+			beq.s	@Aligned				; if no alignment needed
+			subq.w	#4,d1					; get byte count bias
+			add.w	d1,d0					; adjust the byte count
+			jmp		@Aligned(d1.w*2)		; do the alignment
+			move.b	(a1)+,(a3)				; move a byte
+			move.b	(a1)+,(a3)				; move a byte
+			move.b	(a1)+,(a3)				; move a byte
+@Aligned	ror.l	#2,d0					; save tail byte count in high 2 bits
+			moveq.l	#7,d1					; mask for starting index
+			and.w	d0,d1					; number of long words to move first
+			neg.w	d1						; negate to index backwards
+			lsr.w	#3,d0					; number of 32 byte blocks to move
+			jmp		@CopyStart(d1.w*2)		; jump into the loop
+
+@CopyLoop	move.l	(a1)+,(a3)				; move a 32 byte block of data....
+			move.l	(a1)+,(a3)				; ... 4 bytes at a time
+			move.l	(a1)+,(a3)
+			move.l	(a1)+,(a3)
+			move.l	(a1)+,(a3)
+			move.l	(a1)+,(a3)
+			move.l	(a1)+,(a3)
+			move.l	(a1)+,(a3)
+@CopyStart	dbra	d0,@CopyLoop			; loop through all of the blocks
+
+			add.l	d0,d0					; load c and n with remaining 2 bits
+			bcs.s	@Copy2or3bytes
+@Copy0or1byte
+			bpl.s	@exit					; if no bytes left
+			move.b	(a1),(a3)				; copy the last byte
+@exit		rts								; all done
+
+@veryShort	roxr.l	#2,d0					; load c and n with remaining 2 bits
+			bcc.s	@Copy0or1byte
+@Copy2or3bytes
+			bpl.s	@Copy2bytes				; if only 2 bytes left
+			move.b	(a1)+,(a3)				; copy 1 byte, 2 still remaining
+@Copy2bytes	move.w	(a1),(a3)				; copy the last 2 bytes
+			rts								; all done
+			TITLE	'IOPmgr - Compare With IOP'
+
+;_______________________________________________________________________
+;
+;  Routine:		CompareWithIop
+;  Inputs:		A0 - pointer to imCompRel byte (result addr)
+;				A1 - pointer to Host RAM buffer (dest addr)
+;				A2 - pointer to IOPRamAddrReg
+;				(A2) - IOP data address (source addr)
+;				A3 - pointer to IOPRamDataReg
+;				D0 - (word) transfer byte count (zero extended to long)
+;  Outputs:		none
+;  Destroys:	A1, D0, D1, D2
+;  Calls:		none
+;  Called by:	IOPMoveData
+;
+;  Function:	Compares data from the IOP to the Host memory.
+;
+;_______________________________________________________________________
+
+CompareWithIop
+			cmpi.w	#3,d0					; check for very short compare
+			bls.s	@Aligned				; skip alignment if very short
+			move.l	a1,d1					; get the Host Address
+			andi.w	#$0003,d1				; check for long word alignment
+			beq.s	@Aligned				; if no alignment needed
+			subq.w	#4,d1					; get byte count bias
+			add.w	d1,d0					; adjust the byte count
+			not.w	d1						; setup count for DBNE
+@AlignLoop	move.b	(a3),d2					; get byte of data from IOP
+		IF forSTP601v1 THEN
+			subq.w	#3, (a2)				;ZZZ 
+		ENDIF
+			cmp.b	(a1)+,d2				; compare to HOST data
+			dbne	d1,@AlignLoop			; loop until longword aligned
+			bne.s	@NotEqual				; exit if didn't compare
+
+@Aligned	moveq.l	#3,d1					; mask for byte remainder
+			and.w	d0,d1					; number of tail bytes to compare
+			lsr.w	#2,d0					; number of long words to compare
+			beq.s	@TailStart				; if no longs, start with tail
+			subq.w	#1,d0					; adjust loop count for DBNE
+@CmpLoop	move.l	(a3),d2					; get long word of data from IOP
+			cmp.l	(a1)+,d2				; compare to HOST data
+			dbne	d0,@CmpLoop				; loop through all long words
+			bra.s	@TailStart				; then compare the remaining bytes
+
+@TailLoop	move.b	(a3),d2					; get byte of data from IOP
+		IF forSTP601v1 THEN
+			subq.w	#3, (a2)				;ZZZ 
+		ENDIF
+			cmp.b	(a1)+,d2				; compare to HOST data
+@TailStart	dbne	d1,@TailLoop			; loop through all remaining bytes
+
+@NotEqual	sne.b	(a0)					; return -1 if IOP < HOST
+			bls.s	@Exit					; return  0 if IOP = HOST
+			neg.b	(a0)					; return +1 if IOP > HOST
+@Exit		rts
+			TITLE	'IOPmgr - IOP Interrupt'
+
+;_______________________________________________________________________
+;
+;  Routine:		IOPInterrupt
+;  Inputs:		D0{31…24}	- flags indicating non-deferrable XMT messages
+;				D0{23…16}	- flags indicating non-deferrable RCV messages
+;				D0{15…8}	- must be zero
+;				D0{7…0}		- IOP number of IOP requesting the interrupt
+;  Outputs:		none
+;  Destroys:	A0, A1, A2, A3, D0, D1, D2, D3
+;  Calls:		DTInstall, IOP message Handler
+;  Called by:	System interrupt handler
+;
+;  Function:	Services interrupts from the IOPs.  Acknowledges the messages,
+;				and calls the message handlers directly, or schedules a
+;				deferred task manager task to call them, if they were
+;				deferrable handlers.  If the interrupt was a Bypass Interrupt
+;				Request, it will reset the interrupt and JMP to the external
+;				label IOPBypassInterrupt passing the IOP number that generated
+;				the interrupt in register D0.
+;
+;_______________________________________________________________________
+
+			with	IOPMgrGlobals,IOPInfo
+
+IOPInterrupt								; a0-a3/d0-d3 saved by int handler
+			movea.l	IOPmgrVars,a0			; point to globals
+			jmp		([IntHandlerPtr,a0])	; jump through the patch vector
+vIOPInterrupt
+			move.l	IOPInfoPtrs(a0,d0.w*4),d1
+			beq.s	@noIop					; ignore if IOP doesn't exist
+			movea.l	d1,a0					; a0 := pointer to IOPInfo
+			assert	IopAddrRegPtr=0
+			movea.l	(a0)+,a2				; a2 := pointer to IOP Ram addr reg
+			assert	IopDataRegPtr=(IopAddrRegPtr+4)
+			movea.l	(a0)+,a3				; a3 := pointer to IOP Ram data reg
+			move.w	sr,d2					; save old interrupt level
+			move.b	d0,d2					; save the IOP number, overwrite saved ccr
+			move.l	a0,-(sp)				; save reg for msg handler to restore
+@checkAgain
+			assert	IopCtlRegPtr=(IopDataRegPtr+4)
+			movea.l	(a0)+,a1				; a1 := pointer to IOP control reg
+			move.b	(a1),d1					; get the control register
+			lsr.b	#iopInt0Active+1,d1		; test INT0 (xmt MessageCompleted)
+			bcs.s	@xmtComp				; handle INT0
+			lsr.b	#iopInt1Active-iopInt0Active,d1	; test INT1 (rcv NewMessageSent)
+			bcs.s	@rcvNew					; handle INT1
+			lsr.b	#iopBypassIntReq-iopInt1Active,d1	; test BypassIntReq
+			bcs.s	@bypassInt				; all done if not bypass interrupt
+@IntHandled	move.w	d2,sr					; restore interrupt level
+			addq.l	#4,sp					; pop saved a0
+			lsr.l	#8,d0					; test the flags
+			bne.w	@RunNonDeferrable		; if non-deferrables, go check for and run them
+			rts								; return from the interrupt					<1.6>
+
+@noIop		cmpi.w	#SccIopNum,d0			; see if it was from the SCC				<1.6>
+			beq.l	SccDecode				; if so, pass it on to the Bypass handler	<1.6> <8> rb
+			rts								; return from the interrupt					<1.6>
+
+
+@bypassInt
+			assert	BypassHandler=(IopCtlRegPtr+4)
+			move.l	(a0),d1					; get address of bypass int handler
+			beq.s	@IntHandled				; no bypass handler, not much we can do
+			move.w	d2,sr					; restore interrupt level
+			move.l	d0,(sp)					; save the flags/iop number
+			movea.l	d1,a0					; setup handler address
+			jsr		(a0)					; call the ByPass interrupt handler
+			move.l	(sp)+,d0				; restore flags/IOP number
+			bra.s	IOPInterrupt			; check again for other interrupts
+
+
+@rcvNew		move.b	#clrIopInt1,(a1)		; clear the interrupt
+			move.w	#(MsgReceived<<8)+\		; new state
+					(NewMsgSent<<0),d1		; state to search for
+			move.w	#IOPRcvMsgBase+1,d3		; IOP address to start search at
+			lea		@rcvFound,a1			; a1 := rcv found routine
+			assert	BypassHandler=(IopCtlRegPtr+4)
+			move.b	MaxRcv-BypassHandler(a0),d0	; get message count
+			adda.w	#MsgTable-BypassHandler,a0	; point before the first message
+			move.w	(a2),-(sp)				; save the IOPRamAddrReg
+			bra.s	@SearchStart			; start searching the message states
+
+@xmtComp	move.b	#clrIopInt0,(a1)		; clear the interrupt
+			moveq.l	#(MsgIdle<<8)+\			; new state
+					(MsgCompleted<<0),d1	; state to search for
+			move.w	#IOPXmtMsgBase+1,d3		; IOP address to start search at
+			lea		@xmtFound,a1			; a1 := xmt done routine
+			assert	BypassHandler=(IopCtlRegPtr+4)
+			move.b	MaxXmt-BypassHandler(a0),d0	; get message count
+			adda.w	#MsgTable-BypassHandler,a0	; point before the first message
+			move.w	(a2),-(sp)				; save the IOPRamAddrReg
+			bra.s	@SearchStart			; start searching the message states
+
+@searchLoop	adda.w	#IOPMsgEntry.IOPMsgEntrySize,a0	; point to next message info
+			cmp.b	(a3),d1					; check for state match
+		IF forSTP601v1 THEN
+			move	ccr, -(sp)				;ZZZ
+			subq.w	#3, (a2)				;ZZZ 
+			move	(sp)+, ccr				;ZZZ
+		ENDIF
+			dbeq	d0,@searchLoop			; loop until match or end of list
+			bne.s	@searchDone				; if all message states checked
+
+			move.w	(a2),d3					; get the address pointer
+@MsgRegs	reg		a0/a1/d0/d1/d2/d3		; registers to save when servicing message
+			movem.l	@MsgRegs,-(sp)			; save the registers
+			subq.w	#1,d3					; point to the message state that was found
+			move.w	d3,(a2)					; re-load ram address pointer
+			lsr.w	#8,d1					; get the new message state
+			move.b	d1,(a3)					; set the new message state
+			move.w	d2,sr					; give higher priority ints a chance
+			jsr		(a1)					; call the xmt/rcv found routine
+			movem.l	(sp)+,@MsgRegs			; restore the registers
+@SearchStart
+			ori.w	#HiIntMask,sr			; disable all interrupts
+			move.w	d3,(a2)					; restore the address pointer
+			dbra	d0,@searchLoop			; loop until end of list
+
+@searchDone	move.w	(sp)+,(a2)				; restore the IOPRamAddrReg
+			clr.w	d0						; setup for zero extended IOP number
+			move.b	d2,d0					; flags in high word, IOP number in low word
+			movea.l	IOPmgrVars,a1
+			tst.b	DTaskQueued(a1)
+			bne.s	@toCkAgain				; if already queued, just return
+			tst.l	CompleteQHdr+qHead(a1)
+			beq.s	@toCkAgain				; if nothing queued, just return
+			st		DTaskQueued(a1)
+			lea		DTask(a1),a0
+@DTaskRegs	reg		a2/d0/d2				; regs to save when queueing a deferred task
+			movem.l	@DTaskRegs,-(sp)		; save regs
+			jsr		([jDTInstall])			; queue the deferred task
+			movem.l	(sp)+,@DTaskRegs		; restore regs
+@toCkAgain	move.w	d2,sr					; give higher priority ints a chance		<1.7>
+			movea.l	(sp),a0					; setup a0 for entry at @checkAgain
+			bra.w	@checkAgain				; return from the interrupt					<1.7>
+
+@XmtFound	lea		IOPMsgEntry.XmtMsgQHdr+qHead(a0),a1	; point to request info
+			move.l	(a1),d1					; get request info
+			beq.s	@empty					; if no handler installed
+			move.l	a1,-(sp)				; save message entry pointer
+			movea.l	d1,a0					; setup request info address
+			subq.l	#qHead,a1				; point to queue header
+			jsr		DequeueTrap				; remove it from the msg queue
+			movea.l	IOPRequestInfo.irReplyPtr(a0),a1	; get the buffer address
+			moveq.l	#0,d0					; zero extend the reply byte count
+			move.b	IOPRequestInfo.irReplyLen(a0),d0	; get the byte count
+			bsr.s	@CopyAndQueue			; read the reply and queue it
+			movea.l	(sp)+,a1				; point to message queue head
+			move.l	(a1),d1					; get head of queue
+			beq.s	@empty					; if empty, do nothing
+			movea.l	d1,a0					; setup to send the queued message
+			jmp		([JIOPMsgRequest])		; send the next message and return
+@empty		rts
+
+@RcvFound	move.l	IOPMsgEntry.RcvMsgInfoPtr(a0),d1	; get request info
+			beq.s	@empty					; if no handler installed
+			movea.l	d1,a0					; setup request info address
+			movea.l	IOPRequestInfo.irMessagePtr(a0),a1	; get the buffer address
+			moveq.l	#0,d0					; zero extend the message byte count
+			move.b	IOPRequestInfo.irMessageLen(a0),d0	; get the byte count
+@CopyAndQueue
+			beq.s	@CopyDone				; if no message data to copy
+			move.w	d3,d1					; get copy of message state address
+			assert	MaxIOPMsgLen=(1<<5)
+			lsl.b	#5,d1					; convert to message data address
+			move.w	d1,(a2)					; point to the message
+			bsr.w	CopyFromIop				; read the message
+@CopyDone	movea.l	IOPmgrVars,a1			; point to globals
+			adda.w	#CompleteQHdr,a1		; point to the completion queue
+			tst.l	IOPRequestInfo.irHandler(a0)	; check the handler address
+			beq.s	@NoHandler				; if no handler, don't enqueue it
+			jmp		EnqueueTrap				; enqueue the completed request, and return
+
+@NoHandler	clr.b	IOPRequestInfo.irReqActive(a0)	; indicate that it is done
+			rts								; return
+
+
+@RunNonDeferrable
+			move.l	d0,d3					; save the flags
+			lsr.l	#8,d3					; get flags into low 2 bytes
+			movea.l	IOPmgrVars,a1			; get the globals
+			lea		CompleteQHdr(a1),a1		; point to the completion queue
+			lea		qHead-qLink(a1),a0		; point to ptr to first element
+			ori.w	#HiIntMask,sr			; disable all ints while touching queue
+@RunLoop	move.l	qLink(a0),d0			; get ptr to next element
+			beq.s	@RunDone				; if end of queue, we're done
+			movea.l	d0,a0					; setup queue element pointer
+			cmp.b	IOPRequestInfo.irIOPNumber(a0),d2	; is it for this IOP
+			bne.s	@RunLoop				; if not, go on to next one
+			move.b	IOPRequestInfo.irMsgNumber(a0),d0	; get the message number
+			assert	IOPRequestInfo.irSendXmtMessage=0
+			tst.b	IOPRequestInfo.irRequestKind(a0)	; test for xmt/rcv
+			bne.s	@ChkMsgNum				; if receive, bit number is correct
+			addq.b	#8,d0					; point to next byte for xmt
+@ChkMsgNum	btst.l	d0,d3					; see if this msg is non-deferrable
+			beq.s	@RunLoop				; if not, go on to next one
+			jsr		DequeueTrap				; remove it from the queue
+			move.l	a0,-(sp)				; remember the address
+			bsr.s	@RunLoop				; check the next one (using recursion)
+
+			movea.l	(sp)+,a0				; get the queue element address
+			clr.b	IOPRequestInfo.irReqActive(a0)	; indicate that it is done
+			move.l	IOPRequestInfo.irHandler(a0),d0	; get the handler address
+			beq.s	@RunRTS					; if no handler, don't try to call it
+			movea.l	d0,a1					; get handler address
+			jmp		(a1)					; run the handler (may trash a0-a3/d0-d3)
+			
+@RunDone	move.w	d2,sr					; restore interrupt level
+@RunRTS		rts								; search done, now let them run
+
+			endwith
+			TITLE	'IOPmgr - IOP Deferred Task'
+
+;_______________________________________________________________________
+;
+;  Routine:		IOPDefTask
+;  Inputs:		none
+;  Outputs:		none
+;  Destroys:	A0, A1, D0
+;  Calls:		IOP message Handler
+;  Called by:	Deferred task manager
+;
+;  Function:	Calls the message handlers for the deferrable messages
+;				that were marked and acknowledged by the IOP interrupt
+;				handler.
+;
+;_______________________________________________________________________
+
+CallCompHandler
+			move.w	(sp)+,sr				; restore interrupts
+			movea.l	d0,a0					; setup element to dequeue
+			jsr		DequeueTrap				; dequeue the element
+			clr.b	IOPRequestInfo.irReqActive(a0)	; indicate that it is done
+			move.l	IOPRequestInfo.irHandler(a0),d0	; get the handler address
+			beq.s	IOPDefTask				; if no handler, don't try to call it
+
+			move.l	a1,-(sp)				; save queue pointer across call to handler
+			movea.l	d0,a1					; get handler address
+			jsr		(a1)					; call the handler (may trash a0-a3/d0-d3)
+			movea.l	(sp)+,a1				; restore queue pointer
+
+IOPDefTask	; Enters HERE					; a0-a3/d0-d3 saved by int handler
+											; a1 := pointer to CompleteQHdr
+			move.w	sr,-(sp)				; save interrupt priority
+			ori.w	#HiIntMask,sr			; disable interrupts
+			move.l	qHead(a1),d0			; read the head of the queue
+			bne.s	CallCompHandler			; if not empty, dequeue and call it
+
+			assert	IOPMgrGlobals.DTaskQueued=(IOPMgrGlobals.CompleteQHdr-1)
+			clr.b	-(a1)					; indicate that the task is done
+			move.w	(sp)+,sr				; restore interrupts
+			rts								; all done
+		if Debugging then					;										<1.3>
+			TITLE	'IOPmgr - IOP VBL Task'
+
+;_______________________________________________________________________
+;
+;  Routine:		IOPVblTask
+;  Inputs:		none
+;  Outputs:		none
+;  Destroys:	A0, A1, A2, D0
+;  Calls:		none
+;  Called by:	Vertical Retrace Manager
+;
+;  Function:	Tests and clears the Alive flag on each IOP, and crashes
+;				if any IOP was not Alive
+;
+;_______________________________________________________________________
+
+			with	IOPMgrGlobals,IOPInfo
+IOPVblTask									; a0-a3/d0-d3 saved by int handler
+			movea.l	IOPmgrVars,a0			; get globals
+			move.w	#AliveVBLrate,VTask+vblCount(a0)	; re-initialize the count
+			move.w	sr,-(sp)				; save interrupt priority
+			ori.w	#HiIntMask,sr			; disable interrupts
+			moveq.l	#NumberOfIOPs-1,d0		; loop counter
+@PollLoop	movea.l	(a0)+,a1				; a1 := pointer to IOPInfo
+			move.l	a1,d1					; test for zero
+			beq.s	@Next					; skip if IOP doesn't exist
+			assert	IopAddrRegPtr=0
+			movea.l	(a1)+,a2				; a2 := IopAddrRegPtr
+			assert	IopDataRegPtr=(IopAddrRegPtr+4)
+			movea.l	(a1)+,a1				; a1 := IopDataRegPtr
+			move.w	(a2),-(sp)				; save the IOPRamAddrReg
+			move.w	#IOPAliveAddr,(a2)		; setup the IOP Ram Address
+			cmpi.b	#$FF,(a1)				; IOP sets it to $FF when Idle
+			beq.s	@Alive					; if alive and well
+			bsr.s	IOPisDead				; crash if dead
+@Alive		move.w	#IOPAliveAddr,(a2)		; setup the IOP Ram Address
+			clr.b	(a1)					; we set it to $00 after testing it
+			move.w	(sp)+,(a2)				; restore the IOPRamAddrReg
+@Next		dbra	d0,@PollLoop			; poll the next IOP
+			move.w	(sp)+,sr				; restore interrupt priority
+			rts								; return
+
+
+IOPisDead	move.w	#dsSysErr,d0			; Sorry, a system error occurred
+			_SysError						; crash
+			bra.s	IOPisDead				; IOP failure, crash and burn
+
+			endwith
+		endif								;										<1.3>
+			TITLE	'IOPmgr - Move Request Handler'
+
+;_______________________________________________________________________
+;
+;  Routine:		MoveReqHandler
+;  Inputs:		A0 - pointer to IOPRequestInfo
+;  Outputs:		none
+;  Destroys:	A0-A2/D0-D2
+;  Calls:		IOPMsgRequest, IOPMoveData
+;  Called by:	IOP interrupt handler
+;
+;  Function:	Handles Data Movement requests issued by drivers on the IOPs.
+;
+;_______________________________________________________________________
+
+			with	IOPRequestInfo,IOPMoveInfo
+MoveReqHandler								; a0-a3/d0-d3 saved by Interrupt Handler
+
+;	The message that the IOP sent looks very much like a IOPMoveInfo parameter
+;	block, the message from the IOP was read directly into the IOPMoveInfo block.
+
+			movea.l	a0,a2					; save pointer to IOPRequestInfo for later
+			movea.l	irMessagePtr(a0),a0		; message buffer is IOPMoveInfo request block
+
+;	The IOP number field is the only field that was not in the message from
+;	the IOP, so just copy it from the IOPAccessInfo, and then issue the Move.
+
+			move.b	irIOPNumber(a2),imIOPNumber(a0)	; fill in the IOP number
+			jsr		([JIOPMoveData])		; Perform the Move Request
+
+;	Send the result from IOPMoveData back as the reply.
+;	Send the Message Completed interrupt to the IOP, and return.
+
+			movea.l	a2,a0					; a0 <- IOPRequestInfo
+			move.b	#irSendRcvReply,irRequestKind(a0)
+			jmp		([JIOPMsgRequest])		; tell IOP that Message Completed and return
+
+			endwith
+			TITLE	'IOPmgr - Initialize IOP Manager'
+
+;_______________________________________________________________________
+;
+;  Routine:		jsr InitIOPMgr
+;  Inputs:		none
+;  Outputs:		none
+;  Destroys:	none
+;  Calls:		none
+;  Called by:	Start Manager
+;
+;  Function:	Initializes the IOPs, downloads their code, and starts them
+;				running.  Allocates and initializes the IOPMgr global data
+;				structures.
+;
+;_______________________________________________________________________
+
+			with	IOPMgrGlobals,IOPAccessInfo,IOPInfo
+InitIOPMgr
+@SavedRegs	reg		a0-a3/d0
+			movem.l	@SavedRegs,-(sp)		; save registers
+
+			move.w	sr,-(sp)				; save interrupt priority
+			ori.w	#HiIntMask,sr			; disable interrupts
+
+			moveq.l	#0,d0					; amount of space for IOPInfos
+
+			TestFor	SCCIOPExists			; see if we have an SCC IOP
+			beq.s	@noSCCIOP				; if not, don't allocate space for it
+
+			addi.w	#IOPInfoSize,d0			; allocate space for it
+@noSCCIOP
+
+			TestFor	SWIMIOPExists			; see if we have an SWIM IOP
+			beq.s	@noSWIMIOP				; if not, don't allocate space for it
+
+			addi.w	#IOPInfoSize,d0			; allocate space for it
+@noSWIMIOP
+
+			tst.w	d0						; are there any IOPs
+			beq.s	@noIOPs					; if not, exit
+
+			addi.w	#GlobalsSize,d0			; d0 <- data structure size
+			_NewPtr	,SYS,CLEAR				; allocate and clear the structure
+
+			lea		-IOPMgrGlobals(a0),a2	; Globals are negative to the pointer
+			move.l	a2,IOPmgrVars			; initialize the Pointer
+		if Debugging then					;										<1.3>
+
+;	Install the VBL task to look for dead IOPs
+
+			lea		VTask(a2),a0			; a0 <- VBL task
+			move.w	#vType,qType(a0)		; initialize qType field
+			move.w	#AliveVBLrate,vblCount(a0)	; initialize the count
+			lea		IOPVblTask,a1			; get the task address
+			move.l	a1,vblAddr(a0)			; initialize vblAddr field
+			_VInstall						; install the VBL task
+		endif								;										<1.3>
+
+;	Setup the deferred task manager data structure
+
+			move.w	#dtQType,DTask+qType(a2)	; Initialize DTask.qType
+			lea		IOPDefTask,a0			; a0 <- addr of IOPDefTask
+			move.l	a0,DTask+dtAddr(a2)		; Initialize DTask.dtAddr
+			lea		CompleteQHdr(a2),a0		; a0 <- completion queue header
+			move.l	a0,DTask+dtParm(a2)		; DTask.dtParm (loaded into A1 for DTask)
+
+;	Setup the Interrupt Handler Pointer
+
+			lea		vIOPInterrupt,a0		; point to the handler
+			move.l	a0,IntHandlerPtr(a2)	; initialize the data structure
+
+;	Install and initialize the IOPs
+
+			lea		IOPInfos(a2),a2			; point to start of IOPInfo records
+
+			TestFor	SCCIOPExists			; see if we have an SCC IOP
+			beq.s	@SCCIOPdone				; if not, don't install it
+
+			moveq.l	#(iaInstallIOP<<8)|\
+					SccIopNum,d0			; get the IOP number and access kind
+			movea.l	SCCrd,a1				; get the base address
+			lea		SccDecode,a3			; get the bypass interrupt handler address
+			bsr.s	@InstallIOP				; install the SCC IOP
+@SCCIOPdone
+
+			TestFor	SWIMIOPExists			; see if we have an SWIM IOP
+			beq.s	@SWIMIOPdone			; if not, don't install it
+
+			moveq.l	#(iaInstallIOP<<8)|\
+					SwimIopNum,d0			; get the IOP number and access kind
+			movea.l	IWM,a1					; get the base address
+			suba.l	a3,a3					; no bypass interrupt handler
+			bsr.s	@InstallIOP				; install the SWIM IOP
+@SWIMIOPdone
+
+@Done		move.w	(sp)+,sr				; restore interrupts
+			movem.l	(sp)+,@SavedRegs		; restore registers
+			rts								; all done
+
+@noIOPs		lea		@traps,a1				; point to the list
+			move.w	(a1)+,d0				; get the _Unimplemented trap
+			_GetTrapAddress	,newTool		; get address of unimplemented trap
+@trapLoop	move.w	(a1)+,d0				; get next trap to un-implement
+			beq.s	@Done					; traps disabled, exit
+			_SetTrapAddress	,newOS			; un-implement the trap
+			bra.s	@trapLoop				; loop through the table
+
+@traps		_Unimplemented
+			_IOPInfoAccess
+			_IOPMsgRequest
+			_IOPMoveData
+			dc.w	0						; end of list
+
+@InstallIOP	movea.l	a2,a0					; a0 <- IOPInfoRecord
+			assert	iaIOPInfoPtr=(iaAccessInfoSize-4)
+			move.l	a0,-(sp)				; setup IOP info pointer
+			clr.w	-(sp)					; clear reserved field
+			assert	iaIOPNumber=(iaIOPInfoPtr-3)
+			assert	iaAccessKind=(iaIOPInfoPtr-4)
+			move.w	d0,-(sp)				; setup the IOP number and access kind
+
+			assert	IopAddrRegPtr=0
+			lea		iopRamAddr(a1),a1		; point to the address register
+			move.l	a1,(a0)+				; setup IopAddrRegPtr
+
+			assert	IopDataRegPtr=(IopAddrRegPtr+4)
+			addq.w	#iopRamData-iopRamAddr,a1	; point to the data register
+			move.l	a1,(a0)+				; setup IopDataRegPtr
+
+			assert	IopCtlRegPtr=(IopDataRegPtr+4)
+			subq.w	#iopRamData-iopStatCtl,a1	; point to the status/control register
+			move.l	a1,(a0)+				; setup IopCtlRegPtr
+
+			assert	BypassHandler=(IopCtlRegPtr+4)
+			move.l	a3,(a0)+				; setup BypassHandler
+
+			movea.l	sp,a0					; a0 <- IOPAccessInfo record
+			_IOPInfoAccess					; install the IOP
+			addq.l	#iaAccessInfoSize,sp	; de-allocate the IOPAccessInfo record
+			adda.w	#IOPInfoSize,a2			; point to next IOPInfo record
+			rts								; go on to the next IOP
+
+			endwith
+			TITLE	'IOPmgr - Set SCC IOP ByPass mode'
+
+;_______________________________________________________________________
+;
+;  Routine:		jsr SCCIOPByPass   <1.2>
+;  Inputs:		none
+;  Outputs:		none
+;  Destroys:	none
+;  Calls:		none
+;  Called by:	InitIO
+;
+;  Function:	Checks to see if the SCC IOP should be placed in bypass
+;				and set it accordingly.
+;
+;_______________________________________________________________________
+
+			with	IOPMgrGlobals,IOPAccessInfo,IOPInfo,IOPRequestInfo
+
+SCCIOPByPass
+
+;
+; Check PRAM to see if we should put the SCC IOP into enhanced communications mode.
+;
+; Bit 0 = 1 -> leave in bypass														<2>
+;       = 0 -> put in enhanced communications mode									<2>
+;
+
+@SavedRegs	reg		a0-a2/d0
+			movem.l	@SavedRegs,-(sp)		; save registers
+			move.l	#((01<<16)|IOPPRAM), d0	; index and number of bytes to get
+			clr.b	-(sp)					; make room for data
+			movea.l	sp, a0					; a0 points to data buffer
+			_ReadXPRAM
+
+			MOVE.B	(SP),SCCIOPFlag			; save the PRAM byte in low mem			<1.9>
+
+			moveq.l	#$01,d0					; check the bypass bit
+			and.b	(sp)+, d0				; get the PRAM value
+			bne.s	@Done					; branch if SET, stay in bypass mode	<2.0>
+
+			clr.l	-(sp)					; reply buffer 
+			clr.l	-(sp)					; [long] -> Completion Routine Address (Nil)
+			pea		4(sp)					; [long] -> Reply Buffer Address
+			pea		@ByPassMsg				; [long] -> Message Buffer Address
+			move.l	#((Active<<0)+\			; [byte] -> Request active
+					  (ReplyLen<<8)+\		; [byte] -> Reply Length
+					  (MsgLen<<16)+\		; [byte] -> Message Length
+					  (KernMsg<<24)), -(sp)	; [byte] -> Message Number
+			move.l	#((irSendXmtMessage<<0)+\ 	; [byte] -> kind of request to perform
+					  (SccIopNum<<8)), -(sp)	; [byte] -> IOP Number for SCC
+					  							; [word] -> queue type
+			clr.l	-(sp)						; [long] -> link to next queue element
+			movea.l	sp, a0
+			_IOPMsgRequest
+			bne.s	@FlagBypass				; if send failed, don't wait			<1.5><2>
+
+@Sync_Loop	tst.b	irReqActive(sp)			; make this a sync call
+			bne.s	@Sync_Loop			
+
+@waitDone	adda.w	#(irReqInfoSize+4), sp	; adjust stack							<1.5>
+
+@Done		movem.l	(sp)+,@SavedRegs		; restore registers
+			rts
+
+@FlagBypass	BSET	#0,SCCIOPFlag			;set bit 0=1 to flag bypass mode		<2>
+			BRA.S	@waitDone				;										<2>
+
+@ByPassMsg	DC.B	ByPassCmd, 0, $ff			; Turn bypass on or off
+			align	2
+			endwith
+			TITLE	'IOPmgr - Initialize SCC IOP Hardware'
+
+;_______________________________________________________________________			<1.4>
+;
+;  Routine:		jsr SCCIOPHwInit
+;  Inputs:		none
+;  Outputs:		none
+;  Destroys:	A0, A1, D0
+;  Calls:		none
+;  Called by:	Start Manager
+;
+;  Function:	Initializes the SCC IOP, so that the SCC can be used in ByPass
+;				mode and has the correct timing to that when TimeSCCDB is
+;				computed it will be correct.
+;
+;_______________________________________________________________________
+
+
+SCCIOPHwInit			
+			movea.l	SCCRd,a1			; a1 <- IOP Base
+			move.b	#resetIopRun,iopStatCtl(a1)	; init the Status/Ctl reg, hold IOP reset
+
+;	Download the IOP code
+
+			lea		SCCIOPInitCode,a0	; a0 <- start of IOP code (in this ROM)
+			move.w	(a0)+,d0			; get the size code (-1 for DBRA)
+			move.w	(a0)+,iopRamAddr(a1); setup the code load address
+
+@LoadLoop 	move.b	(a0)+,iopRamData(a1); download a byte
+			dbra	d0,@LoadLoop		; load all of the bytes
+
+;	Start IOP execution
+
+			move.b	#setIopRun,iopStatCtl(a1) ; release IOP reset (let it rip!)
+			lsr.w	#6,d0				; $FFFF -> $03FF -> loop 1024 times
+@wait		dbra	d0,@wait			; delay a bit while IOP initializes
+			rts							; all done
+		
+										; 6502 code to throw SCC IOP into bypass mode
+SCCIOPInitCode
+			dc.w	(@end-@Start)-1		;   size of the code (in bytes), -1 for DBRA
+			dc.w	$8000-(@end-@Start)	;   (word) load address
+@start									;   code starts here
+			dc.b	$A9,$81				; 7FEE:	lda	#1*DEBUG+0*SCCISM+1*BYPASS
+			dc.b	$8D,$30,$F0			; 7FF0:	sta	SCCControlReg
+			dc.b	$A9,$23				; 7FF3:	lda	#SccIOCtlReg					<2>
+			dc.b	$8D,$31,$F0			; 7FF5:	sta	IOControlReg
+			dc.b	$80,$FE				; 7FF8:	bra	$7FF8
+
+			dc.b	$EE,$7F				; 7FFA	7FEE	Non-Maskable Interrupt vector
+			dc.b	$EE,$7F				; 7FFC	7FEE	Processor reset vector
+			dc.b	$EE,$7F				; 7FFE	7FEE	Interrupt Request vector
+@end									;   code ends here
+
+
+		if PadForOverpatch then			;						<1.6>
+			align	4					; 						<1.5>
+			string	asis				;						<1.5>
+			dcb.l	($770-(*-IOPmgr))/4,'Gary'	; padding for overpatch	<1.5>
+		endif							;						<1.6>
+
+			endproc
+			END
+

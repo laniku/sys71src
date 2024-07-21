@@ -1,0 +1,263 @@
+;
+;	File:		SysEnvirons.a
+;
+;	Copyright:	© 1988-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <4>	 2/12/92	JSM		Moved this file to Gestalt folder, keeping all the old
+;									revisions.
+;		 <3>	 8/30/91	JSM		Cleanup header, include SysEqu.a and use SysEnvirons stuff from
+;									there instead of redefining it.
+;		 <2>	 1/23/91	KON		bbm:  no BRC #, QuickDraw check should return CQD if Gestalt
+;									returns a value greater than 100, not greater than 0.
+;	   <1.8>	 8/28/89	SES		Changed EnvBadSel & EnvSelTooBig that were previously defined in
+;									nFiles to EnvBadVers & EnvVersTooBig so that file is no longer
+;									dependent on nFiles.
+;	   <1.7>	 8/10/89	CCH		NEEDED FOR 6.0.4: Changed gestaltQuickdrawType to
+;									GestaltQuickdrawVersion.
+;	   <1.6>	 7/16/89	CCH		NEEDED FOR 6.0.4: Made SysEnvirons check Gestalt error codes.
+;	   <1.5>	 5/25/89	CCH		Revised again to deal with Gestalt equates.
+;	   <1.4>	 5/23/89	CCH		Added check for GestaltUnknownErr.
+;	   <1.3>	 5/18/89	CCH		Updated SysEnvirons to use new Gestalt interface.
+;	   <1.2>	 4/16/89	CCH		Changed Gestalt equates to new naming convention.
+;	   <1.1>	  3/6/89	CCH		Gutted SysEnvirons, and replaced with calls to Gestalt to get
+;									information.
+;	   <1.0>	11/16/88	CCH		Added to EASE.
+;
+
+;-----------------------------------------------------------------------------
+; SysEnvirons -- an environs call
+;
+; *** Note ***:	SysEnvirons now calls uses the Gestalt call to determine it's 
+;				information.  Previous versions still operate normally, however,
+;				the latest (and last) version is updated as Gestalt entries are updated.
+;
+;	Register Usage:
+;
+;	INPUT
+;		D0.W: Selector
+;		A0.L: Pointer to theWorld
+;
+;	USAGE
+;		D0: scratch
+;		D1: holds requested version number
+;		D2: holds EnvErr
+;		A0: scratch
+;		A2: hold pointer to theWorld!!! Don't touch this !
+;
+;	OUTPUT
+;		D0.W: error code
+;		A0.L: pointer to theWorld
+;-----------------------------------------------------------------------------
+
+;-----------------------------------------------------------------------------------------
+
+				INCLUDE		'SysEqu.a'		; <3>
+				INCLUDE		'GestaltEqu.a'
+
+; FUNCTION SysEnvirons(VersionRequested: Integer; VAR theWorld: SysEnvRec): OSErr;	<PB302>
+mySysEnvirons		PROC 	EXPORT			;											<PB302>
+										; Proc header moved up to clear up dupl		<A/UX>
+										;   label problems.							<PB302>
+										
+;-----------------------------------------------------------------------------------------
+;		Equates
+;-----------------------------------------------------------------------------------------
+envTRUE			EQU	1	; IM V1 p.86: "Boolean value in bit 0" -- FALSE EQU 0
+
+SysWDProcID		EQU	'ERIK'	; for use with OpenWD
+TwoBitsClear	EQU	$3FFF	; for compare below (two high bits clear)
+
+;-----------------------------------------------------------------------------------------
+;	The code starts here 
+;-----------------------------------------------------------------------------------------
+			WITH 	SysEnvRec			; <3>
+			MOVEM.L	A0/D2,-(SP)			; save regs
+			MOVE.L	A0,A2				; Pointer to theWorld
+
+;-----------------------------------------------------------------------------------------
+;   Check for negative selector, or for selector too high -- Selector is in D0 at this point
+;-----------------------------------------------------------------------------------------
+			MOVE.W	#EnvBadVers,D2		; assume error number in D2											<1.8>
+			TST.W	D0					; test the selector
+			BLE		EXIT				; if less than or equal to zero, then exit
+			
+			MOVE.W	#noErr,D2			; error return, set to zero for now, MPW will generate CLR.W here
+			MOVE.W	D0,D1				; save requested version number in D1
+			CMP.W	#curSysEnvVers,D0	; test to see if requested version was bigger than current version	<3>
+			BLE.S	GetSize				; if not, then continue
+			MOVE.W	#EnvVersTooBig,D2	; put error here, but continue										<1.8>
+			MOVE.W	#SysEnvRec.size,D0	; change this as versions increase (which they won't)				<3>
+			BRA.S	ZeroWorld			; start filling in
+
+;-----------------------------------------------------------------------------------------
+;-> Since all the environment records for versions 1-2 are the same size, we can
+;   use the same size for all of them.
+;-----------------------------------------------------------------------------------------
+GetSize		MOVE.W	#SysEnvRec.size,D0	; for now, just do this 											<3>
+
+;-----------------------------------------------------------------------------------------
+; ZeroWorld
+;   	routine to zero out bytes of record
+;
+;	On Input: 	D0 == bytes to zero
+;			D1 == requested version
+;		  	A0 == pointer to the world
+;		  	A2 == (copy of) pointer to the world
+;
+;	Register usage:
+;			A0 == copy of world pointer
+;-----------------------------------------------------------------------------------------
+ZeroWorld
+			ASR.W	#1,D0			;count by words
+			SUBQ	#1,D0			;adjust for Debra
+ZeroLoop
+			CLR.W	(A0)+			;clear next word
+			DBRA	D0,ZeroLoop		;loop till done.
+			; now we've zeroed out the record
+
+FillInWorld1
+			MOVE.W	D1,environsVersion(A2)		; put in version number	<3>
+
+;-----------------------------------------------------------------------------------------
+;   Get machineType -- assumes 4.1 and later will not even run on 64K ROMs
+;	so we don't need to check for XLs or even 64K ROM Macs
+;		WARNING -- if run on old ROMS, this will return Env512KE!!
+;	this also assumes that future Macs will have 8(ROMBase) > 0 
+;
+;->	Actually get this from _Gestalt.
+;-----------------------------------------------------------------------------------------
+GetMachineType	
+			Move.l	#gestaltMachineType,D0		; ask for machine type
+			_Gestalt							; ask gestalt for the info
+			tst.w	d0							; any errors?
+			Beq.s	OkMach						; if not, return result
+			moveq	#envMachUnknown,A0			; oh well, use SysEnvs bad way of saying unknown
+			Bra.s	SaveMach
+			
+OkMach		Sub.w	#2,A0						; convert gestalt result to sysEnv result
+SaveMach	Move.w	A0,machineType(A2)			; save the result in the record		<3>
+
+;-----------------------------------------------------------------------------------------
+;  SYSTEM VERSION code
+;-----------------------------------------------------------------------------------------
+			Move.l	#gestaltSystemVersion,D0	; ask for system version
+			_Gestalt							; ask gestalt for the info
+			tst.w	d0							; any errors?
+			Beq.s	@ok							; if not, return result
+			sub.l	a0,a0						; otherwise, return zero
+@ok			Move.w	A0,systemVersion(A2)		; no problem, dude..				<3>
+
+;-----------------------------------------------------------------------------------------
+;   Get Processor Stuff 
+;-----------------------------------------------------------------------------------------
+			Move.l	#gestaltProcessorType,D0	; ask for processor type
+			_Gestalt							; ask gestalt for the info
+			tst.w	d0							; any errors?
+			Beq.s	OkProc						; if not, return result
+			moveq	#envCPUUnknown,A0			; oh well, use SysEnvs bad way of saying unknown
+
+OkProc		Move.w	a0,processor(A2)			; save it							<3>
+
+;-----------------------------------------------------------------------------------------
+;   HasFPU
+;-----------------------------------------------------------------------------------------
+			Move.l	#gestaltFPUType,D0			; ask for fpu type
+			_Gestalt							; ask gestalt for the info
+			tst.w	d0							; any errors?
+			bne.s	NoFPU						; whoops
+			move.l	a0,d0						; this will be nonzero if an FPU exists, else zero
+			Beq.s	NoFPU						; oh well.. entry is already zero
+			Move.b	#envTRUE,hasFPU(A2)			; cool, we have one					<3>
+NoFPU		
+
+;-----------------------------------------------------------------------------------------
+;   Has ColorQD 
+;-----------------------------------------------------------------------------------------
+ColorQD		Move.l	#gestaltQuickdrawVersion,D0	; ask for QD version				<1.7>
+			_Gestalt							; ask gestalt for the info
+			tst.w	d0							; any errors?
+			bne.s	NoCQD						; whoops
+			cmp		#gestalt8BitQD,a0			; values less than gestalt8BitQD indicate 	<KON 23JAN90>
+			Blt.s	NoCQD						; no CQD									<KON 23JAN90>
+			MOVE.B	#envTRUE,hasColorQD(A2)		;									<3>
+NoCQD
+
+;-----------------------------------------------------------------------------------------
+;   Get Keyboard type 
+;-----------------------------------------------------------------------------------------
+			Move.l	#gestaltKeyboardType,D0		; ask for keyboard type
+			_Gestalt							; ask gestalt for the info
+			tst.w	d0							; any errors?
+			Beq.s	OkKeyBd						; whew..
+			moveq	#envUnknownKbd,A0			; oh well, use SysEnvs bad way of saying unknown
+
+OkKeyBd		MOVE.W	a0,keyBoardType(A2)			; move in the value and we're done	<3>
+		
+;-----------------------------------------------------------------------------------------
+;   Get AppleTalk Driver Version Number
+;-----------------------------------------------------------------------------------------
+			Move.l	#gestaltAppleTalkVersion,D0	; ask for ATalk driver version num
+			_Gestalt							; ask gestalt for the info
+			tst.w	d0							; any errors?
+			Beq.s	@ok							; if not, return result
+			sub.l	a0,a0						; otherwise, return zero
+@ok			Move.w	a0,atDrvrVersNum(A2)		; put version number in record		<3>
+	
+;-----------------------------------------------------------------------------------------
+;   Get SysVRef --  returns WDRefNum of directory that contains
+;			open system file in D0 -- if this call fails, returns 0
+;	We use GetFCBInfo here -- slower but smaller
+;
+;	NOTE -- 4.1 will patch BootDrive code so BootDrive is always accurate
+;		we still need to use this method because DAs or unscrupulous
+;		apps may change BootDrive.
+;
+;	Assumes system 4.1 and 128K or greater ROMs (HFS)
+;-----------------------------------------------------------------------------------------
+getSysVRef		Clr.l	D0								; in case we get an error below
+			
+				Move.w	#(ioHVQElSize/2)-1,D1			; this many CLR.Ws, minus one for the DBRA
+@1				Clr.w	-(SP)							; push zeros on stack, worse case 2 too many.
+				DBra	D1,@1							; branch if not done
+			
+				Move.l	SP,A0							; A0 points to cleared param blk for HFS calls
+				Move.w  SysMap,ioRefNum(A0)				; get the fileRefNum of System File
+				_GetFCBInfo								; get info
+				Bne.s	FixStack						; oops, clean up stack and leave
+	
+; now we need to do a PBHGetVInfo call -- we've already established that we're running HFS
+	
+				Move.w	ioFCBVRefNum(A0),ioVRefNum(A0)	; Thanks Bill B. -- no thanks Inside Mac
+				_HGetVInfo								; get VFndrInfo (blessed folder's dirID)
+				Bne.s	FixStack						; oops, clean up stack and leave
+	
+; we're OK so far, now we just do a OpenWD, the VRef is set up we just need to 
+; get the id of the blessed folder from ioVFndrInfo[1] and put it into the dirID
+; field of the parameter block, and away we go!
+	
+VInfoOK			Move.L	ioVFndrInfo(A0),ioWDDirID(A0)	; set up the "blessed folder"
+				Move.L	#SysWDProcID,ioWDProcID(A0)		; put 'ERIK' into WDProcID
+				_OpenWD									; open a working directory (probably already open?)
+				Bne.s	FixStack						; oops, clean up stack and leave
+				Move.w	ioVRefNum(A0),sysVRefNum(A2)	; put result in parameter block	<3>
+FixStack		Adda	#ioHVQelSize,SP					; clean up the stack, same count as above.
+		
+;-----------------------------------------------------------------------------------------
+;   End of FillInWorld1  - for future versions (>=2) put checking in here to see how
+; 				much more to fill in, based on selector passed in in D0
+;-----------------------------------------------------------------------------------------
+	
+		ENDWITH
+		
+Exit	MOVE.W	D2,D0					; put error number in D0
+		MOVEM.L	(SP)+,A0/D2				; restore regs, including A0 (pointer to record)
+		RTS								; return to caller (Return address should be on stack)
+
+		ENDPROC							; SysEnvirons								<C982>
+
+;;;;;;;;;;;;;;;;;
+;;;	end-of-file
+;;;;;;;;;;;;;;;;;
+

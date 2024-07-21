@@ -1,0 +1,644 @@
+;
+;	File:		DeCompressorPatch.a
+;				By Donn Denman
+;
+;	Contains:	patch to Resource Manager's CheckLoad hook for resource decompression.
+;
+;	Copyright:	© 1990-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		<18>	12/18/91	pvh		Add '040 cache flushing at a point after the resources have been
+;									decompressed. This helps executable code out a great deal.
+;									Catches both DonnBits & GreggyBits (and any new ones that may
+;									come along).
+;		<17>	  2/7/91	gbm		csd, #82402: Make this patch reentrant.
+;		<16>	 1/30/91	gbm		sab, #38: Change the name of one of the decompressor header
+;									files (because Sheila said it was okay)
+;		<15>	12/20/90	gbm		(dba) Reintroduce the saving and restoring of some key Resource
+;									Manager globals. This will make decompression work.
+;		<14>	10/30/90	dba		only accept decompressor defprocs from resource files with a
+;									special bit set
+;		<13>	 9/25/90	gbm		Stop caching what we think was the last defproc... this was
+;									bogus
+;		<12>	  9/4/90	gbm		make a new calling interface for new defProcs
+;		<11>	  9/3/90	gbm		add knowledge of new header types. Types newer (higher) than 8
+;									have a different format. DefProcs called when the new header is
+;									present have a calling interface different from previous
+;									defprocs.
+;		<10>	  9/2/90	csd		Made the resource handle NIL if we don’t have enough memory to
+;									load the resource
+;		 <9>	 8/31/90	stb		Change var table allocation from NewPtr to NewHandle. It’s
+;									faster and won’t burp the new resource handle.
+;		 <8>	 3/23/90	DD		Fixed a bug in which the variable table was not being made large
+;									enough.
+;		 <7>	  3/9/90	DD		Fixed both decompression and SizeRsrc patch to be robust about
+;									resources with the extended attributes bit that don't have the
+;									right signiture.  Note that MacPaint has the 'compressed' bit
+;									set on all of their resources.
+;		 <6>	 2/28/90	DD		major rewrite includes decompress in place, and separate
+;									decompress defproc 'dcmp'
+;		 <6>	  2/2/90	DD		Changed the error code returned when a resource can't be
+;									 decompressed to CantDecompress: -186, new from SysErr.a
+;		 <5>	 1/29/90	DD		Removed a userbreak so you won't go into Macsbug during an error
+;									condition.
+;		 <4>	 1/18/90	DD		reorganized the resource header for extended attribute
+;									resources, and compressed flavor extended attribute resources
+;		 <3>	 1/18/90	DD		Updated the source to match a newer version with several bug
+;									fixes.
+;		 <2>	 1/18/90	DD		Removed a user break, and changed the message in a user break
+;									that informs of an out-of-memory condition
+;		 <1>	 1/17/90	DD		Adding for the first time into BBS.
+;
+
+		ROMVersions 	MacPlus, MacSE, MacII, Esprit, Aurora
+
+; Location of the _Read trap in Resource Manager's RdData routine.
+FromReadInResMgr	Bind	(MacPlus,$14250),(MacSE,$E864),(MacII,$1319E),(Esprit,$147F6),(Aurora,$1BA1A)
+
+; Location of the Bsr RdData in Resource Manager's SizeRsrc routine.
+FromSizeRsrc		Bind	(MacPlus,$141DA),(MacSE,$E7EE),(MacII,$13128),(Esprit,$14780),(Aurora,$1B9A4)
+
+; Location of the Bsr SizeRsrc in Resource Manager's SizeResource routine - the _SizeRsrc code.
+FromSizeResource	Bind	(MacPlus,$1487A),(MacSE,$EE9C),(MacII,$137D6),(Esprit,$14E2E),(Aurora,$1C052)
+
+; Location of the second Bsr RdData in Resource Manager’s NewMap routine.
+FromNewMap			Bind	(MacPlus,$136B4),(MacSE,$DCB0),(MacII,$125E4),(Esprit,$13C54),(Aurora,$1AE6C)
+
+DecompressionLocals	RECORD	{a6Link},decr	;<17>
+return				DS.L	1
+a6Link				DS.L	1
+ResHeaderBuffer		DS.B	ResourceTemplate.ResTemplateSize	; room for a ExtResRecord
+DoDonnDecompress	DS.B	1								; boolean set if we're doing "old" decompression
+extra				DS.B	1								; and a little padding
+localSize			EQU		*
+					ENDR	;<17>
+
+DeCompression	PROC
+				EXPORT	OldCheckLoadJump,MyCheckLoad
+
+				With	ExtendedResource, ExtResRecord, VarTableRec, ResourceTemplate, DecompressionLocals
+
+;
+; ReadResData - Read the resource data for D0 bytes into the buffer (A0).
+;
+;		Entry:	D0 - number of bytes to read.
+;				D1 - relative data location within the resource data block.
+;				A0 - pointer to the data buffer.
+;				A4 - resource map handle.
+;				A6 - LINKed locals for decompression <17>
+;		Exit:	D0 - result code.
+;				A0 - pointer to the header data.
+;				all other registers saved.
+
+ReadResBuffer
+		Lea 	ResHeaderBuffer(a6),A0 			; <17>
+ReadResData
+		MoveM.L D1-D2/A0-A3,-(SP)
+		MoveQ	#ioQElSize,D2					;create a param block on the stack.
+		Sub.L	D2,SP
+
+		Move.L	A0,ioBuffer(SP) 				;place to put the data.
+		Move.L	SP,A0							;for the read call.
+		Move.L	(A4),A1 						;deref the map handle.
+		Move.W	MRefNum(A1),ioRefNum(A0)		;refNum from the resource map.
+		Move.L	D0,ioReqCount(A0)				;number of bytes to read.
+		Move.W	#1,ioPosMode(A0)				;read from start of file.
+		Add.L	ResDataOffset(A1),D1			;add the base data offset in the file.
+		Move.L	D1,ioPosOffset(A0)				;computed offset from file start.
+		_Read									;read the resource data.
+
+		Add.L	D2,SP							;strip the ioParam block.
+		MoveM.L (SP)+,D1-D2/A0-A3
+		Rts
+
+;
+; Buffer for I/O with read.
+;starting with change <17>, this is all on a local stack frame (for recursion)
+;ResHeaderBuffer
+;		DS.B	ResTemplateSize 				;room for a ExtResRecord
+;DoDonnDecompress
+;		DS.B	1								; boolean set if we're doing "old" decompression
+;		ALIGN
+;_______________________________________________________________________________
+; Register conventions throughout the Resource Manager:
+;
+; A0, D0, D1, D2, D7 scratch.
+;
+; A1 is the handle to the resource
+; A2 points to an entry in the map
+; A3 points to the beginning of a sub-block
+; A4 is the map handle
+;
+; D3 is the resource type, if any
+; D4 is the number of resource entries (-1) for looping
+; D5 is the number of types (-1) for looping
+; D6 is the resource map reference number
+;
+; A6 is always LINKed, through StdEntry.  There is only 1 local variable,
+; an IOStackFrame.		A0 also always points to 8(A6) when returning from StdEntry.
+;
+; Slight modification to above.... we have our own locals LINKed on A6
+;_______________________________________________________________________________
+
+********************************************************************************************
+*
+* MyCheckLoad
+*
+* Description:	If we are reading in a packed resource, then unpack the
+*						data as it is loaded.
+*
+* New
+* Operation:	If the resource is not compressed,
+*						or if the handle has data then Jump OldCheckLoad.
+*				Remember ResLoad, Clear ResLoad.
+*				Call OldCheckLoad to allocate the data handle.
+*				Restore ResLoad, if False then exit.
+*				Allocate the data handle (in the right heap), with a
+*						little extra slop (using resrvemem if locked).
+*				Unpack the data in place.
+*				Trim away the extra slop.
+*				Exit.
+*
+*		Input:	A2: 	pointer to resource list entry
+*				A4: 	resource map handle
+*
+*				ResLoad:		true if load, false if no load
+*
+*	   Output:	A0: 	handle to resource
+*				A1: 	trashed
+*				A2-A7:	unchanged
+*				D0-D2:	trashed
+*				D3-D7:	unchanged
+*
+*	Called by:	Resource Manager
+*
+*  Reister usage:		D2 - offset of raw data in this resource.
+*						D3 - handle's zone.
+*						D4 - resource attributes.
+*						D5 - unpacked size.
+*						D6 - offset to this resource's data, then the var table handle.
+*						D7 - original resLoad state.
+*						A2/A3/A4 - as the Resource Manager needs them.
+*						A5 - the resource handle.
+*						A6 - LINKed locals <17>
+*
+********************************************************************************************
+
+MyCheckLoad
+
+;is it compressed?	Flag that it isn't in case it gets modified and written.
+
+				BTst.B	#resExtended,RAttr(A2)
+				BNZ.S	TestResHandle			;no, then just do the old checkload stuff.
+
+		IF		ForROM			THEN
+			AERROR 'The decompression patch for the CheckLoad hook needs to be reworked to go into ROM!'
+		ELSE
+OldCheckLoadJump
+				Jmp 	(0).L					;gets stuffed with the old address.
+		ENDIF
+
+; if there is alredy data in the handle, then just call old checkload.
+
+TestResHandle
+				Move.L	RHndl(A2),D0			;is the handle loaded already?
+				BZ.S	DeCompressor			;no, then we will try to load it.
+
+				Move.L	D0,A0
+				Move.L	(A0),D0 				;check if the master pointer is nil
+				BNZ.S	OldCheckLoadJump		; it has data, so no need to load, or decompress.
+
+DeCompressor
+				LINK	A6, #localSize			; save space for a read buffer and stuff <17>
+
+				MoveM.L D3-D7/A4-A5,-(SP)		;save some regs.
+
+; Remember ResLoad, Set ResLoad False.
+
+				Move.B	ResLoad,D7				;remember ResLoad.		?Should I use _GetResLoad and SetResLoad?
+				Clr.B	ResLoad 				;don't load the data in old checkLoad.
+
+; The resource is compressed but not loaded yet.  Make sure the handle gets created.
+
+				BSr.S	OldCheckLoadJump		;create the handle for the data.
+				Move.B	D7,ResLoad				;restore ResLoad.
+				BZ.S	@IfZExit2
+
+				Move.L	A0,A5					;remember the handle.
+				Move.L	A0,D0					;is the handle allocated now?
+@IfZExit2
+				BZ		Exit2					; no, then we can't do any more.
+
+				Move.B	RAttr(A2),D4			;remember the attribute flags.
+
+; read in the resource data header.  This gives us decompressed size.
+
+				MoveQ	#ResHeaderSize,D0		;amount we wish to read.
+				Move.L	RLocn(A2),D6			;get the relative data location.
+				And.L	Lo3Bytes,D6 			;mask off the resource attributes.
+				Move.L	D6,D1					;this is where we want to start reading from.
+				Bsr 	ReadResBuffer			;read in the resource data.
+
+; do a robustness check to see if the handle really seems to be compacted.
+
+				Cmp.L	#RobustnessData,ResHeader.signiture(A0) ;is it really an extended resource?
+				BEQ.S	@TestHeaderVersion
+
+				MoveM.L (SP)+,D3-D7/A4-A5		;restore the regs, but don't pop them yet.
+				UNLK	A6						; <17>
+				Bra.S	OldCheckLoadJump		;read in the data, now that resLoad is restored.
+
+@TestHeaderVersion
+				Move.W	#CantDecompress,D2										;assume bad extended resource.
+				lea 	DoDonnDecompress(a6), A1								;get flag location <17>
+				sf		(a1)													;set the flag, assuming that's what we want
+				Cmp.B	#CurHeaderVersion,ResHeader.headerVersion(A0)			;is this DonnBits?
+				BEQ 	@headerVersionOK										;yep, okay
+				st		(a1)													;nope, clear the flag
+				cmp.b	#greggyHeaderVersion, ResHeader.headerVersion(a0)		;is this GreggyBits?
+				bne 	ErrorExit												;no, bail
+@headerVersionOK																;move along
+; Make the pointers into the Map relative offsets, so we can rebuild them after a heap shuffle.
+
+				Sub.L	(A4),A2 								; pointer to map entry becomes an offset.
+				Sub.L	(A4),A3 								; some callers have a block pointer here.
+
+; assume it's just a non-compressed extended resource, compute data size and offset.
+
+				MoveQ	#ExtendedResource.extendedData,D2		;offset to start of data for a normal extended attribute resource
+				Move.L	ResSize(A0),D5							;get the size, including header.
+				Sub.L	D2,D5									;actual amount of data to read.
+				BTst	#resCompressed,ResHeader.extendedAttributes(A0)
+		;Debugging
+		if DoDebug then
+				BNZ 	@SkipDebugBreak
+		Break	'Simple Extended Resource'
+@SkipDebugBreak
+		endif
+		;Debugging
+				BZ		HaveSizeAndOffset						;not compressed, then we have the size and offset.
+
+; check which def proc to unpack it with.  We use a simple robust caching scheme to avoid _GetResource calls.
+
+				Move.W	#badExtResource,D2						;assume an error if it was the wrong version!
+				btst	#0, DoDonnDecompress(a6)				; are we doing DonnBits <17>
+				bne.s	@notDonn								; no, get ID from revised general header format
+				Move.W	ResHeader.decompressID(A0),D5			;get the Donn ID this resource needs
+				bra.s	@gotID		 							; ...and keep going
+@notDonn
+				move.w	ResHeader.defprocID(a0), d5 			; get defProc
+@gotID
+
+; here, we look for decompression defprocs in all files below the current one
+
+				Move.W	#CantDecompress,D2						;assume bad extended resource
+				move.l	a4,a1									;get a handle to the first file to look in
+@tryMap
+				move.l	a1,d0									;are we done?
+				bz		ErrorExit								;yes, we looked and didn’t find anything
+
+				move.l	(a1),a0									;get map pointer
+				btst	#decompressionPasswordBit,mInMemoryAttr(a0)
+				bz.s	@nextFile
+
+				move.w	CurMap,-(sp)
+				Move.B	ResOneDeep,-(SP)						;preserve the depth setting
+				move.w	ROMMapInsert,-(sp)						;save the value of ROMMapInsert	<15>
+				move.l	ResErrProc,-(sp)						;remember the ResErrProc		<15>
+
+				move.w	mRefNum(a0),CurMap						;get resource from this file
+				clr.w	ROMMapInsert							;don’t even think about ROM map	<15>
+				clr.l	ResErrProc								;and don’t call the app.		<15>
+
+				SubQ	#4,SP
+				Move.L	#DeCompressDefType,-(SP)				;'dcmp'
+				Move.W	D5,-(SP)
+				_Get1Resource									;get the decompress def. proc.
+				Move.L	(SP)+,A0
+
+				move.l	(sp)+,ResErrProc						;back to normal					<15>
+				move.w	(sp)+,ROMMapInsert						;restore ROM guy too			<15>
+				Move.B	(SP)+,ResOneDeep						;restore depth
+				move.w	(sp)+,CurMap
+
+				Move.L	A0,D0
+				bne 	@gotDecompressor						;if we got the decompressor, then use it
+
+				move.w	ResErr,d0								;if there was no dcmp, go on
+				beq.s	@nextFile
+				cmp.w	#resNotFound,d0							;if there was an error, quit with the error
+				bne		ErrorExit
+@nextFile
+				move.l	(a1),a1									;get map pointer
+				move.l	mNext(a1),a1							;go on to the next file in the chain
+				bra.s	@tryMap
+@gotDecompressor
+
+; remember the defproc handle. (mostly 'cause we don't have any registers left...)
+
+				Lea 	DefProcHandle,A1						;stuff away the defproc ID
+				Move.L	A0,(A1)+								;stuff away the defproc handle into DefProc
+
+; it is a compressed resource, make sure we can handle it, and get its size from the header.
+
+@HaveDefProc
+				Lea 	ResHeaderBuffer(a6),A0					;point into our frame. <17>
+				btst	#0, DoDonnDecompress(a6)				; are we DonnBits? <17>
+				bne.s	@cTableDontCare 						; no, then cTables are not used
+				Tst.W	ResHeader.cTableID(A0)					;is the built in table to be used?
+
+				Bne 	ErrorExit								; for now, we don't load decompression tables.
+@cTableDontCare
+				MoveQ	#ExtendedResource.compressedData,D2 	;offset to start reading from.
+				Move.L	ResHeader.actualSize(A0),D5 			;get the unpacked size.
+				MoveQ	#0,D0									;overRun indicates the amount of extra room we need to
+				btst	#0, DoDonnDecompress(a6)				; are we DonnBits? <17>
+				bne.s	@getWordSizedSlop						; no, then slop size is a word
+				Move.B	ResHeader.overRun(A0),D0				; avoid the input and output pointers crossing during decompression.
+				bra.s	@addOverRun 							;
+@getWordSizedSlop												;
+				move.w	ResHeader.decompressSlop(a0), d0		; get word sized slop size
+@addOverRun 													;
+				Add.L	D0,D5									; block size must include overRun.
+HaveSizeAndOffset
+
+; Remember the current heap zone, and switch to the zone of the compressed handle.
+
+				_GetZone						;get the current heap zone.
+				Move.L	A0,D3					;remember current heap.
+
+				Cmp.L	RomMapHndl,A4			; is it in the ROM map?
+				Bne.S	@NotROMMap				; then go recover information
+		Break	'RomMapHndl Zone'
+				Move.L	A4,A0
+				_HandleZone 					; use the zone that the ROM Map comes from.
+				Bra.S	@SetRightZone
+
+@NotROMMap
+				BTst.L	#ResSysHeap,D4			; Is it in the system heap?
+				BZ.S	@SetRightZone			; No, use same heap
+				Move.L	SysZone,A0				; otherwise set the system zone for now
+
+@SetRightZone
+				_SetZone						; and use it, for now.
+
+; If the handle was locked, then we reserve low memory for the bigger unpacked handle.
+
+				BTst.L	#resLocked,D4			;should the handle be locked?
+				BZ.S	@DoneReserve
+				Move.L	D5,D0					;amount of space we will need.
+				_ResrvMem						;reserve room in locked space for the handle.
+@DoneReserve
+
+; Reallocate the handle.
+
+				Move.L	A5,A0
+				Move.L	D5,D7					;remember new size.
+				Move.L	D5,D0
+				_ReallocHandle					;set up the unpacked handle's size.
+				Move.W	D0,D1
+				BZ.S	@GotHandle				;did it get allocated without an error?
+		Break	'Error from _ReallocHandle'
+				Move.W	D1,ResErr
+				Suba.l	A5, A5					; return NIL since we don’t have enough memory					<10>
+				Bra 	@ExitPastHSetState		;exit if an error happened. Skip HSetState						<10>
+@GotHandle
+
+; compute the amount of data to be read.
+
+				Move.L	ResHeaderBuffer+ExtResRecord.ResSize(a6),D0 ;amount of raw resource data. <17>
+				Sub.L	D2,D0					;subtract the (offset of data from the header) from size.
+
+; compute where the data should go.
+
+				Move.L	(A5),A0 				;point to the handle base.
+				Sub.L	D0,D7					;subtract the data size from the block size.
+				Add.L	D7,A0					;point to the last place where the data will fit.
+
+; Read the data into the end part of the handle.
+
+				Move.L	D6,D1					;where the size and resource header start.
+				AddQ.L	#ResHeader-ResSize,D1	; point past the size.
+				Add.L	D2,D1					; we want to read from beyond the header.
+				Bsr 	ReadResData 			;read the data into the block.
+				BZ.S	@NoReadError			; do an error check.
+				Move.W	D0,ResErr				;set up res error from I/O error.
+		Break	'error during read'
+				Bra 	@Exit
+@NoReadError
+
+; if it is not a compressed resource, then we are done.
+
+				BTst	#resCompressed,ResHeaderBuffer+ExtResRecord.ResHeader.extendedAttributes(a6)		;compressed resource? <17>
+				Beq 	@Exit
+
+; create the room for the variable table.  It is a percentage of the unpacked size.
+				btst	#0, DoDonnDecompress(a6); DonnBits? <17>
+				bne.s	@dontCallDonn			; no, call defProc via new and improved interface
+				MoveQ	#0,D0					;get the ratio of var table to unpacked size.
+				Move.B	ResHeaderBuffer+ResHeader.varTableRatio(a6),D0 ;<17>
+				Beq.S	@HaveVarSize
+				AddQ.L	#1,D0					;round up.
+				Move.L	D5,D1					;unpacked size - is it a long?
+				Swap	D1
+				Mulu	D0,D1					;in case it is, scale the high word too.
+				Swap	D1
+				Clr.W	D1						;clear out the overflow.
+				Mulu	D5,D0
+				Add.L	D1,D0
+				Lsr.L	#8,D0
+@HaveVarSize
+				AddQ.L	#VarRecSize,D0			;add enough room for at least one record.
+				Move.L	D0,D1					;save var table size.
+				_NewHandle						;get the table.  Used to be a _NewPtr, but that moves the Realloc'ed handle
+				Bne 	ErrorExitBlowoffHandle	;blow off the handle and return a nil handle
+				_HLock							;don’t let it move
+				Move.L	A0,D6					;save var table ptr.
+
+; Finally we are ready to decompress the data in the clone into our larger handle.
+
+				Move.L	(A5),A0
+				Add.L	D7,A0					;point to the data.
+				Move.L	A0,-(SP)				;source ptr
+				Move.L	(A5),-(SP)				;destination ptr.
+				Move.L	D6,A0					;var table handle
+				Move.L	(A0),-(SP)				;pass var table ptr.
+				Move.L	D1,-(SP)				;pass var table size
+				Move.L	DefProcHandle,A0		;get the defproc handle.
+				Move.L	(A0),A0
+				Jsr 	(A0)					;call the defproc.	Note: the defProc can't move memory!
+
+; dispose of the var table handle.
+
+				Move.L	D6,A0
+				_DisposHandle					;dispose of the var table handle.
+				bra.s	@cutBackHandle
+
+@dontCallDonn
+				pea 	ResHeaderBuffer+ExtResRecord.ResHeader(a6) ; header ptr <17>
+				move.l	DefProcHandle, a0		;
+				move.l	(a0), a0				;
+				adda.w	0(a0), a0				; move to offset of "Prepare" routine
+				jsr 	(a0)					; call defProc "Prepare" routine
+
+				move.l	(a5), a0				; get start of block
+				add.l	d7, a0					; point to the start of the data
+				move.l	a0, -(sp)				; source
+				move.l	(a5), -(sp) 			; destination
+				pea 	ResHeaderBuffer+ExtResRecord.ResHeader(a6) ; header ptr <17>
+				move.l	DefProcHandle, a0		;
+				move.l	(a0), a0				;
+				adda.w	2(a0), a0				; move to offset of "Decompress" routine
+				jsr 	(a0)					; call defProc "Decompress" routine
+
+				pea 	ResHeaderBuffer+ExtResRecord.ResHeader(a6) ; header ptr <17>
+				move.l	DefProcHandle, a0		;
+				move.l	(a0), a0				;
+				adda.w	4(a0), a0				; move to offset of "Done" routine
+				jsr 	(a0)					; call defProc "Done" routine
+
+@cutBackHandle									; cut back the handle to get rid of the slop.
+				Move.L	ResHeaderBuffer+ExtResRecord.ResHeader.actualSize(a6),D0	;final size. <17>
+				Move.L	A5,A0
+				_SetHandleSize					;shrink the handle to it's correct size.
+
+; restore the handle state, and restore the zone.
+
+@Exit
+				Move.L	A5,A0					;The following bit-smashing is from the resource manager.
+				LSL.B	#3,D4					; Shift over lock to bit 7 in D4, purge bit to X .
+				RoL.B	#1,D4					; Rotate Lock to bit 0
+				RoXR.B	#2,D4					; Rotate L & P to bits 7 & 6
+				Or.B	#$20,D4 				; Set Resource Flag bit of D4.B
+				And.B	#$E0,D4 				; Çlear all but LPR bits of D4.B
+				_HGetState						; D0 <- LPR bits		Is this needed?
+				AND.B	#$1F,D0 				; Clear LPR bits only
+				OR.B	D4,D0					; Set up new LPR bits
+				_HSetState						; MemMgr bits <- D0
+
+@ExitPastHSetState								;														<10>
+				Move.L	D3,A0
+				_SetZone						; restore the zone.
+
+; Make the offsets into the Map pointers again, so they will be valid after a heap shuffle.
+
+				Add.L	(A4),A2 				; pointer to map entry.
+				Add.L	(A4),A3 				; some callers have a block pointer here.
+				Move.L	A5,A0					;return the handle.
+
+			MACHINE	MC68040						; (should we cache flush on all cpus?)										<18>
+												; (if we do then make sure to save D1 since trashed by '030 flush routine)	<18>
+				cmp.b	#cpu68040,CPUFlag		; check if we are on a 68040												<18>
+				bne.s	@not040					; If we are then															<18>
+				jsr		([jCacheFlush])			; 	flush data cache for consistency!										<18>
+												; we should really do this cache line by line for speed... maybe later 		<18>
+@not040																
+			MACHINE	MC68000
+
+Exit2
+				MoveM.L (SP)+,D3-D7/A4-A5
+				UNLK	A6						; <17>
+				Rts
+
+; We got an error cloning the handle, or creating the unpacked handle.	Toss the clone (even if Nil).
+
+ErrorExitBlowoffHandle
+				Move.W	#MemFullErr,D2			;not enough to allocate var table
+				Move.L	A5,A0
+				_DisposeHandle
+ErrorExit
+*** 	Break	'DeCompressor - not enough RAM - set up the error code for the Resource Man'
+				Move.W	D2,ResErr				;set up the error code for the Resource Man.
+				Sub.L	A0,A0					;return with nil.
+				Bra.S	Exit2
+
+********************************************************************************************
+
+; Storage
+
+DefProcHandle	DC.L	0						;current defProc.
+
+********************************************************************************************
+
+
+********************************************************************************************
+;
+; SizeRsrc patch
+;
+********************************************************************************************
+
+SizeRsrcStack			Record	0
+dispatcherReturn		DS.L	1								;return address to the dispatcher
+dispatcherRegs			DS.L	4								;dispatcher saves five regs.  We ignore the first four.
+oldRegisterA2			DS.L	1								;register A2 is saved here by the dispatcher.
+dispatcherResult		DS.L	1								;dispatcher pops this result long.
+readReturn				DS.L	1								;return address for the _Read trap.
+RdResgisters			DS.L	4								;four registers saved by RdData.
+RdDataReturn			DS.L	1								;return address (to SizeRsrc?)
+SzResgisters			DS.L	4								;four registers saved by SizeRsrc.
+RdDataResult			DS.L	1								;room for result from RdData
+SizeRsrcReturn			DS.L	1								;return address (to SizeResource?)
+						EndR
+
+						With	ExtendedResource, ExtResRecord, SizeRsrcStack
+						Export	ReadDecompression
+ReadDecompression
+						bra.s	SkipOldRead						;the special header here for patch protector
+JumpOldRead 			BackToTrap Read							;now do the old read.
+SkipOldRead
+
+						CmpBind FromReadInResMgr,readReturn(SP) ;check return from _Read -- coming from resource manager?
+						BNE.S	JumpOldRead 					;nope, skip the patch.
+
+						CmpBind FromNewMap,RdDataReturn(SP)		;will RdData return to NewMap?
+						BEQ.S	NewMapPatch 					;yes, do the NewMap patch
+
+						CmpBind FromSizeRsrc,RdDataReturn(SP)	;will RdData return to SizeRsrc?
+						BNE.S	JumpOldRead 					;nope, skip the patch.
+
+						CmpBind FromSizeResource,SizeRsrcReturn(SP) 	;will SizeRsrc return to SizeResource?
+						BNE.S	JumpOldRead 					;nope, skip the patch.
+
+; now we know that we are about to read the length for _SizeRsrc on an extended resource.
+
+						Move.L	oldRegisterA2(SP),A1			;rebuild A2 here.
+						Add.L	(A4),A1 						; restore to a pointer											<30may85> BBM
+						BTst.B	#resExtended,RAttr(A1)			;is this an extended resource?
+						Bz.S	JumpOldRead 					;nope, skip the patch.
+
+; make sure this is really a compressed resource by reading in the header data, and testing for our signiture.
+						LINK	A6, #localSize					; <17>
+						MoveM.L D1/A0,-(SP)
+						MoveQ	#ResHeaderSize,D0				;amount we wish to read.
+						Move.L	RLocn(A1),D1					;get the relative data location.
+						And.L	Lo3Bytes,D1 					;mask off the resource attributes.
+						Bsr 	ReadResBuffer					;read in the resource data.
+
+; do a robustness check to see if the handle really seems to be compacted.
+
+						Cmp.L	#RobustnessData,ResHeader.signiture(A0) ;is it really an extended resource?
+						MoveM.L (SP)+,D1/A0
+						UNLK	A6								; <17>
+						BNE.S	JumpOldRead 					;didn't match, then just do old sizersrc.
+
+; adjust the position offset to point within the header to the actual length.
+
+						MoveQ	#ExtResRecord.ResHeader.actualSize,D0	 ;get delta to the new position.
+						Add.L	D0,ioPosOffset(A0)				;bump the offset by our header and a long.
+						BRA.S	JumpOldRead						;go do the read
+
+NewMapPatch
+
+; we have already read in the map header, and are about to read in the extended attributes
+
+						move.l	a0,-(sp)
+						move.l	(a4),a0							;get pointer to the map
+						clr.b	mInMemoryAttr(a0)				;clear attributes that are set at run-time only
+						move.l	(sp)+,a0
+
+						BRA.S	JumpOldRead						;go do the read
+
+						EndWith
+						ENDP
+

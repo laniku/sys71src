@@ -1,0 +1,771 @@
+;-----------------------------------------------------------------------------------
+;
+;	File:		GetReal.a
+;
+;	Written by:	Carl C. Hewitt
+;
+;	Copyright:	© 1991-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM10>	10/14/93	pdw		(CCH) Split PowerPC EDiskProtect code into seperate routine.
+;									Added EDisk support for PDM.
+;	   <SM9>	 6/21/93	kc		Fix vm test in GetMMUInfo.
+;	   <SM8>	 6/14/93	SAM		Clarified the comments related to the isVMRunnning check in
+;									GetMMUInfo.
+;	   <SM7>	 6/14/93	kc		Roll in Ludwig.
+;	   <LW5>	 4/23/93	MR		Add code to check VMInstalled flag inside VM's globals. This
+;									fixes bug #1076279. Reviewed by Clinton Bauder
+;	   <LW4>	 3/25/93	MR		Remove GetMMUInfoQ. Instead put a hack inside VM to set
+;									VMGlobals($B78) to -1 when calling GetPhysical at VM
+;									initialization time.
+;		<LW3>	 3/16/93	MR		Created GetMMUInfoQ which is identical to GetMMUInfo except it
+;									does not check for VM. This is an EMERGENCY FIX for the
+;									RAMDISK/VM bug that broke Ludwig B3. Will be merged in the
+;									future with GetMMUInfo. GetMMUInfoQ is only called by
+;									MemoryDispatch routines (i.e. LockMemory,GetPhysical etc).
+;	   <SM6>	 2/23/93	kc		Fix bug introduced in last check in.
+;	   <SM5>	 2/20/93	SAM		Added LogicalToPhysical code for EMMU machines.  Placed a few
+;									Supports24Bit's around some things.  Removed a trap call or two
+;									where possible.  If it works at all, it should be faster for
+;									everyone.
+;	   <SM4>	  2/5/93	SAM		Adjusted PDMs temporary Log2Phys.  Removed several Gestalt calls
+;									from GetReal.  Removed all the 24bit stuff for ROM builds of
+;									this file in GetReal.
+;	   <SM3>	10/18/92	CCH		Fixed EDiskProtect to abort if an MMU is not present.
+;	   <SM2>	 5/17/92	kc		Roll in Horror sources.
+;	   <SM0>	 5/17/92	kc		Fix bug in translate040. We were puting phisical address into the wrong register.
+;		<H3>	12/12/91	CCH		Changed method of checking for VM in GetMMUInfo, since VM calls
+;									GetPageDesc after it sets up it's globals, but before taking
+;									over the MMU.
+;		<H2>	11/14/91	jmp		(CCH) Removed redundant physical-to-logical conversion in
+;									translate030 routine. Made EDiskProtect return a result. Also
+;									removed Gestalt calls in favor of checks of lo-mem. This is
+;									necessary since, in ROM, this routine can get called before
+;									Gestalt is.
+;	   <SM2>	 2/12/92	JSM		Moved this file to MMU folder, keeping all the old revisions;
+;									remove some unused equates.
+;	   <SM1>	12/31/91	RB		first checked in
+;	   <T10>	 7/11/91	CCH		Fixed a bug in translate040, and saved D1 in GetReal.
+;		<T9>	  7/9/91	HJR		Added overpatch space
+;		<T8>	 5/29/91	CCH		Moved the call to getMMUInfo to ensure it will always be called
+;									in 32-bit mode.
+;		<T7>	 5/24/91	CCH		Added call to enter supervisor mode, if necessary, and flushed
+;									the ATC in the EDiskProtect routine.
+;		<T6>	 5/10/91	CCH		Added the EDiskProtect routine.
+;		<T5>	  4/2/91	djw		fixed GetRealProc trashing reg D4.  This is crashing A/ROSE on
+;									Tim.
+;		<T4>	 3/18/91	CCH		Changed check for Gestalt to check for existence of ExpandMem
+;									instead of trap address.
+;		<T3>	 3/18/91	CCH		Fixed to not call Gestalt if it's not around.  Also made 040
+;									translation routine aware of non logical = physical memory.
+;		<T2>	 1/24/91	CCH		Ensured a logical 32-bit mode address for page descriptors on
+;									030's.
+;		<T1>	 1/24/91	CCH		first checked in
+;
+;----------------------------------------------------------------------------------
+
+			MACHINE	MC68030
+			PRINT	OFF
+			LOAD	'StandardEqu.d'
+			INCLUDE	'HardwareEqu.a'
+			INCLUDE	'MMUEqu.a'
+			INCLUDE	'GestaltEqu.a'
+			PRINT	ON
+
+;----------------
+; Misc Equates
+;----------------
+TTEnable	EQU		15						; transparent translation enable bit
+VMTrap		EQU		$A05C					; VM trap number
+VMGlobals	EQU		$0B78					; VM globals ptr
+VMInstalled	equ		$0101					; VMInstalled offset inside VM's globals  <LW5> 
+
+;----------------------------------------------------------------------------------
+;	GetReal	-	Translates a logical address into a physical address.  The address
+;				translation is performed in the MMU mode at the time of the call.
+;
+;	input:		a0.l =	logical address to be translated
+;
+;	output:		a0.l =	corresponding physical address
+;				d0.w =	result code
+;
+;	destroys:	a1-a2
+;----------------------------------------------------------------------------------
+GetRealRegs	REG		d1-d4					;												<t5> djw <t10> cch
+
+GetRealVars	RECORD	0,decrement
+oldA6		ds.l	1						; old A6 value
+theTC		ds.l	1						; TC reg (32-bit for 851/030, 16-bit for 040)
+theSRP		ds.l	1						; root pointer of tables to use
+theCRP		ds.l	1						; limit and flags long for 68851 and 68030 MMUs
+myPhys2Log	ds.l	1						; offset to convert root ptr to logical addr
+initShift	ds.b	1						; initial shift bits				 (IS)
+levelFour	ds.b	1						; width of fourth level offset field (TID)
+levelThree	ds.b	1						; width of third level offset field	 (TIC)
+levelTwo	ds.b	1						; width of second level offset field (TIB)
+levelOne	ds.b	1						; width of first level offset field  (TIA)
+			ds.b	1						; padding
+GetRealSize	equ		*
+			ENDR
+
+GetRealProc	PROC	EXPORT
+			WITH	GetRealVars,MemDispGlobals
+			EXPORT	GetPageDescProc
+			EXPORT	GetMMUInfo
+			EXPORT	checkTTRegs
+
+											; Note: We dont support "GetPageDesc Address" 
+			cmpi.b	#EMMU1,MMUType			; Do we have an Emulated MMU?
+			bne.s	GetRealAddr				; -> No, OSW (old slow way).
+			
+; Do Logical to Physical Translation for machines with EMMUs.								<SM5> SAM
+
+			MOVEM.L	A2/D1/D2,-(SP)			; Save some regs
+			
+			MOVE.L	LockMemCt,A2			; Get the MemDispatch globals
+			MOVE.L	mdLog2PageSize(A2),D1	; Get the Log2 page size
+			
+			MOVE.L	A0,D0					; Copy the log addr
+			MOVE.L	A0,D2					; Make another copy (Shitty addressing modes)
+			
+			LSR.L	D1,D0					; Turn the Addr into a logical page number
+			MOVE.L	D0,A0					; Put the page number back into A0
+			
+			_nkMMUGetPhysicalPage			; Get the physical page in D0
+			
+			LSL.L	D1,D0					; Turn the Phys page number into an Address
+			MOVE.L	mdPageSize(A2),D1		; Get the page size
+			SUBQ.L	#1,D1					; Turn the log2 page size into a mask
+			AND.L	D1,D2					; Mask out the upper 12 bits of the logical addr
+			OR.L	D2,D0					; Combine the phys page & logcal offset to make phys addr
+
+			MOVE.L	D0,A0					; Put the physical address into A0
+			MOVEQ	#0,D0					; Signal no error
+
+			MOVEM.L	(SP)+,A2/D1/D2			; Restore regs
+*			BRA.S	@Done					; -> Exit
+			RTS
+
+GetRealAddr
+			move.w	#getReal,-(sp)			; indicate we want physical address in a0
+			bra.s	walkTable				; go walk table									<SM6>
+			
+GetPageDescProc
+			move.w	#getpageDesc,-(sp)		; indicate we want page descriptor ptr in a0
+			
+walkTable	movem.l	GetRealRegs,-(sp)		; save working registers
+			link	a6,#GetRealSize			; allocate some room for our locals
+			cmpi.b	#PMMU851,MMUType		; check to see if we have an MMU
+			bhs.s	@haveAnMMU				; IF we do not have an MMU THEN
+			move.w	#noMMUErr,d0			;	return an error
+			bra.s	@exitGetReal			;	>>EXIT routine
+@haveAnMMU									; ENDIF
+			move.l	a0,d2					; get logical address into d2
+			jsr		GetMMUInfo				; fill our globals with MMU info
+		IF Supports24Bit THEN
+			move.b	MMU32Bit,-(sp)			; save current MMU mode
+			bne.s	@in32BitMode			; IF we're in 24-bit mode THEN
+			moveq	#true32b,d0				;	we want to go to 32 bit addressing
+			_SwapMMUMode					;	switch the MMU mode
+			and.l	Lo3Bytes,d2				;	clean up the 24-bit address
+			bra.s	@doTranslation			;	go do the translation
+		ENDIF
+@in32BitMode								; ELSE
+			jsr		checkTTRegs				;	check transparent translation regs
+			bne.s	@doTranslation			;	IF we matched a TT register THEN
+			move.l	d2,a0					;	  put the original address into a0
+			move.l	#0,a2					;	  return null for page descriptor address
+			moveq	#noErr,d3				;	  return good status
+			bra.s	@cleanupGetReal			;	  >>EXIT with easy translation
+											;	ENDIF
+@doTranslation								; ENDIF											
+			cmp.b	#PMMU040,MMUType		; check MMU type
+			beq.s	@trans68040				; IF we're on a 68030 THEN
+			jsr		translate030			;	do the translation for an 851/030
+			bra.s	@cleanupGetReal			; ELSE
+@trans68040	jsr		translate040			;	do the translation for a 68040
+											; ENDIF
+
+;------------
+; a2.w = address of page descriptor, if any
+; d3.w = result code
+; a0.l = physical address if successful
+;------------
+@cleanupGetReal
+		IF Supports24Bit THEN				; SM is always in 32 bit mode					<SM4>
+			move.b	(sp)+,d0				; get original MMU mode
+			bne.s	@returnResult			; IF we were originally in 24-bit mode THEN
+			_SwapMMUMode					;	swap back to it
+		ENDIF
+@returnResult								; ENDIF
+			move.w	d3,d0					; return result in d0
+@exitGetReal
+			unlk	a6						; restore registers
+			movem.l	(sp)+,GetRealRegs		; save working registers
+			cmp.w	#getpageDesc,(sp)+		; check for page getPageDesc call
+			bne.s	@getRealDone			; IF this is the getPageDesc call THEN
+			move.l	a2,a0					;	return page descriptor pointer
+@getRealDone								; ENDIF
+			tst.w	d3
+@done		rts
+
+
+;----------------------------------------------------------------------------------
+;	GetMMUInfo	-	Fills the global area with MMU-specific table information.
+;
+;	input:		a6.l =	pointer to global area
+;
+;	output:		none (globals are set up)
+;
+;	destroys:	a0-a1/d0/d3-d4
+;----------------------------------------------------------------------------------
+ISOffset	equ		12						; bit offset into 851/030 TC of IS field
+pageSizeBit	equ		14						; bit number of page size bit in 68040 TC
+
+GetMMUInfo
+			cmpi.b	#EMMU1,MMUType			; Do we have an Emulated MMU
+			beq		@VMisOn					; -> Yes, just clear the Log2Phys field & Exit
+			cmp.b	#PMMU040,MMUType		; check MMU type
+			beq.s	@get040Info				; IF the MMU is an 851/030 THEN
+			pmove	crp,theCRP(a6)			;	get the 64-bit CRP value
+			pmove	tc,theTc(a6)			;	get TC value
+			move.l	theTc(a6),d4			;	put TC into d4
+			move.l	#ISOffset,d3			;	get offset into TC of IS field
+			bfextu	d4{d3:4},d0				;	get IS value
+			move.b	d0,initShift(a6)		;	save IS value in globals
+			add.l	#4,d3					;	get offset into TC of TIA field
+			bfextu	d4{d3:4},d0				;	get TIA value
+			move.b	d0,levelOne(a6)			;	save level one index width in globals
+			add.l	#4,d3					;	get offset into TC of TIB field
+			bfextu	d4{d3:4},d0				;	get TIB value
+			move.b	d0,levelTwo(a6)			;	save level one index width in globals
+			add.l	#4,d3					;	get offset into TC of TIC field
+			bfextu	d4{d3:4},d0				;	get TIC value
+			move.b	d0,levelThree(a6)		;	save level one index width in globals
+			add.l	#4,d3					;	get offset into TC of TID field
+			bfextu	d4{d3:4},d0				;	get TID value
+			move.b	d0,levelFour(a6)		;	save level one index width in globals
+			bra.s	@gotInfo				; 	go check for log2Phys offset
+@get040Info									; ELSE
+			MACHINE	MC68040					;	use 68040 instructions
+			movec	srp,d0					;	get 68040 srp
+			move.l	d0,theSRP(a6)			;	save the root ptr
+			move.l	#0,theCRP(a6)			;	68040 only has a 32-bit root pointer					<T6>
+			move.b	#7,levelOne(a6)			;	68040 always uses 7 bits for first level
+			move.b	#7,levelTwo(a6)			;	68040 always uses 7 bits for second level
+			move.b	#5,levelThree(a6)		;	assume 5 bits for 8k pages in third level
+			movec	tc,d0					;	get 68040 tc
+			move.w	d0,theTC(a6)			;	store it in globals
+			btst	#pageSizeBit,d0			;	check which page size we're using
+			bne.s	@not4kPages				;	IF we're using 4k pages
+			move.b	#6,levelThree(a6)		;	  use 6 bits for 4k pages in third level
+@not4kPages									;	ENDIF
+			move.b	#0,levelFour(a6)		;	68040 never has a fourth level
+			move.b	#0,initShift(a6)		;	68040 never has an initial shift
+			MACHINE	MC68030					;	switch back to 68030 instructions
+@gotInfo									; ENDIF
+			move.l	phys2log,myPhys2Log(a6)	; get our phys2log translation offset (Assume no vm)		<SM4>
+
+		IF not forROM THEN					; Supermario is always 32bit capable						<SM4>
+			cmp.l	#-1,ExpandMem			; is gestalt unimplemented?									<T3>
+			beq.s	@done					; IF gestalt is implemented THEN							<T3>
+			move.l	#gestaltAddressingModeAttr,d0 ; we need to find out 32-bit cleanliness
+			_Gestalt						;	call Gestalt
+			tst.w	d0						;	check for errors
+			bne.s	@VMisOn					;	>>EXIT on error			
+			move.l	a0,d0					;	get response in d0
+			btst	#gestalt32BitCapable,d0	;	check if phys2Log globals exists
+			beq.s	@VMisOn					;	>>EXIT on error
+		ENDIF
+
+		; Some history:  Since GetMMUInfo cannot be making lengthy Gestalt calls to determine if VM is on
+		; we would (previously) test the lomem where VM puts its globals to see it it had been initialized.
+		; A problem arises when VM has saved its globals ptr in VMGlobals but has not yet whacked the MMU
+		; tables and someone (VM) calls GetPhysical.  An additional flag inside the VMGlobals has been added
+		; that is set at the very end of VMs initalization.  We now check it to determine if the MMU world
+		; has been changed on us.																		<SM8> SAM
+		; 
+		
+		; Determine if VM is installed an running														<LW5>
+			
+			move.l	VMGlobals,d0			; Has VM installed its globals ptr (is it installed?)		<SM4>
+		 	ble.s	@done					; -> No.  Leave with Phys2Log offset set.
+
+			move.l	d0,a0					; Globals in.  Is VM actually running yet?
+			tst.b	VMInstalled(a0)			; VM's Gestalt inited?										<LW5>
+			beq.s	@done					; -> Nope, leave the offset alone							<LW5>
+
+@VMisOn		clr.l	myPhys2log(a6)			; VM is on. No phys2log translation
+@done		rts								; return
+
+
+;----------------------------------------------------------------------------------
+;	checkTTRegs	-	Checks a logical address against the MMU's transparent 
+;					translation registers.  This routine assumes that the 
+;					instruction and data TT registers contain identical information
+;					on the 68040.
+;
+;	input:		d2.l =	logical address to check
+;
+;	output:		ccr.z is set if the address would be transparently translated
+;
+;	destroys:	d0-d1/d3-d4
+;----------------------------------------------------------------------------------
+checkTTRegs
+			cmp.b	#PMMU040,MMUType		; check MMU type
+			beq.s	@get040Regs				; IF the MMU is an 851/030 THEN
+			subq	#4,sp					;	create room on stack for tt values
+			pmove	tt0,(sp)				;	get tt0 value
+			move.l	(sp),d0					;	store in d0
+			pmove	tt1,(sp)				;	get tt1 value
+			move.l	(sp),d1					;	store in d1
+			addq	#4,sp					;	restore stack
+			bra.s	@checkTTs				;	continue with check
+@get040Regs									; ELSE
+			MACHINE	MC68040					;	use 68040 instructions
+			movec	dtt0,d0					;	store tt0 in d0
+			movec	dtt1,d1					;	store tt1 in d1
+			MACHINE	MC68030					;	switch back to 68030
+@checkTTs									; ENDIF
+			btst	#TTEnable,d0			; see if tt0 is on
+			beq.s	@checkTT1				; IF tt0 is enabled THEN
+			move.l	d2,d3					;	make a copy of the logical address
+			eor.l	d0,d3					;	exclusive OR to leave ones in different bits
+			rol.l	#8,d3					;	move upper 8-bits into low byte
+			swap	d0						;	put logical address mask in low byte
+			not.b	d0						;	invert logical address mask
+			and.b	d0,d3					;	isolate bits we care about
+			beq.s	@checkDone				;	>>EXIT if we found a match
+@checkTT1									; ENDIF
+			btst	#TTEnable,d1			; see if tt1 is on
+			beq.s	@notEnabled				; IF tt1 is enabled THEN
+			move.l	d2,d3					;	make a copy of the logical address
+			eor.l	d1,d3					;	exclusive OR to leave ones in different bits
+			rol.l	#8,d3					;	move upper 8-bits into low byte
+			swap	d1						;	put logical address mask in low byte
+			not.b	d1						;	invert logical address mask
+			and.b	d1,d3					;	isolate bits we care about
+			bra.s	@checkDone				;	go exit
+											; ELSE
+@notEnabled	andi	#$fffb,sr				;	clear zero bit
+@checkDone									; ENDIF
+			rts
+
+
+;----------------------------------------------------------------------------------
+;	translate030	-	Translates a logical address to its corresponding physical
+;						address on a 68030.
+;
+;	input:		a6.l =	pointer to globals
+;				d2.l =	logical address to translate
+;
+;	output:		a0.l =	physical address
+;				a2.l =	ptr to page descriptor for translated address
+;				d3.w =	result code
+;
+;	destroys:	d0-d1
+;----------------------------------------------------------------------------------
+tcSRE		EQU		25						; SRP Enable in TC for 851/030
+tcFCL		EQU		24						; Function code Lookup in TC for 851/030
+tcEnable030	EQU		31						; MMU enable bit in TC on 851/030
+pageDesc	EQU		1						; page descriptor
+valid4		EQU		2						; valid 4 byte
+valid8		EQU		3						; valid 8 byte
+
+transRegs	REG		d4-d7
+
+translate030
+			movem.l	transRegs,-(sp)			; save working registers
+			move.l	theSRP(a6),d1			; get root ptr
+			move.l	theCRP(a6),d7			; get limit in d7
+			move.b	d7,d3					; get descriptor type in d3
+			and.b	#3,d3					; isolate it
+			move.l	theTC(a6),d0			; get a copy of the TC in d0
+			btst	#tcSRE,d0				; check for SRP mode
+			bne		@paramErr				; >>EXIT if on
+			btst	#tcFCL,d0				; check for FCL mode
+			bne		@paramErr				; >>EXIT if on
+			btst	#tcEnable030,d0			; check if MMU is on
+			bne.s	@startTranslate			; IF MMU is off THEN
+			move.l	d2,a1					;   return logical address unchanged
+			clr.l	d1						;	return null for page descriptor addr
+			moveq	#noErr,d3				;   return good status
+			bra.s	@xlatDone				;   >>EXIT with physical address
+@startTranslate								; ENDIF
+			clr.l	d4						; clear offset into logical address
+			move.b	initShift(a6),d4		; add in initial shift
+			lea		levelOne(a6),a1			; point a1 at width of first field
+			clr.l	d5						; get a clear longword
+			move.b	(a1)+,d5				; get width of next field
+
+;-----------------
+; a1.l = pointer to width of next field
+; d1.l = current descriptor entry
+; d2.l = logical address to translate
+; d3.b = descriptor type of current descriptor
+; d4.l = offset into logical address of index field
+; d5.l = width of index field
+; d7.l = limit of current descriptor
+;-----------------
+@xlatLoop									; LOOP (to walk an MMU table)
+			cmp.b	#pageDesc,d3			;	is this a page descriptor?
+			beq.s	@getPage				;	>>BREAK on page descriptor
+			bfextu	d2{d4:d5},d6			;	get index into next table
+			tst.l	d7						;	is there a limit for this table?
+			beq.s	@noLimit				;	IF there is a limit THEN
+			jsr		checkLimit				;	  check the index against the limit
+			bcs.s	@paramErr				;	  >>EXIT on a limit overflow
+@noLimit									;	ENDIF
+			and.l	#$fffffff0,d1			;	  remove unused bottom byte
+			cmp.b	#valid4,d3				;	check for 4-byte descriptor
+			bne.s	@not4byte				;	IF this is a four byte descriptor THEN
+			add.l	myPhys2Log(a6),d1		;	  convert current descriptor to logical addr
+			move.l	d1,a2					;	  get pointer to next table
+			lsl.w	#2,d6					;	  multiple index by four
+			add.l	d6,a2					;	  get address of next descriptor
+			move.l	(a2),d1					;	  get next descriptor
+			clr.l	d7						;	  no limit on this descriptor
+			move.b	d1,d3					;	  get a copy of descriptor
+			bra.s	@doNext					;	  look at next descriptor
+@not4byte									;	ELSE
+			cmp.b	#valid8,d3				;	  check for 8-byte descriptor
+			bne.s	@paramErr				;	  >>EXITLOOP on invalid descriptors 
+			add.l	myPhys2Log(a6),d1		;	  convert current descriptor to logical addr
+			move.l	d1,a2					;	  get pointer to next table
+			lsl.w	#3,d6					;	  multiple index by eight
+			add.l	d6,a2					;	  get address of next descriptor
+			move.l	4(a2),d1				;	  get lower word of next descriptor	
+			move.l	0(a2),d7				;	  get upper word of next descriptor	
+			move.b	d7,d3					;	  get a copy of descriptor
+
+@doNext										;	ENDIF
+			add.l	d5,d4					;	update d4 to contain number of bytes decoded
+			move.b	(a1)+,d5				;	get width of next field
+			and.b	#3,d3					;	isolate descriptor type
+			bra.s	@xlatLoop				; ENDLOOP
+@getPage
+			move.l	#32,d5					; total number of bits in address
+			sub.l	d4,d5					; get number of bits not yet decoded
+			bfextu	d1{0:d4},d0				; get top bits of address of physical page
+			bfextu	d2{d4:d5},d6			; get offset into physical page
+			lsl.l	d5,d0					; make a base address out of it
+			add.l	d6,d0					; get physical address
+			move.l	d0,a0					; put address into a1
+			moveq	#noErr,d3				; return no error
+@xlatDone
+			movem.l	(sp)+,transRegs			; restore registers
+			rts
+
+@paramErr
+			move.w	#paramErr,d3
+			bra.s	@xlatDone
+
+
+;----------------------------------------------------------------------------------
+;	translate040	-	Translates a logical address to its corresponding physical
+;						address on a 68040.
+;
+;	input:		a6.l =	pointer to globals
+;				d2.l =	logical address to translate
+;
+;	output:		a0.l =	physical address
+;				a2.l =	ptr to page descriptor for translated address
+;				d3.w =	result code
+;
+;	destroys:	d0-d1
+;----------------------------------------------------------------------------------
+tcEnable040	EQU		15						; MMU enable bit in TC on 68040
+UDTResident	EQU		1						; UDT resident bit in table descriptor
+PDTResident	EQU		1						; PDT field value for a resident page
+PDTIndirect	EQU		2						; PDT field value for an indirect page desc
+
+translate040
+			movem.l	transRegs,-(sp)			; save working registers
+			move.l	theSRP(a6),d1			; get root ptr in a2
+			move.w	theTC(a6),d0			; get a copy of the TC in d0
+			btst	#tcEnable040,d0			; check if MMU is on
+			bne.s	@startTranslate			; IF MMU is off THEN
+			move.l	d2,a0					;	return logical address unchanged	<SM0>
+			clr.l	d1						;	return null for page descriptor addr
+			moveq	#noErr,d3				;	return good status
+			bra.s	@xlatDone				;	>>EXIT with physical address
+											; ENDIF
+@startTranslate
+			clr.l	d4						; clear offset into logical address
+			clr.w	d3						; clear level counter
+			clr.l	d5						; get a clear longword
+			lea		levelOne(a6),a1			; init pointer to field widths
+;-----------------
+; a1.l = pointer to field width info
+; d1.l = current descriptor entry
+; d2.l = logical address to translate
+; d3.w = level counter
+; d4.l = offset into logical address of index field
+;-----------------
+@walkLoop									; LOOP (to walk 68040 table)
+			move.b	(a1)+,d5				;	get width of first index field
+			move.l	#(32-2),d0				;	get total bits in descriptor (table pointer/4)
+			sub.l	d5,d0					;	get number of significant bits in table ptr
+			bfextu	d1{0:d0},d1				;	get pointer to next table
+			lsl.l	d5,d1					;	almost make a base address out of it
+			lsl.l	#2,d1					;	make a base address out of it
+			bfextu	d2{d4:d5},d6			;	get index into next table
+			lsl.w	#2,d6					;	multiple index by four
+			add.l	d6,d1					;	get address of next descriptor
+			add.l	myPhys2Log(a6),d1		;	convert pointer to logical addr				<T3>
+			move.l	d1,a2					;	put into an address register
+			move.l	(a2),d1					;	get next descriptor
+			cmp.w	#2,d3					;	is this the third level
+			beq.s	@getPage				;	>>EXITLOOP if so
+			btst	#UDTResident,d1			;	is it resident?
+			beq.s	@paramErr				;	>>EXIT if not
+			add.l	d5,d4					;	update d4 to contain number of bytes decoded
+			add.w	#1,d3					;	bump level count
+			bra.s	@walkLoop				; ENDLOOP
+@getPage
+			move.b	d1,d0					; get a copy of the page descriptor
+			and.b	#3,d0					; isolate PDT field
+			cmp.b	#PDTResident,d0			; is this page resident?
+			beq.s	@residentPage			; IF it is not resident THEN
+			cmp.b	#PDTIndirect,d0			;	check for indirect pointer
+			bne.s	@paramErr				;	>>EXIT if invalid
+			and.l	#$fffffffc,d1			;	clear PDT field from indirect descriptor
+			add.l	myPhys2Log(a6),d1		;	convert pointer to logical addr				<T3>
+			move.l	d1,a2					;	get address of page descriptor
+			move.l	(a2),d1					;	get page descriptor
+@residentPage								; ENDIF			
+			add.l	d5,d4					; update d4 to contain number of bytes decoded	<t10> cch
+			move.l	#32,d5					; total number of bits in address
+			sub.l	d4,d5					; get number of bits not yet decoded
+			bfextu	d1{0:d4},d0				; get address of physical page
+			bfextu	d2{d4:d5},d6			; get offset into physical page
+			lsl.l	d5,d0					; make a base address out of it
+			add.l	d6,d0					; get physical address
+			move.l	d0,a0					; put address into a0
+			moveq	#noErr,d3				; return no error
+@xlatDone
+			movem.l	(sp)+,transRegs			; restore registers
+			rts
+
+@paramErr
+			move.w	#paramErr,d3
+			bra.s	@xlatDone
+
+
+;----------------------------------------------------------------------------------
+;	checkLimit	-	Checks an index against a limit for an 8-byte descriptor.
+;
+;	input:		d6.l =	index to be checked
+;				d7.l =	upper word of descriptor
+;
+;	output:		ccr.c set on invalid index
+;				ccr.c clear on valid index
+;
+;	destroys:	d7
+;----------------------------------------------------------------------------------
+
+checkLimit	swap	d7						; get limit into low word
+			btst	#15,d7					; check type of limit
+			bne.s	@lower					; IF it is an upper limit THEN
+			cmp.w	d6,d7					;	compare upper limit
+			bra.s	@limitExit				; ELSE
+@lower		and.w	#$7fff,d7				;	remove l/u bit
+			cmp.w	d7,d6					;	compare lower limit
+@limitExit									; ENDIF
+			rts	
+
+
+			ENDWITH
+			ENDP
+
+
+;----------------------------------------------------------------------------------
+;	EDiskProtectPPC	-	Protects or unprotects the EDisk as specified for PowerPC.
+;
+;	input:		d0[15:0] = HwPriv selector #8
+;				d0[16] =	set to protect specified area, clear to unprotect it
+;				a0.l   =	32-bit base address of area to protect/unprotect
+;				a1.l   =	length of area to protext/unprotect
+;
+;	output:		a0.l =	pointer to the 1st-level table descriptor for the eDisk
+;				d0.w =	result code
+;
+;	destroys:	d1/a1
+;----------------------------------------------------------------------------------
+EMMUWrProtBit	EQU		16
+EMMUWrProtMask	EQU		$00010000
+wrBit			EQU		2
+
+ProtectRegsPPC	REG		d2-d4
+
+EDiskProtectPPC	PROC	EXPORT
+				WITH	GetRealVars
+
+				cmp.b	#EMMU1,MMUType			; check to see if we have a PowerPC MMU
+				bne		@paramErr				; >>EXIT if not
+
+				movem.l	ProtectRegsPPC,-(sp)	; save working registers
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+; PowerPC EDisk Write Protect Code
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+				move.l	#12,d4					; number of bits in page size
+				move.l	a1,d2					; get byte length in d2
+				lsr.l	d4,d2					; convert byte length to page count
+				addq.l	#1,d2					; always round up by one
+
+				move.l	a0,d1					; get the base address in d1
+				lsr.l	d4,d1					; convert base address to page number
+
+				move.l	d0,d3					; get a copy of the protect bit into d3
+				and.l	#EMMUWrProtMask,d3		; isolate write protect flag
+				move.l	#EMMUWrProtBit-wrBit,d4	; number of bits to shift protect bit
+				lsr.l	d4,d3					; shift the bit into place so we can OR.L it in
+
+@protectLoop									; LOOP (to protect/unprotect pages in Edisk)
+				move.l	d1,a0					;	Put the page number in A0
+				_nkGetPTEntryGivenPage			;	Get the 030+ PTE from the nk
+	
+				bclr	#wrBit,d0				;	Clear the W bit
+				or.l	d3,d0					;	Clear/set the write-protect flag
+	
+				move.l	d0,a0					;	Move the PTE to A0
+				move.l	d1,a1					;	Put the page number in A1
+				_nkSetPTEntryGivenPage			;	Set the 030+ PTE
+				
+				addq.l	#1,d1					;	bump the page number by 1
+				dbra	d2,@protectLoop			; END
+
+				moveq	#noErr,d0				; return successful				
+				movem.l	(sp)+,ProtectRegsPPC	; restore working registers
+@return			rts
+				
+@paramErr		move.w	#paramErr,d0			; return paramErr
+				bra.s	@return
+				
+				ENDWITH
+
+				ENDP
+
+
+
+;----------------------------------------------------------------------------------
+;	EDiskProtect	-	Protects or unprotects the EDisk as specified.
+;
+;	NOTE:		This algorithm assumes that the Edisk space is the only space
+;				mapped by it's 1st level descriptor.
+;
+;	input:		d0.w =	HwPriv selector #8
+;				a0.l =	32-bit base address of EDisk
+;				a1.w =	flag to protect or unprotect Edisk (1=protect)
+;
+;	output:		a0.l =	pointer to the 1st-level table descriptor for the eDisk
+;				d0.w =	result code
+;
+;	destroys:	d1/a1
+;----------------------------------------------------------------------------------
+ProtectRegs		REG		d2-d4/a2
+
+EDiskProtect	PROC	EXPORT
+				IMPORT	GetMMUInfo
+				IMPORT	checkTTRegs
+				WITH	GetRealVars
+
+				cmp.b	#PMMU851,MMUType		; check to see if we have an MMU		<SM3>
+				blo		@bailNoMMU				; >>EXIT if not							<SM3>
+
+				movem.l	ProtectRegs,-(sp)		; save working registers
+				link	a6,#GetRealSize			; allocate some room for our locals
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+; 68K EDisk Write Protect Code
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+@noEMMU			move.l	a0,d2					; get base address of Edisk
+				move.w	a1,a2					; save protect flag in a2
+
+				Move	SR,D0					; Get and save the SR.					<T7>
+				Btst	#13,D0					; Are we in Supervisor mode?
+				Bne.s	@noVM					; Yes? Then don't call _EnterSupervisorMode.
+				_EnterSupervisorMode			; Must be in supervisor mode (SR returned in D0).
+@noVM	
+				move.w	d0,-(sp)				; save status register value			<T7>
+		IF Supports24Bit THEN
+				move.b	MMU32Bit,-(sp)			; save current MMU mode
+				bne.s	@in32BitMode			; IF we're in 24-bit mode THEN
+				moveq	#true32b,d0				;	we want to go to 32 bit addressing
+				_SwapMMUMode					;	switch the MMU mode
+				bra.s	@doTranslation			;	go do the translation
+@in32BitMode									; ELSE
+		ENDIF
+				jsr		checkTTRegs				;	check transparent translation regs
+				bne.s	@doTranslation			;	IF we matched a TT register THEN
+				move.l	d2,a0					;	  put the original address into a0
+				moveq	#paramErr,d3			;	  return bad status
+				bra.s	@cleanup				;	  >>EXIT with easy translation
+												;	ENDIF
+@doTranslation									; ENDIF											
+				jsr		GetMMUInfo				; set up globals						<T8>
+				clr.l	d0						; clear starting bit value
+				clr.l	d1						; clear bit field length
+				move.b	initShift(a6),d0		; get bit to start at, with initial shift, if any
+				move.b	levelOne(a6),d1			; get bit field length
+				bfextu	d2{d0:d1},d0			; get index into 1st-level table
+				lsl.l	#2,d0					; convert to a 4-byte entry pointer index
+				btst.b	#0,theCRP+3(a6)			; is this an 8-byte table?
+				beq.s	@is4Byte				; IF this is a 8-byte entry table THEN
+				lsl.l	#1,d0					;	convert to an 8-byte entry pointer index
+@is4Byte										; ENDIF
+				add.l	theSRP(a6),d0			; get the physical address of the 1st-level entry
+				add.l	myPhys2Log(a6),d0		; convert to a logical address
+				move.l	d0,a0					; save in a0
+				
+;------------
+; Change RAM disk protection
+;------------
+
+				move.w	#noErr,d3				; return good result if we get here.	<Z11><H2>
+				bset	#writeProtectBit,3(a0)	; set the write-protect bit
+				tst.w	a2						; check if protect flag is set
+				bne.s	@protect				; IF we want to unprotect THEN
+				bclr	#writeProtectBit,3(a0)	;	clear the write-protect bit
+@protect										; ENDIF
+				cmp.b	#cpu68040,CPUFlag		; check for processor type				<T7>
+				bne.s	@not040					; IF on a 68040 THEN
+				MACHINE	MC68040					;	
+				pflusha							;	flush the ATC regs
+				bra.s	@cleanup				; ELSE
+				MACHINE	MC68030					;
+@not040			jsr		([jCacheFlush])			;	flush caches since they're logical	<Z11><H2>
+				pflusha							;	flush the ATC regs
+												; ENDIF									<T7>
+
+;------------
+; d3.w = result code
+; a0.l = physical address if successful
+;------------
+@cleanup
+		IF Supports24Bit THEN
+				move.b	(sp)+,d0				; get original MMU mode
+				bne.s	@skipMMUSwap			; IF we were originally in 24-bit mode THEN
+				_SwapMMUMode					;	swap back to it
+@skipMMUSwap									; ENDIF
+		ENDIF
+				move.w	(sp)+,d0				; get status register value				<T7>
+				move	d0,sr					; restore status register				<T7>
+				move.w	d3,d0					; return result in d0
+@return			unlk	a6
+				movem.l	(sp)+,ProtectRegs		; restore working registers
+@bailNoMMU
+				rts
+				
+				ENDWITH
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+; That's all folks.
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+
+
+				ENDP
+				
+				
+				END

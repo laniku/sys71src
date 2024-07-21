@@ -1,0 +1,191 @@
+;
+;	File:		BootItt.a
+;
+;	Contains:	Code to stuff d5 with a scsi id and jump to a driver
+;
+;	Author:		Clinton Bauder
+;
+;	Copyright:	© 1992-1993 by Apple Computer, Inc., All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM14>	10/14/93	pdw		<MC> roll-in.
+;	   <MC2>	10/12/93	pdw		Added support for Synchronous data transfers, rewrote State
+;									Machine, message handling etc.
+;	  <SM13>	  9/9/93	pdw		Lots of little changes.  Name changes, temporary cache_bug
+;									stuff.
+;	  <SM12>	 8/23/93	pdw		Added support for LimitPRAMClear, IgnoreCmdOptShDel,
+;									LoadDefaultOnly - three options required for AIX security,
+;									enabled by setting bits in PRAM $76.
+;	  <SM11>	  7/8/93	pdw		Added LdD- and -LdD events to trace when drivers are being
+;									called.
+;	  <SM10>	 6/29/93	pdw		Massive checkins: Change asynchronicity mechanism to CallMachine
+;									stack switching mechanism.  Adding support for Cold Fusion.
+;									Rearranging HW/SW Init code. Some code optimizations.
+;	   <SM9>	 5/29/93	PW		Added line to change TheZone as well as AppZone after driver is
+;									run.
+;	   <SM8>	  5/5/93	PW		Converted names to meanies-friendly names.  Updated with latest
+;									from Ludwig stuff.
+;	   <LW2>	  2/2/93	DCB		Saved registers around call to driver install to fix Radar bug
+;									#1063405
+;	   <SM6>	  2/1/93	PW		Update from the latest of Ludwig. Also changes required for PDM
+;									(will update Ludwig with these as needed myself).
+;	   <SM5>	 12/1/92	PW		Added applZone/sysZone stuff after returning from driver to fix
+;									multiple drives not mounting bug.
+;	   <SM4>	10/30/92	DCB		Changed to reflect new name for scsi.a
+;	   <SM3>	 8/20/92	DCB		Fixed a checksum problem
+;	   <SM2>	 7/28/92	PW		Added comment.
+;		 <0>	 6/5/92		DCB		New today.
+;
+;==========================================================================							
+
+			MACHINE		MC68020			; '020-level
+			BLANKS		ON				; assembler accepts spaces & tabs in operand field
+			PRINT		OFF				; do not send subsequent lines to the listing file
+										;	don't print includes
+			CASE		OBJECT			; preserve case in object file
+
+
+			IMPORT		RecordEvent
+			
+;--------------------------------------------------------------------------
+
+
+			LOAD		'StandardEqu.d'
+			INCLUDE		'Debug.a'				; for NAME macro
+			INCLUDE		'SCSI.a'				; <SM4>
+			INCLUDE		'ACAM.a'
+			
+;--------------------------------------------------------------------------
+
+JmpToDrvr	PROC	EXPORT
+
+				MOVE.L	D5,-(SP)				; Save d5
+				MOVE.L	D7,-(SP)				; Save d7
+				move.l	12(sp), D5				; get the SCSI ID or Device Ident
+				MOVE.L	20(SP),A0				; Get Block zero
+				MOVE.L	SBData(A0),D7			; save the default data area (Does anybody use this ?)
+				MOVE.L	24(SP),A0				; Get the partition map entry
+				MOVE.l	16(SP),A1				; get the driver
+			IF RECORD_ON THEN
+				pea		'LdD-'
+				move.l	D5, -(SP)
+				bsr		RecordEvent
+				addq.l	#8, sp
+			ENDIF			
+				MOVEM.L	A0-A6/D1-D7,-(SP)		; save everything dammit!	<LW2>
+				JSR		(A1)					; install it
+				MOVEM.L	(SP)+,A0-A6/D1-D7		; restore everything.		<LW2>
+			IF RECORD_ON THEN
+				pea		'-LdD'
+				move.l	A1, -(SP)
+				bsr		RecordEvent
+				addq.l	#8, sp
+			ENDIF			
+
+; Make the System Heap growable by making the App Heap and TheZone the same zone as the System.
+				MOVE.L	SysZone,A0				; which zone is the system zone
+				MOVE.L	A0,TheZone				; make THE REAL zone that zone
+				MOVE.L	A0,ApplZone				; good-bye to the app zone (make it same zone)
+				MOVE.L	bkLim(A0),HeapEnd		; end of System heap is now end of App Heap.
+		
+				MOVE.L	(SP)+,D7				; restore d7
+				MOVE.L	(SP)+,D5				; restore d5
+				RTS								; adios
+
+		NAME 'JmpToDrvr'
+
+CheckSumDrvr	PROC	EXPORT
+			
+				MOVE.L	D7,-(SP)				; save D7
+				MOVE.L	12(SP),D1				; the size of the driver in bytes
+				MOVE.L	8(SP),a0				; the driver itself
+
+;
+;	Checksum routine added <A311/31Oct86>.  It uses the algorithm in the
+;	partition design document. On entry, a0 points to the driver and d1
+;	has the size in bytes (word quantity).
+;
+;	Returns 16-bit checksum in d0.  Destroys d1,d7,a0.
+;
+
+DoCksum
+				moveq.l	#0,d0					; initialize sum register
+				moveq.l	#0,d7					; zero-extended byte
+				bra.s	CkDecr					; handle 0 bytes		<A349/04Nov86>
+CkLoop
+				move.b	(a0)+,d7				; get a byte
+				add.w	d7,d0					; add to checksum
+				rol.w	#1,d0					;   and rotate
+CkDecr
+				dbra	d1,CkLoop				; next byte
+				tst.w	d0						; convert a checksum of 0
+				bne.s	@1						;	into $FFFF (as per
+				subq.w	#1,d0					;	algorithm description).
+@1
+				MOVE.L	(SP)+,D7				; restore D7
+				rts
+
+		NAME 'CheckSumDrvr'
+		
+		
+;________________________________________________________________________________________
+;
+; Routine:	Ck4IgnoreCmdShOptDel
+;
+; Inputs:	none
+;
+; Outputs:	Z:	NE = ignore
+;				EQ = don't ignore
+; 			D0:	NE = ignore
+;				EQ = don't ignore
+;
+; Trashes:	D0, A0
+;
+;________________________________________________________________________________________
+
+Ck4IgnoreCmdShOptDel	PROC	EXPORT
+
+			subq.w	#2,sp							; allocate buffer on stack
+			movea.l	sp, A0							; get buffer ptr
+			MOVE.L	#$00010076, D0					; Read 1 bytes starting at loc $76
+			_ReadXPRam
+			move.b	(sp)+, D0
+			and.b	#4, D0							; bit 2
+			rts
+
+		NAME 'Ck4IgnoreCmdShOptDel'
+
+			ENDPROC
+			
+;________________________________________________________________________________________
+;
+; Routine:	Ck4OnlyLoadFromDefault
+;
+; Inputs:	none
+;
+; Outputs:	Z:	NE = only load/boot from Default device
+;				EQ = boot from Floppy or Default
+; 			D0:	NE = only load/boot from Default device
+;				EQ = boot from Floppy or Default
+;
+; Trashes:	D0, A0
+;
+;________________________________________________________________________________________
+
+Ck4OnlyLoadFromDefault	PROC	EXPORT
+
+			subq.w	#2,sp							; allocate buffer on stack
+			movea.l	sp, A0							; get buffer ptr
+			MOVE.L	#$00010076, D0					; Read 1 bytes starting at loc $76
+			_ReadXPRam
+			move.b	(sp)+, D0
+			and.b	#2, D0							; bit 1
+			rts
+
+		NAME 'Ck4OnlyLoadFromDefault'
+
+			ENDPROC
+			
+
+			END

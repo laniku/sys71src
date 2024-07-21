@@ -1,0 +1,897 @@
+;
+;	File:		TimDriver.a
+;
+;	Contains:	This file contains the video driver for use by the Macintosh
+;				OS for the Jaws (TIM) hardware.
+;
+;	Written by: David A. Fung/Mike Puckett
+;
+;	Copyright:	© 1990-91 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 11/5/92	SWC		Changed VideoEqu.a->Video.a and ShutdownEqu.a->Shutdown.a.
+;	   <SM2>	 11/2/92	kc		Don't include SonicEqu.a.
+;		 <1>	 10/6/92	GDW		New location for ROMLink tool.
+;	   <SM4>	09-03-92	jmp		(jmp,H2) Corrected .s vs. non-.s branches and odd-alignment
+;									problems.
+;		 <1>	 3/30/92	JSM		first checked in
+;		<10>	 6/10/91	djw		Add NeedsGoodBye Kiss csCode to Control, to close driver
+;		 <9>	  6/5/91	jmp		In VidOpen, I now try to re-open the Backlight driver, because
+;									it might have been closed.  In VidClose, I now close the
+;									Backlight driver and gray the screen; this is to support a new &
+;									improved method of restarting and shutting donw the system
+;									(i.e., to prevent desktop persistence on restart).
+;		 <8>	 5/22/91	jmp		Code Review changes:  For consistency, did a StripAddress on
+;									VidOpen’s copy of the privates; eliminated the redundant clears
+;									and checks for the the driver copy of the fixed-entry clut; and
+;									replaced #0’s with #noErr’s where appropriate.
+;		 <7>	 5/15/91	jmp		SetInterrupt wasn’t checking the input value (supposed to be
+;									either 0 or 1), but instead was just looking at D0; so, it would
+;									either enable (0) or disable (1), depending on whether D0.w was
+;									non-zero or not.  GetInterrupt returned -1.w (instead of 1.b)
+;									for  the disabled state, so some test tools were getting
+;									confused; so, I now just return 1.b when interrupts are
+;									disabled.
+;		 <6>	 5/10/91	jmp		Made the GrayScreen code more universal (for things like
+;									DB-Lite) by swapping into 32-bit mode prior to accessing the
+;									framebuffer.
+;		 <5>	 5/10/91	jmp		Fixed a bug in GetEntries where A0 was not loaded properly.
+;									Made GetEntries 32-bit clean.  GetEntries was trashing A1, so
+;									async calls were failing (i.e., jumping thru IODone requires A1
+;									to be pointing to the AuxDCE).  Indexed GetEntries didn’t work
+;									at because I was checking for index vs. sequential off A3
+;									instead of A2!  Made the Control & Status dispatchers 32-bit
+;									clean.  SaveMode was never being set up!  From the code review:
+;									Changed the TimeMgr task to micro-second base and fixed
+;									frequency at approximately 60.15Hz; eliminated SetEntries &
+;									SetDefaultMode and fixed GetDefaultMode.
+;		 <4>	 4/17/91	jmp		Updated various comments, and cleaned up the fixed-device
+;									support.
+;		 <3>	 4/15/91	djw		Fix trashed register bug in interrupt handler, Enabled fixed
+;									depth code in Open.
+;		 <2>	 2/15/91	jmp		Started looking into making TIM a fixed device, but need to get
+;									working properly -- commented out for now.  Also, need to look
+;									at VidClose for last VBL problem.
+;		 <1>	 12/8/90	HJR		First time for Terror.
+;		 <3>	 9/13/90	MSH		Waimea is gone, long live TIM
+;		 <2>	 4/19/90	DAF		Correct header (I almost got it right...)
+;		 <1>	 4/19/90	DAF		Added WaimeaDriver.a for the first time
+;
+;-------------------------------------------------------------------
+;	Mod History :
+;
+;	17Apr90 	DAF		New today (spawned from ElsieDriver.a)
+;
+;-------------------------------------------------------------------
+
+
+				STRING 	C
+
+				PRINT	OFF
+				LOAD	'StandardEqu.d'
+
+				INCLUDE 'DockingEqu.a'
+				INCLUDE	'EgretEqu.a'
+				INCLUDE	'GestaltEqu.a'
+				INCLUDE	'GestaltPrivateEqu.a'
+				INCLUDE 'HardwarePrivateEqu.a'
+				INCLUDE	'IOPrimitiveEqu.a'
+				INCLUDE	'PowerPrivEqu.a'
+				INCLUDE 'ROMEqu.a'
+				INCLUDE	'Video.a'
+				INCLUDE	'SlotMgrEqu.a'
+				INCLUDE	'ShutDown.a'
+;				INCLUDE	'SonicEqu.a'
+				INCLUDE	'UniversalEqu.a'
+				
+				INCLUDE	'DepVideoEqu.a'
+				PRINT	ON
+
+				SEG		'_sTimDriver'
+
+					BLANKS		ON
+					STRING		ASIS
+					MACHINE		MC68020
+
+kTIMVBLTime			EQU			-16626		; 60.14742 Hz using the microsecond timer.
+
+; This is device storage which is stored in the dCtlStorage field of the AuxDCE.
+
+TIMVidPrivates		RECORD		0
+saveBaseAddr 		DS.L		1			; the screen base address
+saveFixedCLUT		DS.L		1			; pointer to fixed-entry CLUT
+saveNumFixedEntries	DS.W		1			; number of entries in fixed CLUT (zero based)
+saveMode			DS.W		1			; the current mode setting
+GFlags				DS.W		1			; flags word
+TTask				DS.B		tmXQSize	; extended time manager task block
+IntDisableFlag		DS.W		1			; this word is non-zero when the VBL interrupt
+											; 	simulator is disabled
+TIMVidPrivSize		EQU			*
+					ENDR
+					
+LTimDriver		MAIN	EXPORT
+;-------------------------------------------------------------------
+;	Video Driver Header
+;-------------------------------------------------------------------
+;
+TIMDrvr		DC.W	$5C00					; ctl,status,needsLock,needsGoodBye
+			DC.W	0,0,0					; not an ornament
+
+; Entry point offset table
+
+			DC.W	TIMVidOpen-TIMDrvr 		; open routine
+			DC.W	TIMDrvr-TIMDrvr			; no prime
+			DC.W	TIMVidCtl-TIMDrvr		; control
+			DC.W	TIMVidStatus-TIMDrvr	; status
+			DC.W	TIMVidClose-TIMDrvr		; close
+
+			STRING	Pascal
+TIMVidTitle	DC.B	'.Display_Video_Apple_TIM'		
+			STRING	ASIS
+			ALIGN	2						; make sure we're word aligned
+			DC.W	CurTimDrvrVersion		; version
+			
+;
+; According to CARDS & DRIVERS, video drivers are supposed to shut off
+;	video at close time “to avoid the persistence of the desktop
+;	during reboots.”  Since we can’t really turn TIM’s video off,
+;	we must simulate it by turning off the backlighting and writing
+;	white (because it’s an LCD screen) to the frame buffer.  Also,
+;	because the video driver might be closed and then re-opened
+;	prior to a reboot (AUX?), we must always re-open the backlight
+;	driver in the video driver’s open routine.  And, for this reason,
+;	when we close the backlight driver, we do NOT remove it’s DCE,
+;	and do we don’t dispose of the driver.  NOTE:  On the first
+;	time thru (i.e., after startup or restart), the Backlight driver
+;	will not have been installed yet, so our attempting to open it
+;	in our open routine will fail, which is okay.  This may change
+;	in the future.
+;
+
+			String	Pascal
+TIMBackLite	Dc.b	'.Backlight'			; Name of Backlight Driver for TIM.
+			String	Asis
+			Align	2
+			
+**********************************************************************
+*
+* TIMVidOpen allocates private storage for the device in the AuxDCE and locks
+*	it down for perpetuity. Also, install the simulated interrupt handler and 
+*	start it going.
+*
+* Entry:	A0 = param block pointer
+*			A1 = AuxDCE pointer
+*
+* Locals:	A3 = pointer to private storage
+*
+**********************************************************************
+
+			WITH	VDPageInfo,TIMVidPrivates,spBlock
+
+TIMVidOpen	
+		
+;
+; Allocate private storage (since block is CLEAR, GFlags are zeroed) and get
+;	a pointer to it in A3.
+;
+
+			MOVEQ	#TIMVidPrivSize,D0			; get size of parameters
+			_ResrvMem  ,SYS 					; make room as low as possible
+			MOVEQ	#TIMVidPrivSize,D0			; get size of parameters
+			_NewHandle ,SYS,CLEAR				; get some memory for private storage
+			BNE  	@OpError1					; => return an error in open
+			MOVE.L	A0,dCtlStorage(A1)			; save returned handle in AuxDCE
+			_HLock								; and lock it down forever (this includes a Time Mgr QElem)
+			MOVE.L	(A0),A3						; get a pointer to it
+			
+			MOVE.L	(A0),D0						; Get a 32-bit clean pointer
+			_StripAddress						;	to our privates into A3.
+			Move.l	D0,A3
+			
+			MOVE.L	dCtlDevBase(A1),saveBaseAddr(A3) ; save the screen base address
+
+;
+; TIM doesn't have a normal slot interrupt handler since the LCD doesn't really interrupt!  We simulate
+;	the interrupt with a timer task that goes off at 60.14742 Hz.
+
+			LEA		TIMBeginIH,A0				; get a pointer to the interrupt simulation timer task code
+			MOVE.L	A0,tmAddr+TTask(A3)			; put it in the time task
+			LEA		TTask(A3),A0				; get a pointer to the timer queue element
+			Move.l	#'eada',(A0)				; Put in the magic signature to prevent VM from deferring us.
+			_InsXTime							; Install the task (fixed frequency).
+
+; Note that IntDisableFlag is clear from the NewHandle above which “enables” the interrupt.
+
+			BSR		TIMEnableVGuts				; turn on and prime the interrupt simulator
+			
+; For doing GetEntries, we need to get our fixed-entry CLUT from the Slot Manager.
+;
+			With	spBlock
+
+			Suba	#spBlockSize,Sp				; Make an SpBlock on the stack and
+			Move.l	Sp,A0						;	get a pointer to it in A0.
+			
+			Move.b	dCtlSlot(A1),spSlot(A0)		; Get the slotnumber.
+			Move.b	dCtlSlotID(A1),spID(A0)		; Get the spID of video sRsrc.
+			Clr.b	spExtDev(A0)				;
+			_sRsrcInfo							; Try to get the spsPointer.
+			Bne.s	@OpError2					; We’re dead if this fails.
+			
+			Move.b	#firstVidMode,spID(A0)		; Look for our mode entry.
+			_sFindStruct						; If we don’t find it, then
+			Bne.s	@OpError2					;	we’re dead.
+			
+			Move.b	#mTable,spID(A0)			; Get our fixed-entry CLUT.
+			 _sGetBlock							; If we don’t get it, then
+			Bne.s	@OpError2					;	we’re dead.
+			
+			Move.l	spResult(A0),A0				; Get ptr to fixed-entry CLUT
+			Move.w	ctSize(A0),saveNumFixedEntries(A3)	; Save the number of entries.
+			Lea		ctTable(A0),A0						; Get ptr to table, and
+			Move.l	A0,saveFixedCLUT(A3)				;	save it.
+			
+			Adda	#spBlockSize,Sp				; restore stack
+			
+			EndWith
+			
+; There’s only one vidMode, so save it now because SetMode doesn’t need to.
+;
+			Move.w	#firstVidMode,saveMode(A3)
+			
+; Attempt to re-open the Backlight driver because it might have been closed
+;	if someone (AUX?) closed us and then tried to reopen us prior to
+;	rebooting.  Currently, this call will fail the first time thru
+;	because video is installed before backlighting on boot.
+;
+			Sub.w	#ioQElSize,Sp				; Get a param block on the stack.
+			Move.l	Sp,A0						; Point to it.
+			Lea		TIMBackLite,A1				; Get pointer to Backlight driver name.
+			Move.l	A1,ioFileName(A0)			; Load it.
+			_Open								; Open the driver.
+			
+			Add.w	#ioQElSize,Sp				; Restore the stack.
+
+; All done!
+;
+@AllDone	MOVEQ	#noErr,D0					; no error
+@EndOpen	RTS 								; return
+
+@OpError2	ADDA	#spBlockSize,SP				; release the spBlock
+			LEA		TTask(A3),A0				; get the time manager task block
+			_RmvTime							; remove this element from the queue
+			MOVE.L	dCtlStorage(A1),A0			; get the private storage back
+			_DisposHandle
+@OpError1	MOVE.L	#OpenErr,D0					; say can't open driver
+			BRA.S	@EndOpen
+
+			ENDWITH
+
+**********************************************************************
+*
+* Video Driver Control Call Handler.  There are ten calls:
+*
+*	(-1) GoodBye kiss																			<t10>
+*	(0)  Reset (VAR mode, page: INTEGER; VAR BaseAddr: Ptr);
+*	(1)  KillIO
+*	(2)	 SetMode(mode, page: INTEGER; VAR BaseAddr: Ptr);
+*	(3)	 SetEntries ( Table: Ptr; Start,Count : integer );
+*	(4)	 SetGamma ( Table : Ptr );
+*   (5)  GrayPage (page);
+*   (6)  SetGray (csMode = 0 for color, 1 for gray)
+*	(7)	 SetInterrupt ( csMode = 0 for enable, 1 for disable)
+*	(8)	 DirectSetEntries (not implemented)
+*	(9)	 SetDefaultMode 
+*
+*   Entry: 	A0 		= param block pointer
+*			A1 		= AuxDCE pointer
+*	Uses:	A2		= ptr to cs parameters (ie. A2 <- csParam(A0))
+*			A3 		= scratch (doesn't need to be preserved)
+*			A4		= scratch (must be preserved)
+*			D0-D3 	= scratch (don't need to be preserved)
+*
+*	Exit:	D0	  	= error code
+*
+**********************************************************************
+
+;
+; Decode the call
+;
+
+TIMVidCtl	
+			MOVEM.L	A0/A1,-(SP)						; Preserve exit registers.
+
+			MOVE.L	csParam(A0),A2					; A2 <- Ptr to control parameters
+					
+			MOVE.L	dCtlStorage(A1),A3				; A3 <- Ptr to private storage
+			MOVE.L	(A3),D0							;
+			_StripAddress							;
+			MOVE.L	D0,A3							;
+
+			MOVE.W	csCode(A0),D0					; get the opCode
+			
+			ADDQ.W	#1,D0							; offset opCode by 1						<t10>
+			CMP.W	#10,D0							; IF csCode NOT IN [0..10] THEN				<t10>
+			BHI.S	TIMCtlBad						;   Error, csCode out of bounds
+			MOVE.W	TIMCtlJumpTbl(PC,D0.W*2),D0		; Get the relative offset to the routine
+			JMP		TIMCtlJumpTbl(PC,D0.W)			; GOTO the proper routine
+				
+TIMCtlJumpTbl	
+			DC.W	TIMGoodBye-TIMCtlJumpTbl		; $FF => NeedGoodBye Kiss					<t10>
+			DC.W	TIMVidReset-TIMCtlJumpTbl		; $00 => VidReset
+			DC.W	TIMCtlGood-TIMCtlJumpTbl		; $01 => KillIO
+			DC.W	TIMSetVidMode-TIMCtlJumpTbl		; $02 => SetVidMode
+			DC.W	TIMCtlBad-TIMCtlJumpTbl			; $03 => SetEntries			(not needed)
+			DC.W	TIMCtlBad-TIMCtlJumpTbl			; $04 => SetGamma			(not needed)
+			DC.W	TIMGrayPage-TIMCtlJumpTbl		; $05 => GrayPage
+			DC.W	TIMCtlBad-TIMCtlJumpTbl			; $06 => SetGray			(not needed) 
+			DC.W	TIMSetInterrupt-TIMCtlJumpTbl	; $07 => SetInterrupt
+			DC.W	TIMCtlBad-TIMCtlJumpTbl			; $08 => DirectSetEntries	(not needed)
+			DC.W	TIMCtlBad-TIMCtlJumpTbl			; $09 => SetDefaultMode		(not needed)
+
+TIMCtlBad	MOVEQ	#controlErr,D0					; else say we don't do this one
+			BRA.S	TIMCtlDone						; and return
+			
+TIMCtlGood	MOVEQ	#noErr,D0						; return no error
+
+TIMCtlDone	MOVEM.L	(SP)+,A0/A1						; Restore exit registers.
+			BRA		TIMExitDrvr
+
+TIMGoodBye											;											<t10>
+;---------------------------------------------------------------------
+;
+;	Upon the GoodBye Kiss, close the video driver
+;
+;---------------------------------------------------------------------
+
+			BSR.S	TIMVidClose						; make the driver close call
+			BRA.S	TIMCtlGood						; => no error
+		
+TIMVidReset
+;---------------------------------------------------------------------
+;
+;	Reset the card to its default
+;
+;---------------------------------------------------------------------
+
+			WITH	VDPageInfo,TIMVidPrivates
+		
+			MOVE	#FirstVidMode,csMode(A2)		; return default mode
+			MOVE	#FirstVidMode,saveMode(A3)		; remember FirstVidMode as the requested mode
+			CLR.W	csPage(A2)						; return page zero
+			MOVE.L	saveBaseAddr(A3),csBaseAddr(A2) ; return the base address
+			BSR		TIMGrayScreen					; paint the screen gray
+			BRA.S	TIMCtlGood						; => no error
+
+			ENDWITH
+		
+TIMSetVidMode
+;---------------------------------------------------------------------
+;
+;	Set the card to the specified mode and page.  If it's not 1-bit 
+;	mode, page zero, then return an error
+;
+;   If the card is already set to the specified mode, then do nothing.
+;
+;---------------------------------------------------------------------
+
+			WITH	VDPageInfo,TIMVidPrivates
+		
+			CMP.W	#FirstVidMode,csMode(A2)		; is it one-bit (the first and only)
+			BNE.S	TIMCtlBad						; => not a valid mode
+
+			TST.W	csPage(A2)						; it is page zero?
+			BNE.S	TIMCtlBad						; => not a valid page
+
+			MOVE.L	saveBaseAddr(A3),csBaseAddr(A2)	; return the base address
+			BRA.S 	TIMCtlGood						; => return no error
+		
+			ENDWITH
+
+TIMSetEntries
+;---------------------------------------------------------------------
+;
+;	Since TIM has no color table, there’s nothing do here.  Return a ctl
+;	bad result (but do it up above in the control dispatcher, since it
+;	saves a few bytes.
+;
+;---------------------------------------------------------------------
+			
+TIMSetGamma
+;---------------------------------------------------------------------
+;
+;	Since TIM has no color table, there's no opportunity to set the
+;	gamma correction in this hardware.  Return a ctl bad result (but
+;	do it up above in the control dispatcher, since it saves a few bytes.
+;
+;---------------------------------------------------------------------
+			
+TIMGrayPage											
+;---------------------------------------------------------------------
+;
+;	Clear the specified page in the current mode to gray
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+			
+			WITH 	VDPageInfo,TIMVidPrivates
+		
+			TST.W	csPage(A2)						; Is it requesting page zero?
+			BNE.S	TIMCtlBad
+
+			BSR		TIMGrayScreen					; paint the screen gray
+			BRA.S	TIMCtlGood						; => return no error
+
+			ENDWITH
+		
+TIMSetGray
+;---------------------------------------------------------------------
+;
+;	Since TIM has no color table, there's no opportunity to set
+;	luminence mapping in this hardware.  Return a ctl bad result (but
+;	do it up above in the control dispatcher, since it saves a few bytes.
+;
+;---------------------------------------------------------------------
+			
+TIMSetInterrupt
+;---------------------------------------------------------------------
+;
+;	Enable (csMode = 0) or disable (csMode = non-zero) VBL interrupts
+;
+;   As a future performance enhancement, interrupts on the card can be
+;	disabled or enabled from software. For instance, if the cursor is
+;	not on a screen, and there is nothing in the Slot Interrupt Queue
+;	for that device, interrupts may be disabled reducing interrupt 
+;	overhead for the system.
+;
+;	The slot interrupt queue element is always allocated by the Open call.
+;	This routine just inserts and removes it from the slot interrupt task queue.
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+
+			WITH	VDPageInfo,TIMVidPrivates
+			
+			Move.b	csMode(A2),D0					; get mode
+			Ext.w	D0								; extend for word-sized flag
+			MOVE.W	D0,IntDisableFlag(A3)			; save it
+			BNE.S	TIMSIDone						; if disabling, setting the flag word is all that's needed
+
+; if enabling interrupt simulator, then we need to prime the timer task
+
+			BSR.S	TIMEnableVGuts					; call common code
+TIMSIDone
+			BRA.S	TIMCtlGood						; and go home
+	
+	
+TIMEnableVGuts										; 	
+
+			MOVE.L	A1,-(SP)						; jPrimeTime trashes A1									<3> djw
+			LEA		TTask(A3),A0					; get time task block in A0
+			MOVE.L	#kTIMVBLTime,D0					; delay for about 1/60th of a second
+			MOVE.L	jPrimeTime,A1					; point straight at the Time Manager dispatch vector
+			JSR		(A1)							; start the delay going
+			MOVEA.L	(SP)+,A1						;														<3> djw
+
+			RTS										; return home						
+
+			ENDWITH
+	
+TIMSetDefaultMode
+;---------------------------------------------------------------------
+;
+;	Since TIM only has one video sRsrc and it’s already set, just return
+;	a ctl bad result (but do it up above in the control dispatcher, since
+;	it saves a few bytes.
+;
+;---------------------------------------------------------------------
+
+**********************************************************************
+*
+* VideoClose releases the device's private storage and removes the 
+*		interrupt handler.
+*
+*
+* Entry:	A0 = param block pointer
+*			A1 = AuxDCE pointer
+*
+* Other:	A2 = temporary AuxDCE pointer copy
+*
+**********************************************************************
+			
+			WITH	 TIMVidPrivates
+
+TIMVidClose		
+		
+			MOVE.L	dCtlStorage(A1),A3				; A3 <- Ptr to private storage
+			MOVE.L	(A3),D0							;
+			_StripAddress							;
+			MOVE.L	D0,A3							;
+
+; Shut off VBL interrupts.
+;
+			MOVE.W	#1,IntDisableFlag(A3)			; set this word to “disable” interrupts
+			LEA		TTask(A3),A0					; get the time manager task block
+			_RmvTime								; remove this element from the queue
+			
+; Close the Backlight driver.
+;
+			Sub.w	#ioQElSize,Sp					; Get a param block on the stack.
+			Move.l	Sp,A0							; Point to it.
+			Lea		TIMBackLite,A1					; Get pointer to Backlight driver name.
+			Move.l	A1,ioFileName(A0)				; Load it.
+			_Open									; Open driver to get the refNum.
+			Bne.s	@SkipClose						; If open fails, don’t try to close it.
+			_Close									; Otherwise, close it.
+
+@SkipClose			
+			Add.w	#ioQElSize,Sp					; Restore the stack.
+			
+; Gray the screen.
+;
+			Bsr		TimGrayScreen					; Gray the screen.		
+			
+; Dispose of all storage.
+;
+			Move.l	saveFixedCLUT(A3),A0			; Dispose of our fixed-entry CLUT.
+			_DisposPtr
+
+			MOVE.L	dCtlStorage(A1),A0				; Dispose of the private storage
+			_DisposHandle							;
+
+			MOVEQ	#noErr,D0						; no error
+			RTS										; and return
+			
+			ENDWITH
+
+**********************************************************************
+*
+* Video Driver Status Call Handler.  Right now there are ten calls:
+*
+*	(0)  Error
+*	(1)  Error
+*	(2)	 GetMode
+*	(3)  GetEntries
+*	(4)	 GetPage
+*	(5)	 GetPageBase
+*	(6)  GetGray
+*	(7)	 GetInterrupt
+*	(8)	 GetGamma
+*	(9)  GetDefaultMode
+*
+*   Entry: 	A0 		= param block
+*			A1 		= AuxDCE pointer
+*	Uses:	A2		= cs parameters
+*			A3 		= pointer to private storage
+*			D0-D3 	= scratch (don't need to be preserved)
+*
+*	Exit:	D0	  	= error code
+*
+**********************************************************************
+
+TIMVidStatus	
+
+			MOVEM.L	A0/A1,-(SP)						; Preserve exit registers.
+			
+			MOVE.L	csParam(A0),A2					; A2 <- Ptr to control parameters
+		
+			MOVE.L	dCtlStorage(A1),A3				; A3 <- Ptr to private storage
+			MOVE.L	(A3),D0							;
+			_StripAddress							;
+			MOVE.L	D0,A3							;
+
+			MOVE.W	csCode(A0),D0					; get routine selector
+			
+			CMP.W	#9,D0							;IF csCode NOT IN [0..9] THEN
+			BHI.S	TIMStatBad						;  Error, csCode out of bounds.
+			MOVE.W	TIMStatJumpTbl(PC,D0.W*2),D0	;Get the relative offset to the routine.
+			JMP		TIMStatJumpTbl(PC,D0.W)			;GOTO the proper routine.
+				
+TIMStatJumpTbl
+			DC.W	TIMStatBad-TIMStatJumpTbl		;$00 => Error
+			DC.W	TIMStatBad-TIMStatJumpTbl		;$01 => Error
+			DC.W	TIMGetMode-TIMStatJumpTbl		;$02 => GetMode
+			DC.W	TIMGetEntries-TIMStatJumpTbl	;$03 => GetEntries
+			DC.W	TIMGetPage-TIMStatJumpTbl		;$04 => GetPage
+			DC.W	TIMGetPageBase-TIMStatJumpTbl	;$05 => GetPageBase
+			DC.W	TIMStatBad-TIMStatJumpTbl		;$06 => GetGray				(not needed)
+			DC.W	TIMGetInterrupt-TIMStatJumpTbl	;$07 => GetInterrupt
+			DC.W	TIMStatBad-TIMStatJumpTbl		;$08 => GetGamma			(not needed)
+			DC.W	TIMGetDefaultMode-TIMStatJumpTbl ;$09 => GetDefaultMode
+
+			
+TIMStatBad	MOVEQ	#statusErr,D0					; else say we don't do this one
+			BRA.S	TIMStatDone						; and return
+			
+TIMStatGood	MOVEQ	#noErr,D0						; return no error
+
+TIMStatDone	MOVEM.L	(SP)+,A0/A1						; Restore exit registers.
+			BRA		TIMExitDrvr
+
+TIMGetMode
+;---------------------------------------------------------------------
+;
+;	Return the current mode
+;
+;		Inputs : A2 = pointer to csParams
+;				 A3 = pointer to private storage
+;
+;---------------------------------------------------------------------
+
+			WITH	TIMVidPrivates,VDPageInfo
+		
+			MOVE.W	saveMode(A3),csMode(A2)			; return the mode
+			CLR.W	csPage(A2)						; return the page number
+			MOVE.L	saveBaseAddr(A3),csBaseAddr(A2)	; and the base address
+			
+			BRA.S	TIMStatGood						; => return no error
+	
+			ENDWITH
+
+TIMGetEntries
+;---------------------------------------------------------------------
+;
+;	Fake the current contents of the CLUT.  There isn't really a clut around,
+;	but that's no reason not to return a reasonable looking response
+;
+;		Inputs : A2 = pointer to csParams
+;				 A3 = pointer to privates
+;
+;	For TIM the color table is fixed.  So, we’ll always return good values
+;	as long as there is a reasonable looking color table around.
+;
+;	Idea:	If we’re in indexed mode, we’ll cycle thru the input
+;			table.  While doing this, we’ll ignore all entries
+;			whose value fields are out of range.  For entries
+;			whose value field are in range, we’ll return the
+;			appropriate rgb fields.
+;
+;			If we’re in sequential mode, we just need to write out
+;			the number of entries we know about.
+;
+;---------------------------------------------------------------------
+
+			With	TimVidPrivates
+
+			Move.l	csTable(A2),D0					; If we were handed a nil pointer,
+			Beq.s	TIMStatBad						;	then hike.
+			_StripAddress							; Otherwise, make it 32-bit clean.
+			
+			Move.l	D4,-(Sp)						; Save work register.
+
+; Calculate the index range…
+;
+			Move.w	saveNumFixedEntries(A3),D3		; Get number of entries to check against.
+			
+			Move.w	csCount(A2),D4					; Get the number of entries to set,
+			Bmi.s	@GEErr							; 	and hike if it’s out of range.
+			Cmp.w	D3,D4							; If D4-D3 > 0 (count > # of entries),
+			Bhi.s	@GEErr							;	then hike.
+			Move.w	D4,D2							; Otherwise, copy the count.
+			
+			Move.l	D0,A0							; Get pointer to input table.
+			Cmp.w	#indexEntries,csStart(A2)		; If table accesses are to be indexed,
+			Beq.s	@GECom							;	then go on.
+			
+			Move.w	D4,D1							; Otherwise, sequence thru table from
+			Add.w	csStart(A2),D2					;	csStart thru csCount entries.
+
+; The following code is BAD, BAD, BAD!  We should build our own table here so
+;	as to NOT mess up the user’s data.  But all the previous Apple video drivers
+;	have done the same thing, so we’ll continue the trend for now.
+
+@TableLoop	Move.w	D2,value(A0,D1*colorSpecSize)	; Write the index into the table.
+			Subq	#1,D2							; Decrement index.
+			Dbra	D1,@TableLoop
+
+@GECom		
+@Repeat		Move.w	value(A0),D1					; Get the NEXT table position into D1.
+			Cmp.w	D3,D1							; If this position is out of range,
+			Bhi.s	@Until							;	then go on.
+			
+			Move.l	saveFixedCLUT(A3),A1			; Point to start of fixed CLUT.	
+			Lea		(A1,D1*colorSpecSize),A1		; Index into right entry.
+
+			Move.w	rgb+red(A1),rgb+red(A0)			; Copy	red,
+			Move.w	rgb+green(A1),rgb+green(A0)		; 		green,
+			Move.w	rgb+blue(A1),rgb+blue(A0)		;		blue.
+
+@Until		Addq	#colorSpecSize,A0				; Point to next entry in input ColorTable.
+			Dbra	D4,@Repeat
+
+			Move.l	(Sp)+,D4						; Restore work register.
+			Bra.s	TimStatGood						; Return noError.
+			
+@GEErr		Move.l	(Sp)+,D4						; Restore work register.
+			Bra.s	TimStatBad						; Return statError.
+			
+			EndWith
+
+TIMGetPage
+;---------------------------------------------------------------------
+;
+;	Return the number of pages in the specified mode.  
+;
+;---------------------------------------------------------------------
+			
+			WITH	TIMVidPrivates,VDPageInfo
+		
+			CMP.W	#FirstVidMode,csMode(A2)		; this mode, or else
+			BNE		TIMStatBad						; oh,oh
+			
+ 			MOVE.W	#OBMPagesLCD,csPage(A2)			; return page count
+			BRA		TIMStatGood						; => return no error
+			
+			ENDWITH
+		
+TIMGetPageBase
+;---------------------------------------------------------------------
+;
+;	Return the base address for the specified page in the current mode
+;
+;---------------------------------------------------------------------
+			
+			WITH	TIMVidPrivates,VDPageInfo
+		
+			MOVE.W	csPage(A2),D0					; get the requested page
+			BNE		TIMStatBad						; => no, just return
+						
+			MOVE.L	saveBaseAddr(A3),csBaseAddr(A2)	; return the base address
+			BRA 	TIMStatGood						; => return no error
+			
+			ENDWITH
+			
+TIMGetGray
+;---------------------------------------------------------------------
+;
+;	No CLUT, so this routine returns an status error.  It's implemented
+;	in the Status dispatch table above.
+;
+;---------------------------------------------------------------------
+
+TIMGetInterrupt
+;---------------------------------------------------------------------
+;
+;	Return a boolean in csMode, set true if VBL interrupts are disabled
+;
+;---------------------------------------------------------------------
+
+			WITH	TIMVidPrivates,VDPageInfo
+		
+			TST.W	IntDisableFlag(A3)				; test the interrupt state
+			BEQ.S	@isOn							; if not on,
+			MOVE.B	#1,csMode(A2)					;	then return disabled state.
+			BRA		TIMStatGood						; 
+@isOn	
+			CLR.B	csMode(A2)						; return enabled state
+			BRA		TIMStatGood
+			
+			ENDWITH
+		
+TIMGetGamma
+;---------------------------------------------------------------------
+;
+;	No CLUT, so this routine returns an status error.  It's implemented
+;	in the Status dispatch table above.
+;
+;---------------------------------------------------------------------
+
+TIMGetDefaultMode
+;---------------------------------------------------------------------
+;
+;	Read the card default mode from slot pRAM.
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+
+; For most video drivers, we look in pRAM to see what the last
+;	configuration set was.  However, for TIM, there only one
+;	mode possible, so we just return that value here.
+
+			WITH		VDPageInfo					; GDW1
+			MOVE.B		dCtlSlotID(A1),csMode(A2)	; return the result
+			BRA			TimStatGood					;
+			ENDWITH									; GDW1
+
+;---------------------------------------------------------------------
+;
+;	Exit from Control or Status.
+;
+;	 	A0 = Ptr to param block.
+;		A1 = Ptr to AuxDCE.
+;		D0 = error code.
+;
+;---------------------------------------------------------------------
+
+TIMExitDrvr	BTST	#NoQueueBit,ioTrap(A0)			; no queue bit set?
+			BEQ.S	TIMGoIODone						; => no, not immediate
+			RTS 									; otherwise, it was an immediate call
+
+TIMGoIODone	MOVE.L	JIODone,-(Sp)					; Get the IODone address,
+			Rts										; 	and go there.
+
+;=====================================================================
+;
+;	Utilities
+;
+;=====================================================================
+
+TIMGrayScreen
+;---------------------------------------------------------------------
+;
+;	Fill the screen with a 50% dithered gray pattern.
+;			A3 = driver private storage
+;
+;	All registers are preserved
+;
+
+				WITH 		TIMVidPrivates
+
+				MOVEM.L		D0/D2/D3/A0/A1,-(SP)	; save all registers
+
+				Moveq		#true32b,D0				; Set up to flip into 32-bit mode.
+				_SwapMMUMode						; Flip.
+				Move.b		D0,-(Sp)				; Save previous mode.
+
+				MOVE.L		#OneBitGray,D3			; get the one-bit gray pattern
+
+				MOVE.L		saveBaseAddr(A3),A0		; get the frame buffer base address
+				MOVE.W		#defmBounds_BLCD-1,D0	; get the # of rows
+
+@NxtRow			MOVE.W		#(OBMLCDRB/4)-1,D2		; get the # of longs/row 
+@NxtLong		MOVE.L		D3,(A0)+				; write gray
+				DBRA		D2,@NxtLong				; for each scanline
+				NOT.L		D3						; invert pattern on next row
+				DBRA		D0,@NxtRow				; for each row
+
+				Move.b		(Sp)+,D0				; Restore previous addressing mode.
+				_SwapMMUMode
+				
+				MOVEM.L		(SP)+,D0/D2/D3/A0/A1	; restore registers
+				RTS
+
+				ENDWITH			
+
+;-----------------------------------------------------------------------------
+;	The Interrupt handler for the TIM Built-In Video
+;
+;	Since it doesn't make much sense for an LCD system to have all the 
+;		interrupt related hardware that the CRT systems have since there
+;		really isn't a blanking interval anyway.  On this machine we
+;		simulate the slot interrupt system with a timer task.  We still 
+;		call the slot VBL task queue so slot VBL tasks get called.
+;-----------------------------------------------------------------------------
+;
+; The new time manager sets A1 to point to the TTask block on entry
+;
+
+TIMBeginIH		
+
+				MOVE.L	A1,-(SP)					; save A1 (it's trashed by JVBLTask)
+				
+				CLR.W	D0							; set slot zero in D0	
+				MOVE.L	JVBLTask,A0					; call the VBL task manager
+				JSR		(A0)						; with slot # in D0
+				MOVEA.L	(SP)+,A1					; restore A1 (ptr to TTask block)									<3> djw
+				
+				TST.W	tmXQSize(A1)				; test the flag word to see if “interrupts” are on
+													;	WARNING! - this field must be immediately after the TTask elem
+				BNE.S	@Done						; if ≠ 0, then “interrupts” are disabled, so don't reprime
+				
+				MOVEA.L	A1,A0						; get time task block addr in A0									<3> djw
+				MOVE.L	#kTIMVBLTime,D0				; delay for about 1/60th of a second
+				MOVE.L	jPrimeTime,A1				; point straight at the Time Manager dispatch vector
+				JSR		(A1)						; start the delay going
+@Done			
+				RTS									; and return to caller
+
+		END

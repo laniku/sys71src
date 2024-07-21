@@ -1,0 +1,270 @@
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;
+;	File:		Recorder.a
+;
+;	Contains:	Cousin Itt debugging event tape recorder
+;
+;	Written by:	Paul Wolf
+;
+;	Copyright:	© 1992-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM13>	11/22/93	pdw		Rolling in from <MCxx>.
+;	   <MC5>	11/10/93	pdw		Moved the event break stuff down to the bottom of RecordEvent.
+;	   <MC4>	 11/8/93	pdw		Added better build-time control over tape_length and
+;									noncachability.
+;	   <MC3>	 11/5/93	pdw		Series of attempts and re-attempts to fix various VM/FileShare
+;									problems.
+;	  <SM12>	10/29/93	DCB		<MC> roll-in.
+;	   <MC2>	10/28/93	pdw		Completely change how Record_Event stuff is done.  Now it's back
+;									to front, among other things.
+;	  <SM11>	10/14/93	pdw		<MC> roll-in.
+;	  <SM10>	  9/9/93	pdw		Lots of little changes.  Name changes, temporary cache_bug
+;									stuff.
+;	   <SM9>	 7/17/93	pdw		Minor change to StopRecordOnFull.
+;	   <SM8>	  7/8/93	pdw		Adding RecordError stuff and StopRecordAtFull ability.
+;	   <SM7>	 6/29/93	pdw		Changed where I get the event-debug trigger values. Used to be 0
+;									and 4, now it's $90 and $94 off SCSIGlobals.
+;	   <SM6>	  5/5/93	PW		Converted names to meanies-friendly names.  Updated with latest
+;									from Ludwig stuff.
+;	   <LW5>	  5/1/93	PW		Changed mechanism for removing this routine when RECORD_ON==0.
+;	   <LW4>	 4/30/93	DCB		Adding an RTS to the front of RecordEvent to prevent a crash in
+;									the unlikely event that someone calls it.
+;	   <LW2>	  3/3/93	PW		Get rid of drop to int level 6.
+;	   <SM3>	 12/5/92	PW		Added Break-at-event-match stuff.
+;	   <SM2>	10/30/92	DCB		Name Change for SCSI.a
+;
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+
+
+			MACHINE		MC68020					; '020-level
+
+			LOAD		'StandardEqu.d'
+			INCLUDE		'Debug.a'				; for NAME macro						
+			INCLUDE		'ACAM.a'
+			INCLUDE		'XPTEqu.a'
+
+			CASE		OBJECT
+	
+
+;	Input
+;		D0 = size
+;
+;	Output
+;		none
+;
+InitRecorder	PROC	EXPORT
+
+		IF RECORD_NONCACHABLE THEN
+
+			move.l	#2*PAGE_SIZE, D0
+			_NewPtr	Sys, Clear				; returns ptr in A0 to tape buffer
+			move.l	A0, D0					; did we get some?
+			bne.s	@1
+			DebugStr 'Could not allocate Record buffer'
+@1	
+			subq.l	#1, D0
+			and.w	#$10000-PAGE_SIZE, D0	; align to previous page
+			add.l	#PAGE_SIZE, D0			; 
+			move.l	D0, A0
+
+			move.l	A0, -(sp)				; save around LockMemory/GetPhysical
+			move.l	#PAGE_SIZE, A1
+			_LockMemory
+			move.l	(sp), A0				; get address back
+			
+			subq.l	#8, sp					; make room for physical result
+			move.l	#PAGE_SIZE, -(sp)		; parm: length
+			move.l	A0, -(sp)				; parm: logical address
+			move.l	sp, A0					; pass in addr of log to phys table
+			move.l	#1, A1					; setup the count
+			_GetPhysical					; do the translation
+			tst.w	D0
+			beq.s	@3
+			DebugStr 'GetPhysical failed'
+@3	
+			addq.l	#8, sp					; forget about logical addr/count
+			move.l	(sp)+, A2				; get physical address (result)
+			move.l	(sp)+, D0				; get physical count 
+			
+			move.l	(sp)+, A0				; pop logical address
+		ELSE
+
+			move.l	#TAPE_LENGTH, D0
+			_NewPtr	Sys, Clear				; returns ptr in A0 to tape buffer
+			move.l	#TAPE_LENGTH, D0
+			move.w	#-1, A2
+
+		ENDIF
+		
+			move.l	SCSIGlobals, A1
+
+			move.l	A0, SCSIGlobalsRec.recStartLog(A1)	; store ptr to tape storage
+			move.l	D0, SCSIGlobalsRec.recSize(A1)		
+			add.l	A0, D0								; pt to the end of actual tape
+			move.l	D0, SCSIGlobalsRec.recCurrent(A1)	; current ptr is at the end
+			move.l	A2, SCSIGlobalsRec.recStartPhys(A1)	; store physical for user
+
+			clr.l	SCSIGlobalsRec.recordBreak0(A1)		; clear our break-at-event stuff
+			clr.l	SCSIGlobalsRec.recordBreak4(A1)
+			
+			rts
+			
+		NAME 'InitRecorder'
+		
+				ENDP
+		
+			
+			
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ			
+StackFrame			RECORD	{link},DECR
+
+params				EQU	*			
+;---- parameters ----
+eventName		ds.l	1
+event			ds.l	1
+
+;---- mechanics
+paramSize		EQU	params-*	
+returnAddr		ds.l	1		; return address
+link			ds.l	1		; location of old A6 (after LINK A6)
+
+;----
+linkSize		EQU	*
+
+					ENDR
+
+VMG			equ		$B78		; pointer to our low-memory pointer to VM globals 
+
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ	
+;
+;	Input
+;		(A7+4)^.L = event
+;
+RecordEvent		PROC	EXPORT
+			
+			WITH	StackFrame
+
+trashedRegs	REG		D0-D1/A0-A1		
+
+			link	A6, #linkSize
+			movem.l	trashedRegs, -(sp)
+			
+			move.w	SR, D0					; keep old SR in D0
+			ori.w	#$0700,SR				; disable all ints
+
+
+; Generate and update address of next event
+
+			move.l	SCSIGlobals, A1
+			move.l	SCSIGlobalsRec.recCurrent(A1), A0		; get ptr to tape storage
+			sub.l	#$10, A0
+			cmp.l	SCSIGlobalsRec.recStartLog(A1), A0		; at or after start of tape?
+			bcc.s	@asis									; yes-> use ptr as is
+			add.l	SCSIGlobalsRec.recSize(A1), A0			; no: pt to end
+@asis
+			move.l	A0, SCSIGlobalsRec.recCurrent(A1)		; store current ptr
+
+
+; Stuff passed in parameters
+
+			move.l	eventName(A6), (A0)+	; record event Name
+			move.l	event(A6), (A0)+		; record event Data
+
+
+; Stuff additional constant data
+
+;	First long
+
+			move.l	A5, D1					; lwA527DB
+				swap	D1
+
+			move.w	D0, D1					; 	 SR				xxxx2700
+
+		IF 0 THEN
+			move.b	Ticks+3, D1				;					xxxx27Ti
+			move.b	SCSIGlobalsRec.isfLevel0Count(A1), D1
+			lsl.b	#4, D1
+			add.b	SCSIGlobalsRec.isfLevel1Count(A1), D1
+			move.b	FSBusy, D1			
+				lsl.l	#8, D1
+
+			tst.l	VMG
+			bmi.s	@11
+			move.b	([VMG],$49), D1			; userCodeDisabled	xx27TixU
+			lsl.b	#4, D1					;					xx27TiUx
+			add.b	([VMG],$4b), D1			; pageFaultFatal	xx27TiUP
+@11
+				lsl.l	#8, D1				;					27TiUPxx
+		ENDIF	
+
+			move.b	#0, D1			
+			tst.b	$D92					; Deferred Task Q flag
+			beq.s	@noDT
+			add.b	#$D0, D1				;					27TiUPDx
+@noDT
+			tst.b	$160					; VBL flag byte
+			beq.s	@noVBL
+			add.b	#$B, D1					;					27TiUPDB
+@noVBL
+			move.l	D1, (A0)+				; record VBL, DTflags, Ticks, SR
+
+
+;	Second long
+
+			move.w	FSQHead+2, D1
+			swap	D1
+			move.w	ticks+2, D1
+			move.l	D1, (A0)+
+
+
+; Check for event match breakpoint
+
+			move.l	SCSIGlobalsRec.recordBreak0(A1), D1
+			beq.s	@noDebug
+			cmp.l	eventName(A6), D1
+			bne.s	@noDebug
+			move.l	SCSIGlobalsRec.recordBreak4(A1), D1
+			beq.s	@doDebug
+			cmp.l	event(A6), D1
+			bne.s	@noDebug
+@doDebug
+			DebugStr 'Break at Event Match ; dm A0-10'
+@noDebug
+
+			
+			move.w	D0, SR					; restore SR
+			
+			movem.l	(sp)+, trashedRegs
+			unlk	A6
+			
+			rts
+			
+		NAME 'RecordEvent'
+
+				ENDP
+
+
+BreakAtEventMatch	PROC
+			nop
+			rts
+		NAME 'BreakAtEventMatch'
+				ENDP
+
+
+RecordError		PROC	EXPORT
+
+			pea		'Err!'
+			move.l	8(sp), -(sp)
+			bsr		RecordEvent
+			addq.l	#8, sp
+			rts
+			
+		NAME 'RecordError'
+
+				ENDP
+
+				END

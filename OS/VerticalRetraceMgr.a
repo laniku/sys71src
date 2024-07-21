@@ -1,0 +1,424 @@
+;
+;	File:		VerticalRetraceMgr.a
+;
+;	Contains:	This file contains the core routines pertaining to the vertical
+; 				retrace manager.  VINSTALL installs a routine into the vertical
+;  				retrace task list while VREMOVE removes it.
+;
+;	Written by:	Andy Hertzfeld 05-May-81
+;
+;	Copyright:	© 1981-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM6>	 11/9/93	KW		added some eieioSTP macros.  Only expands for CygnusX1 ROM
+;	   <SM5>	 1/29/93	RB		Made the PseudoVBLInt routine compatible with NuKernel by
+;									changing the way it uses the status register.
+;      <SM4>     9/10/92    AEK     Other half of pseudo-VBL support, add code to re-arm timemgr task
+;	   <SM3>	 5/21/92	kc		Append "Trap" to the names of Enqueue and Dequeue to avoid name
+;									conflict with the glue.
+;		 <6>	  5/6/92	JSM		Get rid of conditionals: hasSlotMgr is always true, Cpu is
+;									always ≥ 020 since this file is only used in ROM builds. This
+;									file now has no conditionals.
+;		 <5>	 10/1/91	JSM		Don’t use hasADB conditional, all future ROMs will support ADB.
+;		 <4>	 9/10/91	JSM		Cleanup header.
+;		 <2>	 6/12/91	LN		Changed #include 'HardwareEqu.a' to 'HardwarePrivateEqu.a'
+;	   <1.4>	 4/16/89	GGD		Rewritten so that SlotVBLs can share code with classic VBL
+;									handling. Changed slot handling to use shared data structures
+;									with slot interrupt handler. Increased data structures to
+;									support slots $0…$E, to allow for expansion chassis.
+;	   <1.3>	  3/6/89	GGD		moved VBL and SlotVBL interrupt handlers to VerticalRetraceMgr.a
+;									from InterruptHandlers.a Modified 60hz handler to not re-enable
+;									interrupts if it was interrupting a vbl task, to prevent
+;									potential excessive stack growth if other level 1 interrupts are
+;									consuming a lot of time. Deleted obsolete unreferenced exported
+;									label CoreStub. Eliminated unused include files.
+;	   <1.2>	 2/20/89	rwh		changed to feature based conditionals.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.2>	10/24/88	djw		Modified InitVBLQs to alloc space for all supported NuBus slots
+;									(internal and bus expansion). Modified ChkSlot to support slot
+;									zero and bus expansion slots.
+;	  <•1.1>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.0>	 2/10/88	BBM		Adding file for the first time into EASE…
+;	  <C914>	10/29/87	rwh		Port to Modern Victorian. Changed Via2IntMask to SlotIntMask to
+;									make things more general
+;	  <C913>	10/16/87	MSH		Added nHardwareEqu.a to INCLUDEs
+;	  <C755>	  2/4/87	RDC		Cleanup error return codes in AttachVBL and DoVBLTask routines
+;	  <C665>	 1/22/87	RDC		Code review cleanup
+;	  <C582>	  1/2/87	RDC		Misc cleanup
+;	  <C572>	12/30/86	RDC		Changed various equate names due to changes by GWN in equate
+;									file
+;	  <A327>	 11/2/86	RDC		Finally added a copyright notice!
+;	  <C224>	10/15/86	RDC		Add error checking code for invalid slot #'s
+;	  <C206>	 10/9/86	bbm		Modified to mpw aincludes.
+;	  <C147>	  9/8/86	RDC		Added routines to support NuMac slot VBL queues
+;				 7/24/85	RDC		Changed interrupt level masking to use equates Added separate
+;									include statement for HWequ file (no longer in systlqk.sym)
+;				  5/7/85	JTC		Disallow VBL interrupts during computation. <07May85>
+;				 4/30/85	JTC		Fix overflow problem in computing initial phase bias. <30Apr85>
+;				 1/30/85	LAK		Added RAM patch to VInstall.
+;				 1/23/85	LAK		Adapted for new equate files.
+;				  8/8/83	LAK		added a comment only.
+;				 6/18/83	AJH		saved 2 bytes by moving CoreStub
+;				 7/26/82	LAK		phase of zero specifies no offset (used for exact one shots) -
+;									mod to VINSTALL
+;				  6/4/82	LAK		use phase in VINSTALL to determine initial count
+;				 9/17/81	bmw		vinstall returns zero in d0 if it's happy
+;
+
+			print	off
+			LOAD	'StandardEqu.d'
+			include	'HardwarePrivateEqu.a'
+			include 'SlotMgrEqu.a'
+			print	on
+			print	nomdir
+
+			machine	mc68020
+
+VBLCore 	proc	export	
+
+			export	VInstall,VRemove,VBLInt,PseudoVblInt
+			import	EnqueueTrap,DequeueTrap
+			
+			export	InitVBLQs,SlotVInstall,SlotVRemove
+			export	AttachVBL,DoVBLTask
+
+;_______________________________________________________________________
+;
+; Trap:			_VINSTALL
+;
+; Arguments:	A0 (input) :	address of vertical retrace control block
+;				D0 (output):	error code -	0  no error
+;											   -2  invalid queue element type
+;
+; Function: 	Installs a vertical retrace routine which is called after
+;				VBLCOUNT(A0) video frames.
+;				To permit VBl tasks to be called with the same frequencies but		<30Apr85>
+;				in different time slices the following phasing mechanism is used:
+;				Compute T := Ticks MOD Count  (this takes two DIVU's to avoid overflow).
+;				Then T indicates the momentary phase, relative to Count.
+;				Then compute the proper InitialCount so that the VBl task will be
+;				executed Phase slices AFTER the next slice whose MOD with Count is 0.
+;				if (Phase - T) >= 0
+;					then  InitialCount := Count + (Phase - T)
+;					else  InitialCount := Count + (Count + (Phase - T))
+;				To compute Ticks MOD Count we let Ticks = 2^16*Thi + Tlo and note that
+;					Ticks MOD Count  =	( 2^16*(Thi MOD Count) + Tlo ) MOD Count
+;				with the pleasant benefit that neither MOD cannot cause DIVU to overflow!
+;
+;				However, life is not without its uncertainties! If the clock should tick
+;				whilest this computation is performed, the initial phase will be off by
+;				a tick.  But this could be solved by INSTALLING such tasks at VBL time,
+;				guaranteeing a fresh slice within which to work!!!
+;
+; Registers Used: D0,D1,D2,A0,A1													<30Apr85>
+;_______________________________________________________________________
+
+VInstall	lea 	VBLQueue,a1 		; get address of queue				<1.4>
+
+VInstallCommon							; common code shared with SlotVInstall
+			cmpi.w 	#vType,VBLType(a0)	; is it the proper type?
+			bne.s	VTypeError			; if not, exit with error			<1.4>
+
+			move.w	vblCount(a0),d1 	; D1.W = Count						<30Apr85>
+			beq.s	@QueueIt			; Count=0 is special, one-shot case <30Apr85>
+			tst.w	VBLPhase(a0)		; zero phase is also special		<C204>
+			beq.s	@QueueIt			; queue up for count ticks later	<C204>
+
+			move.w	sr,-(sp)			; save current interrupt status 	<07May85>
+			ori.w 	#HiIntMask,sr		; disallow VBL interrupts			<07May85>/<24Jul85>
+
+			move.l	Ticks-VBLQueue(a1),d0; D0 = 2^16*Thi + Tlo				<30Apr85>
+			swap	d0					;									<30Apr85>
+			moveq.l	#0,d2				;									<30Apr85>
+			move.w	d0,d2				; D2 = Thi							<30Apr85>
+			divu	d1,d2				; D2.hi = Thi MOD Count 			<30Apr85>
+			swap	d2					;									<30Apr85>
+			move.w	d2,d0				;									<30Apr85>
+			swap	d0					; D0 = 2^16*(Thi MOD Count) + Tlo	<30Apr85>
+			divu	d1,d0				;									<30Apr85>
+			swap	d0					; D0.W = Ticks MOD Count			<30Apr85>
+
+			sub.w	VBLPhase(a0),d0 	;									<30Apr85>
+			neg.w	d0					; D0.W = Phase - (Ticks MOD Count)	<30Apr85>
+			bpl.s	@PhaseDone			;									<30Apr85>
+			add.w	d1,d0				; D0.W = Count + (Phase - (...))	<30Apr85>
+@PhaseDone								;									<30Apr85>
+			add.w	d0,vblCount(a0) 	;									<30Apr85>
+
+			move.w	(sp)+,sr			; restore old status				<07May85>
+
+@QueueIt	jsr 	EnqueueTrap			; install it in the queue
+			moveq.l	#noErr,D0			; indicate success
+			rts 						; and return...
+
+VTypeError	moveq.l	#VTypErr,d0 		; flag the error
+			rts 						; and return...
+
+
+;_______________________________________________________________________
+;
+; The VREMOVE trap routine removes a vertical retrace control block from the
+; VBL queue. On entry, A0 points to the control block.	D0 returns the error
+; code; all other registers are preserved.
+;
+;_______________________________________________________________________
+;
+VRemove	 	cmpi.w 	#vType,VBLType(a0)	; is it the proper type?
+			bne.s	VTypeError			; if not, exit with error
+
+			move.l	a1,-(sp)			; preserve A1
+			lea 	VBLQueue,a1 		; get address of queue
+			jsr 	DequeueTrap			; remove it from the queue
+			movea.l	(sp)+,a1			; restore A1
+AnRTS		rts							; return Dequeue error code
+
+
+;_______________________________________________________________________ <1.3>
+;
+; we put the code for the VBL interrupt handler next
+;
+; NOTE:	This handler expects that the interrupt is still pending, and clears
+;		it by clearing the CA1 interrupt flag on VIA 1 (base address passed
+;		in register A1).  On OSS based machines, this is not quite the case,
+;		A1 is setup to point to OSS60HzAck-VIFR, so that when the write to
+;		VIFR(A1) is done, it will actually write to OSS60HzAck.  Be Carefull!
+;
+;_______________________________________________________________________
+
+;
+; Fake time manager VBL interrupts enter here
+;
+PseudoVBLInt
+			movea.l a1, a0
+			move.l	#-16626,d0			; 60.15 Hz
+			movea.l jPrimeTime, a1
+			jsr		(a1)				; restart time manager task
+			bra.s	BumpTicks			
+VBLInt
+		eieioSTP
+			move.b	#1<<ifCA1,vIFR(a1)	; clear and re-enable vertical retrace interrupts
+		eieioSTP
+BumpTicks
+			addq.l	#1,Ticks			; bump tick count
+			bset.b	#inVBL,qFlags+VBLQueue ; already in the VBL mgr?
+			bne.s	AnRTS				; if so, skip it this time
+			
+			ANDI.W 	#$F8FF,SR			; open up interrupts					<1.3>	<SM5> rb
+
+; We call the cursor task every vertical retrace and the keyboard and mouse
+; button tasks every other one, so these calls are just "hardwired" in.
+
+			move.l	StkLowPt,d0
+			beq.s	@StackOk
+			cmpa.l	d0,sp				; new low?
+			bhs.s	@CheckStack
+			move.l	sp,StkLowPt 		; new low in stack movement
+
+@CheckStack	movea.l	ApplZone,a1
+			cmpa.l	BkLim(a1),sp
+			bhs.s	@StackOk			; br if no crash (always another time)
+			moveq.l	#dsStknHeap,d0
+			_SysError					; it may already be too late . .
+
+@StackOk
+
+; now we service the VBL queue . . .
+
+			lea 	VBLQueue,a1 		; A1 points to the queue
+
+RunVBLs		lea		qHead-vblink(a1),a0	; setup to fetch head of list
+@VBLloop 	move.l	vblink(a0),d0		; advance to next block
+			beq.s	@VBLDone			; if queue is empty, exit
+
+; Here we update the counter in the vertical retrace control block and
+; call the appropriate routine when it times out. A0 points to the current
+; block.
+
+			movea.l	d0,a0				; get pointer to next VBL control block
+			subq.w	#1,vblCount(a0) 	; decrement the counter
+			bne.s	@VBLloop			; if non-zero, don't bother
+
+			move.l	a0,-(sp)			; preserve A0 (pointer to VBL ctl block)
+			move.l	a1,-(sp)			; preserve queue header pointer
+
+			movea.l	vblAddr(a0),a1		; get address of service routine
+			jsr 	(a1)				; call the routine with A0 pointing to the block
+			
+			movea.L (sp)+,a1 			; restore A1
+			movea.L (sp)+,a0 			; restore A0
+
+			tst.w 	vblCount(A0)		; did the routine reset count?
+			bne.s	@VBLloop 			; if not, leave it in the queue
+
+; unlink the element since it timed out
+
+			jsr 	DequeueTrap			; unlink it
+			bra.s	@VBLloop			; and search the rest of the queue
+
+@VBLDone	bclr.b   #inVbl,qFlags(a1)	; remember that we're done!
+*			moveq.l	#noErr,d0			; no error (d0=0 from code at @VBLloop)
+			rts							; return with success
+
+;_______________________________________________________________________
+;
+; The following routines handle slot VBL tasks for the NuBus system
+;_______________________________________________________________________
+
+			with	slotVBLInfo
+
+;	In order to share code, we take advantage of structure of the low memory
+;	variables associated with the classic VBL manager, and group the queue
+;	header and tick count in the same way for slots.
+
+			_AssumeEq	slotTickCount-slotVBLQHdr,Ticks-VBLQueue
+
+;_______________________________________________________________________
+;
+; Routine:		GetSlotVBLQHdr
+;
+; Arguments:	D0 (input) :	video card slot ($0..$E possible)
+;				D0 (output):	error code
+;				A1 (output):	address of SlotVBLQHdr for requested slot
+;
+; Function: 	Utility routine to do check for valid slot number, and return
+;				the address of the associated slot VBL queue header.
+;				If the slot number is out of range, an error code will be
+;				returned, and the routine will return to the callers caller,
+;				instead of directly to the caller.
+;
+; Called by:	SlotVInstall, SlotVRemove, AttachVBL, DoVBLTask
+;
+; Registers Used: D0,A1
+;_______________________________________________________________________
+
+			with	slotIntGlobals
+GetSlotVBLQHdr
+			ext.w	d0					; ignore high byte
+			cmpi.w	#sLastSlot,d0		; check for valid slot #
+			bgt.s	@slotTooBig			; return error if too big
+			movea.l	([SlotQDT],d0.w*4,slotVBLPtrs),a1	; point to the VBL queue header
+			rts							; return with success
+
+@slotTooBig	move.w	#smSlotOOBErr,d0	; return with slot # error
+			addq.w	#4,sp				; pop the return address
+			rts							; return to callers caller
+			endwith
+
+;_______________________________________________________________________
+;
+; Trap:			_SlotVINSTALL
+;
+; Arguments:	A0 (input) :	address of vertical retrace control block
+;				D0 (input) :	video card slot ($0..$E possible)				<v1.2>
+;				D0 (output):	error code -	0   no error
+;											   -2   invalid queue element type
+;											   -360 invalid slot #
+;
+; Function: 	Installs a slot specific vertical retrace routine which is 
+;				called after VBLCOUNT(A0) video frames.  The count is treated
+;				as being in units of the slot's VBL time (e.g. 1/67th sec for
+;				the standard system monitor).  Phase parameter is treated in 
+;				same way as for Mac+ VBL tasks with substitution of a "slot
+;				tickcount" in place of the global TICKS value.
+;
+; Registers Used: D0,D1,D2,A0,A1
+;_______________________________________________________________________
+
+SlotVInstall
+			bsr.s	GetSlotVBLQHdr		; find the VBL Queue for the slot
+			bra		VInstallCommon		; install the slot VBL handler
+
+;_______________________________________________________________________
+;
+; Trap:			_SlotVRemove
+;
+; Arguments:	A0 (input) :	address of vertical retrace control block
+;				D0 (input) :	video card slot ($0..$E possible)				<v1.2>
+;				D0 (output):	error code -	0  no error
+;											   -2  invalid queue element type
+;
+; Function: 	Removes a slot specific vertical retrace control block from the
+; 				slot's VBL queue.
+;
+; Registers Used: D0,D1,A1
+;_______________________________________________________________________
+
+SlotVRemove	bsr.s	GetSlotVBLQHdr		; find the VBL Queue for the slot
+			cmpi.w 	#vType,VBLType(a0)	; is it the proper type?
+			bne		VTypeError			; if not, exit with error
+			jmp 	DequeueTrap			; remove it from the queue, and return
+
+
+;_______________________________________________________________________
+;
+; Trap:			_AttachVBL
+;
+; Arguments:	D0 (input) :	new video card slot for system VBL ($0..$E possible)	<v1.2>
+;				D0 (output):	error code
+;
+; Function: 	Does setup of ptr in slot VBL table to main system VBL queue.  
+;
+; Registers Used: D0,D1,A1
+;_______________________________________________________________________
+
+AttachVBL	bsr.s	GetSlotVBLQHdr		; find the VBL Queue for the slot
+			move.l	a1,ScrnVBLptr		; save new screen VBL ptr
+			moveq.l	#noErr,d0			; no error
+			rts							; and return with success
+
+
+;_______________________________________________________________________
+;
+; Trap:			_DoVBLTask
+;
+; Arguments:	D0 (input) :	video card slot ($0..$E possible)			<v1.2>
+;				D0 (output):	error code
+;
+; Function: 	Triggers servicing of slot specific VBL queue.  
+;
+; Registers Used: D0,D1,A1
+;_______________________________________________________________________
+
+DoVBLTask	bsr.s	GetSlotVBLQHdr		; find the VBL Queue for the slot
+
+; first update the slot's "tickcount"
+
+			addq.l	#1,slotTickCount-slotVBLQHdr(A1)	; increment slot tickcount
+			
+; check if main system queue being serviced
+
+			cmpa.l	ScrnVBLPtr,a1		; is it the main screen?
+			bne.s	@cursorDone			; skip if not
+			move.l	JCrsrTask,d0		; else call the cursor task
+			beq.s	@cursorDone			; if there is one installed
+			movea.l	d0,a0				; there is - go do it
+			move.l	a1,-(sp)			; save queue header ptr
+			jsr		(a0)				; run the cursor task
+			movea.l	(sp)+,a1			; restore queue ptr
+@cursorDone
+
+; now we service the VBL queue . . .
+
+			bra		RunVBLs				; run the VBL tasks, return with success
+			endwith
+
+;_______________________________________________________________________
+;
+; Routine:		InitVBLQs
+;
+; Arguments:	none
+;
+; Function:		Initializes the variables related to Slot VBL's.
+;				
+; Registers Used: A0
+;_______________________________________________________________________
+
+InitVBLQs		LEA		DoVBLTask,A0			; and save hook to  
+				MOVE.L	A0,JVBLTask				;  VBL task execute routine
+				CLR.L	ScrnVBLPtr				; init main screen ptr save global
+				RTS								; exit to caller
+
+			end 
+

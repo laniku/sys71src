@@ -1,0 +1,159 @@
+;
+;	File:		forXO.a
+;
+;	Copyright:	© 1990, 1992 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 11/5/92	SWC		Changed INCLUDEs to a LOAD of StandardEqu.d.
+;		 <2>	  3/9/90	PWD		merge from xo split-off; fixes to opt-cmd pram setting and open
+;									code
+;		 <1>	 2/20/90	PWD		first checked in
+;
+
+			PRINT	OFF
+			LOAD	'StandardEqu.d'
+			INCLUDE	'Slots.a'					; Slot equates
+			INCLUDE	'ROMequ.a'					; Slot ROM declarations
+			INCLUDE	'NetBootEQU.a'				; netBoot defs
+			PRINT	ON
+
+
+InstallNetBoot	PROC	EXPORT
+			IMPORT		netBoot
+			IMPORT		DoDrvrOpen
+
+			movem.l	d1-d7/a0-a7, -(sp)		; save most regs
+;
+; see if we are enabled
+;
+			clr		-(sp)					; make read area for _ReadXPram
+			move.l	sp,a0					; place to read
+			move.l	#$00010007, d0			; one byte, location 7 (forth net booting byte)
+			_ReadXPRam						; trashes D0, puts byte in (a0)
+			move	(sp)+, d0				; "pop" the return value
+			and		#BOOT_ENABLE<<8, d0		; mask for enabled bit but in high byte
+			beq		@done					; punt if not enabled
+		
+;
+; CheckForResetPRAM: Checks for the Cmd-Option-N-B keys down, resets our byte if so
+; stolen from startinit.a
+
+			lea		@Keys,a1			; keys to check for								
+			lea		KeyMap,a0			; compare to the Key Down Map					
+			moveq.l	#4-1,d0				; compare loop count
+@loop		cmpm.l	(a0)+,(a1)+			; check for exactly this combo
+			dbne	d0,@loop			; examine the entire key map
+			bne		@ok					; if not equal, keep going
+										; otherwise, reset pram and go home
+			clr		-(sp)				; make read area for _WriteXPram
+			move	sp,a0				; place to read for write
+			move.l	#$00010007, d0		; one byte, location 7 (forth net booting byte)
+			_ReadXPRam					; pick up existing flags byte
+			andi.w	#$7FFF, (sp)		; clear boot enabled flag
+			move.l	sp,a0				; reset a0 for the next call
+			move.l	#$00010007, d0		; one byte, location 7 (forth net booting byte)
+			_WriteXPram
+			tst		(sp)+				; pop stack
+			bra		@done				; go home
+
+@Keys		dc.l	$00080000			; I just looked at keymap in macsbug, I have no idea
+			dc.l	$00208004			; which bit is which
+			dc.l	$00000000
+			dc.l	$00000000
+;
+; We are enabled! Open the netBoot driver.
+;
+@ok			lea		netBoot, a3			; point to driver to install
+			move	#49, d3				; set the refnum
+			bsr		DoDrvrOpen
+			tst		d0					; set ccr's
+@Error		
+@done		movem.l	(sp)+,d1-d7/a0-a7	; restore most regs
+			rts
+			ENDP
+
+DODRVROPEN		PROC	EXPORT
+;
+; First, find an empty unit table entry using d3 as a starting place.
+;
+			lsl		#2, d3				; turn index into offset
+			move.l	UTableBase, a0		; pick up unit table
+@10			tst.l	0(a0,d3.w)			; anybody home?
+			beq.s	@20
+			addq.w	#4, d3				; bump refnum
+			bra.s	@10
+;
+; setup a param block for _DrvrInstall
+;
+@20			lsr		#2, d3				; turn offset into index
+			sub		#ioQElSize,sp		; allocate ioQElement
+			move.l	SP,a0				; a0 -> ioQElement
+			clr.b	ioPermssn(a0)		; clear permission byte
+			move	d3,d0				; d0 = driver number
+			add		#1, d0				; add one and...
+			neg		d0					; amke it a refnum
+			move	d0,ioRefnum(a0)		; Set in PB
+			_DrvrInstall				; Make DCE
+			bne.s	@Error				; Branch if error
+			move.l	UTableBase,A1		; A1 -> base of unit table
+			move	d3,d0				; pick up driver number
+			lsl		#2, d0				; multiply by four for long word table
+			move.l	0(A1,d0.w),a2		; a2 = handle to DCE
+			move.l	a2,a0				; set up for lock
+			_HLock						; Lock it down
+			move.l	(a2),A1				; A1 -> DCE
+			move.l	a3,a2				; a2 -> driver
+			move.l	a2,DCtlDriver(A1)	; Set in DCE (pretend ROM-based)
+			move	(a2)+,DCtlFlags(A1)	; Set flags from driver
+			clr.b	DCtlFlags+1(A1)		; Say it's ROM-based
+			move.l	(a2)+,DCtlDelay(A1)	; Set delay
+			move	(a2)+,DCtlMenu(A1)	; Set menu
+			bset	#DOpened,DCtlFlags+1(A1) ; Set flags to opened
+			move	DrvrOpen(a3),d1		; d1 = offset to open routine
+			move.l	sp, a0				; pick up that param block
+			moveq	#0,d0				; Assume no errors
+			jsr		0(a3,d1)			; Call open routine
+			move	ioRefNum(sp),d1		; d1 = driver refNum to return
+@Error		add		#ioQElSize,sp		; deallocate the IOQEl
+			tst		d0
+			rts
+			ENDP
+
+;------------------------------------------------------------------------------------
+;	DoATBootOpen
+;
+;	This routine overrides the default open for XO, opening the driver in a pc-relative
+;	manner.
+;
+;	4(sp) -> param block (ignored)
+;------------------------------------------------------------------------------------
+			CASE	OBJ					; c case for the linker
+DoATBootOpen	PROC	EXPORT
+			IMPORT	ATBOOT
+			IMPORT	DODRVROPEN
+			movem.l	d1-d7/a0-a7, -(sp)	; save most regs
+			lea		ATBoot, a3			; pick up driver
+			move	#50, d3				; driver number
+			lsl		#2, d3				; turn index into offset
+			move.l	UTableBase, a0		; pick up unit table
+			move.l	0(a0,d3.w), d0		; anybody home?
+			beq.s	@10
+			move.l	d0,a0				; put in address reg
+			move.l	(a0), a0			; dereference (point to dce)
+			cmp.l	DCtlDriver(a0), a3	; compare to atboot driver entry
+			bne.s	@10					; do real open if not
+			move	#-51, d1			; fake refnum
+			bra.s	@ok
+			
+@10			move	#50,d3
+			bsr		DODRVROPEN			; do that open
+			beq.s	@ok
+			clr		d0					; return refnum=0 if error
+			bra		@done
+@ok			move	d1,d0				; return refnum
+@done		movem.l	(sp)+,d1-d7/a0-a7	; restore most regs
+			rts
+			ENDP
+
+			END

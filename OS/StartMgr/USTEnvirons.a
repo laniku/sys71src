@@ -1,0 +1,2235 @@
+;__________________________________________________________________________________________________
+;
+;	File:		USTEnvirons.a
+;
+;	Contains:	This file contains routines which perform necessary housekeeping
+;				in order to run tests in the ROM.  They also provide the interface
+;				between the serial test manager and the ROM based CTE kernel.
+;
+;	Written by:	Scott Smyers
+;
+;	Copyright:	© 1990, 1992-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM5>	 9/13/93	SAM		Added a flag to USTInit to tell it not to call SizeMem (again!).
+;	   <SM4>	 11/3/92	rab		Roll in Horror changes. Comments Follow:
+;				<H12>	 7/27/92	AL		Fixed the IHT setup for the Address Line Test, which changed
+;											when SizeMemory changed (see comments in USTCritTests.a).
+;				<H11>	 7/15/92	AL		Fixed the UTEReturnTestInfo and UTEReturnSubtestInfo functions
+;											to work correctly, modified some comments to be more accurate.
+;				<H10>	  7/9/92	AL		Did some fine tuning of a few routines for STM and the IHT hook.
+;				<H9>	07-07-92	jmp		Fixed previous check-in comments.
+;				<H8>	07-07-92	jmp		Had to conditionally remove the BigBSR to DataBusTest
+;											due to an assembler error when the -ram option is
+;											used.  Anyone know/care why?
+;				<H7>	  7/1/92	AL		Fixed a couple of things in the IHT hook. Preserving the
+;											environment across IHT_Init and fixing a small stack
+;											messer-upper is about it. Added some more comments for fun and
+;											enjoyment.
+;				<H6>	 6/17/92	AL		Fixed the UTEExecuteDTM routine to correctly access a couple of
+;											variables relative to the stack.
+;				<H5>	  6/7/92	AL		Fixed a minor problem with a couple of <H4> comments that
+;											weren't separated from the code, which could possibly cause an
+;											assembly process anomoly.
+;				<H4>	  6/7/92	AL		Added some comments to help demistify some of the sources. Fixed
+;											the environment checking logic to find and execute the correct
+;											tests for the given situation (startup, restart, etc.). Fixed
+;											the critical test access mechanism for the IHT hook.
+;	   <SM3>	 9/25/92	RB		Changed a BSR6 macro to jump.
+;	   <SM2>	  5/2/92	kc		Roll in Horror. Comments follow:
+;		<H3>	  3/6/92	AL		After the conditionalized PROC mods made by jmp, it was
+;									discovered
+;									that the original USTStartTest.a had outgrown its allocated
+;									space
+;									in the ROM. So, I had to create a new file, USTSTartTest1.a, and
+;									moved this file and USTTestMgr.a into it. It takes a little less
+;									than 16k from OverPatch1.a, and currently uses about 6k.
+;									Other changes include the removal of all obsolete pre-CTE v2.1
+;									routines and references. Made the conversion to CTE v2.1. Added
+;									greater functionality to the Serial Test Manager and Board
+;									Tester Hook (IHT) to support the new CTE. Enhanced some of the
+;									comments to more accurately reflect what the code is actually
+;									doing.
+;		<H2>	01/27/92	jmp		Conditionalized the PROC parts of this file for use in lining up
+;									the UST part of HORROR with that of TERROR/Zydeco.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;	  Pre-Horror ROM comments begin here.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;		 <7>	 4/22/91	BG		Rolling in Scott Smyers changes: restore the diagnostic ROM
+;									entry point before returning to the IHT ROMs, and other fixes to
+;									this hook. Also, added the raw cte install test and subtest
+;									calls to the CTE dispatch table for use by IHT code.
+;		 <6>	 4/13/91	BG		Rolling in Scott Smyers changes: Added the board tester ROM hook
+;									code to this file from USTTestMgr.a. In the process, I changed
+;									the code so that it leverages off of the new CTE engine I added
+;									to the Serial test manager. That engine is in this file, so
+;									that's why I moved it.
+;		 <5>	  4/2/91	CCH		Rolled in Scott Smyers' changes: Added support for new test list
+;									structure element names. Made the "install test" algorithm into
+;									a loop to install all ROM based tests.
+;		 <4>	 3/13/91	CCH		Rolled in RBI changes from Scott Smyers.
+;		 <3>	 1/24/91	CCH		Rolled in changes from Scott Smyers.
+;		 <2>	 1/14/91	CCH		Rolled in Scott Smyers' changes.
+;		 <1>	12/14/90	HJR		Adding for the first time.
+;		 
+;__________________________________________________________________________________________________
+
+	TITLE	'USTEnvirons.a'
+	CASE	OFF
+
+EnvironProc		PROC
+
+	IMPORT	SizeMemory
+	IMPORT	JGetHardwareInfo
+	IMPORT	USTCPUList
+	IMPORT	USTSubtests
+	IMPORT	USTInit
+	IMPORT	CopyPRAMToRAM
+	IMPORT	CopyRAMToPRAM
+	IMPORT	GetChar
+	IMPORT	OutChar
+
+	IMPORT	Mod3Test					;	<H4><SM4>
+	IMPORT	RevMod3Test					;	<H4><SM4>
+	IMPORT	RomTest						;	<H4><SM4>
+	IMPORT	StartUpROMTest				;	<H4><SM4>
+	IMPORT	ExtRAMTest					;	<H4><SM4>
+	IMPORT	AddrLineTest				;	<H4><SM4>
+	IMPORT	DataBusTest					;	<H4><SM4>
+	IMPORT	dynamic_bussize_test		;	<H4><SM4>
+
+	IMPORT	GI_InitInterface
+	IMPORT	GI_GetVersion
+	IMPORT	GI_ExecuteDTM
+	IMPORT	GI_AllocPermMem
+	IMPORT	GI_AllocTempMem
+	IMPORT	GI_FreeTempMem
+	IMPORT	ClkWpOff
+	IMPORT	USTCPUList
+	IMPORT	USTTests
+	IMPORT	TJump						;	<SM4>
+	
+	EXPORT	USTMainTest
+	EXPORT	SetupForExecuteDTM
+	EXPORT	UTECmd
+	EXPORT	diagROMentry
+
+	; These equates are used by the UTEReturnTestInfo and UTEReturnSubtestInfo functions. They	<SM4>
+	; are defined in the OPPOSITE order of the USTTest and USTSubtest structure definitions,	<SM4>
+	; because they are used to place the USTTest entries on the stack as local variables		<SM4>
+	; in preparation for the SendData call. Local variables are referenced with negative		<SM4>
+	; offsets from the stack frame pointer (in this case, it's going to be A5):					<SM4>
+	
+resultSizeLoc		equ		-4			; this many bytes off of A5, for the SendData routine	<H11><SM4>
+paramSizeLoc		equ		-8			; this many bytes off of A5, for the SendData routine	<H11><SM4>
+codeSizeLoc			equ		-12			; this many bytes off of A5, for the SendData routine	<H11><SM4>
+namePtrLoc			equ		-16			; this many bytes off of A5, for the SendData routine	<H11><SM4>
+testAddrLoc			equ		-20			; this many bytes off of A5, for the SendData routine	<H11><SM4>
+testIDSizeLoc		equ		-24			; this many bytes off of A5, for the SendData routine	<H11><SM4>
+
+
+USTMainTest
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This routine is the test in the ROM.  This routine is CTE Type 2 style. When
+; executed it sets up the registers as needed for the ROM based subtests, then calls
+; the requested ROM subtest using the BSR6 convention. Note that although this is a
+; CTE style test in as much as the stack has the expected parameters for a CTE test,
+; none of the ROM-based noncritical tests (subtests in CTE lingo) use these values. In
+; fact, all they need are the decoder and product info ptrs, and the bases valid flags.
+; However, for the sake of conformity future enhancement to the ROM-based non critical
+; subtests and stuff like that, this routine is setup to be like a real CTE test.
+;
+;	Input:	Information on the stack according to the following format:
+;
+
+USTTestCallStack	RECORD	0,increment
+
+@A6Link			ds.l	1		; saves space for the "linked" A6
+@ReturnAddr		ds.l	1		; caller's return address
+@CTEGlobs		ds.l	1		; pointer to the CTE globals
+@testParams		ds.l	1		; pointer to the test parameter block
+@testResults	ds.l	1		; pointer to the test result block
+@subtestParams	ds.l	1		; pointer to subtest parameter block
+@SubTestID		ds.l	1		; subtest ID
+					ENDR
+
+;
+;	Output:
+;		Executes a test
+;
+;----------------------------------------------------------------------
+@savedRegs	reg	a0-a5/d1-d7
+
+	WITH	USTSubtest, USTGlobals, ProductInfo, USTTestCallStack
+
+		link	a6,#0
+		movem.l	@savedRegs,-(sp)		; save these during this operation
+		movea.l	@CTEGlobs(a6),a3		; get a pointer to the globals so I can get to
+		movea.l	a3,a4					; the HW info, and save this for later
+
+
+;	All of the ROM-based non-critical tests expect a0, a1, d0 and d2 to be pointing to
+;	some valid information on entry. Therefore, these registers must be setup before
+;	jumping into the subtest. The Terror ROM had the CTE globals modified to include
+;	access to this information, but there is a way to do it while maintaining compatibility
+;	with the stock CTE. That way is to use the userInfo pointer of the ExecutionOptions
+;	parameter to ExecuteDTM to hold a pointer to the USTGlobals structure (which contains
+;	the necessary hardware info). This test can look through the CTE globals to the
+;	ExecutionOptions field, then through this field to the USTGlobals:
+
+
+;		CASE	ON							; if this is disabled, things build better...
+		WITH  CTEInfo, CTESubtestInfo, CTEDTMExecutionOptions
+			movea.l	subtestInfo(a3),a3			; get a ptr to the subtest info...
+			movea.l	functionEntry(a3),a3		; and get the entry point
+			movea.l	executionOptions(a4),a4		; get the execution options ptr
+												; get the ptr to the userInfo (which
+												;	points to the USTGlobals)
+			movea.l	CTEDTMExecutionOptions.userInfo(a4),a4 
+												
+		ENDWITH
+;		CASE OFF
+		
+;	Here's where the actual hardware info registers are filled in:
+
+		move.l	BasesValidFlags(a4),d0	; get the bases valid flags
+		movea.l	DcdrInfPtr(a4),a0		; and decoder info pointer for tests
+		movea.l	PrdctInfPtr(a4),a1		; and product info pointer
+		move.w	ProductKind(a1),d2		; get our box flag and decoder kind info
+	
+
+;	Now prepare to execute the subtest and return the results:
+
+		moveq.l	#0,d6					; zero out the result register
+		movem.l	a6,-(sp)				; save our registers
+		
+		lea		@1,a6					; setup return address					<SM3> rb
+		jmp		(a3)					; and execute the subtest				<SM3> rb
+@1										;										<SM3> rb
+
+		movem.l	(sp)+,a6				; restore our registers
+		move.l	d6,d0					; return with error code (the result from a
+										; C function should be in D0, and since this
+										; is simulating a C function, put it there)
+
+		movem.l	(sp)+,@savedRegs		; restore all registers
+		unlk	a6
+
+		rts								; and return
+
+	ENDWITH
+
+;	End of USTMainTest
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+;----------------------------------------------------------------------
+;
+;	This table (STM_Util) holds relative entry points to utility functions used by the
+;	Serial Test Manager (STM), to facilitate STM-specific operations, including the
+;	use of the CTE kernel. There is a separate table, GI_Table, which contains relative
+;	entry points for the GenericInterface routines used to manipulate the CTE environment.
+;
+;
+STM_Util
+
+	dc.l UTEReset					-STM_Util	; Init or re-init the CTE kernel (MUST BE FIRST!!!)
+	dc.l UTEExecuteDTM				-STM_Util	; execute a DTM given the test & subtest IDs
+	dc.l UTEDownloadTest			-STM_Util	; download a test
+	dc.l UTEDownloadSubtest			-STM_Util	; download a subtest
+	dc.l UTEDownloadExecutionOptions -STM_Util	; download an execution options structure
+	dc.l UTEDownloadExecutionResults -STM_Util	; download an execution results structure
+	dc.l UTEDumpRAM					-STM_Util	; dump a section of RAM to the host
+	dc.l UTEReadPRAM				-STM_Util	; read an area of PRAM				<T4>
+	dc.l UTEWritePRAM				-STM_Util	; write an area of PRAM				<T4>
+	dc.l UTEReturnTestInfo 			-STM_Util 	; return the vital statistics of a given
+												;	ROM-based test
+	dc.l UTEReturnSubtestInfo		-STM_Util 	; do the same for a subtest
+		
+STM_UtilSize	equ		(*-STM_Util)>>2			; number of jump table entries
+;----------------------------------------------------------------------
+
+
+;----------------------------------------------------------------------
+;
+;	This table (GI_Table) contains relative entry points for the GenericInterface
+;	routines used to manipulate the CTE environment. It is used by both the Serial Test
+;	Manager (STM) and In-House Tester hook (IHT - sometimes known as the board testers
+;	or diagnostic ROMs).
+;
+;	These environments would use this table to access the GI_ExecuteDTM call directly
+;	only if they wanted to take care of their own DTMs (setting up the testInfo,
+;	subtestInfo, executionOptions structures, etc.) that are NOT in the system ROM,
+;	and just use the STM/IHT hooks to handle making the calls to the Generic Interface.
+;
+;	When they want to execute DTMs that exist in the ROM, all they need to do is
+;	request the special DiagExecuteDTM (for the IHT hook) or UTEExecuteDTM (for STM)
+;	routines and supply the test and subtest IDs. Those two routines can take care of
+;	the rest of the work (setting up the structures, etc.).
+;
+GI_Table
+
+	CASE ON
+															; These are the ID values as
+															; documented in the STM manual
+		dc.l	GI_InitInterface				-GI_TABLE	;100
+		dc.l	GI_GetVersion					-GI_TABLE	;101
+		dc.l	GI_AllocPermMem					-GI_TABLE	;10B
+		dc.l	GI_AllocTempMem					-GI_TABLE	;10C
+		dc.l	GI_FreeTempMem					-GI_TABLE	;10D
+		dc.l	GI_GetCommentary				-GI_TABLE	; ?????
+		dc.l	GI_GetDefaultExecutionOptions	-GI_TABLE	; ?????
+		dc.l	GI_ExecuteDTM					-GI_TABLE	; ?????
+
+	CASE OFF
+
+GI_TableSize	equ		*-GI_Table
+;----------------------------------------------------------------------
+
+
+
+UTECmd
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This is the entry point for the interface to the serial test manager "!" commands.
+; The "*" commands are handled in the USTTestMgr.a source file. This code receives
+; the CTE command string, decodes it, then executes the selected command. The format
+; of the command string is as follows:
+;
+;		!<offset><# params><params><other>
+;
+;		Where:  <offset>	- (long) Command number (offset into jump table below)
+;				<# params>	- (word) Number of bytes to receive for calling params
+;				<params>	- (longs) Parameters for command, must agree with <# params>
+;				<other>		- (bytes) Other information, such as test/subtest code
+;
+; This routine assumes that the stack is pointing to somewhere useful.  If an
+; initialize command is received, the stack will be moved around.
+;
+; If the command received is not an initialize command, this code assumes that the
+; UTEReset command has already been executed, and that the stack looks like this (the
+; UST Globals pointer is the first item on the stack):
+;
+GICodeBase	equ		$10000				;base number for GI routines
+cmdBytes	equ		6
+;
+StackFrame1		RECORD	0, Increment	;Starts at offset 0 into the stack
+
+@return			ds.l	1				;Return address
+@myGlobs		ds.l	1				;Our local global data
+
+	ENDR
+;
+;
+; Note that the various STM_Util routines have different stack frame needs. Some calls
+; don't need any information added to the stack beyond what is already here when this
+; routine is entered. Others need a substantial amount of information set up on the
+; stack. So, the burning question is: WHO sets up the stack for these calls? The
+; burning answer is: THIS ROUTINE, BASED ON THE COMMAND LINE FROM STM.
+;
+; Here's how it works. In the command line prototype above, the #params field gives
+; me the number of bytes that will be coming in for the particular request. It is the
+; responsibility of the user (whether that be a person using MacTerminal to control
+; STM or running a diagnostics tool that provides a friendly interface to STM or
+; whatever) to provide this information when typing in the command. From here, I can
+; pick that information from the serial port, push it on the stack, and make the
+; necessary utility call. It's as simple as that.
+;----------------------------------------------------------------------
+
+	WITH	StackFrame1, USTGlobals
+		lea		-cmdBytes(sp),sp	;make room for our command number
+		move.l	sp,-(sp)			;and store a pointer to it on the stack
+		move.l	#cmdBytes,-(sp)		;command # is 4 bytes (1 long)
+		bsr		GetCmdData			;then get the command number
+		lea		8(sp),sp			;pop off our stack data
+		move.l	(sp)+,d0			;then get the command number
+		bne.s	@notInit			;continue if this is not a reset
+
+		addq.l	#2,sp				;else pop off the command stack frame size
+		movea.l	@return(sp),a6		;Get the return address (init returns directly to caller)
+		lea		STM_Util,a0			;get the pointer to the jump table
+		adda.l	(a0),a0				;offset to init routine (adjust address to absolute)
+		jmp		(a0)				;and go init
+
+@notInit
+		moveq.l	#0,d1				;clear d1 first
+		move.w	(sp)+,d1			;get the command stack frame size
+		movea.l	@myGlobs(sp),a5		;Get our globals pointer
+		movem.l	a3/d3,-(sp)			;save our SCC registers for after the call
+
+		move.l	d0,CmdNumber(a5)	;Save the command number
+		move.l	d1,CallFrameSize(a5);and get the stack frame size
+		beq.s	@CmdDecode			;continue if no additional data to fetch
+	
+		suba.l	d1,sp				;get ready to receive the stack information
+		move.l	sp,-(sp)			;save a pointer to the area on the stack
+		move.l	d1,-(sp)			;and save the number of bytes to get
+		bsr		GetCmdData			;get the data
+		lea		8(sp),sp			;pop off our stack data
+		move.l	CmdNumber(a5),d0	;retrieve the command number
+
+@CmdDecode
+		lea		STM_Util,a0			;Assume utility function
+		cmp.l	#GICodeBase,d0		;is this a GI call?
+		blt.s	@Branch				;continue if not
+		
+		lea		GI_Table,a0			;else, get the base address of the GI table
+		sub.l	#GICodeBase,d0		;and adjust the base of the cmd #
+		
+; Need to do some range checking here to see if we want to use the ROM or the
+; RAM based jump table.
+;
+;	NOTE: the previous comment was in the original sources, but I have no idea what
+;	it means. 
+	
+@Branch
+		move.l	CTEGlobals(a5),-(sp);all CTE rouines expect the globs pointer first
+		
+		lsl.l	#2,d0				;adjust the offset
+		move.l	(a0,d0.l),d0		;get the jump table entry (a relative entry at this point)
+		jsr		(a0,d0.l)			;and dispatch to proper point (adjusted to absolute)
+		addq.l	#4,sp				;pop off the CTE globs
+		
+		adda.l	CallFrameSize(a5),sp;pop our data off the stack
+		movem.l	(sp)+,a3/d3			;restore the SCC information
+	ENDWITH
+	
+	
+
+	move.l	d0,-(sp)		;put data to report on the stack
+	move.l	sp,-(sp)		;put the address of the data on the stack
+	move.l	#4,-(sp)		;and the number of bytes to send
+	bsr		SendData		;send out the contents of d0
+	lea		8(sp),sp		;pop our stuff off the stack
+	moveq.l	#0,d0			;clear the return status
+	
+	move.l	(sp)+,d6		;put the return status into the result register
+	beq.s	@finish			;did we have an error?
+	move.b	#'X',d0			;Signal the world if so
+	
+@finish
+	rts								;and return
+
+;	End of UTECmd
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+
+UTEReset
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+;	UTEReset creates a fresh set of UST globals and CTE globals. It should only
+;	be called once, after memory has been tested and validated. In the process, this
+;	routine calls USTInit, which will size memory and set up the stack. So, this is
+;	where it all begins. When we're done here, we go back to the entity that called
+;	the UTECmd routine in the first place; there is no further interaction with the
+;	STM stuff until the entity starts requesting operations.
+;
+;	NOTE: The BSR6 to USTInit was changed to a BigBSR6 because this file was taken
+;	out of USTStartTest.a and put into USTStartTest1.a, and the branch became too
+;	far for a BSR6.		HAL 2/12/92
+;
+	WITH	USTGlobals
+		move.l	a6,usp						; save the return address
+		move	#0,D2						; Tell USTInit to call SizeMem				<SM5>
+		BigBSR6	USTInit,a0					; Initialize the universal environment		<T7>
+
+		move.w	#RunBits.STM,RunMode(a5)	; set the run mode for serial test manager
+
+		suba.l	#SizeOfCTEGlobals,sp		; allocate our CTE global area on the stack
+		move.l	sp,CTEGlobals(a5)			; save the global area pointer
+
+		move.l	a5,-(sp)					; save our global pointer
+		move.l	usp,a0						; now put the return address on the stack
+		move.l	a0,-(sp)
+
+		movea.l	CTEGlobals(a5),a0			; get the globs pointer
+
+		CASE ON
+			GIM_InitInterface	(a0),#SIZEOFCTEGLOBALS	; init the CTE interface
+		CASE OFF
+	ENDWITH
+
+	rts										; this returns directly to the caller of UTECmd
+
+;	End of UTEReset
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+UTEDumpRAM
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This routine sends a section of RAM to the host.  The start address and
+; size of the transfer are specified in the calling sequence.
+;
+;	The following record describes the stack on input to this routine:
+StackFrame2		RECORD	0, Increment	;Starts at offset 0 into the stack
+
+@return			ds.l	1				;Return address
+@CTEGlobs		ds.l	1				;Pointer to CTE globals (not used here)
+@startAddr		ds.l	1				;Start address of RAM to dump
+@size			ds.l	1				;number of bytes to dump
+
+	ENDR
+;
+;----------------------------------------------------------------------
+	WITH	StackFrame2
+		movea.l	sp,a0
+		move.l	@startAddr(a0),-(sp)	;put the start address on the stack
+		move.l	@size(a0),-(sp)			;and the size
+		bsr		SendData				;transmit the data
+		lea		8(sp),sp				;pop the data off the stack
+	ENDWITH
+	moveq.l	#0,d0						;clear the return status
+	rts
+
+;	End of UTEDumpRAM					see <T4> below
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+
+UTEReadPRAM
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This routine reads a section of PRAM and sends it to the host.  The start address and
+; size of the transfer are specified in the calling sequence.
+;
+;	The following record describes the stack on input to this routine:
+StackFrame3		RECORD	0, Increment	;Starts at offset 0 into the stack
+
+@savedA6		ds.l	1				;location for "linked" A6 register
+@return			ds.l	1				;Return address
+@CTEGlobs		ds.l	1				;Pointer to CTE globals (not used here)
+@startAddr		ds.w	1				;Start address of PRAM to dump
+@size			ds.w	1				;number of bytes to dump
+
+	ENDR
+;
+;----------------------------------------------------------------------
+	WITH	StackFrame3, USTGlobals
+		link	a6,#0						;get our stack frame pointer
+		
+		movea.l	DcdrInfPtr(a5),a0			;get the pointer to the decoder info
+		movea.l	PrdctInfPtr(a5),a1			;and the product info
+		movea.l	DecoderInfo.VIA1Addr(a0),a2	;then get the VIA1 pointer
+		
+		suba.w	@size(a6),sp				;make room for the data in RAM
+		movea.l	sp,a4						;get the address of this area
+		
+		movem.l	d3/a3-a4/a6,-(sp)			;save our local variables
+		
+		move.w	@startAddr(a6),a3			;get the PRAM source address			<H8><SM4>
+		move.w	@size(a6),d3				;get the size							<H8><SM4>
+		_CopyPRAMToRAM		a3, (a4), d3	;go read PRAM							<H8><SM4>
+		movem.l	(sp)+,d3/a3-a4/a6			;and restore our local variables
+		
+		movem.l	a6,-(sp)					;save our local data pointer
+		
+		move.l	a4,-(sp)					;now:  send the data to the serial port
+		move.w	@size(a6),d0				;get the number of bytes to move
+		ext.l	d0							;make it a long
+		move.l	d0,-(sp)					;put the size on the stack
+		bsr		SendData					;transmit the data
+		lea		8(sp),sp					;pop the data off the stack
+		
+		movem.l	(sp)+,a6					;restore our local pointer
+		
+		unlk	a6							;restore the stack
+	ENDWITH
+	moveq.l	#0,d0							;clear the return status
+	rts
+
+;	End of UTEReadPRAM
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+
+UTEWritePRAM
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This routine receives data from the host and writes it to PRAM. The start
+; address and size of the transfer are specified in the calling sequence.
+;
+;	The following record describes the stack on input to this routine:
+StackFrame4		RECORD	0, Increment	;Starts at offset 0 into the stack
+
+@savedA6		ds.l	1				;saved a6 location (used in LINK instruction)
+@return			ds.l	1				;Return address
+@CTEGlobs		ds.l	1				;Pointer to CTE globals (not used here)
+@startAddr		ds.w	1				;Start address (in PRAM) to receive data
+@size			ds.w	1				;number of bytes to dump
+
+	ENDR
+;
+;----------------------------------------------------------------------
+	WITH	StackFrame4, USTGlobals
+		link	a6,#0					;get our stack frame pointer
+		
+		move.w	@size(a6),d0			;get the number of bytes to fetch
+		ext.l	d0						;make it a long
+		suba.l	d0,sp					;make some room on the stack for the data
+		movea.l	sp,a4					;save the address of the pointer
+		
+		movem.l	a4/a6,-(sp)				;save our stack frame pointer
+		move.l	a4,-(sp)				;put address of an area to hold the data
+		move.l	d0,-(sp)				;put the number of bytes to fetch on the stack
+		bsr		GetCmdData				;go get the data
+		lea		8(sp),sp				;restore the stack
+		movem.l	(sp)+,a4/a6				;and get our stack frame pointer again
+		
+		movea.l	DcdrInfPtr(a5),a0			;get the pointer to the decoder info
+		movea.l	PrdctInfPtr(a5),a1			;and the product info
+		movea.l	DecoderInfo.VIA1Addr(a0),a2	;then get the VIA1 pointer
+		
+		movem.l	a4-a6,-(sp)				;save our local registers
+		BigBSR6	ClkWpOff,a4				;turn off the write protect bit
+		movem.l	(sp)+,a4-a6				;and restore our regs
+		
+		movem.l	a6,-(sp)				;save our local data pointer
+		_CopyRAMToPRAM	(a4), @startAddr(a6), @size(a6)	;write the data to PRAM
+		movem.l	(sp)+,a6				;restore our local pointer again
+				
+		unlk	a6						;clean it up and go home
+	ENDWITH
+	moveq.l	#0,d0						;clear the return status
+	rts
+
+;	End of UTEWritePRAM														<T4>^
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+UTEExecuteDTM
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This routine gives the host one-stop-shopping for executing ROM-based DTMs. All the
+;	user needs to know are the test and subtest IDs, and this routine does the rest.
+;	Accordingly, the stack needs to be formatted to hold the two IDs. The stack is
+;	setup by the UTECmd routine, based on the user's input stream that comes into the
+;	serial port.
+;
+;	NOTE: Like many of the CTE-related routines that support the Serial Test Manager,
+;	some assumptions have to be made. One of those is that the user (host machine) has
+;	previously requested that memory tests be executed and determined that memory is
+;	OK. Once memory tests have been executed, the CTE world should be initialized by
+;	calling the STM and requesting the UTEReset routine. After that, any more memory
+;	testing will wipe out CTE so it will have to be initialized all over again.
+;
+;	Another assumption is that a5 points to the USTGlobals structure, which it should
+;	if the user has already called the UTEReset routine.
+;
+;	Inputs:
+StackFrame5		RECORD	0, Increment	; Starts at offset 0 into the stack
+
+@savedReg		ds.l	1				; place to hold the saved value for the link			<H8><SM4>
+@return			ds.l	1				; return address is first
+@CTEGlobs		ds.l	1				; CTE globals pointer is next
+@subTestID		ds.l	1				; ROM-based subtest ID
+@testID			ds.l	1				; ROM-based test ID
+
+	ENDR
+;
+;----------------------------------------------------------------------
+@savedRegs	reg	a0-a5/d1-d5
+
+	link	a6,#0					;															<H8><SM4>
+	movem.l	@savedRegs,-(sp)		; save these during this operation
+
+	WITH StackFrame5, USTGlobals
+		move.l	@subTestID(a6),d4	; prepare for the SetupForExecuteDTM call					<H6><H8><SM4>
+		move.l	@testID(a6),d5		;															<H6><H8><SM4>
+		move.l	a6,-(sp)			; save this across the next call							<H8><SM4>
+
+		bsr6	SetupForExecuteDTM	; do a RAM-less bsr to the routine that takes
+									;	care of setting up for the execution of a DTM
+		
+		move.l	(sp)+,a6			; restore my stack frame pointer							<H8><SM4>
+	; Check for errors in setting up for the ExecuteDTM and don't try to execute the DTM
+	;	if any were found:
+	
+		cmp.l	#-1,tInfoFunctionEntry(a5)	; -1 in this field means test not found
+		beq.s	@LogError
+		cmp.l	#-1,sInfoFunctionEntry(a5)	; -1 in this field means subtest not found
+		beq.s	@LogError
+
+		movea.l	@CTEGlobs(a6),a0	; get the CTE globals pointer for GIM_ExecuteDTM			<H8><SM4>
+
+		CASE ON						; everything's OK, so do the DTM thing
+			GIM_ExecuteDTM		(a0), EXOPUSERINFO(a5), TINFOUSERINFO(a5), SINFOUSERINFO(a5), EXRESERR(a5)
+		CASE OFF
+		
+		bra.s	@End				; go clean up the stack and return the results
+	ENDWITH
+
+
+@LogError
+	move.l	#-1,d6					; return -1 indicating that either the test
+									; or subtest doesn't apply to this machine (or
+									; was not found, or can't be run from STM for
+									; some reason)
+									
+@End
+	movem.l	(sp)+,@savedRegs		; restore them registers
+	unlk	a6						; clean it up and go home									<H8><SM4>
+	move.l		d6,d0				; return any error
+	rts
+
+;	End of UTEExecuteDTM
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+
+UTEDownloadTest
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This routine is used to handle downloading tests from the host (usually another
+;	Mac running a communications program like MacTerminal, but it could be just any
+;	old black box). This glue routine receives the calling parameters for
+;	GI_InstallTest (just so it can get the size of the downloaded code and the
+;	test ID for later reference), allocates memory for the downloaded code,
+;	receives the downloaded code, then adds the test info (ID and entry point - as
+;	determined by this routine) to a RAM-based table that will be used to execute DTMs
+;	when requested by the host. DTM execution will be requested by asking for the
+;	test and subtest IDs.
+;
+;	NOTE: Like many of the CTE-related routines that support the Serial Test Manager,
+;	some assumptions have to be made. One of those is that the user (host machine) has
+;	previously requested that memory tests be executed and determined that memory is
+;	OK. Once memory tests have been executed, the CTE world should be initialized.
+;	After that, any more memory testing will wipe out CTE so it will have to be started
+;	all over again.
+;
+;	Inputs:
+StackFrame6		RECORD	0, Increment	; starts at offset 0 into the stack
+
+@return			ds.l	1				; return address
+@globs			ds.l	1				; CTE Global pointer
+@TestID			ds.l	1				; ID for downloaded test
+@TestPtr		ds.l	1				; not included as input
+@Size			ds.l	1				; size of test to download (in bytes)
+@NamePtr		ds.l	1				; not used, should be zero
+@TestUserInfo	ds.l	1				; the userInfo pointer
+@pbSize			ds.l	1				; the test parameter block size
+@rbSize			ds.l	1				; the test result block size
+
+
+	ENDR
+;
+;----------------------------------------------------------------------
+	WITH StackFrame6, USTGlobals
+		movea.l	@globs(sp),a0			; get the CTE globals pointer
+		move.l	@size(sp),d0			; get the size of the test
+
+		CASE ON
+			GIM_AllocPermMem  (a0), d0	; allocate the necessary memory from CTE
+		CASE OFF
+
+		tst.l	d0						; is everything OK? (d0 = 0 means no memory available)
+		bne.s	@allocOK				; continue if OK
+		moveq.l	#-1,d0					; report problems with allocation
+		bra.s	@error					; and error out
+		
+@allocOK
+		move.l	@size(sp),d1			; get the size of test
+		move.l	d0,-(sp)				; put the memory pointer on the stack
+		move.l	d1,-(sp)				; put the memory size on the stack
+		bsr		GetCmdData				; and receive the test code
+		move.l	(sp)+,d1				; get the size back
+		movea.l	(sp)+,a0				; and the test code pointer
+		
+	; Fill in the testInfo structure of the USTGlobals in anticipation of someday trying
+	;	to execute this test as part of a DTM. Note that I'm bypassing the normal way
+	;	of doing this (which is to call SetupForExecutDTM) because I am working with
+	;	downloaded Tests and Subtests, not ROM-based ones (the SetupForExecuteDTM routine
+	;	only works with the ROM-based DTMs):
+	
+		move.l	a0,tInfoFunctionEntry(a5)				; the entry point
+		move.l	@testID(sp), tInfoID(a5)				; the test ID
+		move.l	@TestUserInfo(sp),tInfoUserInfo(a5)		; the userInfo field
+		move.l	@pbSize(a0),tInfoParamsSize(a5)			; the paramsSize field
+		move.l	@rbSize(a0),tInfoResultsSize(a5)		; the resultsSize field
+	
+@error
+	move.l	d0,d6						; this is either the address of the downloaded
+										;	test (as determined by GI_AllocPermMem) or
+										;	-1, meaning that not enough memory was available
+	ENDWITH
+	rts
+
+;	End of UTEDownloadTest
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+
+UTEDownloadSubtest
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This routine is used to handle downloading subtests from the host (usually another
+;	Mac running a communications program like MacTerminal, but it could be just any
+;	old black box). This glue routine receives the calling parameters for
+;	GI_InstallSubtest (just so it can get the size of the downloaded code and the
+;	subtest ID for later reference), allocates memory for the downloaded code,
+;	receives the downloaded code, then adds the subtest info (ID and entry point - as
+;	determined by this routine) to a RAM-based table that will be used to execute DTMs
+;	when requested by the host. DTM execution will be requested by asking for the
+;	test and subtest IDs.
+;
+;	NOTE: Like many of the CTE-related routines that support the Serial Test Manager,
+;	some assumptions have to be made. One of those is that the user (host machine) has
+;	previously requested that memory tests be executed and determined that memory is
+;	OK. Once memory tests have been executed, the CTE world should be initialized.
+;	After that, any more memory testing will wipe out CTE so it will have to be started
+;	all over again.
+;
+;	Inputs:
+StackFrame7		RECORD	0, Increment	; starts at offset 0 into the stack
+
+@return			ds.l	1				; return address
+@globs			ds.l	1				; CTE Global pointer
+@SubtestID		ds.l	1				; ID for downloaded subtest
+@SubtestPtr		ds.l	1				; not included as input
+@Size			ds.l	1				; size of subtest to download (in bytes)
+@NamePtr		ds.l	1				; not used, should be zero
+@SubtestUserInfo ds.l	1				; the userInfo pointer field
+@pbSize			ds.l	1				; parameter block size
+@rbSize			ds.l	1				; result block size
+
+	ENDR
+;
+;----------------------------------------------------------------------
+	WITH StackFrame7, USTGlobals
+		movea.l	@globs(sp),a0			; get the CTE globals pointer
+		move.l	@size(sp),d0			; get the size of the subtest
+
+		CASE ON
+			GIM_AllocPermMem  (a0), d0	; allocate the necessary memory
+		CASE OFF
+		
+		tst.l	d0						; is everything OK?	(d0 = 0 means no memory available)
+		bne.s	@allocOK				; Continue if OK
+		moveq.l	#-1,d0					; report problems with allocation
+		bra.s	@error					; and error out
+		
+@allocOK
+		move.l	@size(sp),d1			; get the size of subtest
+		move.l	d0,-(sp)				; put the memory pointer on the stack
+		move.l	d1,-(sp)				; put the memory pointer on the stack
+		bsr		GetCmdData				; and receive the subtest code
+		move.l	(sp)+,d1				; get the size back
+		movea.l	(sp)+,a0				; and the subtest code pointer
+		
+	; Fill in the subtestInfo structure of the USTGlobals in anticipation of someday trying
+	;	to execute this subtest as part of a DTM. Note that I'm bypassing the normal way
+	;	of doing this (which is to call SetupForExecutDTM) because I am working with
+	;	downloaded Tests and Subtests, not ROM-based ones (the SetupForExecuteDTM routine
+	;	only works with the ROM-based DTMs):
+	
+;;;;;	HAL	HAL	HAL	AARON 	AARON	WARNING	WARNING
+;;;;; NOTE Make sure to support the Standard Test Params thing if necessary.
+
+
+		move.l	a0,sInfoFunctionEntry(a5)				; the entry point
+		move.l	@SubtestID(sp), sInfoID(a5)				; the test ID
+		move.l	@SubtestUserInfo(sp),sInfoUserInfo(a5)	; the userInfo field
+		move.l	@pbSize(a0),sInfoParamsSize(a5)			; the paramsSize field
+		move.l	@rbSize(a0),sInfoResultsSize(a5)		; the resultsSize field
+		
+	ENDWITH
+	
+@error
+
+;;;;;	HAL	HAL	HAL	AARON 	AARON	WARNING	WARNING
+;;;;; NOTE Check to make sure what the returned address of the allocated perm mem is
+;		from GI_AllocPermMem (is it in d0 or a0)? Also, make sure that registers are
+;		used so that nothing is lost - the macros use a0, etc.
+
+
+
+
+	move.l	d0,d6						; this is either the address of the downloaded
+										;	subtest (as determined by GI_AllocPermMem) or
+										;	-1, meaning that not enough memory was available
+	rts
+
+;	End of UTEDownloadSubtest
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+
+UTEDownloadExecutionOptions
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This routine is used to handle downloading an executionOptions structure for use by the
+; ExecuteDTM routine. This is usually performed when the user is also downloading a
+; test and subtest combo to be executed as a DTM. However, the user has the option of
+; just asking the STM to make a GI_GetDefaultExecutionOptions call if there is nothing
+; special needed. The downloaded structure is placed into the executionOptions section
+; of the USTGlobals, which has been allocated from the stack (see the USTInit routine).
+;
+;	Inputs: a5 must already be pointing to the USTGlobals
+;
+;			Also, the stack needs to be setup as shown, with the size of the
+;			executionOptions structure to be downloaded. The reason for requiring the
+;			size parameter is that it helps insulate STM from CTE-specific knowledge,
+;			such as the size of data structures, etc. This is good because if anything
+;			changes about CTE, then the STM needs to know as little as possible. Since
+;			the user/host is working with CTE, it is not unreasonable to expect the user
+;			to have this information and supply it to the STM.
+;
+;			While this is a noble cause (separation of STM and CTE), it has not been done
+;			consistently throughout the ROM yet. Please be patient. Remember that old
+;			phrase, "Reorg early and reorg often"...or was that "vote early and vote
+;			often"? Anyway, remember that old phrase.
+;
+StackFrame8		RECORD	0, Increment	; starts at offset 0 into the stack
+
+@return			ds.l	1				; return address
+@globs			ds.l	1				; CTE Global pointer (not used by this routine)
+@Size			ds.l	1				; size of the executionOptions structure (in bytes)
+
+	ENDR
+;
+;	Outputs:	None. If the user gives a bogus address for the info or something else
+;				goes wrong, it's tough doo doo.
+;
+;----------------------------------------------------------------------
+	WITH StackFrame8, USTGlobals
+		move.l	@size(sp),d1			; get the size of the structure
+		pea		exOpUserInfo(a5)		; put the destination struct pointer on the stack		<H8><SM4>
+		move.l	d1,-(sp)				; put the size on the stack
+		bsr		GetCmdData				; and receive the execution options structure
+		move.l	(sp)+,d1				; get the size back										<H8><SM4>
+		move.l	(sp)+,d0				; and the pointer (to be reported to the user)			<H8><SM4>
+		
+	ENDWITH
+	rts
+
+;	End of UTEDownloadExecutionOptions
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+
+
+UTEDownloadExecutionResults
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This routine is used to handle downloading an executionResults structure for use by the
+; ExecuteDTM routine. This is usually performed when the user is also downloading a
+; test and subtest combo to be executed as a DTM. However, the user has the option of
+; not specifying an execution results structure, in which case the stock exec. results
+; structure that is allocated in the USTGlobals will be used (see the USTInit routine).
+; The downloaded structure is placed into the executionResults section of the USTGlobals.
+;
+;	Inputs: a5 must already be pointing to the USTGlobals
+;
+;			Also, the stack needs to be setup as shown, with the size of the
+;			executionResults structure to be downloaded. The reason for requiring the
+;			size parameter is that it helps insulate STM from CTE-specific knowledge,
+;			such as the size of data structures, etc. This is good because if anything
+;			changes about CTE, then the STM needs to know as little as possible. Since
+;			the user/host is working with CTE, it is not unreasonable to expect the user
+;			to have this information and supply it to the STM.
+;
+StackFrame9		RECORD	0, Increment	; starts at offset 0 into the stack
+
+@return			ds.l	1				; return address
+@globs			ds.l	1				; CTE Global pointer (not used by this routine)
+@Size			ds.l	1				; size of the executionOptions structure (in bytes)
+
+	ENDR
+;
+;	Outputs:	None. If the user gives a bogus address for the info or something else
+;				goes wrong, it's tough tomatoes.
+;
+;----------------------------------------------------------------------
+	WITH StackFrame9, USTGlobals
+		move.l	@size(sp),d1			; get the size of the structure
+		pea		exResErr(a5)			; put the destination struct pointer on the stack		<H8><SM4>
+		move.l	d1,-(sp)				; put the size on the stack
+		bsr		GetCmdData				; and receive the execution results structure
+		move.l	(sp)+,d1				; get the size back										<H8><SM4>
+		move.l	(sp)+,d0				; and the pointer (to be reported to the user)			<H8><SM4>
+		
+	ENDWITH
+	rts
+
+;	End of UTEDownloadExecutionResults
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+
+UTEReturnTestInfo
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This routine returns all of the information available to this ROM about a ROM-based
+; test. The caller passes a pointer to some memory, and it will be filled in with
+; information in the following format:
+;
+;			DS.L	Test_ID			; ID for this test
+;			DS.L	EntryPtr		; pointer to the entry point
+;			DS.L	NamePtr			; pointer to the name of this test
+;			DS.L	CodeSize		; size of the code (in bytes)
+;			DS.L	ParamSize		; size of the parameter block
+;			DS.L	ResultSize		; size of the results block
+;
+; Yes, filling in the test ID is probably redundant, but it saves the caller that much
+; sweat...
+;
+; One possible use for this routine would be to get the address so that a breakpoint
+; could be set on an emulator.
+;
+; Another use would be to get a pointer to the name, and download the name using that
+; address (the name strings are in "pcString" format, i.e., they're pascal strings with
+; terminating nulls).
+;
+;	Inputs:
+StackFrame10	RECORD	0, Increment	; starts at offset 0 into the stack
+
+@savedReg		ds.l	1				; place to hold the saved value for the link			<H8><SM4>
+@return			ds.l	1				; return address is first
+@CTEGlobs		ds.l	1				; CTE globals pointer is next
+@testID			ds.l	1				; the ID of a ROM-based test
+
+	ENDR
+;
+;	NOTE: We must leave a3 and d3 alone for the SendData call.									<H11><SM4>
+;----------------------------------------------------------------------
+@savedRegs	reg	a0-a5/d1-d5
+
+	link	a6,#0						; create a stack frame pointer							<H8><SM4>
+	movem.l	@savedRegs,-(sp)			; save these during this operation
+
+	WITH StackFrame10, USTTest
+	
+		move.l	@testID(a6),d5			;														<H8><SM4>
+		
+	; Search the USTTests list of all the ROM-based tests in this ROM (this routine
+	;	will return the address of a Test even if it doesn't apply to this machine,
+	;	just in case someone wants to try stepping through it for some reason). If it
+	;	isn't found, then return -1:
+
+		movea.l	@CTEGlobs,a0			; save these for the UTEDumpRAM call
+		BigLea	USTTests,a2				; get the Test list address
+		move.l	a2,d1					; and save it for later
+
+@searchLoop
+		cmp.l	#-1,TTest_ID(a2)		; is this the end of the list?
+		beq.s	@Error					; yup, so bail out
+		cmp.l	TTest_ID(a2),d5			; is this the test we want?
+		beq.s	@foundTest				; yup, so start getting the info
+		adda.l	#sizeofUSTTest,a2		; nope, so keep looking
+		bra.s	@searchLoop
+
+@foundTest
+
+	; Since I know the test info is available at this point, I'll set up some space on
+	;	the stack, fill it in, and setup for the UTEDumpRAM routine, which will send
+	;	it across the serial port to the host:
+
+		link 	a5,#-sizeofUSTTest			; save this much space on the stack for myself
+		move.l	sp,a1						; the source address for the SendData call			<H11><SM4>
+
+		move.l	TTest_ID(a2),testIDSizeLoc(a5)	; fill in the testID							<H11><SM4>
+		
+		move.l	TEntryPtr(a2),a4			; get the relative entry point						<H11><SM4>
+		add.l	d1,a4						;	make it absolute								<H11><SM4>
+		move.l	a4,testAddrLoc(a5)			;	and store it in its place						<H11><SM4>
+		
+		move.l	TNamePtr(a2),a4				; get the relative ptr to the name string			<H11><SM4>
+		add.l	d1,a4						;	make it absolute								<H11><SM4>
+		move.l	a4,namePtrLoc(a5)			;	and store it in the stack						<H11><SM4>
+		
+		move.l	TCodeSize(a2),codeSizeLoc(a5)	; fill in the code size							<H11><SM4>
+		
+		move.l	TParamSize(a2),paramSizeLoc(a5)	; and the parameter block size					<H11><SM4>
+		
+		move.l	TResultSize(a2),resultSizeLoc(a5)	; and finally, the result block size		<H11><SM4>
+
+	; Now, prepare the stack for a call to SendData and do it:
+	
+		movem.l	a2/a6,-(sp)					; preserve this across the call						<H8><H11><SM4>
+		move.l	a1,-(sp)					; the start address of the data to transfer			<H11><SM4>
+		move.l	#sizeofUSTTest,-(sp)		; size of the transfer
+		bsr		SendData					; transmit the data									<H11><SM4>
+		lea		8(sp),sp					; pop the data off the stack						<H11><SM4>
+		movem.l	(sp)+,a2/a6					; restore the USTTests pointer and stack frame ptr	<H8><H11><SM4>
+		unlk	a5							; clean up the stack from the link
+
+@End
+	moveq.l	#0,d0					; return zero (indicating success) or -1					<H11><SM4>
+									;	(indicating that this test is not						<H11><SM4>
+									;	available on this machine)
+
+@Error								;															<H11><SM4>
+	movem.l	(sp)+,@savedRegs		; restore them registers
+	unlk	a6						; clean it up and go home									<H8><SM4>
+
+	ENDWITH
+
+	rts
+
+;	End of UTEReturnTestInfo
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+
+UTEReturnSubtestInfo
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This routine returns all of the information available to this ROM about a ROM-based
+; subtest. The caller passes a pointer to some memory, and it will be filled in with
+; information in the following format:
+;
+;			DS.L	Subtest_ID		; ID for this subtest
+;			DS.L	EntryPtr		; pointer to the entry point
+;			DS.L	NamePtr			; pointer to the name of this subtest
+;			DS.L	CodeSize		; size of the code
+;			DS.L	ParamSize		; size of the parameter block
+;			DS.L	ResultSize		; size of the results block
+;
+; Yes, filling in the subtest ID is probably redundant, but it saves the caller that much
+; sweat...
+;
+; One possible use for this routine would be to get the address so that a breakpoint
+; could be set on an emulator.
+;
+; Another use would be to get a pointer to the name, and download the name using that
+; address (the name strings are in "pcString" format, i.e., they're pascal strings with
+; terminating nulls).
+;
+;	Inputs:
+StackFrame11	RECORD	0, Increment	; starts at offset 0 into the stack
+
+@savedReg		ds.l	1				; place to hold the saved value for the link			<H8><SM4>
+@return			ds.l	1				; return address is first
+@CTEGlobs		ds.l	1				; CTE globals pointer is next
+@subtestID		ds.l	1				; the ID of a ROM-based subtest
+
+	ENDR
+;
+;	NOTE: We must leave a3 and d3 alone for the SendData call.									<H11><SM4>
+;----------------------------------------------------------------------
+@savedRegs	reg	a0-a5/d1-d5
+
+	link	a6,#0						; create a stack frame pointer							<H8><SM4>
+	movem.l	@savedRegs,-(sp)			; save these during this operation
+
+	WITH StackFrame11, USTSubtest
+	
+		move.l	@subtestID(a6),d5		;														<H8><SM4>
+		
+	; Search the USTTests list of all the ROM-based tests in this ROM (this routine
+	;	will return the address of a Test even if it doesn't apply to this machine,
+	;	just in case someone wants to try stepping through it for some reason). If it
+	;	isn't found, then return -1:
+
+		movea.l	@CTEGlobs(a6),a0		; save these for the UTEDumpRAM call
+		BigLea	USTSubtests,a2			; get the Subtest list address
+		move.l	a2,d1					; and save it for later
+
+@searchLoop
+		cmp.l	#-1,STSubtest_ID(a2)	; is this the end of the list?
+		beq.s	@Error					; yup, so bail out										<H11><SM4>
+		cmp.l	STSubtest_ID(a2),d5		; is this the test we want?
+		beq.s	@foundSubtest			; yup, so start getting the info
+		adda.l	#sizeofUSTSubtest,a2	; nope, so keep looking
+		bra.s	@searchLoop
+
+@foundSubtest
+
+	; Since I know the test info is available at this point, I'll set up some space on
+	;	the stack, fill it in, and setup for the UTEDumpRAM routine, which will send
+	;	it across the serial port to the host:
+
+		link 	a5,#-sizeofUSTSubtest				; save this much stack space for myself
+		move.l	sp,a1								; the source address for the SendData call	<H11><SM4>
+
+		move.l	STSubtest_ID(a2),testIDSizeLoc(a5)	; fill in the subtestID						<H11><SM4>
+		
+		move.l	STEntryPtr(a2),a4					; get the relative entry point				<H11><SM4>
+		add.l	d1,a4								;	make it absolute						<H11><SM4>
+		move.l	a4,testAddrLoc(a5)					;	and store it in its place				<H11><SM4>
+		
+		move.l	STNamePtr(a2),a4					; get the relative ptr to the name string	<H11><SM4>
+		add.l	d1,a4								;	make it absolute						<H11><SM4>
+		move.l	a4,namePtrLoc(a5)					;	and store it in the stack				<H11><SM4>
+		
+		move.l	STCodeSize(a2),codeSizeLoc(a5)		; fill in the code size						<H11><SM4>
+		
+		move.l	STParamSize(a2),paramSizeLoc(a5)	; and the parameter block size				<H11><SM4>
+		
+		move.l	STResultSize(a2),resultSizeLoc(a5)	; and finally, the result block size		<H11><SM4>
+
+	; Now, prepare the stack for a call to SendData and do it:
+	
+		movem.l	a2/a6,-(sp)					; preserve this across the call						<H8><H11><SM4>
+		move.l	a1,-(sp)					; the start address of the data to transfer			<H11><SM4>
+		move.l	#sizeofUSTSubtest,-(sp)		; size of the transfer
+		bsr		SendData					; transmit the data									<H11><SM4>
+		lea		8(sp),sp					; pop the data off the stack						<H11><SM4>
+		movem.l	(sp)+,a2/a6					; restore the USTTests pointer and stack frame ptr	<H8><H11><SM4>
+		unlk	a5							; clean up the stack from the link
+
+@End
+	moveq.l	#0,d0					; return zero (indicating success) or -1					<H11><SM4>
+									;	(indicating that this test is not						<H11><SM4>
+									;	available on this machine)
+
+@Error								;															<H11><SM4>
+	movem.l	(sp)+,@savedRegs		; restore them registers
+	unlk	a6						; clean it up and go home									<H8><SM4>
+
+	ENDWITH
+
+	rts
+
+;	End of UTEReturnSubtestInfo
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+
+GetCmdData
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+;
+; This routine gets a certain number of characters from the serial port
+; using the register based routine GetChar.   Data is returned to a place in
+; RAM pointed to by a0.  The number of characters to get is in d0.  If the ASKI bit
+; in d7 is set, the data will be converted from ASCII to binary upon input.
+;
+;	Inputs:
+StackFrame12	RECORD	0, Increment	;Starts at offset 0 into the stack
+
+@return			ds.l	1				;Return address
+@byteCnt		ds.l	1				;byte count to receive
+@outputPtr		ds.l	1				;place to put the received data
+
+	ENDR
+;
+;		and the following registers:
+;
+;			a3 - SCC read base addr
+;			d3 - SCC write offset from base
+;
+;	Output:
+;		(a0) - holds the retrieved data
+;
+;	Destroyed:
+;
+;	Called by:  bsr
+;
+;----------------------------------------------------------------------
+
+	WITH	StackFrame12
+	
+		move.l	@byteCnt(sp),d1			;get the byte count
+		btst.l	#aski,d7				;is this binary we're receiveing?
+		beq.s	@binary					;branch if we're in binary mode
+		lsl.l	#1,d1					;else, adjust for ascii
+@binary
+		movea.l	@outputPtr(sp),a0		;get the output buffer pointer
+		
+@nextChar
+		movem.l	a0/a5/d1,-(sp)			;save our local copies
+@wait
+		BSR6	GetChar					;see if there's a char waiting
+		tst.w	d0						;do we have one?
+		bmi.s	@wait					;keep waiting if not
+		
+		btst.l	#echo,d7				;are we supposed to be echoing?
+		beq.s	@noEcho					;continue if not
+		move.l	d0,d1					;else, save d0
+		BSR6	OutChar					;and send out the char
+		move.l	d1,d0					;then restore the value
+		
+@noEcho
+		btst.l	#aski,d7				;binary or ascii?
+		beq.s	@noConversion			;branch if already in binary
+		cmp.b	#'a',d0					;is this an upper case letter?
+		blt.s	@notUpper				;branch if not
+		and.b	#~('a'--'A'),d0			;else, fold this to upper case
+@notUpper
+		BSR6	CvtAscii				;and convert it to binary
+		movem.l	(sp)+,a0/a5/d1			;restore our regs
+		btst.l	#0,d1					;is this an even nibble or odd?
+		bne.s	@odd					;branch if odd
+		lsl.b	#4,d0					;else, move it to the high nibble
+		move.b	d0,(a0)					;and store it in RAM for latter
+		bra.s	@Continue				;then continue
+@odd
+		or.b	d0,(a0)+				;OK, or in the low nibble and increment
+		bra.s	@Continue				;then continue
+	
+@noConversion
+		movem.l	(sp)+,a0/a5/d1			;restore our regs
+		move.b	d0,(a0)+				;store the next byte into the receiving area
+@Continue
+		subq.l	#1,d1					;decrement the count
+		bgt.s	@nextChar				;and continue if necessary
+		
+	ENDWITH
+	rts
+
+SendData
+;----------------------------------------------------------------------
+;
+; This routine sends numeric data to the serial port using the register
+; based routine OutChar.   This routine takes a pointer to data and sends it,
+; byte for byte to the serial port.  If the ASCII mode option is selected, this
+; routine first translates the data into ASCII before sending it.
+;
+;	Inputs:
+StackFrame13	RECORD	0, Increment	;Starts at offset 0 into the stack
+
+@return			ds.l	1				;Return address
+@byteCnt		ds.l	1				;byte count to send
+@outputPtr		ds.l	1				;pointer to data to send
+
+	ENDR
+;
+;		and the following registers:
+;
+;			a3 - SCC read base addr
+;			d3 - SCC write offset from base
+;
+;	Output:
+;
+;	Destroyed:
+;		a0, d0, d1, d2
+;
+;	Called by:  bsr
+;
+;----------------------------------------------------------------------
+	WITH	StackFrame13
+		
+		bsr		@crlf				;start out with a <CR><LF>
+		
+		move.l	@byteCnt(sp),d1		;get the byte count
+		move.l	d1,d4				;save it for later
+		movea.l	@outputPtr(sp),a0	;and the output buffer pointer
+		
+@nextChar
+		move.b	(a0)+,d0			;get the next byte to send
+		btst.l	#aski,d7			;is this ascii mode?
+		beq.s	@notASCII			;branch if not
+		move.b	d0,d2				;save it for later
+		lsr.b	#4,d0				;get the upper nibble
+		bsr		@CvtBin				;convert to an ASCII char
+		BSR6	OutChar				;send it out
+		move.b	d2,d0				;get the next nibble
+		and.b	#$0F,d0				;mask out the nibble of interest
+		bsr		@CvtBin				;convert it to ASCII
+
+@notASCII
+		BSR6	OutChar				;send character out
+		cmp.l	#4,d4				;are we reading less than a long word?
+		ble.s	@notBoundary		;continue if so
+		
+		move.l	a0,d0				;let's look at this address
+		and.b	#3,d0				;are we at a long word boundary?
+		bne.s	@notBoundary		;continue if not
+		bsr		@crlf				;else, send a <CR><LF>
+		
+@notBoundary
+		subq.l	#1,d1				;subtract one from the count
+		bgt.s	@nextChar			;and continue if more to go
+
+	ENDWITH
+	moveq.l	#0,d0				;clear return status
+	rts
+
+@CvtBin
+	cmp.b	#$0A,d0			;is this going to be a letter or number?
+	blt.s	@number			;branch if number
+	add.b	#('A'-$A),d0	;else, convert to a letter
+	bra.s	@rtn			;and return
+	
+@number
+	add.b	#'0',d0			;convert to an ASCII number
+@rtn
+	rts						;and return
+
+@crlf
+	move.b	#cr,d0			;send a crlf
+	BSR6	OutChar
+	move.b	#lf,d0
+	BSR6	OutChar
+	rts		
+
+;	End of SendData
+;----------------------------------------------------------------------
+;----------------------------------------------------------------------
+
+
+; From here to the next <T6> below was added from USTTestMgr.a.
+;The original code has been modified so that it leverages off of the CTE tables I
+;added to the serial test manager, all the support code for which is located in this
+;file, hence the move.		Scott Smyers
+;-----------------------------------------------------------------------------
+;-----------------------------------------------------------------------------
+;
+; This entry point is called as a subroutine from the diagnostic ROMs. It is safe to	<H4><SM4>
+; assume that there are at least 256 bytes of valid memory (established by the board	<H4><H7><SM4>
+; tester before coming here), so using stack-based activities is OK.					<H4><SM4>
+;
+; For all commands but the initialization request and the critical memory tests, the	<H4><SM4>
+; value in a5 must be preserved between calls.											<H4><SM4>
+;
+; For the Horror ROM, there are basically six things that can be done by this			<H4><SM4>
+; routine:																				<H4><SM4>
+;				- init the interface
+;				- execute any of the CTE Generic Interface calls
+;				- execute a DTM
+;						(this ability is provided as a convenience to the board tester
+;						because it will not have access to the required information
+;						to make the GI_ExecuteDTM call for ROM-based DTMS - this is
+;						by design)
+;				- read PRAM
+;				- write PRAM
+;				- execute a critical test (these are NOT DTMs, but stand alone tests)
+;
+;	IMPORTANT NOTE: In order to maintain the connection with the board testers across
+;	the memory tests (which wipe out everything), the board testers will save their
+;	critical information in PRAM before requesting a critical test. After executing
+;	a critical test, I need to restore their information from PRAM. They will save
+;	their info in the following format:
+;
+;		D0 - D5, D7
+;		A0 - A2, A4 - A7
+;
+;	These registers will have been stored in PRAM in the following locations:
+;
+;		$10 - $48
+;
+;	Therefore, I need to restore them appropriately. However, since reading from PRAM
+;	uses a lot of registers, I will use the first chunk of RAM and read the bytes
+;	from PRAM ($10 - $48) into RAM. Then, I will stuff the values in RAM into the
+;	appropriate registers, and jump back to the board tester.
+;
+;	--- New comments added from this <H7> to the one below: ---
+;
+;	There is a special case where I need to store a couple of values into PRAM myself.
+;	When the IHT is requesting initialization (D7 = 0), I will end up wiping out the
+;	stack and registers. The IHT will need to store its data as it would if it were
+;	requesting a critical test (in the format above), but I will pull the return
+;	address off the stack when I get control and stuff it into PRAM where A6 is stored
+;	by the IHT. In addition, after doing the USTInit routine and before restoring
+;	the registers, I will store the new value of A5 (my USTGlobals pointer) into
+;	PRAM where the IHT would store A5. Finally, I need to store the new A7 (after USTInit)
+;	in PRAM where it would be. That way, when I go to the routine that restores
+;	the registers, A5, A6 and A7 will be set appropriately.
+;
+;	---	New comments added from this <H7> to the one above. ---
+;
+; For all commands except the initialization request, the stack must be set up by
+; the caller (board tester). This is done by invoking one of the board tester-specific
+; macros in the file IHTROMHook.i. These macros take care of preparing the stack
+; and setting D7 to the correct selector value.
+;
+;
+; Input:
+;		d7.l	$00000000 - initialize the interface and CTE (must be first call)
+;
+;				$0000yyyy - execute a utility call where yyyy is the following:
+;					0001 - DiagExecuteDTM - the test & subtest IDs are on the stack
+;					0002 - Read PRAM
+;					0003 - Write PRAM
+;
+;				$0001yyyy - execute any Generic Interface call where yyyy is the following:
+;					0000 - GI_InitInterface
+;					0001 - GI_GetVersion
+;					0002 - GI_AllocPermMem
+;					0003 - GI_AllocTempMem
+;					0004 - GI_FreeTempMem
+;					0005 - GI_GetCommentary
+;					0006 - GI_GetDefaultExecutionOptions
+;					0007 - GI_ExecuteDTM
+;
+;				$0002yyyy - execute a critical test where yyyy is the following:
+;					0000 - SizeMemory
+;					0001 - DataBusTest
+;					0002 - Mod3Test
+;					0003 - Address Line
+;					0004 - ROM Byte Lane Checksum
+;					0005 - RevMod3Test
+;					0006 - ExtRAMTest
+;
+; Output:
+;		d6.l	The DTM error code returned from the requested operation or from the
+;				ExecuteDTM routine (depending on what was done).
+;
+;		a3.l	The address of this entry point for the IHT to use to get back here.
+;
+;-----------------------------------------------------------------------------
+diagROMentry
+
+IHTCritCodeBase		equ		$20000				; base number for IHT critical routines				<H7><SM4>
+A5PRAMLocation		equ		$3c					; where A5 will be stored in PRAM					<H7><SM4>
+A6PRAMLocation		equ		$40					; where A6 will be stored in PRAM					<H7><SM4>
+A7PRAMLocation		equ		$44					; where A7 will be stored in PRAM
+NumPRAMBytes		equ		$38					; this is how many bytes the IHT will save			<H7><SM4>
+												;	in PRAM, and how many I should restore			<H7><SM4>
+RAMDestination		equ		$10					; PRAM will be read into this location of RAM		<H7><SM4>
+PRAMSource			equ		$10					; the IHT will store data in PRAM here				<H7><SM4>
+
+
+	; Check first to see if this is an initialization request (d7 = 0):
+	
+		tst.l	d7								; see what's requested
+		bne.w	@notInit						; branch if this is not an init request				<H7><SM4>
+		
+		WITH	USTGlobals
+
+		; Save the return address in PRAM where the IHT would have saved A6 for a critical test:	<H7><SM4>
+		
+			moveq.l	#0,d2						;													<H7><SM4>
+			BigBSR6	JGetHardwareInfo,a0			; get hardware info about this machine				<H7><SM4>
+			movea.l	DecoderInfo.VIA1Addr(a0),a2	; then get the VIA1 pointer							<H7><SM4>
+
+			move.l	sp,a6						; retrieve the return address to the board tester	<H7><SM4>
+			move.w	#A6PRAMLocation,a3			; get the destination PRAM address					<H7><SM4>
+			move.w	#4,a5						; number of bytes to write (decimal)				<H7><SM4>
+
+			_CopyRAMToPRAM		(a6), a3, a5	; write the return address to PRAM					<H7><SM4>
+
+			nop									; this is used to separate the macro above			<H7><SM4>
+												;	from the one below, for the assembler			<H7><SM4>
+			
+		; Do the real initialization stuff:															<H7><SM4>
+		
+			moveq	#0,D2						; Tell USTInit to call SizeMem						<SM5>
+			BigBSR6	USTInit,a0					; Initialize the universal environment				<H7><SM4>
+		
+			move.w	#RunBits.STM,RunMode(a5)	; set the run mode for serial test manager			<H7><SM4>
+			suba.l	#SizeOfCTEGlobals,sp		; allocate our CTE global area on the stack			<H7><SM4>
+			move.l	sp,CTEGlobals(a5)			; save the global area pointer						<H7><SM4>
+			movea.l	CTEGlobals(a5),a0			; get the globs pointer								<H7><SM4>
+			
+			CASE ON
+				GIM_InitInterface	(a0),#SIZEOFCTEGLOBALS	;init the CTE interface	<T7>
+			CASE OFF
+
+
+		; Now save the resulting A5 and A7 values into PRAM before jumping to the @CritExit routine	<H7><SM4>
+		;	I know this is ugly, but I have to do two separate write requests because A5 and A7 are	<H7><SM4>
+		;	not contiguous in PRAM.																	<H7><SM4>
+		
+			move.l	a5,-(sp)					; put A5 into RAM for CopyRAMToPRAM					<H7><SM4>
+			moveq.l	#0,d2						;													<H7><SM4>
+			BigBSR6	JGetHardwareInfo,a0			; get hardware info about this machine				<H7><SM4>
+			movea.l	DecoderInfo.VIA1Addr(a0),a2	; then get the VIA1 pointer							<H7><SM4>
+			move.l	sp,a6						; get the RAM source address						<H7><SM4>
+			move.w	#A5PRAMLocation,a3			; get the PRAM destination address					<H7><SM4>
+			move.w	#4,a5						; the number of bytes to write						<H7><SM4>
+			_CopyRAMToPRAM		(a6), a3, a5	; write the USTGlobals address to PRAM				<H7><SM4>
+			lea		4(sp),sp					; clean up the stack								<H7><SM4>
+
+			move.l	sp,-(sp)					; put A7 into RAM for CopyRAMToPRAM					<H7><SM4>
+			moveq.l	#0,d2						;													<H7><SM4>
+			BigBSR6	JGetHardwareInfo,a0			; get hardware info about this machine				<H7><SM4>
+			movea.l	DecoderInfo.VIA1Addr(a0),a2	; then get the VIA1 pointer							<H7><SM4>
+			move.l	sp,a6						; get the RAM source address						<H7><SM4>
+			move.w	#A7PRAMLocation,a3			; get the PRAM destination address					<H7><SM4>
+			move.w	#4,a5						; the number of bytes to write						<H7><SM4>
+			_CopyRAMToPRAM		(a6), a3, a5	; write the new sp address to PRAM					<H7><SM4>
+			lea		4(sp),sp					; clean up the stack								<H7><SM4>
+
+		ENDWITH
+		
+		bra.l	@CritExit						; return to the board tester						<H7><SM4>
+	
+	;	From here to the <H4> below was modified to support access to the critical tests in
+	;	ROM by the IHT.
+	;_______________________________________________________________
+@notInit
+
+	; It's not an init request, so check to see if it's a critical test request:
+	
+		movea.l	sp,a4				; preserve the return address to board testers
+									;	(none of the critical tests modify a4)
+		move.l	d7,d4				; get a copy of the operation request
+		and.l	#$000F0000,d4		; mask out the "code type" value
+		cmp.l	#IHTCritCodeBase,d4	; see if it's a $xxx2xxxx function (critical test)
+		bne.l	@OtherRequest		; nope, so it's probably a GI_xxx or Utility request
+	
+	; OK, do the critical test as required. Since I'm responsible for doing the setup
+	; before testing memory (sizing, determining which bank(s) to test, etc.), I need
+	; to retain some amount of control in between test cycles. Since I want to use the
+	; TJump table, I'll have to do a little work in some circumstances (specifically,
+	; for the RAM tests - MOD3, RevMOD3, ExtRAMTest). So, the first thing I need to do
+	; is jump to the appropriate setup routine, based on the operation requested (Mod3,
+	; SizeMemory, etc.). Note that some of the tests (ROM checksum, Address Line Test)
+	; don't require any setup:
+	
+		move.l	d7,d4				; get a copy of the operation request
+		and.l	#$000000FF,d4		; isolate the test number, prepare for setup entry
+		lea		@DiagCritSetup,a5	; get the critical test setup table
+		lsl.w	#2,d4				; adjust the offset
+		move.l	(a5,d4.w),d4		; get the jump table entry
+		jmp		(a5,d4.w)			; and dispatch to proper point
+		
+		nop							; these are here in case the proper point happens
+		nop							; to be the entry point below (@theSizeMemTest)
+		nop
+		nop
+	
+
+	;_______________________________________________________________
+	;
+	;---- Do the SizeMem test:
+	;
+@theSizeMemTest
+		BigBSR6	SizeMemory,a0			; do the test
+		bra.l	@critExit				; now restore the IHT (error result is in d6)
+										;	and return to it
+
+	;_______________________________________________________________
+	;
+	;---- Do the ExtRAMTest, Mod3Test or the RevMod3Test - NOTE: it is best to test memory one
+	;		bank at a time with these tests, so that's how I'll be doing it. Since I need to
+	;		retain control to test each memory bank, I will set the return address back to me
+	;		until all banks have been tested. After the test, or if any errors occur during a
+	;		test, I will return to the diagnostic ROM with the results.
+	;
+@theRAMTests
+
+		moveq.l	#0,d0					; this is the index into the memory chunk table
+
+		; For each bank of memory, do a SizeMem to get the range of addresses for the tests,
+		;	then test that bank. Keep looping until all banks have been tested:
+
+		lsl.w	#8,d7					; save the test number in the high byte of the
+										;	low word of d7
+		move.b	d0,d7					; preserve d0 across SizeMemory - d7 is the only
+										;	register that remains unmolested by SizeMemory
+@testAChunkOMemory						; branch back to here on subsequent loops, with the test
+										;	number and d0 still preserved from making the call
+										;	to the requested test							<6><Apollo>
+		BigBSR6	SizeMemory,a0			; on return, (sp) points to memory table
+		tst.l	d6						; check for an error
+		bne.l	@critExit				; error, exit to board testers
+		movea.l	(sp),a2					; otherwise, get pointer to memory table
+
+		; Now, test the next bank of memory with the selected test:
+
+		move.l	#0,d0					; restore d0 after the SizeMemory call				<6><Apollo>
+		move.b	d7,d0					; restore my running memory table index				<6><Apollo>
+		lsr.w	#8,d7					; get access to the test number						<6><Apollo>
+		movea.l	(a2,d0.w),a0			; get address of the next chunk in the memory table
+		cmpa.l	#$FFFFFFFF,a0			; check it for the termination value
+		beq.l	@critExit				; end of the Mod3Tests if end of memory table
+
+		movea.l	(a2,d0.w),a1			; otherwise, prepare to get terminating address for test
+		add.w	#4,d0					; get the length of the next chunk in the table
+		adda.l	(a2,d0.w),a1			; add chunk length to the address, to get end of chunk
+		lea		TJump,a5				; point to test jump table
+		adda.l	(a5,d7.w * 4),a5		; point to test
+		lsl.w	#8,d7					; save the test number in the high byte of the			<6><Apollo>
+										;	low word of d7
+		move.b	d0,d7					; preserve d0 across the RAM tests - d7.lw is the only	<6><Apollo>
+										;	data register that remains untouched by the
+										;	mod3 tests IF AND ONLY IF d7.hw = 0, because of
+										;	code that was added for parity but not documented.
+
+		lea		@1, a6					; setup return address								<SM4>
+		jmp		(a5)					; execute requested test							<6><Apollo><SM4>
+@1										;													<SM4>
+
+		tst.l	d6						; see if there is an error returned					<6><Apollo>
+		bne.l	@critExit				; quit the test if so								<6><Apollo>
+		addq.b	#4,d7					; increment the mem table index to point to the 	<6><Apollo>
+										;	next chunk o' memory							<6><Apollo>
+		bra.s	@testAChunkOMemory		; and go test it
+
+
+	;_______________________________________________________________
+	;
+	;---- Do the Data Bus Test:
+	;
+@theDataBusTest
+
+		; Start by doing a SizeMem to get the range of addresses for the Data Bus Test:
+			
+		BigBSR6	SizeMemory,a0			; on return, (sp) points to memory table
+		tst.l	d6						; check for an error
+		bne		@critExit				; error, exit to board testers
+		movea.l	(sp),a0					; otherwise, get pointer to memory table
+										;	for the Data Bus Test
+		
+		; Now do the DataBus test:
+	If Not forRomulator Then
+		BigBSR6	DataBusTest,a1			; do the test and return here (d6 will be set)
+	Endif
+		bra.l	@critExit				; done with this critical test, so restore the
+										;	state of the IHT and go back to it
+
+
+	;_______________________________________________________________
+	;
+	;---- Do the Address Line or ROM Checksum Tests. These don't require any setup, but
+	;		I am using the TJump table to gain access, based on the selector in d7:
+	;
+@theOtherTests
+
+		; Start by doing a SizeMem to get the range of addresses for the Address Line Test		<H12><SM4>
+		;	in case that happens to be the one we're going to execute:							<H12><SM4>
+			
+		BigBSR6	SizeMemory,a0			; on return, (sp) points to memory table				<H12><SM4>
+		tst.l	d6						; check for an error									<H12><SM4>
+		bne		@critExit				; error, exit to board testers							<H12><SM4>
+		movea.l	(sp),a0					; otherwise, get pointer to memory table				<H12><SM4>
+										;	for the Data Bus Test								<H12><SM4>
+		
+		lea		@critExit,a6			; the return address after the test is done
+		lea		TJump,a5				; point to test jump table
+		and.l	#$000000FF,d7			; isolate the test number
+		adda.l	(a5,d7.w * 4),a5		; point to test
+		jmp		(a5)					; execute requested test - return address to
+										;	@critExit is in a6
+
+
+	;_______________________________________________________________
+	;
+	;---- At this point, a critical test has been completed (it may have failed). The
+	;		result register (d6) will be set by the time control is passed here, so all
+	;		I need to do is restore the IHT registers from PRAM. The way I do this is to
+	;		read the PRAM data into the first few bytes of memory (I know that these bytes
+	;		are OK because the IHT tests them before even coming here for the first time;
+	;		if I'm here now, then I can assume that those bytes of memory are OK). After
+	;		reading the bytes into RAM, I just copy them into the various registers and
+	;		jump back to the board tester. The reason for doing this is that reading and
+	;		writing PRAM uses up registers, so I need to read everything then write the
+	;		final "real" values into the registers before going back. Note that registers
+	;		d6 (test result) and a3 (IHT hook address - diagROMEntry) are not preserved
+	;		in PRAM; they are set by the hook before going back to the IHT:
+	;
+@critExit
+
+	; Read the PRAM data into RAM starting at RAM address $10 (and PRAM address $10):
+	
+		moveq.l	#0,d2						;												<H7><SM4>
+		BigBSR6	JGetHardwareInfo,a0			; get hardware info about this machine
+		movea.l	DecoderInfo.VIA1Addr(a0),a2	; then get the VIA1 pointer
+		movea.l	#RAMDestination,a3			; get the destination RAM address				<H7><SM4>
+		move.w	#PRAMSource,a4				; beginning address of PRAM to use				<H7><SM4>
+		move.w	#NumPRAMBytes,a5			; number of bytes to read						<H7><SM4>
+		
+		_CopyPRAMToRAM	a4, (a3), a5		; go read PRAM
+
+	; Now it's time to load the registers with the required data. The only register I
+	; have left to work with is a3 (all of the others are going to hold the restored
+	; data), so I need to be clever in how I do this:
+
+		movea.l	#RAMDestination,a3			; the RAM destination is the source now			<H7><SM4>
+		movem.l	(a3),d0-d5/d7/a0-a2/a4-a7	; copy the data into the registers in
+											;	one fell swoop
+		
+	; Finally, restore a3 (the return address to this IHT hook, diagROMEntry), and jump
+	; back to the IHT. Remember that d6 is already set, and a6 will be loaded with the
+	; IHT entry point because the IHT saved a6 in PRAM before coming here:
+
+		lea		diagROMentry,a3			; in case the IHT wants to come back later			<H7><SM4>
+		jmp		(a6)					; return to the diagnostic ROM
+	;_______________________________________________________________
+	
+	
+	;_______________________________________________________________
+@OtherRequest
+
+	; It's not an init request and it's not a critical test request, so check to see
+	; if it's a GI_xxx or IHT Utility request:
+	
+		move.l	d7,d0				; get selected function code in d0
+		lea		@DiagROMUtil,a0		; assume utility function
+		and.l	#$000F0000,d7		; mask out the "code type" value
+		cmp.l	#GICodeBase,d7		; is this a GI call? (d7 = $xxx1xxxx)
+		bne.s	@Branch				; continue if not (it's a utility call)
+		
+		; At this point we're going to ASSUME it's a GI_xxx call:
+		
+		lea		GI_Table,a0			; else, get the base address of the GI table
+		sub.l	#GICodeBase,d0		; and adjust the base of the cmd #
+		
+@Branch
+		WITH USTGlobals
+		
+			move.l	(sp)+,CmdNumber(a5)	; save our return address in a secret location
+			move.l	CTEGlobals(a5),-(sp); common to all
+			
+			lsl.l	#2,d0				; adjust the offset
+			move.l	(a0,d0.l),d0		; get the jump table entry
+			jsr		(a0,d0.l)			; and dispatch to proper point
+			addq.l	#4,sp				; pop off the CTE globs
+			move.l	d0,d6				; put the result into the usual result register
+			movea.l	CmdNumber(a5),a0	; get the return address
+			lea		diagROMentry,a3		; get the diag ROM entry point again			<T7>
+			jmp		(a0)				; and return to caller
+		
+		ENDWITH
+
+;	End of diagROMentry
+;
+;	From here to the <H4> above was modified to support access to the critical tests in
+;	ROM by the IHT.
+;-----------------------------------------------------------------------------
+;-----------------------------------------------------------------------------
+
+
+;----------------------------------------------------------------------
+;
+; This table (DiagCritSetup) holds relative entry points to critical test setup
+; routines. The reason for these is that for some of them I need to setup prior
+; to running them (i.e., size memory and do the Mod3 test for each bank of memory,
+; etc.). Also, I need to retain control after the test is done so I can restore the
+; state of the board tester and get back to it. So, for the various kinds of critical
+; tests available, these are the routines that take care of the setup and dispatch.
+;
+@DiagCritSetup									;										<H4><SM4>
+	dc.l	@theSizeMemTest		-@DiagCritSetup ; 0 - SizeMemory						<H4><SM4>
+	dc.l	@theDataBusTest		-@DiagCritSetup	; 1 - DataBusTest						<H4><SM4>
+	dc.l	@theRAMTests		-@DiagCritSetup	; 2 - Mod3Test							<H4><SM4>
+	dc.l	@theOtherTests		-@DiagCritSetup	; 3 - Address Line						<H4><SM4>
+	dc.l	@theOtherTests		-@DiagCritSetup	; 4 - ROM Byte Lane Checksum			<H4><SM4>
+	dc.l	@theRAMTests		-@DiagCritSetup	; 5 - RevMod3Test						<H4><SM4>
+	dc.l	@theRAMTests		-@DiagCritSetup	; 6 - ExtRAMTest						<H4><SM4>
+	
+@DiagCritSetupSize	equ		(*-@DiagCritSetup)>>2	; number of entries					<H4><SM4>
+;----------------------------------------------------------------------
+
+
+;----------------------------------------------------------------------
+;
+;	This table (DiagROMUtil) holds relative entry points to utility functions used by the
+;	In House Tester hook (IHT - also known as the board testers or diagnostic ROM), to
+;	facilitate IHT-specific operations, which include all of the operations described
+;	in the diagROMEntry description except the execution of the Generic Interface
+;	routines. Those routines are accessed from the GI_Table. Note that the IHT environment
+;	shares one routine with the STM environment, which is DiagExecuteDTM. This routine
+;	takes a test and subtest ID as input, and executes the ROM-based DTM.
+;
+@DiagROMUtil
+	dc.l	@DiagROMUtil	-@DiagROMUtil	; null entry								<T7>
+	dc.l	DiagExecuteDTM	-@DiagROMUtil	; execute a DTM
+	dc.l	DiagReadPRAM	-@DiagROMUtil	; read PRAM
+	dc.l	DiagWritePRAM	-@DiagROMUtil	; write PRAM
+	
+@DiagUtilSize	equ		(*-@DiagROMUtil)>>2	;number of jump table entries
+;----------------------------------------------------------------------
+
+
+DiagExecuteDTM
+;----------------------------------------------------------------------------
+;----------------------------------------------------------------------------
+;
+; This routine executes a DTM, based on the Test ID and the Subtest ID provided on the
+; stack by the caller.  Note that a5 must already be initialized to point to the
+; USTGlobals before this entry point can be called.
+;
+; The input is the following call stack:
+
+StackFrame14	RECORD	0, Increment	; start at offset 0 into the stack
+
+@savedReg		ds.l	1				; place to hold the saved value for the link
+@return			ds.l	1				; return address is first
+@CTEGlobs		ds.l	1				; CTE globals pointer is next
+
+; The following information must be placed on the stack by the code in the Diagnostic
+; ROM (board testers):
+
+@subTestID		ds.l	1				; ROM-based subtest ID
+@testID			ds.l	1				; ROM-based test ID
+
+	ENDR
+;
+;----------------------------------------------------------------------------
+
+	WITH	StackFrame14, USTGlobals
+		link	a6,#0				; save the stack frame pointer	
+		
+; Since I can use a BSR6 to RAM-lessly jump to a common subroutine that will find
+;	and execute a DTM combination, the only thing I need to do here is pick the
+;	test and subtest IDs off of the stack and stuff them into a couple of unused
+;	registers for the subroutine to use. When it's done, it can RTS6 back to this
+;	point:
+		
+		move.l	@subTestID(a6),d4
+		move.l	@testID(a6),d5
+		move.l	a6,-(sp)			; save my a6 because the BSR6 uses it
+		bsr6	SetupForExecuteDTM	; do a RAM-less bsr to the routine that takes
+									;	care of setting up for the execution of a DTM
+		move.l	(sp),a6				; restore A6 for parameter access later (leave stack as is)	<H7><SM4>
+
+; Check for errors in setting up for the ExecuteDTM and don't try to execute the DTM
+;	if any were found:
+	
+		cmp.l	#-1,tInfoFunctionEntry(a5)	; -1 in this field means test not found
+		beq.s	@LogError
+		cmp.l	#-1,sInfoFunctionEntry(a5)	; -1 in this field means subtest not found
+		beq.s	@LogError
+
+		move.l	@CTEGlobs(a6),a3	; we need this for GIM_ExecuteDTM
+		
+		CASE ON
+			GIM_ExecuteDTM	(a3), EXOPUSERINFO(a5), TINFOUSERINFO(a5), SINFOUSERINFO(a5), EXRESERR(a5)
+		CASE OFF
+		
+		bra.s	@End
+	ENDWITH
+
+@LogError
+	move.l	#-1,d6					; return -1 indicating that either the test
+									; or subtest doesn't apply to this machine
+
+@End
+	movea.l	(sp)+,a6	; restore the stack frame pointer										<H7><SM4>
+	move.l	d6,d0		; The normal way of returning the results of a non-critical
+						;	test (ROM-based subtest in CTE lingo) is through d6.
+						;	However, the diagROMEntry routine expects all of the other
+						;	utility routines (write PRAM, etc.) to return the error
+						;	in d0, which it then moves to d6 before returning to the
+						;	board tester. So, we put d6 into d0 here, and the
+						;	diagROMEntry routine will unwittingly move it back to d6.
+	unlk	a6			; clean up the stack
+	rts					; return to caller
+
+;	End of DiagExecuteDTM
+;----------------------------------------------------------------------------
+;----------------------------------------------------------------------------
+
+
+
+DiagReadPRAM
+;----------------------------------------------------------------------------
+;----------------------------------------------------------------------------
+;
+; This routine reads parameter RAM into an area of RAM. Note that a5 must already
+; be initialized before this entry point can be called (this will be the case as long
+; as the initialization request has already been done).
+;
+; The input is the following call stack:
+
+StackFrame15	RECORD	0, Increment	; start at offset 0 into the stack
+
+@savedReg		ds.l	1				; place to hold the saved value for the link
+@return			ds.l	1				; return address is first
+@CTEGlobs		ds.l	1				; CTE globals pointer is next (not used here)
+
+; The following information must be placed on the stack by the code in the Diagnostic
+; ROM:
+
+@numBytes		ds.w	1				; number of bytes to read from PRAM
+@destRAMAddr	ds.l	1				; destination RAM address
+@startPRAMAddr	ds.w	1				; starting PRAM address to read from
+
+	ENDR
+;
+;----------------------------------------------------------------------------
+
+	WITH	StackFrame15, USTGlobals
+		link	a6,#0						; save the stack frame pointer
+		
+		movea.l	DcdrInfPtr(a5),a0			; get the pointer to the decoder info
+		movea.l	PrdctInfPtr(a5),a1			; and the product info
+		movea.l	DecoderInfo.VIA1Addr(a0),a2	; then get the VIA1 pointer
+		movea.l	@destRAMAddr(a6),a3			; get the destination RAM address
+		
+		movem.l	a6,-(sp)					; save our local stack frame pointer
+		_CopyPRAMToRAM	@startPRAMAddr(a6), (a3), @numBytes(a6)	; go read PRAM
+		movem.l	(sp)+,a6					; restore our local pointer
+		
+		unlk	a6							; clean up
+	ENDWITH
+	rts										; and return to caller
+
+;	End of DiagReadPRAM
+;----------------------------------------------------------------------------
+;----------------------------------------------------------------------------
+
+
+
+DiagWritePRAM
+;----------------------------------------------------------------------------
+;----------------------------------------------------------------------------
+;
+; This routine writes parameter RAM from an area of RAM.  Note that a5 must already
+; be initialized before this entry point can be called.
+;
+; The input is the following call stack:
+
+StackFrame16	RECORD	0, Increment	; start at offset 0 into the stack
+
+@savedReg		ds.l	1				; place to hold the saved value for the link
+@return			ds.l	1				; return address is first
+@CTEGlobs		ds.l	1				; CTE globals pointer is next (not used here)
+
+; The following information must be placed on the stack by the code in the Diagnostic
+; ROM:
+
+@numBytes		ds.w	1				; number of bytes to write to PRAM
+@startPRAMAddr	ds.w	1				; starting PRAM address to write to
+@sourceRAMAddr	ds.l	1				; source RAM address
+
+	ENDR
+;
+;	NOTE: The BSR6 to ClkWpOff was changed to a BigBSR6 because this file was taken
+;	out of USTStartTest.a and put into USTStartTest1.a, and the branch became too
+;	far for a BSR6.		HAL 2/12/92
+;----------------------------------------------------------------------------
+
+	WITH	StackFrame16, USTGlobals
+		link	a6,#0						; save the stack frame pointer
+		
+		movea.l	DcdrInfPtr(a5),a0			; get the pointer to the decoder info
+		movea.l	PrdctInfPtr(a5),a1			; and the product info
+		movea.l	DecoderInfo.VIA1Addr(a0),a2	; then get the VIA1 pointer
+
+		movem.l	a5/a6,-(sp)					; save some regs
+		BigBSR6	ClkWpOff,a5					; turn off the write protect bit
+		movem.l	(sp)+,a5/a6					; restore regs
+
+		movea.l	@sourceRAMAddr(a6),a3		; get the source RAM address
+		
+		movem.l	a6,-(sp)					; save our local stack frame pointer
+		_CopyRAMToPRAM	(a3), @startPRAMAddr(a6), @numBytes(a6)	; go write PRAM
+		movem.l	(sp)+,a6					; restore our local pointer
+		
+		unlk	a6							; clean up
+	ENDWITH
+	rts
+
+;	End of DiagWritePRAM
+;----------------------------------------------------------------------------
+;----------------------------------------------------------------------------
+
+
+SetupForExecuteDTM
+;----------------------------------------------------------------------------
+;----------------------------------------------------------------------------
+; Well, here it is. This is that fabled routine that actually does the hard
+; work of setting up the parameters expected by GI_ExecuteDTM (TestInfo, SubtestInfo,
+; ExecutionOptions and ExecutionResults structures). This routine is used by all
+; of the ROM-based diagnostics environments in order to allow the user (whether
+; that user is the ROM Burnin chamber or the Board Tester or whatever) to set up for
+; the GI_ExecuteDTM routine without knowing anything about the various test/subtest
+; tables utilized by the ROM.
+;
+; Currently, this routine fills in the minimum information necessary in the
+; following structures: executionOptions, testInfo and subtestInfo. There is no need
+; to fill in the executionResults structure.
+;
+; Additionally, it fills in the info for a StdTestParams structure (which consists
+; of the modifier and machineType fields), which is pointed to by the testParams
+; field of the executionOptions structure. So, after filling in the standard test
+; params structure, its address is placed in the testParams field of the executionOptions
+; structure that is also created here. The data for the standard test params fields
+; is included in the tests list in the file USTSubtests.a. As CTE-style tests are
+; added to this file, it is the responsibility of the person adding them to make
+; sure that all values are kept up to date. One way of doing this might be to export
+; references to these values from the appropriate CTE test interface files, and include
+; them in the USTSubtests.a file. That way, as things are changed in the CTE interfaces,
+; they are automatically updated in the assembly file. Just a thought.
+;
+;
+;	Input:		d4.l	subtest ID
+;				d5.l	test ID
+;				a5.l	points to the UST Globals (and the ROM-CTE globals which
+;						exist immediately after the UST globals)
+;				a6.l	return address (called by BSR6)
+;
+;
+;	Output:		The ExecuteDTM parameters (on the stack, at the top of the USTGlobals)
+;				will be filled out, ready for the macro call GIM_ExecuteDTM to push
+;				the appropriate addresses on the stack and make the call. The macro
+;				can be called repeatedly in a loop if necessary, and the error code
+;				returned can be checked. The input parameters don't have to be filled
+;				in again until a new DTM is needed.
+;
+;
+;	Register
+;	Usage:		a0,a1,a3,d1,d3 - no guarantees on being the same when leaving.
+;				Specifically, the following happens:
+;
+;				a0,a1 - used mercilessly, then tossed aside like some old shoes
+;
+;				d1,d2,d3 - they suffer the same fate as a0 and a1
+;----------------------------------------------------------------------------
+
+	WITH	USTTest, USTSubtest, USTGlobals, CPUTestList
+
+
+; Do the necessary setup for calling GIM_ExecuteDTM. This is new for CTE v2.1 and later,
+; and differs from Terror in that the structures for testInfo and subtestInfo,
+; executionOptions and executionResults, must be initialized (they are parameters to
+; the ExecuteDTM call). The old way was just to get the test and subtest IDs from the
+; RBIInfo structure and call ExecuteTest.
+
+; Fill in the testInfo structure required as an input to ExecuteDTM. Using the testID
+; that was passed to me in d5, I can look through the cpu specific test list and verify
+; that this test is valid for this machine in this environment (STM, IHT, etc.). Also,
+; I can search the USTTests list and determine the param size, result size and entry
+; point for the TEST:
+
+		BigLea	USTTests,a0					; get the test list address (NOT cpu DTM list)
+		move.l	a0,d1						; save it in another register
+		move.l	d5,d3						; save the test ID for the search loop
+
+		; Begin by walking thru the Test list and determine that this test exists in this ROM:				<H4><SM4>
+		
+@TestSearchLoop
+		cmp.l	TTest_ID(a0),d3				; is this our test?
+		beq.s	@FoundTest					; branch if so
+		adda.w	#sizeofUSTTest,a0			; else, go to the next entry
+		cmp.l	#-1,TTest_ID(a0)			; are we at the end?
+		bne.s	@TestSearchLoop				; continue if not
+		bra.s	@LogTestError				; we didn't find the requested test so bail
+		
+		; OK, it exists. Now, determine if it's OK to run it in this "environment", i.e., startup,			<H4><SM4>
+		; restart, STM, etc. This information can be derived from the CPU-specific test list:				<H4><SM4>
+		
+@FoundTest
+		movea.l	GlobCPUTestList(a5),a1		; get the CPU specific test list
+
+@FlagSearchLoop								;																<H4><H5><SM4>
+		cmp.w	TLSubTest_ID(a1),d4			; check the current entry against the requested subtest ID		<H4><SM4>
+		beq.s	@CheckFlags					; OK, we've found the correct entry, so verify the run flags	<H4><H5><SM4>
+		cmp.w	#-1,TLSubTest_ID(a1)		; have we exhausted the list?									<H4><SM4>
+		beq.s	@LogTestError				; yes, so just indicate "does not apply"						<H4><SM4>
+		adda.l	#sizeofCPUTestList,a1		; index to next DTM entry in CPU-specific list					<H4><SM4>
+		bra.s	@FlagSearchLoop				; go back and keep checking										<H4><H5><SM4>
+		
+@CheckFlags									;																<H4><H5><SM4>
+		move.w	TLrunflags(a1),d2			; get the runmode flag
+		and.w	RunMode(a5),d2				; is this test OK for this environment?
+		bne.s	@FillInTest					; continue if so
+		
+		; If we're here, then either the test wasn't found or it doesn't apply to our current			<H4><SM4>
+		; environment. Either way, move -1 into the result register and skip town:						<H4><SM4>
+		
+@LogTestError
+		move.l	#-1,tInfoFunctionEntry(a5)	; fill in the entry point field of the testInfo 
+											;	struct with -1, indicating that this
+		bra.l	@End						;	test does not apply to this environment
+											;	(either because it wasn't found or the
+											;	run mode flags say so)
+
+		; At this point we've determined that the test does exist AND that it's OK to run it			<H4><SM4>
+		; right now. So, fill in the info structure for it. Also, since it's OK to run this test		<H4><SM4>
+		; at this time, it's also OK to run the subtest, so no need to check on that (just fill			<H4><SM4>
+		; in the subtest info):																			<H4><SM4>
+		
+@FillInTest
+		movea.l	TEntryPtr(a0),a1			; get the entry point
+		adda.l	d1,a1						; make the entry point absolute
+		move.l	a1,tInfoFunctionEntry(a5)	; fill in the entry point field of the testInfo struct
+		move.l	d5, tInfoID(a5)				; do the same for the test ID
+		move.l	#0,tInfoUserInfo(a5)		; the rest of the default values for the testInfo
+		move.l	TParamSize(a0),tInfoParamsSize(a5)		; structure may or may not be
+		move.l	TResultSize(a0),tInfoResultsSize(a5)	; NIL, depending on the Test
+
+; Fill in the subtestInfo structure required as an input to ExecuteDTM. Using the subTestID
+;	that was passed to me in d4, I can search the USTSubTests list and find the entry
+;	point for the SUBTEST. In addition, I can find the param size and result size
+;	values from the USTSubtests table:
+
+		BigLea	USTSubtests,a0				; get the subtest list
+		move.l	a0,d1						; save it in another register
+		move.l	d4,d3						; save the subtest ID for the search loop
+
+@SubtestSearchLoop
+		cmp.l	STSubtest_ID(a0),d3			; is this our subtest?
+		beq.s	@FoundSubtest				; branch if so
+		adda.w	#sizeofUSTSubtest,a0		; else, go to the next entry
+		
+		
+		
+		cmp.l	#-1,STSubtest_ID(a0)		; are we at the end?
+		bne.s	@SubtestSearchLoop			; continue if not
+		move.l	#-1,sInfoFunctionEntry(a5)	; fill in the entry point field of the subtestInfo 
+											;	struct with -1, indicating that there
+		bra.s	@End						;	is something wrong - we didn't find the
+											;	requested subtest
+@FoundSubtest
+		movea.l	STEntryPtr(a0),a1			; get the entry point
+		adda.l	d1,a1						; make the entry point absolute
+		move.l	a1,sInfoFunctionEntry(a5)	; fill in the entry point field of the subtestInfo struct
+		move.l	d4, sInfoID(a5)				; do the same for the subtest ID
+		move.l	#0,sInfoUserInfo(a5)		; the rest of the default values for the subtestInfo
+		move.l	STParamSize(a0),sInfoParamsSize(a5)		; structure may or may not be
+		move.l	STResultSize(a0),sInfoResultsSize(a5)	; NIL, depending on the Subtest
+
+
+; If we've made it this far, then all the test/subtest info was found and verified for the
+; current environment. So, create the standard test params and execution options. Also,
+; set the userInfo field of the executionOptions to point to the USTGlobals and the
+; testParams field to point to the standard test params structure. The reason for setting
+; the userInfo field to point to the USTGlobals is that the ROM-based non-critical
+; tests (the non-CTE ones) all expect the following input register values:
+;
+;			a0	-  ptr to table of hardware base addresses (DecoderInfo ptr)
+;			a1  -  ProductInfo ptr
+;			d0	-  bit mask indicating which base addresses are valid (bases valid flags)
+;			d2	-  boxflag/decoder type
+;
+; The ROM-based CTE-style Test (which is coupled with the non-CTE ROM-based non-
+; critical subtests to form DTMs) takes care of setting up the a0, a1, d0 and d2
+; registers before jumping into one of those subtests. The other ROM-based CTE style
+; DTMs may or may not use the userInfo pointer, based upon their personal preferences. 
+;
+;
+;	Here's the StdTestParams:
+
+;		move.l	
+
+
+
+;	Here's the executionOptions:
+
+		move.l	a5,exOpUserInfo(a5)			; this puts the USTGlobals pointer into the userInfo
+		move.l	#4,exOpProcessorType(a5)
+		move.l	#0,exOpExecutionMode(a5)
+		move.l	#0,exOpTestParams(a5)
+		move.l	#0,exOpTestResultsOverride(a5)
+		move.l	#0,exOpSubtestParamsOverride(a5)
+		move.l	#0,exOpSubtestResultsOverride(a5)
+		move.l	#0,exOpIdleMethod(a5)
+		move.l	#0,exOpIdleMethodArg(a5)
+
+@End
+		
+	ENDWITH
+
+	RTS6									; go back to the caller
+
+;	End of SetupForExecuteDTM
+;----------------------------------------------------------------------------
+;----------------------------------------------------------------------------
+
+;<T6>
+	ENDPROC

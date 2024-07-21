@@ -1,0 +1,2254 @@
+;
+;	File:		SCSIDiskMode.a
+;
+;	Contains:	SCSI Disk Mode Transfer Routines
+;
+;	Written by:	James Blair
+;
+;	Copyright:	© 1992-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;   This file is used in these builds:   ROM
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	12/13/93	PN		Roll in KAOs and Horror changes to support Malcom and AJ
+;									machines.
+;	   <SM1>	11/20/92	SWC		Added to SuperMario from Horror.  Horror changes below.
+;	   <H15>	  9/8/92	jab		Changed "last byte in a write" detection to be state stable
+;									(uses DRQ instead of REQ).
+;	   <H14>	  9/3/92	SWC		jab/make sure REQ is deasserted after DMA-ing a block.
+;	   <H13>	 8/24/92	SWC		jab/Moved back to the DMA code because we were breaking on a Mac
+;									Plus. The beginning of each block to be written will be handled
+;									in a polled fashion, with the rest of the block written using
+;									DMA.
+;	   <H12>	 8/20/92	SWC		jab/Changed the dual bus code to do polled byte handshaking on
+;									writes to avoid problems with certain hard disks (Quantums, for
+;									example).
+;	   <H11>	 7/27/92	SWC		Removed the temporary config ROM kludge.
+;	   <H10>	 7/13/92	SWC		jab/Fine tune low power display toggling.
+;		<H9>	 7/13/92	SWC		Added a routine to put up a DeepShit alert if the user has a
+;									SCSI Disk Mode cable attached when we wake up.
+;		<H8>	 7/13/92	SWC		jab/Added smarter (and easier) check for LCD presence. Added
+;									support for inverting video on external video MainDevices.
+;		<H7>	 7/11/92	ag		Change to call the power manager that scsi disk mode is active.
+;		<H6>	  7/6/92	SWC		jab/Removed kludge that used longword access to Select Enable
+;									register.
+;		<H5>	  7/1/92	ag		Set condition codes on good exit of InitHWDependent.
+;		<H4>	 6/29/92	SWC		jab/Added better support for fast data transfers and fixed some
+;									bugs introduced in <H3>.
+;		<H3>	 6/25/92	SWC		jab/Added interrupt handling support to support /RST & SEL from
+;									external SCSI bus and DMA support for xfers between the DB Lite
+;									and its internal hard drive.
+;		<H2>	  4/7/92	ag		Change the HW Dependent section of code to invert the scsi id
+;									bits (the lines are active low), and power off and on the disk
+;									drive so the new id will be read by the disk drive controller.
+;		<H1>	  3/3/92	jab		First checked in.
+;
+
+			PRINT	OFF
+			LOAD	'StandardEqu.d'
+			INCLUDE	'HardwarePrivateEqu.a'
+			INCLUDE	'SCSI.a'
+			INCLUDE 'SCSIPriv.a'
+			INCLUDE	'PowerPrivEqu.a'
+			INCLUDE	'UniversalEqu.a'
+			INCLUDE	'Video.a'
+			INCLUDE	'DockingEqu.a'
+			INCLUDE	'SCSIDiskModeEqu.a'
+			PRINT	ON
+
+			BLANKS	ON
+			STRING	ASIS
+
+			MACHINE	MC68020
+
+
+Unimplement	EQU		$A89F					; _Unimplemented trap
+
+
+
+;__________________________________________________________________________________________________
+;
+; Routine:	SCSIDiskMode
+;
+; Inputs:	none
+;
+; Outputs:	none
+;
+; Trashes:	d0,d1,d2,a0,a1,a2,a3,a4,a6
+;
+; Function:	checks if we're setup for SCSI Disk Mode, and if so, starts it up
+;
+
+SCSIDiskMode PROC	EXPORT
+
+			EXPORT	TestForDiskMode
+			IMPORT	GetLevel, LCDScreenChk
+			WITH	scsiGlobalRecord, DiskModeVars, PmgrRec, PmgrPramRec, pmCommandRec, hwCfgInfo
+
+
+			bsr		TestForDiskMode				; is the disk mode cable plugged in?
+			beq.s	@NoDiskMode					; -> no, return to your regularly scheduled boot
+
+			lea		@ShutDownDiskMode,a0		; point the level 4-7 interrupt vectors
+			move.l	a0,AutoInt4					;  to the shutdown code
+			move.l	a0,AutoInt5
+			move.l	a0,AutoInt6
+			move.l	a0,AutoInt7
+
+			moveq	#0,zeroReg					; to comply with SCSI Mgr
+
+			link	a6,#DiskModeVarsSize		; create stack frame
+
+			movea.l	SCSIGlobals,a4				; point to the SCSI Manager globals
+			move.l	a6,sdmStack(a4)				; save our local stack pointer for intrp routines
+			
+			bsr		InsdmTimeTask				; install our icon redrawing timer
+			bsr		ReadPramID					; read current virtual SCSI id from PRAM
+
+			bsr		InitDiskModeDrawing			; initialize the drawing environment
+			beq.s	@ShutDownDiskMode			; -> couldn't load one of the pictures
+
+			bsr		InitBacklight				; check for and initialize backlight stuff
+
+			bsr		InitControllers				; set the controller(s) to a known state
+
+			bsr		InitHWDependent				; do any hardware-dependent initialization
+
+			bsr		InstallIntHandler			; install the appropriate interrupt handler
+
+		IF hasPwrControls THEN					; is power controls available 						<H7>
+			bsr		InformPowerMgr				; tell the power manager were in scsi disk mode 	<H7>
+		ENDIF
+
+			bsr		SpinWheels					; wait to be Selected
+			
+@ShutDownDiskMode	
+			_PowerOff							; kill the power
+			bra.s	*							; just hang here if it comes back
+
+@NoDiskMode	rts
+
+
+		IF hasPwrControls THEN				
+;__________________________________________________________________________________________________	<H9>
+;
+; Routine:	SCSIDiskWakeAlert
+;
+; Inputs:	none
+;
+; Outputs:	none
+;
+; Trashes:	D0-D2, A0-A1
+;
+; Function:	Checks if the SCSI Disk Mode cable is plugged in when we wake up.
+;			If it is, put up a DeepShit window with a message.
+;
+
+			EXPORT	SCSIDiskWakeAlert
+SCSIDiskWakeAlert
+@savedRegs	REG		D0-D2/A0-A1
+			MOVEM.L	@savedregs,-(SP)
+			BSR		TestForDiskMode			; is the disk mode cable attached?
+			BEQ		@NoCable				; -> no, continue with wakeup
+
+;	put the alert on the screen and wait until the cable is removed...
+
+@DrawAlert	MOVE.W	#dsSCSIWarn,D0			; put up the DeepShit alert
+			_SysError
+
+@NotGone	MOVEA.L	VIA,A0
+			MOVE.W	#160,D0					; wait about 160ms
+			MULU	TimeDBRA,D0
+			BRA.S	@InnerLoop
+@OuterLoop	SWAP	D0
+@InnerLoop	TST.B	(A0)					; throttle the loop with a VIA access
+			DBRA	D0,@InnerLoop
+			SWAP	D0
+			DBRA	D0,@OuterLoop
+
+			BSR		TestForDiskMode			; is the disk mode cable still attached?
+			BNE.S	@NotGone				; -> yep, keep waiting
+
+;	they finally removed the cable, so clean everything up...
+
+			CLR.B	DSWndUpdate 			; flag GNE to remove the alert
+
+			CMPI.W	#$3FFF,ROM85			; does this machine support color QuickDraw?
+			BHI.S	@NoCable				; -> nope
+			TST.L	DeviceList				; any devices?
+			BEQ.S	@NoCable				; -> nope
+			MOVE.L	MainDevice,D0			; how about a main device?
+			BEQ.S	@NoCable				; -> none to be found (where is everyone?)
+			MOVEA.L	D0,A0					; get the GDevice handle
+			MOVEA.L	(A0),A0					;  and de-reference it
+			MOVE.W	gdRefNum(A0),D0			; get the driver's refNum
+			BEQ.S	@NoCable				; -> no driver (this is getting weird)
+
+			LINK	A6,#-VDPageInfo-ioVQElSize
+			LEA		-VDPageInfo(A6),A1		; point to page info
+			CLR.W	VDPageInfo.csPage(A1)	;  and set to page zero
+			MOVEA.L	SP,A0					; point to the parameter block
+			MOVE.W	D0,ioRefNum(A0)			;  driver's refNum
+			MOVE.W	#cscGrayScreen,csCode(A0); csCode = gray the screen
+			MOVE.L	A1,csParam(A0)			;  csParam = pointer to page info
+			_Control ,IMMED					; gray the screen to erase the DeepShit "window"
+			UNLK	A6						; clean up the stack
+
+@NoCable	MOVEM.L	(SP)+,@savedRegs
+			RTS
+
+
+;_______________________________________________________________________________________ <H7>
+;
+; Routine:	InformPowerMgr
+;
+; Inputs:	none
+; 			
+; Outputs:	none
+;
+; Trashes:	d0
+;
+; Function:	inform power manager of entering scsi disk mode
+;
+
+InformPowerMgr
+		  IF isUniversal THEN
+			TestFor	hwCbPwrMgr					; check for power manager
+			beq.s	@exitPwrMgr					; if no pmgr skip
+		  ENDIF
+			WITH	PowerDispRec,PMgrHookDispRec
+			move.l	#((PScsiDiskMode<<16) | \
+						(PMgrHookDisp<<0)),d0	; set for scsi disk mode call
+			_PowerDispatch						; call power manager
+
+			ENDWITH
+@exitPwrMgr
+			RTS
+		ENDIF
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	ReadPramID
+;
+; Inputs:	a6	-	pointer to Disk Mode stack frame
+; 			
+; Outputs:	none
+;
+; Trashes:	d0, a0
+;
+; Function:	reads the virtual SCSI ID from PRAM
+;
+
+ReadPramID	move.l	#(1<<16)+(PmgrOtherFlags<<0),d0	; get the PRAM address of the SCSI ID byte
+			add.b	([PMgrBase],PRAMbase),d0
+			clr.w	-(sp)						; make space for a buffer on the stack
+			move.l	sp,a0						;  and point to it
+			_ReadXPRAM							; get the PRAM byte
+
+			moveq	#0,d0
+			move.b	(sp)+,d0					; get the ID in bits 7-5
+			lsr.b	#5,d0						;  and move it to bits 2-0
+			bne.s	@done						; -> non-zero, so use it as is
+			moveq	#defaultID,D0				; use the default virtual ID
+
+@done		move.w	d0,DiskID(a6)				; store our retrieved virtual ID
+			rts
+
+
+;_______________________________________________________________________________________			<H8>
+;
+; Routine:	MyBitsProc
+;
+; Inputs:	Stackframe for "Procedure StdBits(VAR srcBits; BitMap; VAR srcRect,dstRect: Rect;
+;												mode: INTEGER; maskRgn: RgnHandle);"
+;
+; Outputs:	none
+;
+; Trashes:	none
+;
+; Function:	Patches into CQD bitsProc bottleneck to correctly set the 
+;			foreground and background colours for drawing on a CRT (assumed CRT that is).
+;
+
+MyBitsProc
+@BitsRegs	REG		a0-a2
+@BitsRegSz	EQU		3*4
+
+			subq.l	#4,sp						; make space for jumping to CQD bitsProc
+			movem.l	@BitsRegs,-(sp)
+			movea.l	SCSIGlobals,a2				; get pointer to SCSI Manager globals
+			movea.l	sdmStack(a2),a2				; get our stack back
+			
+			pea		RGBWhite					; set foreground color to white
+			pea		RGBBlack					; set background color to black
+			_RGBBackColor						; color addresses are on the stack
+			_RGBForeColor						;
+
+			move.l	oldBitsProcPtr(a2),@BitsRegSz(sp)	;
+			movem.l	(sp)+,@BitsRegs
+			rts
+
+
+;_______________________________________________________________________________________			<H8>
+;
+; Routine:	SetupforCRT
+;
+; Inputs:	a6	-	pointer to Disk Mode stack frame
+;
+; Outputs:	none
+;
+; Trashes:	none
+;
+; Function:	Installs the patch for CQD's bitsProc bottleneck.
+;
+
+SetupforCRT
+@CRTRegs	REG		a0-a3
+
+			movem.l	@CRTRegs,-(sp)
+
+			pea		RGBWhite					; set foreground color to white
+			pea		RGBBlack					; set background color to black
+			_RGBBackColor						; color addresses are on the stack
+			_RGBForeColor						;
+
+			lea		myQDProcs(a6),a0
+			lea		MyPort+grafProcs(a6),a3
+			move.l	a0,(a3)						; install pointer to my QDProcs
+			
+			move.l	a0,-(sp)					; initialize the QDProc pointers
+			_SetStdProcs						;
+			
+			movea.l	(a3),a3						; deference the QDProcs 
+			move.l	bitsProc(a3),oldBitsProcPtr(a6)	; save CQD's version of bitsProc
+			
+			lea		MyBitsProc,a2				;
+			move.l	a2,bitsProc(a3)				; stuff our bitsProc handler 
+
+			movem.l	(sp)+,@CRTRegs
+			rts
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	InitDiskModeDrawing
+;
+; Inputs:	a6	-	pointer to Disk Mode stack frame
+;
+; Outputs:	a5	-	pointer to QuickDraw globals
+;			a6	-	pointer to Disk Mode stack frame
+;			ccr	-	bne if initialization was successful
+;
+; Trashes:	d0,d1,d2,d3,d4,a0,a1,a2,a3
+;
+; Function:	initializes the drawing environment, loads in the DiskMode pictures,
+;			and calculates all bounding rectangles for drawing
+;
+
+InitDiskModeDrawing	
+			move.l	CurrentA5,saveA5(a6)		; save host a5
+			lea		localA5(a6),a5				; establish our own a5 for QD
+			move.l	a5,CurrentA5				;
+
+			pea		thePort(a6)					; 
+			_InitGraf							; ...this does just that
+			pea		MyPort(a6)					;
+			_OpenPort	
+
+			_HideCursor							; make sure the cursor is hidden
+
+;	we setup here to erase the main gDevice (LCD) 
+			
+			bsr.l	LCDScreenChk				; is the Main Device and LCD?						<H8>
+			bne.s	@LCDLooking					;													<H8>
+			bsr.s	SetupforCRT					;   no -> invert all drawing						<H8>
+@LCDLooking										;													<H8>
+			move.l	MainDevice,a0				; get handle to main device
+			move.l	(a0),a0						;  and de-reference it
+			move.l	gdPMap(a0),a0				; get its pixmap handle
+			move.l	(a0),a0						;  and de-reference it
+			addq.w	#bounds,a0
+
+			moveq	#-2*16,d4					; calculate the adjusted screen height for later
+			add.w	bottom(a0),d4
+			sub.w	top(a0),d4
+
+			move.w	right(a0),maxRightX(a6)		; save the right edge of the screen for later
+
+			move.l	a0,-(sp)					; erase the screen
+			_EraseRect
+
+;	get the DiskMode picture...
+
+			lea		scsiPictHndl(a6),a2			; point to the first picture handle
+			lea		scsiRect(a6),a3				;  and the first bounds rectangle
+			clr.l	topLeft(a3)					; clear the topLeft coordinate so everything will work
+
+			moveq	#DiskModePICT,d0			; go get the SCSI symbol picture
+			bsr.s	@GetPicture
+			beq.s	@Done						; -> couldn't get it
+
+			movea.l	d0,a0						; get the handle
+			movea.l	(a0),a0						;  and de-reference it
+			addq.w	#picFrame,a0				; point to the PICT's bounding rectangle
+			sub.w	bottom(a0),d4
+			add.w	top(a0),d4
+			lsr.w	#1,d4						; vertical offset = (screenHeight - pictHeight)/2 - 16
+			moveq	#20,d3
+			bsr.s	@CalculateBounds			; calculate the boundsRect for drawing			
+
+;	get the low battery picture...
+
+			moveq	#BattPICT,d0				; go get the low battery picture
+			bsr.s	@GetPicture
+			beq.s	@Done						; -> couldn't get it
+
+			moveq	#BattLeft,d3
+			moveq	#BattTop,d4
+			bsr.s	@CalculateBounds			; calculate the boundsRect for drawing			
+
+;	get the DiskMode SCSI ID picture...
+
+			moveq	#DiskId_Base,d0				; go get the SCSI ID picture
+			add.w	DiskID(a6),d0
+			bsr.s	@GetPicture
+			beq.s	@Done						; -> couldn't get it
+
+			moveq	#IDLeft,d3
+			moveq	#IDTop,d4
+			bsr.s	@CalculateBounds			; calculate the boundsRect for drawing			
+
+;	get the first arrow picture...
+			
+			moveq	#Arrow1,d0					; go get the first arrow picture
+			bsr.s	@GetPicture
+			beq.s	@Done						; -> couldn't get it
+
+			moveq	#ArrowsLeft,d3
+			moveq	#ArrowsTop,d4
+			bsr.s	@CalculateBounds			; calculate the boundsRect for drawing			
+
+;	get the second arrow picture...
+			
+			moveq	#Arrow2,d0					; go get the second arrow picture
+			bsr.s	@GetPicture
+			beq.s	@Done						; -> couldn't get it
+
+;	get the third arrow picture...
+			
+			moveq	#Arrow3,d0					; go get the third arrow picture
+			bsr.s	@GetPicture
+			beq.s	@Done						; -> couldn't get it
+			
+			clr.w	DiskStat(a6)				; clear status word and arrow index word
+			clr.l	DrawCount(a6)				; initialize drawing delay counter
+			clr.l	transCount(a6)				; initialize low power display toggle counter
+
+			move.w	#horizDelta,deltaX(a6)		; initialize how far to move
+
+			move.l	#sbArrowDelay,ArrowDelay(a6); assume we have a single bus
+			movea.l	SCSIGlobals,a0				; point to the SCSI Manager globals
+			tst.l	base5380_2(a0)				; is there an external controller?
+			beq.s	@Finished					; 													<H5>
+			move.l	#dbArrowDelay,ArrowDelay(a6); yes, use the dual bus delay						<H5>
+@Finished	moveq	#1,d0						; set the condition codes 							<H5>
+
+@Done		rts									
+
+
+@GetPicture	move.w	#mapTrue,RomMapInsert		; map ROM into resource chain
+			subq.w	#4,sp
+			move.w	d0,-(sp)					;  theID
+			_GetPicture							; try to load the picture
+			move.l	(sp)+,d0					; get the handle
+			move.l	d0,(a2)+					;  and copy it to our variables
+			rts
+
+@CalculateBounds
+			add.w	scsiRect+left(a6),d3		; adjust position relative to the SCSI symbol picture
+			add.w	scsiRect+top(a6),d4
+			movea.l	d0,a0						; get the handle
+			movea.l	(a0),a0						;  and de-reference it
+			addq.w	#picFrame+right,a0			; point to the picture's bounding rectangle
+			move.w	(a0),d0						; calculate the bounds for drawing
+			move.w	-(a0),d1
+			sub.w	-(a0),d0
+			add.w	d3,d0
+			sub.w	-(a0),d1
+			add.w	d4,d1
+
+			move.w	d4,(a3)+					; relTop
+			move.w	d3,(a3)+					; relLeft
+			move.w	d1,(a3)+					; relTop + bottom-top
+			move.w	d0,(a3)+					; relLeft + right-left
+			rts
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	DrawNewPICT
+;
+; Inputs:	a6	-	pointer to DiskMode stack frame
+;
+; Outputs:	none
+;
+; Trashes:	none
+;
+; Function:	moves the pictures a step in the current direction, checking for screen edges
+;
+
+DrawRegs	REG		d0-d2/a0-a1
+
+DrawNewPICT	movem.l	DrawRegs,-(sp)				;													<H4>
+
+			cmpi.l	#iconDelay,DrawCount(a6)	; is it time to update the display?					<H3>
+			blt.s	@DontDraw					; -> no, keep waiting								<H3>
+			clr.l	DrawCount(a6)				; reset the timer and draw new icon					<H3>
+
+			pea		scsiRect(a6)				; erase the old picture
+			_EraseRect
+
+;  check if we're still on the screen...
+
+			move.w	deltaX(a6),d1				; get the offset
+
+			move.w	scsiRect+left(a6),d0		; will we move off the left edge?
+			add.w	d1,d0
+			bmi.s	@OtherWay					; -> yes, start moving back the other way
+
+			move.w	scsiRect+right(a6),d0		; will we move off the right edge?
+			add.w	d1,d0
+			cmp.w	maxRightX(a6),d0
+			ble.s	@SameWay					; -> no, keep going
+
+@OtherWay	neg.w	d1							; switch directions
+			move.w	d1,deltaX(a6)
+
+;  update all the bounding rectangles...
+
+@SameWay	add.w	d1,scsiRect+left(a6)
+			add.w	d1,scsiRect+right(a6)
+
+			add.w	d1,battRect+left(a6)
+			add.w	d1,battRect+right(a6)
+
+			add.w	d1,scsiIDRect+left(a6)
+			add.w	d1,scsiIDRect+right(a6)
+
+			add.w	d1,arrowRect+left(a6)
+			add.w	d1,arrowRect+right(a6)
+
+;  draw the pieces...
+
+			move.l	scsiPictHndl(a6),-(sp)		;  thePicture
+			pea		scsiRect(a6)				;  theRect
+			_DrawPicture						; draw the SCSI symbol
+
+			btst	#LowPower,diskStat(a6)		; do we have to draw the battery?					<H3>
+			beq.s	@DrawID						; -> no
+			bchg	#DrawWarning,diskStat(a6)	; yes, do we draw the battery this time?
+			beq.s	@DrawID						; -> no
+
+			move.l	battPictHndl(a6),-(sp)		;  thePicture
+			pea		battRect(a6)				;  theRect
+			_DrawPicture						; draw the battery picture
+			bra.s	@DontDraw
+
+@DrawID		move.l	scsiIDPictHndl(a6),-(sp)	;  thePicture
+			pea		scsiIDRect(a6)				;  theRect
+			_DrawPicture						; draw the SCSI ID
+
+@DontDraw	movem.l	(sp)+,DrawRegs				;													<H4>
+			rts									
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	DrawArrows
+;
+; Inputs:	a6	-	pointer to DiskMode stack frame
+;
+; Outputs:	none
+;
+; Trashes:	none
+;
+; Function:	draws the next transfer arrow to show a transfer is in progress
+;
+
+DrawArrows	movem.l	DrawRegs,-(sp)				;													<H4>
+			move.l	ArrowDelay(a6),d0			; is it time to update the display?					<H3>
+			cmp.l	DrawCount(a6),d0			;													<H3>
+			bgt.s	@DontDraw					; -> no, keep waiting								<H3>
+			clr.l	DrawCount(a6)				; -> yes, reset the timer and redraw				<H3>
+
+			moveq	#ArrowMask,d0				; mask off the arrow bits
+			and.b	whichArrow(a6),d0
+			addq.b	#1,d0						; cycle to the next state
+			cmpi.b	#2,d0						; did we wrap?
+			ble.s	@NoPin						; -> no
+			moveq	#0,d0						; yes, pin it at zero
+@NoPin		move.b	d0,whichArrow(a6)			;  and store the new value
+
+			lea		arrow1PictHndl(a6),a0
+			move.l	0(a0,d0.w*4),-(sp)			;  thePict
+			pea		arrowRect(a6)				;  theRect
+			move.l	(sp),-(sp)					; erase the old arrow
+			_EraseRect
+			_DrawPicture						;  and draw the new one
+
+@DontDraw	movem.l	(sp)+,DrawRegs				;													<H4>
+			rts
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	InitBacklight
+;
+; Inputs:	a6	-	pointer to DiskMode stack frame
+;
+; Outputs:	none
+;
+; Trashes:	d0,a0,a1
+;
+; Function:	determines if the backlight driver is installed, and if so, gets the
+;			minimum/maximum backlight values for this machine
+;
+
+InitBacklight
+			clr.w	ioRefNum(a6)				;  zero the refNum field (assume the driver's not open)
+			lea		-ioQElSize(sp),sp			; put a parameter block on the stack
+			movea.l	sp,a0						;  and point to it
+			lea		@driverName,a1
+			move.l	a1,ioVNPtr(a0)				;  driver name
+			clr.b	ioPermssn(a0)				;  open permission = whatever's allowed
+			_Open								; see if the driver's there
+			bne.s	@NoDriver					; -> it's not
+			move.w	ioRefNum(a0),backliteRefNum(a6)	; save the driver's refNum
+
+			move.w	#GetBrightRange,csCode(a0)	;  csCode = return minimum/maximum brightness levels
+			_Status								; get the range
+			move.l	csParam(a0),backliteMax(a6)	; save the max/min values
+
+			move.w	#DisableSlideCtl,csCode(a0)	;  csCode = turn slider control on/off
+			st		csParam(a0)					;  csParam = disable slider control
+			_Control							; put brightness on computer control
+@NoDriver	lea		ioQElSize(sp),sp			; clean up the stack
+			rts
+
+			STRING	PASCAL
+@driverName	dc.w	'.Backlight'
+			STRING	ASIS
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	TurnDownBackLite
+;
+; Inputs:	a6	-	pointer to DiskMode stack frame
+;
+; Outputs:	none
+;
+; Trashes:	d0,d1,a0
+;
+; Function:	turns down the backlight to its minimum value
+;
+
+TurnDownBackLite
+			bset.b	#BackLiteOff,DiskStat(a6)	; make a note of turning the backlight off
+			move.w	backliteMin(a6),d0			; get the minimum value
+			bra.s	BacklightCommon				; go set the new level
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	TurnUpBackLite
+;
+; Inputs:	a6	-	pointer to DiskMode stack frame
+;
+; Outputs:	none
+;
+; Trashes:	d0,d1,a0
+;
+; Function:	turns up the backlight to its maximum value
+;
+
+TurnUpBackLite
+			bclr.b	#BackLiteOff,DiskStat(a6)	; make a note of turning the backlight on
+			move.w	backliteMax(a6),d0			; get the maximum value
+BacklightCommon
+			move.w	backliteRefNum(a6),d1		; is the Backlight driver installed?
+			beq.s	@NoDriver					; -> nope, just exit
+			lea		-ioQElSize(sp),sp			; put a parameter block on the stack
+			movea.l	sp,a0						;  and point to it
+			move.w	d1,ioRefNum(a0)				;  get the driver's refNum
+			move.w	#SetBrightness,csCode(a0)	;  csCode = set brightness level
+			move.w	d0,csParam(a0)				;  csParam = brightness level
+			_Control							; put brightness on computer control
+			lea		ioQElSize(sp),sp			; clean up the stack
+@NoDriver	rts
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	GetBatteryStatus
+;
+; Inputs:	a6	-	pointer to DiskMode stack frame
+;
+; Outputs:	d0	-	normalized battery level (-1 to 4)
+;			ccr	-	set based on d0
+;
+; Trashes:	d0,d1,d2
+;
+; Function:	returns the battery/charger state
+;
+
+GetBatteryStatus
+		IF hasPwrControls THEN
+		  IF isUniversal THEN
+			TestFor	hwCbPwrMgr					; does this machine have a Power Manager?
+			BEQ.S	@NoPMgr						; -> nope, skip
+		  ENDIF
+			movem.l	d3/a0/a2,-(sp)
+			movea.l	PMgrBase,a2					; point to the Power Manager's globals
+			bsr.l	GetLevel					; get the current battery level
+			btst	#HasCharger,Charger(a2)		; is the charger connected?
+			movem.l	(sp)+,d3/a0/a2
+			beq.s	@NoCharger					; -> nope, return the actual level
+@NoPMgr
+		ENDIF
+			moveq	#-1,d0						; default to returning "above warning level"
+@NoCharger	tst.w	d0							; setup the ccr
+			rts
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	InitControllers
+;
+; Inputs:	a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;
+; Outputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip (or -1 if none)
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to Disk Mode stack frame
+;			d7	-	zero
+;
+; Trashes:	d0
+;
+; Function:	sets up chip base address pointers, initializes the controller registers,
+;			and resets the internal SCSI bus
+;
+
+InitControllers								
+		IF hasPwrControls THEN
+		  IF isUniversal THEN
+			TestFor	hwCbPwrMgr					; does this machine have a Power Manager?
+			BEQ.S	@NoPMgr						; -> nope, skip
+		  ENDIF
+			MOVE.B	#hdOn,-(SP)					; what to turn on
+			MOVE.L	SP,-(SP)					;  pmRBuffer
+			MOVE.L	(SP),-(SP)					;  pmSBuffer
+			MOVE.W	#1,-(SP)					;  pmLength = 1
+			MOVE.W	#powerCntl,-(SP)			;  pmCommand
+			MOVEA.L	SP,A0						; point to the parameter block
+			_PMgrOp								; turn on the HD/SCSI chip
+			LEA		pmRBuffer+4+2(SP),SP		; toss the parameter block
+@NoPMgr
+		ENDIF
+			movea.l	SCSIBase,a1_Int				; load base address of internal c80
+			movea.l	SCSI2Base,a2_Ext			; load base address of external c80
+			movea.l	SCSIGlobals,a4				; point to the SCSI Manager globals
+			bset.b	#scBusy,G_State(a4)			; lockout others while testing
+			moveq	#0,zeroReg					; to comply with SCSI Mgr
+
+			bsr.s	ClearBus					; initialize the controllers
+
+			tst.l	base5380_2(a4)				; is there an external controller?
+			beq.s	@Done						; -> no, don't reset
+			move.b	#iRST,sICR(a1_Int)			; assert SCSI reset line on internal controller
+			move.w	TimeDBRA,d0					; wait 250µsec
+			lsr.w	#2,d0
+@delay		dbra	d0,@delay
+			move.b	zeroReg,sICR(a1_Int)		; de-assert *RST
+@Done		rts
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	ClearBus
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip (or -1 if none)
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;
+; Outputs:	same
+;
+; Trashes:	none
+;
+; Function:	initializes the controller registers
+;
+
+ClearBus	movem.l	d0/d1,-(sp)					; save ourselves
+			
+			move.b	zeroReg,sMR(a1_Int)			; clear arbitration bit
+			move.b	zeroReg,sSER(a1_Int)		; clear select int. enable reg
+			move.b	zeroReg,sICR(a1_Int)		; de-assert *RST
+			move.b	zeroReg,sTCR(a1_Int)		; clear select int. enable reg
+			move.b	zeroReg,sODR(a1_Int)		; clear the internal data bus
+			
+			tst.l	base5380_2(a4)				; is there an external controller?
+			beq.s	@Done						; -> no, don't initialize it
+
+			move.b	zeroReg,sTCR(a2_Ext)		; clear target command reg.
+			move.b	#cTargSetup,sMR(a2_Ext)		; put in Target mode
+
+			move.w	DiskID(a6),d0				; retrieve virtual SCSI id							<H3>
+			moveq	#1,d1						; setup for getting id position						<H3>
+			lsl.b	d0,d1
+			move.b	d1,sSER(a2_Ext)				; we want an interrupt on a valid select			<H6>
+
+			move.b	zeroReg,sICR(a2_Ext)		; clear the command register
+			move.b	zeroReg,sODR(a2_Ext)		; clear the internal data bus
+@Done
+			movem.l	(sp)+,d0/d1					; restore ourselves
+			rts
+
+
+;__________________________________________________________________________________________________
+;
+; Routine:	TestForDiskMode
+;
+; Inputs:	none
+;
+; Outputs:	CCR	-	BNE if the SCSI DiskMode cable is attached
+;
+; Trashes:	D0-D2, A0-A1
+;
+; Function:	checks if we're setup for SCSI Disk Mode
+;
+
+TestForDiskMode
+		IF hasNiagra THEN
+		  IF isUniversal THEN
+			TestFor	NiagraExistsBit			; are we running on a Niagra system (Dartanian)?
+			BEQ.S	@NotNiagra				; -> no, can't check for Disk Mode that way
+		  ENDIF
+		  	MOVEA.L	VIA,A0
+			MOVEQ	#1<<vSDMCable,D0		; mask off the cable sense bit
+			AND.B	vBufB(A0),D0
+			EORI.B	#1<<vSDMCable,D0		; return BNE if the cable is attached
+			RTS
+@NotNiagra
+		ENDIF
+
+			MOVE.W	#Unimplement,D0			; does the _DockingDispatch trap exist?
+			_GetTrapAddress	,NEWTOOL
+			MOVEA.L	A0,A1
+			MOVE.W	@DockTrap,D0
+			_GetTrapAddress	,NEWTOOL
+			CMPA.L	A0,A1
+			BEQ.S	@NoDocking				; -> no, we can't check for Disk Mode that way
+
+			SUBQ.W	#4,SP					;  result
+			PEA		dockSCSIDiskMode		;  docking selector = get SCSI Disk Mode info
+			CLR.L	-(SP)					;  params = nil
+@DockTrap	_DockingDispatch				; call the handler
+			MOVEQ	#1<<dockSDMCable,D0		; is the SCSI Disk Mode cable plugged in?
+			AND.L	(SP)+,D0
+			RTS								; return BNE if the cable is attached
+@NoDocking	
+
+
+			NOP								; padding in case there's another way to check
+			NOP
+
+			MOVEQ	#0,D0					; any other case means no disk mode
+			RTS
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	InitHWDependent
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip (if any)
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	d0,d1,a0
+;
+; Function:	does any hardware-dependent initialization
+;
+
+InitHWDependent
+		IF hasNiagra THEN
+		  IF isUniversal THEN
+			TestFor	NiagraExistsBit			; are we running on a Niagra system (Dartanian)?
+			BNE.S	@Niagra					; -> no
+			TestFor	PrattExists				; are we running on a BlackBird?
+			BEQ.S	@NotNiagra				; -> no
+		  ENDIF
+@Niagra		MOVEA.L	VIA,A0
+			ORI.B	#(%111<<vSDMDiskID),vDirB(A0)	; make the disk ID bits outputs					<H2>
+			MOVEQ	#~(%111<<vSDMDiskID),D0	; mask off cable bits									<H2>
+			AND.B	vBufB(A0),D0			; d0 has the current value of the port
+
+			MOVE.W	DiskID(A6),D1			; get the SCSI ID we're going to use
+			ASL.B	#vSDMDiskID,D1			; É and shift it into the appropriate bit position
+			not		d1						; É complement for invert outputs						<H2>
+			and.b	#(%111<<vSDMDiskID),d1	; É mask for only id bits								<H2>
+
+			OR.B	D1,D0					; jam it in
+			MOVE.B	D0,vBufB(A0)			; É and write it all back out
+
+; cycle power to disk drive to change id
+			move.b	#hdOff,d0				; turn off power to drive								<H2>
+			bsr.s	SendPower				;														<H2>
+
+			move	#250,d1					; loop for 250 msec										<H2>
+@Msloop		move.w	TimeDBRA,d0				; get 1msec count										<H2>
+@Loop		dbra	d0,@Loop				; delay 1msec											<H2>
+			dbra	d1,@Msloop				;														<H2>
+
+			move.b	#hdOn,d0				; turn on powr to drive									<H2>
+			bsr.s	SendPower				;														<H2>
+
+			RTS
+@NotNiagra
+		ENDIF
+
+
+		IF hasMSC THEN						; 														<H3>
+		  IF isUniversal THEN				;														 |
+			TestFor	MSCChipBit				; don't initialize interrupt handlers for external		 V
+			beq.s	@notDBLite				; SCSI bus if not on a DB Lite 
+		  ENDIF
+
+; Here we are turning off interrupt sources on the DB Lite motherboard.  These sources are all
+; level two sources that we have to eliminate (our own interrupts come through level two via
+; the slot interrupt source).
+
+			movea.l	VIA2,a0
+			move.b	#(0<<ifIRQ)+\
+					 (1<<RvSndIRQEn)+\
+					 (1<<RvSCSIDRQEn),\
+					MSCVIA2IER(a0)			; disable all but SCSI IRQ
+			
+			move.b	#(0<<ifIRQ)+\
+					 (1<<RvIRQ0En),\
+					MSCSlotIER(a0)			; disable all but SlotE
+
+@notDBLite
+		ENDIF								; {hasMSC}												<H3>								
+
+			RTS
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	SendPower																				<H2>
+;
+; Inputs:	D0	-	power command byte
+;
+; Outputs:	none 
+;
+; Trashes:	A0,D0
+;
+; Function:	Change the power state
+;
+
+SendPower	MOVE.B	D0,-(SP)					; put the power byte into a buffer
+			MOVE.L	SP,-(SP)					;  pmRBuffer
+			MOVE.L	(SP),-(SP)					;  pmSBuffer
+			MOVE.W	#1,-(SP)					;  pmLength
+			MOVE.W	#powerCntl,-(SP)			;  pmCommand
+			MOVEA.L	SP,A0						; point to the parameter block
+			_PMgrOp								;  and send the power command
+			LEA		pmRBuffer+4+2(SP),SP		; toss the parameter block and buffer
+			RTS
+
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	SpinWheels
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip (if any)
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d7	-	zero
+;
+; Outputs:	none (never exits)
+;
+; Trashes:	d0,d1,d2,d3,a0
+;
+; Function:	spin loop to draw the pictures and handle the SCSI transactions
+;
+
+SpinWheels	tst.l	base5380_2(a4)				; is this a dual bus model?
+			bne.s	@DualBusSpin				; -> yes, go do it
+
+
+;  single bus code to just monitor what's going on on the bus...
+
+			movea.l	a1,a2						; point the "external" chip to the internal chip
+@SingleBusSpin
+			bsr.s	@Wait4Select				; go wait for us to be selected
+
+@DoingTransfer
+			bsr		DrawArrows					; let user know that data xfer is occuring
+
+			btst.b	#bBSY,sCSR(a1_Int)			; is BSY still asserted?
+			bne.s	@DoingTransfer				; -> yes, wait here until it isn't
+
+			bsr		SingleBusArrowInt			; turn on single bus arrow interrupts				<H3>
+
+			bra.s	@SingleBusSpin				; -> transfer completed, so go back to waiting
+
+
+;  keep the visual interface running while we wait to be selected...
+
+@Wait4Select
+			bsr		GetBatteryStatus			; read the battery/charger state
+			ble.s	@enoughPower				; -> charger connected or battery's pretty charged
+@weakPower										;													<H3>
+			btst.b	#LowPower,DiskStat(a6)		; are we in low power indicator state?				 |
+			bne.s	@noAdjust					;  yes so do nothing								 V
+			addq.l	#1,transCount(a6)			;  yes, so add to change counter		
+			cmpi.l	#transThres,transCount(a6)	; have we had enough of a push to change?		<H10>
+			blt.s	@noChgYet					;  no, so don't switch yet
+			
+			; we have determined that it is necessary to show the low power warning condition
+			
+			bset.b	#LowPower,DiskStat(a6)		; set indicator for flashing battery PICT
+			bsr		TurnDownBackLite			; because we are have a weak battery	
+			bra.s	@noAdjust					; continue
+@enoughPower
+			btst.b	#LowPower,DiskStat(a6)		; are we in low power indicator state?
+			beq.s	@noAdjust					;  no so do nothing
+			addq.l	#1,transCount(a6)			;  yes, so add to transition counter
+			cmpi.l	#transThres,transCount(a6)	; have we had enough of a push to change?		<H10>
+			blt.s	@noChgYet					;  no, so don't switch yet
+			
+			; we have determined that it is alright to remove the low power warning condition
+			
+			bclr.b	#LowPower,DiskStat(a6)		; set indicator for flashing battery PICT
+			bsr		TurnUpBackLite				; because we are have a strong battery	
+@noAdjust
+			clr.l	transCount(a6)				; reset backlight transition counter		
+@noChgYet										;													
+			bsr		DrawNewPICT					; draw the picture with neat animation
+					
+			btst	#bitSEL,DiskStat(a6)		; have we a SEL (captured via interrupt)
+			beq.s	@Wait4Select				; -> no, keep waiting
+												;  else,
+			bclr	#bitSEL,DiskStat(a6)		;	 clear indication of SEL 						<H3>
+			rts
+			
+
+;  dual bus code to handle passing info between buses...
+
+@DualBusSpin
+			bsr.s	@Wait4Select				; go wait for us to be selected
+
+			move.w	sr,-(sp)					; Save current interrupt level.
+			ori.w	#viaIntMask,sr				; interrupt level set to one						<H3>
+
+			bsr		DrawArrows					; let user know that data xfer is occuring
+
+			move.b	sBSR(a2),d0					; the SEL was for us so let's get ready to set BSY (address 5)
+			bsr		IntArbSel					; Arb and Select on the int. bus
+			bne.s	@validSel					; return to looking for Select (failed Select)
+			move.b	zeroReg,sICR(a2_Ext)		; drop BSY because we failed the internal select
+
+			bra.s	@DualBusSpin
+			
+@validSel
+			bsr		RmvsdmTimeTask				; avoid TM task interrupts							<H3>
+			
+			move.b	zeroReg,sICR(a1_Int)		; this should draw a REQ from the internal drive
+
+; we are now entering either CMD or MSG-OUT phase
+;   wait for a REQ/ from the target before proceeding
+			
+@wait4REQ	btst.b	#bREQ,sCSR(a1_Int)			; check for /REQ: indicates we can read SEL id
+			bne.s	@gotREQ
+			btst.b	#bBSY,sCSR(a1_Int)			; check to see if more work is required
+			bne.s	@wait4REQ					; ...branch if more to be done
+			bsr.w	ClearBus					; we've reached bus free so clean up
+			move.w	(sp)+,sr					; restore previous interrupt level (from viaIntMask setting).
+			bsr		InsdmTimeTask				; restore our TM drawing counter					<H3>
+			bra.s	@DualBusSpin				; return to look for Select
+
+@gotREQ		move.b	sCSR(a1_Int),d3_IntStat		; once we have /REQ we need to know what the target wants to do...
+			lsr.b	#2,d3_IntStat				; setup to xfer /REQ, /MSG, C/D, I/O
+			
+; the lower three bits of d0 contain the index value for jumping
+
+			moveq	#7,d0
+			and.b	d3_IntStat,d0				; mask out non indexing data
+			
+			move.w	sr,savedSR(a6)				; Save current interrupt level.						<H3>	
+			ori.w	#hiIntMask,sr				; set interrupt level to 7							<H3>								
+ 			bset.b	#DoingXfer,DiskStat(a6)		; are we nested in a xfer routine?					<H3>
+
+			move.w	@TransferTbl(d0.w*2),d0		; get the offset to the routine
+			jsr		@TransferTbl(d0.w)			;  and go there
+			move.w	savedSR(a6),sr				; restore interrupt level							<H3>
+			bra.s	@wait4REQ					; return to look for REQ
+
+
+@TransferTbl
+			DC.W	DataOut_DM-@TransferTbl		;  0: Data Out 
+			DC.W	DataIn_DM-@TransferTbl		;  1: Data In
+			DC.W	Command_DM-@TransferTbl		;  2: Command										
+			DC.W	Status_DM-@TransferTbl		;  3: Status										
+			DC.W	Unspecified_DM-@TransferTbl	;  4: Unspecified										
+			DC.W	Unspecified_DM-@TransferTbl	;  5: Unspecified										
+			DC.W	MessageOut_DM-@TransferTbl	;  6: Message Out										
+			DC.W	MessageIn_DM-@TransferTbl	;  7: Message In										
+
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	IntArbSel
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d0	-	contents of external bus status register (to check for ATN)
+;			d7	-	zero
+;
+; Outputs:	ccr	-	BNE if we successfully selected on the internal bus
+;
+; Trashes:	d1,d2
+;
+; Function:	This routine is called after a Select is pending from the external bus.
+;			Once an external Select is seen we jump here to arbitrate and Select
+;			the internal drive.
+;
+
+IntArbSel	move.b	#IntArbMask,sODR(a1_Int)	; put my ID on bus
+
+@ArbRetry	move.b	zeroReg,sMR(a1_Int)			; clear arbitration bit	
+			moveq.l	#0,d1						; clear high word
+			move.w	TimeSCSIDB,d1				; DBRAs/ms.			
+			lsl.l	#8,d1						; wait up to 256 ms	
+			move.l	d1,d2						; get high word
+			swap	d2
+
+			move.b	#iARB,sMR(a1_Int)			; tell 5380 to go into arbitration
+@Wait4Arb	btst.b	#bAIP,sICR(a1_Int)	 		; check to make sure we're arbitrating	
+			dbne	d1,@Wait4Arb				; loop until arbitration has started or time out
+			dbne	d2,@Wait4Arb
+			beq.s 	@ArbTimeout					; -> timed out, so go back to the spin loop
+
+@ArbStarted	bsr.s 	Delay22u					; wait for bus to settle
+			btst.b	#bLA,sICR(a1_Int)			; did we lose arbitration?				
+			bne.s 	@ArbRetry					; -> yes, try again
+			
+			move.b	zeroReg,sTCR(a1_Int)		; reset because we won't get data on bus in Select phase if it isn't zero
+			move.b	#iSEL,sICR(a1_Int)			; set select
+			move.b	#IntSELMask,sODR(a1_Int)	; get ready to put myID and deviceID on bus
+			moveq	#iSEL+iBSY+iDB,d1			; assume we didn't see ATN
+			btst.l	#bitATN,d0					; did we?
+			beq.s	@noATN						; -> nope
+			moveq	#iSEL+iBSY+iDB+iATN,d1		; yes, assert ATN as well
+@noATN		move.b	d1,sICR(a1_Int)				; issue /SEL and assert data bus, perhaps with ATN
+
+			move.b	zeroReg,sMR(a1_Int)			; reset /ARB
+			move.b	zeroReg,sSER(a1_Int)		; clear select int. enable reg
+			
+; we currently don't wait to drop BSY because we don't really need to arbitrate
+;   no one else is supposed to be on the bus!!!  (this may change!!!!!)
+			
+			andi.b	#~iBSY,sICR(a1_Int)			; reset /BSY bit
+
+			move.w	G_Async(a4),d1 				; select timeout from globals (in ms)		
+			mulu.w	TimeSCSIDB,d1				; get # of DBRAs	
+			move.l	d1,d2						; set up d2 as high word
+			swap	d2
+@Wait4BSY	btst.b	#bBSY,sCSR(a1_Int)			; loop until BSY or timeout
+			dbne	d1,@Wait4BSY
+			dbne	d2,@Wait4BSY
+@ArbTimeout	rts
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	Delay22u
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	d1
+;
+; Function:	delays roughly 2200ns
+;
+
+Delay22u	moveq	#0,d1
+			move.b	TimeDBRA,d1					; get DBRAs/ms
+			lsr.w	#12-8,d1
+@loop		dbra	d1, @loop
+			rts
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	DataOut_DM
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d3	-	internal bus status (/REQ, /MSG, C/D, I/O)
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	d0,d1,d2,a0,a3
+;
+; Function:	Handles the DataOut transfer phase.
+;			Entry into this routine means that we have an existing /REQ on the
+;			internal bus from the drive. If the DataOut xfer is from a SCSIWrite or
+;			SCSIWBlind cdb then we use psuedo-DMA access to the internal hard drive;
+;			otherwise the xfer is done completely polled.
+;
+
+DataOut_DM	move.w	savedSR(a6),sr				; restore interrupt level					
+			
+			cmpi.b	#$0A,savedCDB(a6)			; is this a Write cmd ?
+			beq.s	@doitFast					; branch to hhsk if a block oriented write
+			
+			cmpi.b	#$2A,savedCDB(a6)			; is this an Extended Write cmd ?
+			bne		SlowDataOut_DM				; not block oriented, so write slowly
+
+@doitFast
+			move.b	zeroReg,sTCR(a1_Int)		; set phase match for data in (DO = 0)
+			move.b	zeroReg,sTCR(a2_Ext)		; send internal info to external bus
+
+			move.l	BusErrVct,yeOldeBusErrVct(a4)	; keep old vector			
+			lea		DataBusErrHdlr,a0			;									
+			move.l	a0,BusErrVct				; use this SCSI Bus Error handler	
+			
+			movea.l	hhsk5380_1(a4),a0			; load DMA address of internal c80
+			lea		sODR(a0),a0
+			movea.l	hhsk5380_2(a4),a3			; load DMA address of external c80
+			lea		sIDR(a3),a3					;													<H4>
+			
+			bsr.s	FastDataOutXfer				; we return from a bus error or xfer complete
+			
+			move.b	zeroReg,sMR(a1_Int)			; clear DMA mode on internal controller
+			move.b	#cTargSetup,sMR(a2_Ext)		; set external controller to target mode
+	
+			move.l	yeOldeBusErrVct(a4),BusErrVct	; restore old vector			
+
+			bra		ClearIntSem
+			
+
+;_______________________________________________________________________________________
+;
+; Routine:	FastDataOutXfer
+;
+; Inputs:	a0	-	pointer to DMA access address of internal SCSI chip
+;			a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a3	-	pointer to DMA access address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	d0,d1,d2
+;
+; Function:	Handles block data transfers from the Mac thru to the DB Lite internal
+;			hard drive.  Software handshaking is performed between the Mac and the 
+;			DB Lite and psuedo-DMA hardware handshaking is used to transfer data
+;			from the DB Lite to the internal hard drive.  The bus error handler
+;			that regulates the psuedo-DMA transfers is installed by the caller of 
+;			this routine.
+;
+;	        For this to work correctly we must avoid running DMA right to the end 
+;			of the transfer (our last DMA byte would put another /REQ out to the
+; 			Mac and that is bad!
+;
+
+FastDataOutXfer
+			moveq	#0,d1				
+			cmpi.b	#$0A,savedCDB(a6)			; is this a Write cmd ?
+			bne.s	@tenByteCmd					; branch to hhsk if a block oriented write
+			
+			move.b	savedCDB+4(a6),d1			; get number of blocks to write (4 off of CDB)
+			beq.s	@zeroSixAdjust
+			bra		@mainBot
+
+@tenByteCmd
+			move.w	savedCDB+7(a6),d1			; get number of blocks to write (4 off of CDB)
+			beq.s	@zeroTenAdjust
+			bra		@mainBot
+
+@zeroSixAdjust
+			move.w	#$FF,d1
+			bra.s	@zeroTop
+
+@zeroTenAdjust
+			moveq	#-1,d1
+
+@zeroTop
+@mainLoopTop									; this loop xfers all but last block		
+
+	; We do the first byte of the block manually so that any head/track delays will 						<H12> to next <H12>
+	;	propagate themselves to the mac.  After the first byte is transfer we finish 
+	;	the next 511 bytes using DMA.  We actually exit out of the DMA loop one byte
+	; 	early so that we can turn DMA off after the 512th byte DRQ.
+	
+@NotACK		
+			btst.b	#bACK,sBSR(a2_Ext)			; wait for ACK to drop after removing REQ
+			bne.s	@NotACK						;
+@wait4REQ_DO		
+			btst.b	#bREQ,sCSR(a1_Int)			; wait for /REQ to be asserted
+			beq.s	@wait4REQ_DO				; -> no, keep waiting
+
+			move.b	#iREQ,sTCR(a2_Ext)			; send internal /REQ to external bus
+
+@wait4ACK_DO		
+			btst.b	#bACK,sBSR(a2_Ext)			; check for ACK/: indicates we can read data
+			beq.s	@wait4ACK_DO				;
+			
+			move.b	sCDR(a2_Ext),sODR(a1_Int)	; get data from ext. bus and put on int.
+			bclr	#bitREQ,sTCR(a2_Ext)		; drop REQ/ when we have latched the data
+			
+@wait4NotACK_DO		
+			btst.b	#bACK,sBSR(a2_Ext)			; wait for ACK to drop after removing REQ
+			bne.s	@wait4NotACK_DO				;
+
+			move.b	zeroReg,sTCR(a1_Int)		; set phase match for data out (DO = 0)
+			move.b	#iACK+iDB,sICR(a1_Int)		; set ACK for data we are moving from ext. to int. bus
+
+@wait4NotREQ_DO		
+			btst.b	#bREQ,sCSR(a1_Int)			; wait for /REQ to be de-asserted by int. drive
+			bne.s	@wait4NotREQ_DO
+
+			move.b	zeroReg,sICR(a1_Int)		; clear ACK/ and data and then wait for target to respond
+
+	; This is the top of the 510 byte DMA transfer section. 
+
+@dmaTop
+			move.w	#512-3,d2					; we want to dma the next 510 bytes
+
+			move.b	#iDMA,sMR(a1_Int)			; set internal controller to DMA mode
+			ori.b	#iDB,sICR(a1_Int)			; activate data on bus
+			move.b	zeroReg,sDMAtx(a1_Int)		; write to start Initiator DMA sends 
+
+			move.b	#iDMA+cTargSetup,sMR(a2_Ext); set external controller to DMA mode
+			move.b	zeroReg,sTDMArx(a2_Ext)		; write to start Target DMA receives						<H12>
+@dmaLoop
+@waitEDRQ	btst	#bDMAR,sBSR(a2_Ext)			; do we have the DRQ yet ?
+			beq		@waitEDRQ					; 
+			move.b	(a3),d0						; get byte from mac
+			
+@waitIDRQ	btst.b	#bDMAR,sBSR(a1_Int)			; wait for DREQ before starting to read
+			beq.s	@waitIDRQ						; 
+			move.b	d0,(a0)						; put data on internal bus
+			
+			dbra	d2,@dmaLoop
+
+	; We have now transferred a total of 511 bytes (1 polled and 510 DMA) of the 512 we need...
+	;	we now have to turn DMA off after receiving the DRQ for the 512th byte.  
+	; The top of the loop (if we jump back) takes care of waiting for /ACK to disappear 
+	; 	from the external bus.
+
+@waitEDRQ2	btst	#bDMAR,sBSR(a2_Ext)			; do we have the DRQ yet ?
+			beq		@waitEDRQ2					; 
+			move.b	#cTargSetup,sMR(a2_Ext)		; clear external controller DMA mode
+			move.b	sIDR(a2_Ext),d0				; get byte from mac
+			
+@waitIDRQ2	btst.b	#bDMAR,sBSR(a1_Int)			; wait for DREQ before starting to read
+			beq.s	@waitIDRQ2					; 
+			move.b	d0,(a0)						; put data on internal bus
+			
+@wait4LastDRQ									;													<H15>													
+			btst.b	#bDMAR,sBSR(a1_Int)			; wait for DREQ indicating the last byte was taken	<H15>
+			beq.s	@wait4LastDRQ				;													<H15>
+
+			move.b	zeroReg,sMR(a1_Int)			; clear internal controller DMA mode
+			move.b	zeroReg,sICR(a1_Int)		; clear ACK/ and data and then wait for target to respond
+@mainBot	
+			dbra	d1,@mainLoopTop				; we drop out of the main xfer loop
+
+@nextPhase	rts
+			
+			
+;_______________________________________________________________________________________
+;
+; Routine:	SlowDataOut_DM
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d3	-	internal bus status (/REQ, /MSG, C/D, I/O)
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	d0
+;
+; Function:	Handles the data out phase using polled /REQ - /ACK handshaking.
+;
+
+SlowDataOut_DM	
+			move.w	savedSR(a6),sr				; restore interrupt level						
+			move.b	zeroReg,sTCR(a2_Ext)		; get IO/ out so bus can settle
+			move.b	zeroReg,sTCR(a1_Int)		; get IO/ out so bus can settle
+
+@REQACKloop_DO			
+			move.b	d3_IntStat,sTCR(a2_Ext)		; send internal info to external bus
+
+@wait4ACK_DO		
+			btst.b	#bACK,sBSR(a2_Ext)			; check for ACK/: indicates we can read data
+			beq.s	@wait4ACK_DO				;
+			
+			move.b	sCDR(a2_Ext),sODR(a1_Int)	; get data from ext. bus and put on int.
+			bclr	#bitREQ,sTCR(a2_Ext)		; drop REQ/ when we have latched the data
+			
+@wait4NotACK_DO		
+			btst.b	#bACK,sBSR(a2_Ext)			; wait for ACK to drop after removing REQ
+			bne.s	@wait4NotACK_DO				;
+
+			move.b	zeroReg,sTCR(a1_Int)		; set phase match for data out (DO = 0)
+			move.b	#iACK+iDB,sICR(a1_Int)		; set ACK for data we are moving from ext. to int. bus
+
+@wait4NotREQ_DO		
+			btst.b	#bREQ,sCSR(a1_Int)			; wait for /REQ to be de-asserted by int. drive
+			bne.s	@wait4NotREQ_DO
+
+			move.b	zeroReg,sICR(a1_Int)		; clear ACK/ and data and then wait for target to respond
+
+@wait4REQ_DO		
+			btst.b	#bREQ,sCSR(a1_Int)			; wait for /REQ to be asserted
+			beq.s	@wait4REQ_DO				; -> no, keep waiting
+			
+			move.b	sCSR(a1_Int),d3_IntStat		; save it
+			lsr.b	#2,d3_IntStat				; setup to xfer /REQ, /MSG, C/D, I/O
+			moveq	#7,d0
+			and.b	d3_IntStat,d0				;
+		IF phDO­0 THEN
+			subq.b	#phDO,d0					; once we have /REQ we need to know what the target wants to do...
+		ENDIF
+			beq.s	@REQACKloop_DO				; branch if still in Data Out phase
+			
+			bra		ClearIntSem
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	DataIn_DM
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d3	-	internal bus status (/REQ, /MSG, C/D, I/O)
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	d0,d1,d2,a0,a3
+;
+; Function:	Handles the DataIn transfer phase.
+;			Entry into this routine means that we have an existing /REQ on the
+;			internal bus from the drive. If the DataIn xfer is from a SCSIRead or
+;			SCSIRBlind cdb then we use psuedo-DMA access from the internal hard drive;
+;			otherwise the xfer is done completely polled.
+;
+
+DataIn_DM	move.w	savedSR(a6),sr				; restore interrupt level					
+			
+			cmpi.b	#$08,savedCDB(a6)			; is this a Read cmd ?
+			beq.s	@doitFast					; branch to hhsk if a block oriented read
+			
+			cmpi.b	#$28,savedCDB(a6)			; is this an Extended Read cmd ?
+			bne		SlowDataIn_DM				; not block oriented, so read slowly
+
+@doitFast	move.b	#iIO,sTCR(a1_Int)			; set phase match for data in (DI = 1)
+			move.b	#iDMA,sMR(a1_Int)			; set internal controller to DMA mode
+			move.b	zeroReg,sIDMArx(a1_Int)		; write to start Initiator DMA reads 
+
+			move.b	#iIO,sTCR(a2_Ext)			; send internal info to external bus
+			move.b	#iDMA+cTargSetup,sMR(a2_Ext); set external controller to DMA mode
+			ori.b	#iDB,sICR(a2_Ext)			; activate data on bus
+			move.b	zeroReg,sDMAtx(a2_Ext)		; write to start Target DMA sends
+												;  /REQ is asserted until we write data
+												;  to the dma address.
+
+			move.l	BusErrVct,yeOldeBusErrVct(a4)	; keep old vector			
+			lea		DataBusErrHdlr,a0			;									
+			move.l	a0,BusErrVct				; use this SCSI Bus Error handler	
+			
+			movea.l	hhsk5380_1(a4),a0			; load DMA address of internal c80
+			lea		sIDR(a0),a0
+			movea.l	hhsk5380_2(a4),a3			; load DMA address of external c80
+			lea		sODR(a3),a3					;													<H4>
+			
+			bsr.s	FastDataInXfer				; we return from a bus error or xfer complete
+			
+			nop									;													<H4>
+			nop									;													<H4>
+			nop									;													<H4>
+			move.b	zeroReg,sMR(a1_Int)			; clear DMA mode on internal controller
+			move.b	#cTargSetup,sMR(a2_Ext)		; set external controller to DMA mode
+			eori.b	#iDB,sICR(a2_Ext)			; clear assert data bus 							<H4>
+	
+			move.l	yeOldeBusErrVct(a4),BusErrVct	; restore old vector			
+
+			bra		ClearIntSem
+			
+
+;_______________________________________________________________________________________	
+;
+; Routine:	FastDataInXfer
+;
+; Inputs:	a0	-	pointer to DMA access address of internal SCSI chip
+;			a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a3	-	pointer to DMA access address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	d0,d1,d2
+;
+; Function:	Handles block data transfers from the DB Lite internal hard drive
+;			thru to the Mac.  Software handshaking is performed between the Mac and the 
+;			DB Lite and psuedo-DMA hardware handshaking is used to transfer data
+;			from the internal hard drive to the DB Lite.  The bus error handler
+;			that regulates the psuedo-DMA transfers is installed by the caller of 
+;			this routine.
+;
+
+FastDataInXfer
+			cmpi.b	#$08,savedCDB(a6)			; is this a Read cmd ?
+			bne.s	@tenByteCmd					; branch to hhsk if a block oriented read
+			
+			move.b	savedCDB+4(a6),d1			; get number of blocks to read (4 off of CDB)
+			bne.s	@inDoIt
+			move.w	#$FF,d1
+			bra.s	@zeroTop
+
+@tenByteCmd	move.w	savedCDB+7(a6),d1			; get number of blocks to read (4 off of CDB)
+			bne.s	@inDoIt
+			moveq	#-1,d1
+@zeroTop		
+			move.w	#512-1,d2
+@inTop		
+@waitIDRQ	btst.b	#bDMAR,sBSR(a1_Int)			; wait for DREQ before starting to read
+			beq.s	@waitIDRQ
+			move.b	(a0),d0						; get byte from internal drive
+
+@waitEDRQ	btst	#bDMAR,sBSR(a2_Ext)			; do we have the DRQ yet ?
+			beq		@waitEDRQ
+			move.b	d0,(a3)						; put data on external bus
+
+			dbra	d2,@inTop
+@inDoIt		move.w	#512-1,d2					; number of bytes/block
+			dbra	d1,@inTop					; block count
+
+@tailDRQ	btst.b	#bDMAR,sBSR(a2_Ext)			; next DRQ here yet
+			beq.s	@tailDRQ					; if its here then leave
+
+@tailACK	btst.b	#bACK,sBSR(a2_Ext)			; next DRQ here yet
+			bne.s	@tailACK					; if its here then leave
+
+@nextPhase	rts
+			
+			
+;_______________________________________________________________________________________	
+;
+; Routine:	SlowDataIn_DM
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d3	-	internal bus status (/REQ, /MSG, C/D, I/O)
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	d0
+;
+; Function:	Handles the DataIn phase using polled /REQ - /ACK handshaking.
+;
+
+SlowDataIn_DM	
+			moveq	#iIO,d0
+			move.b	d0,sTCR(a2_Ext)				; get IO/ out so bus can settle
+			move.b	d0,sTCR(a1_Int)				; set phase match for command
+@REQACKloop_DI	
+			move.b	sCDR(a1_Int),sODR(a2_Ext)	; put internal data on external bus
+			ori.b	#iDB,sICR(a2_Ext)			; xfer data to external bus
+			move.b	d3_IntStat,sTCR(a2_Ext)		; send internal info to external bus
+
+@wait4ACK_DI		
+			btst.b	#bACK,sBSR(a2_Ext)			; check for ACK/: indicates we can read data
+			beq.s	@wait4ACK_DI				;
+			
+			bclr	#bitREQ,sTCR(a2_Ext)		; drop REQ/ when we see ACK/
+
+@wait4NotACK_DI		
+			btst.b	#bACK,sBSR(a2_Ext)			; check for ACK/: indicates we can read data
+			bne.s	@wait4NotACK_DI				;
+			
+			move.b	#iACK,sICR(a1_Int)			; transfer recv'd ACK/ to internal bus
+
+@wait4NotREQ_DI		
+			btst.b	#bREQ,sCSR(a1_Int)			; wait for /REQ to be de-asserted
+			bne.s	@wait4NotREQ_DI
+			
+			move.b	zeroReg,sICR(a1_Int)		; clear ACK/ then wait for target to respond
+
+@wait4REQ_DI		
+			btst.b	#bREQ,sCSR(a1_Int)			; wait for /REQ to be asserted
+			beq.s	@wait4REQ_DI
+			
+			move.b	sCSR(a1_Int),d3_IntStat		; save it
+			lsr.b	#2,d3_IntStat				; setup to xfer /REQ,/MSG,C/D, I/O
+			moveq	#7,d0
+			and.b	d3_IntStat,d0				;
+			subq.b	#phDI,d0					; once we have /REQ we need to know what the target wants to do...
+			beq.s	@REQACKloop_DI				; branch if still in Data-In phase
+
+			bra		ClearIntSem
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	Command_DM
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d3	-	internal bus status (/REQ, /MSG, C/D, I/O)
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	d0,d1
+;
+; Function:	handles the command phase
+;
+
+Command_DM
+			move.w	savedSR(a6),sr				; restore interrupt level							<H3>
+			moveq	#iCD,d0						;													<H3>
+			move.b	d0,sTCR(a2_Ext)				; get CD/ out so bus can settle						<H3>
+			move.b	d0,sTCR(a1_Int)				; set phase match for command						<H3>
+			moveq	#0,d1
+			
+@REQACKloop	move.b	d3_IntStat,sTCR(a2_Ext)		; send internal info to external bus
+		
+@wait4ACK	btst.b	#bACK,sBSR(a2_Ext)			; check for ACK/: indicates we can read data
+			beq.s	@wait4ACK
+			
+			move.b	sCDR(a2_Ext),d0				; get byte from Mac									<H3>
+			move.b	d0,(savedCDB,a6,d1.w*1)		; store byte in CDB									<H3>
+			addq	#1,d1						; increment CDB index								<H3>
+			move.b	d0,sODR(a1_Int)				; get data from ext. bus and put on int.			<H3>
+
+			bclr	#bitREQ,sTCR(a2_Ext)		; drop REQ/ when we see ACK/
+			
+@wait4NotACK		
+			btst.b	#bACK,sBSR(a2_Ext)			; check for ACK/ before giving next REQ/
+			bne.s	@wait4NotACK
+
+			move.b	#iACK+iDB,sICR(a1_Int)
+
+@wait4NotREQ		
+			btst.b	#bREQ,sCSR(a1_Int)			; wait for /REQ to be de-asserted
+			bne.s	@wait4NotREQ
+
+			andi.b	#~iACK,sICR(a1_Int)			; clear ACK/ and data and then wait for target to respond
+
+@wait4REQ	btst.b	#bREQ,sCSR(a1_Int)			; wait for /REQ to be asserted
+			beq.s	@wait4REQ
+			
+			move.b	sCSR(a1_Int),d3_IntStat		; save it
+			lsr.b	#2,d3_IntStat				; setup to xfer /REQ,/MSG,C/D, I/O
+			moveq	#7,d0
+			and.b	d3_IntStat,d0				;
+			subq.b	#phCmd,d0					; once we have /REQ we need to know what the target wants to do...
+			beq.s	@REQACKloop					; branch if still in command phase
+			
+			move.b	zeroReg,sTCR(a2_Ext)		; clear command on external bus
+
+			bra		ClearIntSem					;													<H3>
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	Status_DM
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d3	-	internal bus status (/REQ, /MSG, C/D, I/O)
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	d0
+;
+; Function:	handles the status phase
+;
+
+Status_DM
+			move.w	savedSR(a6),sr				; restore interrupt level							<H3>
+			moveq	#iIO+iCD,d0					;													<H3>
+			move.b	d0,sTCR(a2_Ext)				; get CD/ and IO/ out so bus can settle				<H3>
+			move.b	d0,sTCR(a1_Int)				; set phase match for command						<H3>
+
+@REQACKloop	move.b	sCDR(a1_Int),sODR(a2_Ext)	; put internal data on external bus
+			ori.b	#iDB,sICR(a2_Ext)			; xfer data to external bus
+			move.b	d3_IntStat,sTCR(a2_Ext)		; send internal info to external bus
+
+@wait4ACK	btst.b	#bACK,sBSR(a2_Ext)			; check for ACK/: indicates we can read data
+			beq.s	@wait4ACK				;
+			
+			bclr	#bitREQ,sTCR(a2_Ext)		; drop REQ/ when we see ACK/
+
+@wait4NotACK		
+			btst.b	#bACK,sBSR(a2_Ext)			; check for ACK/ before giving next REQ/
+			bne.s	@wait4NotACK				;
+			
+			move.b	#iACK,sICR(a1_Int)			; transfer recv'd ACK/ to internal bus
+
+@wait4NotREQ		
+			btst.b	#bREQ,sCSR(a1_Int)			; wait for /REQ to be de-asserted
+			bne.s	@wait4NotREQ
+			
+			move.b	zeroReg,sICR(a1_Int)		; clear ACK/ then wait for target to respond
+			bra		ClearIntSem					;													<H3>
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	Unspecified_DM
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d3	-	internal bus status (/REQ, /MSG, C/D, I/O)
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	none
+;
+; Function:	handles unspecified phases
+;
+
+Unspecified_DM
+			nop
+			rts
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	MessageOut_DM
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d3	-	internal bus status (/REQ, /MSG, C/D, I/O)
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	d0
+;
+; Function:	handles the message out phase
+;
+
+MessageOut_DM
+			move.w	savedSR(a6),sr				; restore interrupt level							<H3>
+			moveq	#iMSG+iCD,d0
+			move.b	d0,sTCR(a2_Ext)				; get CD/ and MSG/ out so bus can settle
+			move.b	d0,sTCR(a1_Int)				; set phase match for command
+
+@REQACKloop	move.b	d3_IntStat,sTCR(a2_Ext)		; send internal info to external bus
+
+@wait4ACK	btst.b	#bACK,sBSR(a2_Ext)			; check for ACK/: indicates we can read data
+			beq.s	@wait4ACK
+			
+			move.b	sCDR(a2_Ext),sODR(a1_Int)	; get data from ext. bus and put it on int.
+			bclr	#bitREQ,sTCR(a2_Ext)		; drop REQ/ when we see ACK/
+			
+@wait4NotACK		
+			btst.b	#bACK,sBSR(a2_Ext)			; check for ACK/ before giving next REQ/
+			bne.s	@wait4NotACK
+			
+			move.b	#iACK+iDB,sICR(a1_Int)
+
+@wait4NotREQ		
+			btst.b	#bREQ,sCSR(a1_Int)			; wait for /REQ to be de-asserted
+			bne.s	@wait4NotREQ
+
+			move.b	zeroReg,sICR(a1_Int)		; clear ACK/ and data and then wait for target to respond
+
+@wait4REQ	btst.b	#bREQ,sCSR(a1_Int)			; wait for /REQ to be asserted
+			bne.s	@gotREQ
+			btst.b	#bBSY,sCSR(a1_Int)			; check to see if more work is required
+			bne.s	@wait4REQ					; ...branch if more to be done
+			bra.s	ClearIntSem					; we've reached bus free so clean up				<H3>
+
+@gotREQ		move.b	sCSR(a1_Int),d3_IntStat		; save it
+			lsr.b	#2,d3_IntStat				; setup to xfer /REQ,/MSG,C/D, I/O
+			moveq	#7,d0
+			and.b	d3_IntStat,d0				;
+			subq.b	#phMsgOut,d0				; once we have /REQ we need to know what the target wants to do...
+			beq.s	@REQACKloop					; branch if still in Message Out phase
+
+			bra.s	ClearIntSem					;													<H3>
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	MessageIn_DM
+;
+; Inputs:	a1	-	pointer to base address of internal SCSI chip
+;			a2	-	pointer to base address of external SCSI chip
+;			a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d3	-	internal bus status (/REQ, /MSG, C/D, I/O)
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	d0
+;
+; Function:	handles the message in phase
+;
+
+MessageIn_DM
+			move.w	savedSR(a6),sr				; restore interrupt level							<H3>
+			moveq	#iMSG+iCD+iIO,d0			;													<H3>
+			move.b	d0,sTCR(a2_Ext)				; get CD/, /MSG and  IO/ out 						<H3>
+			move.b	d0,sTCR(a1_Int)				; set phase match for command						<H3>
+
+@REQACKloop	move.b	sCDR(a1_Int),sODR(a2_Ext)	; put internal data on external bus
+			ori.b	#iDB,sICR(a2_Ext)			; xfer data to external bus
+			move.b	d3_IntStat,sTCR(a2_Ext)		; send internal info to external bus
+
+@wait4ACK	btst.b	#bACK,sBSR(a2_Ext)			; check for ACK/: indicates we can read data
+			bne.s	@gotACK
+			btst.b	#bBSY,sCSR(a1_Int)			; check to see if more work is required
+			bne.s	@wait4ACK					; ...branch if more to be done
+			bra.s	ClearIntSem					; we've reached bus free so clean up				<H3>
+
+@gotACK		bclr	#bitREQ,sTCR(a2_Ext)		; drop REQ/ when we see ACK/
+@wait4NotACK		
+			btst.b	#bACK,sBSR(a2_Ext)			; check for ACK/ before giving next REQ/
+			bne.s	@wait4NotACK
+			
+			move.b	#iACK,sICR(a1_Int)			; transfer recv'd ACK/ to internal bus
+			
+@wait4NotREQ		
+			btst.b	#bREQ,sCSR(a1_Int)			; wait for /REQ to be de-asserted
+			bne.s	@wait4NotREQ
+			
+			move.b	zeroReg,sICR(a1_Int)		; clear ACK/ then wait for target to respond
+
+*			bra.s	ClearIntSem					;													<H3>
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	ClearIntSem
+;
+; Inputs:	none
+;
+; Outputs:	interrupt level set to hiIntMask (7)
+;
+; Trashes:	none
+;
+; Function:	Temporarily turns of interrupts so that we can clear the flag indicating
+;			that a data xfer is taking place.
+;
+
+ClearIntSem										;													<H3>
+			move.w	sr,savedSR(a6)				; Save current interrupt level.
+			ori.w	#hiIntMask,sr				; set interrupt level to 7												
+ 			bclr.b	#DoingXfer,diskStat(a6)		; are we nested in a xfer routine?			
+			rts
+
+
+;_______________________________________________________________________________________
+;
+; Routine:	InstallIntHandler
+;
+; Inputs:	a4	-	pointer to SCSI Manager globals
+;			a6	-	pointer to DiskMode stack frame
+;			d7	-	zero
+;
+; Outputs:	same
+;
+; Trashes:	none
+;
+; Function:	installs the appropriate interrupt handler
+;
+InstallRegs			REG		a0-a2				;													<H4>
+
+InstallIntHandler
+			movem.l	InstallRegs,-(sp)			; save regs for install procs						<H4>
+			tst.l	base5380_2(a4)				; is there an external controller?
+			beq.s	InstallSBIntrpHdlr			; -> no, install the single bus handler
+
+			subq.w	#4,sp						; save room for result
+			pea		dockSCSIDiskIRQ				; docking selector = register SCSI Intrp handler
+			pea		IntrpHdlr					; params = address of handler
+			_DockingDispatch					; call the handler
+			addq.w	#4,sp						; trash the return result
+			movem.l	(sp)+,InstallRegs			;													<H4>
+RSTReturn	rts
+
+
+InstallSBIntrpHdlr
+			move.w	sr,-(sp)					; save int level
+			ori.w	#HiIntMask,sr
+			
+			movea.l	SCSIBase,a1
+			
+			move.b	zeroReg,sMR(a1)				; clear arbitration bit
+
+			
+			move.b	zeroReg,sICR(a1)			; deassert /RST if active
+			move.b	zeroReg,sTCR(a1)			; clear target command reg.
+			move.b	zeroReg,sODR(a1)			; clear the internal data bus
+
+			movea.l	VIA2RBV,a1
+			move.b	#$7f,vIER(a1)				; disable all level 2 interrupts
+			move.b	#$7f,vIFR(a1)				; clear all interrupt flags
+
+			lea		SBIntrpHdlr,a1
+			move.l	a1,AutoInt2					; stuff our handler 
+			
+			bsr.s	SingleBusArrowInt			; turn on single bus SDM arrow interrupts
+					
+			move.w	(sp)+,sr					; save int level
+			movem.l	(sp)+,InstallRegs			; regs saved for installation						<H4>
+			
+			rts
+			
+
+;_______________________________________________________________________________________	
+;
+; Routine:	SBIntrpHdlr
+;
+; Inputs:	Interrupt exception stack frame for '030 (format $0)
+;
+; Outputs:	This handler sets a bit signifying that the internal drive has
+;			been selected on a single SCSI bus SCSIDiskMode machine.  This 
+;			lets us know very quickly (approx. 90 microseconds) that the drive
+;           is being talked to by an initiator.
+;
+; Trashes:	none
+;
+; Function:	Handles the interrupt source from the SCSI controller on the main logic board.
+;			Note that this is only enabled for single bus SCSIDiskMode machines.
+;
+
+SBIntrpHdlr	move.w	sr,-(sp)					; save interrupt level
+			ori.w	#HiIntMask,sr
+			move.l	a0,-(sp)
+
+			movea.l	SCSIGlobals,a0				; get pointer to SCSI Manager globals		
+			movea.l	sdmStack(a0),a0				; restore a pointer to our locals
+			bset	#bitSEL,DiskStat(a0)		; have we a SEL (captured via interrupt)
+
+			movea.l	SCSIBase,a0					; load base address of internal c80
+			move.b	#0,sSER(a0)					; disable the SEL interrupt
+			tst.b	sRESET(a0)					; clear interrupt source
+
+			movea.l	VIA2RBV,a0
+			move.b	#$7f,vIER(a0)				; disable all level 2 interrupts
+			move.b	#$7f,vIFR(a0)				; clear flags
+
+			movea.l	(sp)+,a0
+			move.w	(sp)+,sr					; restore interrupt level
+			rte
+
+			
+;_______________________________________________________________________________________	
+;
+; Routine:	SingleBusArrowInt
+;
+; Inputs:	a6	- SpinWheels stack frame
+;
+; Outputs:	same
+;
+; Trashes:	none
+;
+; Function: Validates the SER register for receiving SEL interrupts on the internal controller
+;
+
+SingleBusArrowInt
+			
+			movem.l	d0/d1/a1,-(sp)				; save
+			
+			movea.l	SCSIBase,a1					; setup for sSER register access
+			move.w	DiskID(a6),d0				; retrieve virtual SCSI id
+			moveq	#1,d1						; setup for getting id position
+			lsl.b	d0,d1
+			move.b	d1,sSER(a1)					; we want an interrupt on a valid select
+
+			movea.l	VIA2RBV,a1
+			move.b	#((1<<ifIRQ)+\				; set the enable bit to one
+					(1<<ifCB2))\				; CB2 ind input neg active edge	(SCSI IRQ interrupt)	
+					,vIER(a1)					; enable the CB2 interrupt				
+
+			movem.l	(sp)+,d0/d1/a1				; restore
+			rts									;										
+
+
+;_______________________________________________________________________________________	
+;
+; Routine:	IntrpHdlr
+;
+; Inputs:	Interrupt exception stack frame for '030 (format $0)
+;
+; Outputs:	Dependant on the location in the DiskMode code that the interrupt occurs.
+;			We can assume, because we do everything at level 1 interrupt level, if we
+;			get here then our stackframe world is still valid
+;
+; Trashes:	d0
+;
+; Function:	Handles the interrupt source from the external SCSI controller.
+;
+
+savedIntrpRegs		REG		a1/a2/a6/d0/d1		; registers trashed in interrupt handler
+intRegSize			EQU		5*4					; size of saved regs on stack
+
+IntrpHdlr
+			movem.l	savedIntrpRegs,-(sp)
+			movea.l	SCSI2Base,a2_Ext			; load base address of external c80
+			
+			movea.l	SCSIGlobals,a6				; get pointer to SCSI Manager globals		
+			movea.l	sdmStack(a6),a6				; restore a pointer to our locals
+
+			btst	#bSEL,sCSR(a2_Ext)			; have we a SEL ?
+			bne.s	@wereSelected				; we are being selected so lets set /BSY...
+			
+			btst.b	#bPM,sBSR(a2_Ext)			; is this a phase match interrupt?
+			beq.s	@noRSTNeeded				; bPM=0 is phase mismatch cause intrp.
+			
+; else we know that the only other intrp source is /RST so pass it thru
+		
+			movea.l	SCSIBase,a1_Int				; load base address of internal c80
+			move.b	#iRST,sICR(a1_Int)			; assert SCSI reset line on internal controller
+			move.w	TimeDBRA,d1					; wait 250µsec
+			lsr.w	#2,d1
+@delay		dbra	d1,@delay
+			move.b	#0,sICR(a1_Int)				; de-assert *RST
+
+			move.w	DiskID(a6),d0				; retrieve virtual SCSI id
+			moveq	#1,d1						; setup for getting id position
+			lsl.b	d0,d1
+			move.b	d1,sSER(a2_Ext)				; we want an interrupt on a valid select			<H6>
+
+			move.b	sRESET(a2_Ext),d1			; clear interrupt source
+
+ 			bclr.b	#DoingXfer,diskStat(a6)		; are we nested in a xfer routine?			
+			beq.s	@noRSTNeeded				; no, the reset was enough
+
+; Fake a format code 0 exception frame (4 words) to finish cleaning up
+
+			clr.w	intRegSize+6(sp)			; format code 0
+			lea		RSTReturn,a1
+			move.l	a1,intRegSize+2(sp)			; PC value
+			bra.s	@Done			
+@noRSTNeeded									; this was a PM intrp so just return
+			eori.b	#iDMA,sMR(a2_Ext)			; clear DMA on external bus
+@Done		movem.l	(sp)+,savedIntrpRegs
+			rte									; allow execution to continue
+
+@wereSelected
+			move.w	DiskID(a6),d0				; retrieve virtual SCSI id
+			btst	d0,sCDR(a2_Ext)				; is our ID bit turned on?
+			beq.s	@Done						; -> no, we're done
+
+@setBSY		bset	#bitSEL,DiskStat(a6)		; have we a SEL (captured via interrupt)
+			move.b	#iBSY,sICR(a2_Ext)			; communicate that we got BSY to external bus
+												; we will pass on REQ as soon as it comes from the internal drive
+			moveq	#0,d1
+			move.b	d1,sSER(a2_Ext)				; disable the SEL interrupt							<H6>
+			move.b	sRESET(a2_Ext),d1			; clear interrupt source
+			bra.s	@Done
+
+
+;_______________________________________________________________________________________	
+;
+; Routine:	InsdmTimeTask
+;
+; Inputs:	a6	- SpinWheels stack frame
+;
+; Outputs:	Installed Time Manager task.
+;
+; Trashes:	none
+;
+; Function:	Install TM task for setting the expiration flags for drawing code.
+;
+
+InsdmTimeTask									;													<H3>
+			movem.l	a0-a1/d0,-(sp)				; save things we use
+			
+			lea.l	drawTimerTsk(a6),a0			; point to Time Mgr task record
+			lea.l	sdmTimeTask,a1				; point to timer interrupt handler
+
+			move.l	a1,tmAddr(a0)				; point to interrupt handler
+			_InsXTime							; install the task record in Time Mgr queue
+			
+			move.l	#500,d0						; 
+			neg.l	d0							; for 500 micro seconds
+			clr.l	tmWakeUp(a0)				; signal the first time
+			_PrimeTime							; activate the task
+			
+			movem.l	(sp)+,a0-a1/d0				; restore things we used
+			rts									;										
+			
+			
+;_______________________________________________________________________________________
+;
+; Routine:	RmvsdmTimeTask
+;
+; Inputs:	a6	- SpinWheels stack frame
+;
+; Outputs:  Time Manager task is removed from the queue.
+;
+; Trashes:	none
+;
+; Function:	Remove the TM Task so that we avoid getting interrupts during data transfer.
+;
+
+RmvsdmTimeTask									;													<H3>
+			movem.l	a0,-(sp)					; save things we use
+			
+			lea.l	drawTimerTsk(a6),a0			; point to Time Mgr task record
+			_RmvTime							; deactivate the task
+			
+			movem.l	(sp)+,a0					; restore things we used
+			rts									;										
+			
+			
+;_______________________________________________________________________________________	
+;
+; Routine:	sdmTimeTask
+;
+; Inputs:	a1	-	pointer to the Time Mgr task record
+;
+; Outputs:	
+;
+; Trashes:	a0,d0
+;
+; Function:	Sets expiration flags for drawing code.
+;
+
+sdmTimeTask										;													<H3>
+			movea.l	SCSIGlobals,a0				; get pointer to SCSI Manager globals
+			movea.l	sdmStack(a0),a0
+			addq.l	#1,DrawCount(a0)
+
+			movea.l	a1,a0						; point to our existing TM task
+			move.l	#500,d0						; 
+			neg.l	d0							; for 500 micro seconds
+			_PrimeTime							; reactivate the task
+			rts									;											
+
+
+;_______________________________________________________________________________________	
+;
+;  Routine:		DataBusErrHdlr
+;
+;	Bus Error handler for data phase transfers
+;
+;	routine:	InitSCSIMgr
+;	file:		SCSIMgrInit.a
+;
+;	Input:	a4	=	ptr to SCSI globals
+;
+
+faultedAdrs			EQU		$10					; offset of Faulted Address for 030 
+shortBEXFrameType	EQU		$0A					; Short bus cycle fault stack frame (020/030)	
+
+savedRegs			REG		d0-d1/a0			; save these registers because we need to use them			
+savedRSize			EQU		3*4					; # bytes on stack for saved registers						
+
+DataBusErrHdlr									;													<H3>
+			movem.l	savedRegs,-(sp)				; save things we trash
+
+			move.l	savedRSize+faultedAdrs(sp),d0		; retrieve faulted address
+			clr.b	d0							; mask off variable bits
+			cmp.l	SCSIHsk,d0 					; compare with internal SCSI hhsk address
+			beq.s	@SCSIFault					; internal controller bus error?
+			
+			; neither SCSI controller bus errored so let bus error bubble up
+
+			move.l	SCSIGlobals, a0				; 
+			move.l	yeOldeBusErrVct(a0),savedRSize(sp)
+			movem.l	(sp)+, savedRegs
+			rts									; jump to old handler, assuming it'll RTE
+			
+@SCSIFault
+			btst.b	#bPM,sBSR(a1_Int)			; are we still in phase?
+			beq.s	@changedPhase				; branch if not still in phase
+			
+@waitDRQ	btst.b	#bDMAR,sBSR(a1_Int)			; do we have DRQ yet?
+			beq.s	@SCSIFault					; no, then wait
+
+			movem.l	(sp)+, savedRegs
+			rte									; we'll try til the end of time
+
+@changedPhase
+			lea		savedRSize(sp),sp			; throw away copy of d0/a0 on stack
+			move.w	(sp),d0						; get sr from stack
+			bfextu	6(sp){0:4},d1				; get format code from stack
+			cmp.b	#shortBEXFrameType,d1		; short exception frame?
+			bne.s	Drop46w						; no, so use larger frame
+			lea		16*2(sp),sp					; dispose of the 16-word frame
+			bra.s	DummyFrame					;  and finish up
+Drop46w
+			lea		46*2(sp),sp					; size of exception frame
+DummyFrame
+			;
+			; Fake a format code 0 exception frame (4 words) to finish cleaning up
+			;
+			clr.w	-(sp)						; format code 0
+			pea		RSTReturn					; PC value
+			move.w	d0,-(sp)					; sr value
+			rte									; 'return' from the fake exception
+
+
+			ENDWITH
+			END

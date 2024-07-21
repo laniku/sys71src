@@ -1,0 +1,182 @@
+;
+;	File:		SecondaryInit.a -> VSCSecondaryInit.a
+;
+;	Contains:	Some code to whack the 'scrn' resource on family mode switches.
+;
+;	Written by:	Russ Emmons
+;
+;	Copyright:	© 1988-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <1>	12/14/93	PN		first checked in
+;		 <1>	07-19-93	jmp		first checked in
+; ———————————————————————————————————————————————————————————————————————————————————————
+;	  Pre-Kaos Proj comments begin here.
+; ———————————————————————————————————————————————————————————————————————————————————————
+;		 <4>	06-24-93	jmp		Since the CheckDevicesInit actually runs AFTER we do, we now
+;									just fix the family-mode 'scrn' resource to have the right bit
+;									depth -- this way, we don’t blow away the user’s setup.
+;		 <3>	06-14-93	jmp		Performed general file clean up.
+;		 <2>	06-11-93	jmp		Added code that removes the 'scrn' resource if it is invalid.
+; ———————————————————————————————————————————————————————————————————————————————————————
+;	  Pre-NuBrawl Proj comments begin here.
+; ———————————————————————————————————————————————————————————————————————————————————————
+;		 <3>	03-17-93	jmp		Ripped out even more stuff.  If I remember, I’m going to pull
+;									this from DeclData!
+; ———————————————————————————————————————————————————————————————————————————————————————
+;	  Pre-Atlantis ROM comments begin here.
+; ———————————————————————————————————————————————————————————————————————————————————————
+;		 <2>	  7/2/92	RLE		remove CTB stuff
+;		 <1>	  5/5/92	RLE		first checked in
+;
+
+;----------------------------------------------------------------------------
+;	Header
+;----------------------------------------------------------------------------
+				
+				dc.b	sExec2								; Header
+				dc.b	sCPU68020
+				dc.w	0
+				dc.l	BeginSInit-*
+
+;---------------------------------------------------------------------
+;	Local variables, definitions, etc....
+;---------------------------------------------------------------------
+
+SInitStackFrame	Record	{A6Link},Decrement
+Return			Ds.l	1								; Return address.
+A6Link			Ds.l	1								; Saved A6.
+spBlk			Ds		SpBlock							; SpBlock for generic use.
+sPRAMBlk		Ds.b	SizesPRAMRec					; SpRAMRec for generic use.
+SInitStackSize	Equ		*
+				Endr
+
+;----------------------------------------------------------------------------
+;	Utilities
+;----------------------------------------------------------------------------
+
+;---------------------------------------------------------------------
+;
+;	Routine:	ChkScrn
+;
+;	Inputs:		None
+;
+;	Outputs:	None
+;
+;	Destroys: 	A0-A2/D0-D2
+;
+;	Function:	Classically, the Monitors control panel writes out an
+;				'scrn' resource that would flip us into 1bpp (i.e.,
+;				mode $80) on family mode changes.  We attempt to
+;				solve that problem here by re-writing the appropriate
+;				value into the 'scrn' resource itself.
+;---------------------------------------------------------------------
+
+				With	SInitStackFrame,SpBlock,ScrnRecord,SP_Params
+
+ChkScrn			Lea			spBlk(A6),A0					; Point to our spBlock.
+				Lea			sPRAMBlk(A6),A2					; Point to a sPRAM block.
+				Move.l		A2,spResult(A0)					; Set up read buffer.
+				_sReadPRAMRec								; Read our Slot’s pRAM.
+
+				Bclr	#spFamilyChanged,SP_Flags(A2)		; Always reset the family-changed bit.
+				Beq		@EndScrn							; If it was already reset, then go on.
+
+; Check to see our video is actually running…
+;
+				Clr.b	spId(A0)							; Begin at id 0.
+				Clr.b	spTBMask(A0)						; No mask in search.
+				Move.w	#catDisplay,spCategory(A0)			; Look for: Display,
+				Move.w	#typVideo,spCType(A0)				;			Video,
+				Move.w	#drSwApple,spDrvrSW(A0)				;			Apple,
+				Move.w	#drHwVSC,spDrvrHW(A0)				;
+				Clr.l	spParamData(A0)						; Look only for enabled sRsrcs.
+				_GetTypeSRsrc								; If we didn’t find ourselves,
+				Bne.s	@EndScrn							;	then just go on.
+				
+				Move.l	A2,spsPointer(A0)					; Set up to write out Slot PRAM…
+				_sPutPRAMRec								; …to clear the spFamilyChanged bit.
+				
+				Moveq	#0,D2								; Clear D2 for good measure.
+				Move.b	spSlot(A0),D2						; Remember our slot number.
+
+; Check to see if there’s an 'scrn' resource available…
+;
+				Clr.l	-(Sp)								; Make room for the function result.
+				Move.l	#'scrn',-(Sp)						; Push desired resource type.
+				Clr.w	-(Sp)								; Resource ID = 0.
+				_GetResource								; Get the resource.
+				Move.l	(Sp)+,D0							; Get the resource handle.
+				Beq.s	@EndScrn							; If nil, then just go on.
+				
+				Move.l	D0,-(Sp)							; Save Handle for _ReleaseResource call.
+				Movea.l	D0,A2								; Save it for easy access later on.
+				Movea.l	D0,A0								; Set up to lock it down for now.
+				_HNoPurge									; Make it non-purgeable and…
+				_HLock										; …lock it down.
+				
+; Check to see if we’re in the 'scrn' resource…
+;
+				Movea.l	(A0),A0								; Get a pointer to the 'scrn' resource.
+				Move.w	(A0)+,D0							; Get the number of 'scrn' records to search.
+				Subq	#1,D0								; Make it zero-based.
+				
+@ScrnLoop		Cmp.b	srSlot(A0),D0						; If this entry is for our slot number,
+				Beq.s	@ChkDrHwID							;	then check the drHwID.
+				Adda.w	#ScrnRecSize,A0						; Otherwise, point A0 at the next entry.
+				Dbra	D0,@ScrnLoop						; Loop until done.
+				Bra.s	@EndScrnChk							; We couldn’t find our 'scrn' entry, so just go on.
+				
+@ChkDrHwID	
+				Move.w	#drHwVSC,D0							; Get our drHwID back into D0.
+				Cmp.w	srDrvrHW(A0),D0						; If the drHwIDs don’t match,
+				Bne.s	@EndScrnChk							;	then just go on.
+				
+; Make sure the depth (mode) setting is correct…
+;
+				Lea		sPRAMBlk(A6),A1						; Point to our sPRAM block.
+				Moveq	#0,D0								; Clear D0 for good measure.
+				Move.b	SP_Depth(A1),D0						; Get the mode we’d like to be at.
+				Cmp.w	srMode(A0),D0						; If the modes match,
+				Beq.s	@EndScrnChk							;	then just go on.
+				Move.w	D0,srMode(A0)						; Otherwise, write out what we want.
+							
+				Move.l	A2,-(Sp)							; Set up to mark our change.
+				_ChangedResource							; Do it.
+				Move.l	A2,-(Sp)							; Set up to write our change out.
+				_WriteResource								; Do it.
+
+; Clean up and go home…
+;
+@EndScrnChk		_ReleaseResource							; Release the ‘scrn’ resource.
+@EndScrn		Rts											; And return home.
+						
+				Endwith		
+
+;----------------------------------------------------------------------------
+;	Main
+;----------------------------------------------------------------------------
+				
+				With		SEBlock,SInitStackFrame
+				
+BeginSInit
+
+				Link		A6,#SInitStackSize				; Allocate some space on the stack.
+				Move.w		#seSuccess,seStatus(A0)			; No reason to fail here.
+
+; Perform some generic intializations.
+;				
+				Move.b		seSlot(A0),spBlk.spSlot(A6)		; Get our slot number from the Slot Manager.
+				Clr.b		spBlk.spExtDev(A6)				; Don’t ask why, always clear this guy.
+
+; Check to see if the 'scrn' resource needs updating.
+;
+				Bsr.s		ChkScrn							; Whack the 'scrn' resource if necessary.							
+				
+; Clean up and go home.
+;
+				Unlk	A6
+				Rts
+
+				Endwith

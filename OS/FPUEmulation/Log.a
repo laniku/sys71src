@@ -1,0 +1,726 @@
+;
+;	File:		Log.a
+;
+;	Contains:	Routines to emulate logarithmic functions
+;
+;	Originally Written by:	Motorola Inc.
+;	Adapted to Apple/MPW:	Jon Okada
+;
+;	Copyright:	© 1990,1991 by Apple Computer, Inc., all rights reserved.
+;
+;   This file is used in these builds:   Mac32
+;
+;	Change History (most recent first):
+;
+;		 <3>	 4/13/91	BG		Modified FLOG2 emulation to not signal inexact on exact cases.
+;		 <2>	 3/30/91	BG		Rolling in Jon Okada's latest changes.
+;		 <1>	12/14/90	BG		First checked into TERROR/BBS.
+
+;  log.a
+
+;  Based upon Motorola files 'slogn.sa' and 'slog2.sa'.
+
+;  CHANGE LOG:
+;  04 Jan 91	JPO	Changed constant names BOUNDS1 and BOUNDS2 to BND1LOG
+;			  and BND2LOG, respectively.  Moved all slogn, slog2, and
+;			  slog10 constants and  table LOGTBL to file 'constants.a'.
+;			  Changed variable names X, XDCARE, and XFRAC to XLN,
+;			  XLNDC, and XLNFR, respectively.  Deleted unreferenced
+;			  label "HiX_0".
+;  28 Mar 91	JPO	Modified routines "slog2d" and "slog2" to handle exact
+;			  cases of FLOG2.  Streamlined "slognd" and "slogn"
+;			  routines (FLOGN).  Created a separate subroutine,
+;			  "lognrm", to normalize subnormal input.
+;
+
+
+;  slogn
+
+*
+*	slogn.sa 3.1 12/10/90
+*
+*	slogn computes the natural logarithm of an
+*	input value. slognd does the same except the input value is a
+*	denormalized number. slognp1 computes log(1+X), and slognp1d
+*	computes log(1+X) for denormalized X.
+*
+*	Input: Double-extended value in memory location pointed to by address
+*		register a0.
+*
+*	Output:	log(X) or log(1+X) returned in floating-point register Fp0.
+*
+*	Accuracy and Monotonicity: The returned result is within 2 ulps in
+*		64 significant bit, i.e. within 0.5001 ulp to 53 bits if the
+*		result is subsequently rounded to double precision. The 
+*		result is provably monotonic in double precision.
+*
+*	Speed: The program slogn takes approximately 190 cycles for input 
+*		argument X such that |X-1| >= 1/16, which is the the usual 
+*		situation. For those arguments, slognp1 takes approximately
+*		 210 cycles. For the less common arguments, the program will
+*		 run no worse than 10% slower.
+*
+*	Algorithm:
+*	LOGN:
+*	Step 1. If |X-1| < 1/16, approximate log(X) by an odd polynomial in
+*		u, where u = 2(X-1)/(X+1). Otherwise, move on to Step 2.
+*
+*	Step 2. X = 2**k * Y where 1 <= Y < 2. Define F to be the first seven
+*		significant bits of Y plus 2**(-7), i.e. F = 1.xxxxxx1 in base
+*		2 where the six "x" match those of Y. Note that |Y-F| <= 2**(-7).
+*
+*	Step 3. Define u = (Y-F)/F. Approximate log(1+u) by a polynomial in u,
+*		log(1+u) = poly.
+*
+*	Step 4. Reconstruct log(X) = log( 2**k * Y ) = k*log(2) + log(F) + log(1+u)
+*		by k*log(2) + (log(F) + poly). The values of log(F) are calculated
+*		beforehand and stored in the program.
+*
+*	lognp1:
+*	Step 1: If |X| < 1/16, approximate log(1+X) by an odd polynomial in
+*		u where u = 2X/(2+X). Otherwise, move on to Step 2.
+*
+*	Step 2: Let 1+X = 2**k * Y, where 1 <= Y < 2. Define F as done in Step 2
+*		of the algorithm for LOGN and compute log(1+X) as
+*		k*log(2) + log(F) + poly where poly approximates log(1+u),
+*		u = (Y-F)/F. 
+*
+*	Implementation Notes:
+*	Note 1. There are 64 different possible values for F, thus 64 log(F)'s
+*		need to be tabulated. Moreover, the values of 1/F are also 
+*		tabulated so that the division in (Y-F)/F can be performed by a
+*		multiplication.
+*
+*	Note 2. In Step 2 of lognp1, in order to preserved accuracy, the value
+*		Y-F has to be calculated carefully when 1/2 <= X < 3/2. 
+*
+*	Note 3. To fully exploit the pipeline, polynomials are usually separated
+*		into two parts evaluated independently before being added up.
+*	
+
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* slogn	IDNT	2,1 Motorola 040 Floating Point Software Package
+
+
+
+ADJK	equ	L_SCR1
+
+;X	equ	FP_SCR1		; deleted <1/4/91, JPO>
+;XDCARE	equ	X+2
+;XFRAC	equ	X+4
+
+XLN	equ	FP_SCR1		; <1/4/91, JPO>
+XLNDC	equ	XLN+2
+XLNFR	equ	XLN+4
+
+F	equ	FP_SCR2
+FFRAC	equ	F+4
+
+KLOG2	equ	FP_SCR3
+
+SAVEU	equ	FP_SCR4
+
+
+slognd:
+*--ENTRY POINT FOR LOG(X) FOR DENORMALIZED INPUT
+
+;	MOVE.L	#-100,ADJK(a6)	...INPUT = 2^(ADJK) * FP0 - deleted <3/28/91, JPO>		<T3>
+
+	tst.l	(a0)		; invalid if negative operand <3/28/91, JPO>			<T3>
+	bmi	t_operr		; <3/28/91, JPO>						<T3>
+	bsr.b	lognrm		; normalize input and initialize ADJK <3/28/91, JPO>		<T3>
+	bra.b	LOGBGN		; continue below <3/28/91, JPO>					<T3>
+
+
+; NEW SUBROUTINE - <3/28/91, JPO>
+; Subroutine lognrm---normalizes the positive extended denormal input at (a0) and
+;   writes result with zero exponent to XLN(a6).  The negative exponent adjustment
+;   is written to ADJK(a6).
+; On input:  a0 points to (assumed positive) input argument.
+; On output: XLN(a6) contains normal argument with zero exponent.
+;	     ADJK(a6) contains the negative exponent adjustment.
+;	     a0 points to XLN(a6).
+
+
+*----normalize the input value by left shifting k bits (k to be determined
+*----below), adjusting exponent and storing -k to  ADJK
+*----the value TWOTO100 is no longer needed.
+*----Note that this code assumes the denormalized input is NON-ZERO.
+
+lognrm:				; label added <3/28/91, JPO>					<T3> thru next <T3>
+;	MoveM.L	D2-D7,-(A7)	...save some registers - DELETED <3/28/91, JPO>
+;	Move.L	#$00000000,D3	...D3 is exponent of smallest norm. # - DELETED <3/28/91, JPO>
+
+	movem.l	D3-D7,-(a7)	; save 5 D registers <3/28/91, JPO>
+
+	Move.L	4(A0),D4
+	Move.L	8(A0),D5	...(D4,D5) is (Hi_X,Lo_X)
+;	Clr.L	D2		...D2 used for holding K - DELETED <3/28/91, JPO>
+	clr.l	d3		; d3 used for holding k <3/28/91, JPO>
+
+;	Tst.L	D4		; DELETED <3/28/91, JPO>
+;	BNE.B	HiX_not0	; DELETED <3/28/91, JPO>
+
+	bfffo	D4{0:32},D6	; find first set bit in Hi_X <3/28/91, JPO>
+	bne.b	HiX_not0	; HiX nonzero <3/28/91, JPO>
+
+;HiX_0:				; label DELETED <1/4/91, JPO>
+	Move.L	D5,D4
+	Clr.L	D5
+;	Move.L	#32,D2		; DELETED <3/28/91, JPO>
+
+	moveq.l	#32,d3		;  <3/28/91, JPO>
+
+;	Clr.L	D6		; DELETED <3/28/91, JPO>
+	BFFFO	D4{0:32},D6
+;	LSL.L	D6,D4		; DELETED <3/28/91, JPO>
+;	Add.L	D6,D2		...(D3,D4,D5) is normalized - DELETED <3/28/91, JPO>
+
+;	Move.L	D3,XLN(a6)	; <1/4/91, JPO> - DELETED <3/28/91, JPO>
+;	Move.L	D4,XLNFR(a6)	; <1/4/91, JPO> - DELETED <3/28/91, JPO>
+;	Move.L	D5,XLNFR+4(a6)	; <1/4/91, JPO> - DELETED <3/28/91, JPO>
+;	Neg.L	D2		; DELETED <3/28/91, JPO>
+;	Move.L	D2,ADJK(a6)	; DELETED <3/28/91, JPO>
+;	FMove.X	XLN(a6),FP0	; <1/4/91, JPO> - DELETED <3/28/91, JPO>
+;	MoveM.L	(A7)+,D2-D7	...restore registers - DELETED <3/28/91, JPO>
+;	LEA	XLN(a6),A0	; <1/4/91, JPO> - DELETED <3/28/91, JPO>
+;	Bra.B	LOGBGN		...begin regular log(X) - DELETED <3/28/91, JPO>
+
+
+HiX_not0:
+;	Clr.L	D6		; DELETED <3/28/91, JPO>
+;	BFFFO	D4{0:32},D6	...find first 1 - DELETED <3/28/91, JPO>
+;	Move.L	D6,D2		...get k - DELETED <3/28/91, JPO>
+	LSL.L	D6,D4
+	add.l	d6,d3		; get k <3/28/91, JPO>
+	Move.L	D5,D7		...a copy of D5
+	LSL.L	D6,D5
+;	Neg.L	D6		; DELETED - <3/28/91, JPO>
+;	AddI.L	#32,D6		; DELETED - <3/28/91, JPO>
+
+	neg.b	d6		; do byte operations <3/28/91, JPO>
+	addi.b	#32,d6		; <3/28/91, JPO>
+
+	LSR.L	D6,D7
+	neg.l	d3		; exponent adjust is -k <3/28/91, JPO>
+	Or.L	D7,D4		...(D3,D4,D5) normalized
+
+;	Move.L	D3,XLN(a6)	; <1/4/91, JPO> - DELETED <3/28/91, JPO>
+
+	clr.l	XLN(a6)		; zero exponent <3/28/91, JPO>
+	Move.L	D4,XLNFR(a6)	; <1/4/91, JPO>
+	Move.L	D5,XLNFR+4(a6)	; <1/4/91, JPO>
+;	Neg.L	D2		; DELETED <3/28/91, JPO>
+;	Move.L	D2,ADJK(a6)	; DELETED <3/28/91, JPO>
+	move.l	D3,ADJK(a6)	; store exponent adjust <3/28/91, JPO>
+;	FMove.X	XLN(a6),FP0	; <1/4/91, JPO> - DELETED <3/28/91, JPO>
+;	MoveM.L	(A7)+,D2-D7	...restore registers - DELETED <3/28/91, JPO>
+	movem.l (a7)+,d3-d7	; restore 5 registers <3/28/91, JPO>
+	LEA	XLN(a6),A0	; <1/4/91, JPO>
+;	Bra.B	LOGBGN		...begin regular log(X) - DELETED <3/28/91, JPO>
+
+	rts			; return <3/28/91, JPO>
+
+
+
+slogn:
+*--ENTRY POINT FOR LOG(X) FOR X FINITE, NON-ZERO, NOT NAN'S
+
+	tst.l	(a0)		; invalid if negative operand
+	bmi	t_operr
+;	FMOVE.X	(A0),FP0	...LOAD INPUT - moved below <3/28/91, JPO>
+;	MOVE.L	#$00000000,ADJK(a6)	; DELETED <3/28/91, JPO>
+	clr.l	ADJK(a6)		; zero exponent adjustment <3/28/91, JPO>
+	move.l	(a0),XLN(a6)		; transfer normal operand to XLN(a6) <3/28/91, JPO>
+	move.l	4(a0),XLN+4(a6)		; <3/28/91, JPO>
+	move.l	8(a0),XLN+8(a6)		; <3/28/91, JPO>
+	lea.l	XLN(a6),a0		; a0 points to XLN(a6) <3/28/91, JPO>			<T3>
+
+LOGBGN:
+*--FPCR SAVED AND CLEARED, INPUT IS 2^(ADJK)*FP0, FP0 CONTAINS
+*--A FINITE, NON-ZERO, NORMALIZED NUMBER.
+
+	move.l	(a0),d0
+	move.w	4(a0),d0
+	FMOVE.X	(a0),FP0		; FPO <- normal operand <3/28/91, JPO>			<T3> thru next <T3>
+
+;	move.l	(a0),XLN(a6)	; <1/4/91, JPO> - moved to above <3/28/91, JPO>
+;	move.l	4(a0),XLN+4(a6)	; <1/4/91, JPO> - <3/28/91, JPO>
+;	move.l	8(a0),XLN+8(a6)	; <1/4/91, JPO> - <3/28/91, JPO>
+
+;	CMPI.L	#0,D0		...CHECK IF X IS NEGATIVE - deleted <3/28/91, JPO>
+;	BLT.W	LOGNEG		...LOG OF NEGATIVE ARGUMENT IS INVALID - deleted <3/28/91, JPO>
+	CMP2.L	BND1LOG,D0	...X IS POSITIVE, CHECK IF X IS NEAR 1
+	BCC.W	LOGNEAR1	...BOUNDS IS ROUGHLY [15/16, 17/16]				<T3>
+
+LOGMAIN:
+*--THIS SHOULD BE THE USUAL CASE, X NOT VERY CLOSE TO 1
+
+*--X = 2^(K) * Y, 1 <= Y < 2. THUS, Y = 1.XXXXXXXX....XX IN BINARY.
+*--WE DEFINE F = 1.XXXXXX1, I.E. FIRST 7 BITS OF Y AND ATTACH A 1.
+*--THE IDEA IS THAT LOG(X) = K*LOG2 + LOG(Y)
+*--			 = K*LOG2 + LOG(F) + LOG(1 + (Y-F)/F).
+*--NOTE THAT U = (Y-F)/F IS VERY SMALL AND THUS APPROXIMATING
+*--LOG(1+U) CAN BE VERY EFFICIENT.
+*--ALSO NOTE THAT THE VALUE 1/F IS STORED IN A TABLE SO THAT NO
+*--DIVISION IS NEEDED TO CALCULATE (Y-F)/F. 
+
+*--GET K, Y, F, AND ADDRESS OF 1/F.
+	ASR.L	#8,D0
+	ASR.L	#8,D0		;...SHIFTED 16 BITS, BIASED EXPO. OF X
+	SUBI.L	#$3FFF,D0 	;...THIS IS K
+	ADD.L	ADJK(a6),D0	;...ADJUST K, ORIGINAL INPUT MAY BE  DENORM.
+	LEA	LOGTBL,A0 	;...BASE ADDRESS OF 1/F AND LOG(F)
+	FMOVE.L	D0,FP1		;...CONVERT K TO FLOATING-POINT FORMAT
+
+*--WHILE THE CONVERSION IS GOING ON, WE GET F AND ADDRESS OF 1/F
+	MOVE.L	#$3FFF0000,XLN(a6)	;...X IS NOW Y, I.E. 2^(-K)*X  <1/4/91, JPO>
+	MOVE.L	XLNFR(a6),FFRAC(a6)	; <1/4/91, JPO>
+	ANDI.L	#$FE000000,FFRAC(a6)	;...FIRST 7 BITS OF Y
+	ORI.L	#$01000000,FFRAC(a6)	;...GET F: ATTACH A 1 AT THE EIGHTH BIT
+	MOVE.L	FFRAC(a6),D0		;...READY TO GET ADDRESS OF 1/F
+	ANDI.L	#$7E000000,D0	
+	ASR.L	#8,D0
+	ASR.L	#8,D0
+	ASR.L	#4,D0			;...SHIFTED 20, D0 IS THE DISPLACEMENT
+	ADDA.L	D0,A0			;...A0 IS THE ADDRESS FOR 1/F
+
+	FMOVE.X	XLN(a6),FP0		; <1/4/91, JPO>
+	move.l	#$3fff0000,F(a6)
+	clr.l	F+8(a6)
+	FSUB.X	F(a6),FP0		;...Y-F
+	FMOVEm.X FP2/fp3,-(sp)	;...SAVE FP2 WHILE FP0 IS NOT READY
+*--SUMMARY: FP0 IS Y-F, A0 IS ADDRESS OF 1/F, FP1 IS K
+*--REGISTERS SAVED: FPCR, FP1, FP2
+
+LP1CONT1:
+*--AN RE-ENTRY POINT FOR LOGNP1
+	FMUL.X	(A0),FP0	...FP0 IS U = (Y-F)/F
+	FMUL.X	LOGOF2,FP1	...GET K*LOG2 WHILE FP0 IS NOT READY
+	FMOVE.X	FP0,FP2
+	FMUL.X	FP2,FP2		;...FP2 IS V=U*U
+	FMOVE.X	FP1,KLOG2(a6)	;...PUT K*LOG2 IN MEMEORY, FREE FP1
+
+*--LOG(1+U) IS APPROXIMATED BY
+*--U + V*(A1+U*(A2+U*(A3+U*(A4+U*(A5+U*A6))))) WHICH IS
+*--[U + V*(A1+V*(A3+V*A5))]  +  [U*V*(A2+V*(A4+V*A6))]
+
+	FMOVE.X	FP2,FP3
+	FMOVE.X	FP2,FP1	
+
+	FMUL.D	LOGA6,FP1	;...V*A6
+	FMUL.D	LOGA5,FP2	;...V*A5
+
+	FADD.D	LOGA4,FP1	;...A4+V*A6
+	FADD.D	LOGA3,FP2	;...A3+V*A5
+
+	FMUL.X	FP3,FP1		;...V*(A4+V*A6)
+	FMUL.X	FP3,FP2		;...V*(A3+V*A5)
+
+	FADD.D	LOGA2,FP1	;...A2+V*(A4+V*A6)
+	FADD.D	LOGA1,FP2	;...A1+V*(A3+V*A5)
+
+	FMUL.X	FP3,FP1		;...V*(A2+V*(A4+V*A6))
+	ADDA.L	#16,A0		;...ADDRESS OF LOG(F)
+	FMUL.X	FP3,FP2		;...V*(A1+V*(A3+V*A5)), FP3 RELEASED
+
+	FMUL.X	FP0,FP1		;...U*V*(A2+V*(A4+V*A6))
+	FADD.X	FP2,FP0		;...U+V*(A1+V*(A3+V*A5)), FP2 RELEASED
+
+	FADD.X	(A0),FP1	;...LOG(F)+U*V*(A2+V*(A4+V*A6))
+	FMOVEm.X  (sp)+,FP2/fp3	;...RESTORE FP2
+	FADD.X	FP1,FP0		;...FP0 IS LOG(F) + LOG(1+U)
+
+	fmove.l	d1,fpcr
+	FADD.X	KLOG2(a6),FP0	;...FINAL ADD
+	bra	t_frcinx
+
+
+LOGNEAR1:
+*--REGISTERS SAVED: FPCR, FP1. FP0 CONTAINS THE INPUT.
+	FMOVE.X	FP0,FP1
+	FSUB.S	one,FP1		;...FP1 IS X-1
+	FADD.S	one,FP0		;...FP0 IS X+1
+	FADD.X	FP1,FP1		;...FP1 IS 2(X-1)
+*--LOG(X) = LOG(1+U/2)-LOG(1-U/2) WHICH IS AN ODD POLYNOMIAL
+*--IN U, U = 2(X-1)/(X+1) = FP1/FP0
+
+LP1CONT2:
+*--THIS IS AN RE-ENTRY POINT FOR LOGNP1
+	FDIV.X	FP0,FP1		;...FP1 IS U
+	FMOVEm.X FP2/fp3,-(sp)	 ;...SAVE FP2
+*--REGISTERS SAVED ARE NOW FPCR,FP1,FP2,FP3
+*--LET V=U*U, W=V*V, CALCULATE
+*--U + U*V*(B1 + V*(B2 + V*(B3 + V*(B4 + V*B5)))) BY
+*--U + U*V*(  [B1 + W*(B3 + W*B5)]  +  [V*(B2 + W*B4)]  )
+	FMOVE.X	FP1,FP0
+	FMUL.X	FP0,FP0		;...FP0 IS V
+	FMOVE.X	FP1,SAVEU(a6)	;...STORE U IN MEMORY, FREE FP1
+	FMOVE.X	FP0,FP1	
+	FMUL.X	FP1,FP1		;...FP1 IS W
+
+	FMOVE.D	LOGB5,FP3
+	FMOVE.D	LOGB4,FP2
+
+	FMUL.X	FP1,FP3		;...W*B5
+	FMUL.X	FP1,FP2		;...W*B4
+
+	FADD.D	LOGB3,FP3	;...B3+W*B5
+	FADD.D	LOGB2,FP2	;...B2+W*B4
+
+	FMUL.X	FP3,FP1		;...W*(B3+W*B5), FP3 RELEASED
+
+	FMUL.X	FP0,FP2		;...V*(B2+W*B4)
+
+	FADD.D	LOGB1,FP1	;...B1+W*(B3+W*B5)
+	FMUL.X	SAVEU(a6),FP0	;...FP0 IS U*V
+
+	FADD.X	FP2,FP1		;...B1+W*(B3+W*B5) + V*(B2+W*B4), FP2 RELEASED
+	FMOVEm.X (sp)+,FP2/fp3	;...FP2 RESTORED
+
+	FMUL.X	FP1,FP0		;...U*V*( [B1+W*(B3+W*B5)] + [V*(B2+W*B4)] )
+
+	fmove.l	d1,fpcr
+	FADD.X	SAVEU(a6),FP0		
+	bra	t_frcinx
+	rts
+
+;LOGNEG:					; label DELETED <3/28/91, JPO>
+;*--REGISTERS SAVED FPCR. LOG(-VE) IS INVALID
+;	bra	t_operr				; DELETED <3/28/91, JPO>
+
+
+slognp1d:
+*--ENTRY POINT FOR LOG(1+Z) FOR DENORMALIZED INPUT
+* Simply return the denorm
+
+	bra	t_extdnrm
+
+
+slognp1:
+*--ENTRY POINT FOR LOG(1+X) FOR X FINITE, NON-ZERO, NOT NAN'S
+
+	FMOVE.X	(A0),FP0	...LOAD INPUT
+	fabs.x	fp0		;test magnitude
+	fcmp.x	LTHOLD,fp0	;compare with min threshold
+	fbgt.w	LP1REAL		;if greater, continue
+	fmove.l	#0,fpsr		;clr N flag from compare
+	fmove.l	d1,fpcr
+	fmove.x	(a0),fp0	;return signed argument
+	bra	t_frcinx
+
+LP1REAL:
+	FMOVE.X	(A0),FP0		...LOAD INPUT
+	MOVE.L	#$00000000,ADJK(a6)
+	FMOVE.X	FP0,FP1			...FP1 IS INPUT Z
+	FADD.S	one,FP0			...X := ROUND(1+Z)
+	FMOVE.X	FP0,XLN(a6)		; <1/4/91, JPO>
+	MOVE.W	XLNFR(a6),XLNDC(a6)	; <1/4/91, JPO>
+	MOVE.L	XLN(a6),D0		; <1/4/91, JPO>
+;	CMPI.L	#0,D0			; DELETED <3/28/91, JPO>			<T3>
+	tst.l	d0			; <3/28/91, JPO>				<T3>
+	BLE.W	LP1NEG0			...LOG OF ZERO OR -VE				<T3>
+	CMP2.L	BND2LOG,D0		;						<T3>
+	BCS.W	LOGMAIN			...BND2LOG IS [1/2,3/2]				<T3>
+*--IF 1+Z > 3/2 OR 1+Z < 1/2, THEN X, WHICH IS ROUNDING 1+Z,
+*--CONTAINS AT LEAST 63 BITS OF INFORMATION OF Z. IN THAT CASE,
+*--SIMPLY INVOKE LOG(X) FOR LOG(1+Z).
+
+LP1NEAR1:
+*--NEXT SEE IF EXP(-1/16) < X < EXP(1/16)
+	CMP2.L	BND1LOG,D0
+	BCS.B	LP1CARE
+
+LP1ONE16:
+*--EXP(-1/16) < X < EXP(1/16). LOG(1+Z) = LOG(1+U/2) - LOG(1-U/2)
+*--WHERE U = 2Z/(2+Z) = 2Z/(1+X).
+	FADD.X	FP1,FP1	...FP1 IS 2Z
+	FADD.S	one,FP0	...FP0 IS 1+X
+*--U = FP1/FP0
+	BRA.W	LP1CONT2
+
+LP1CARE:
+*--HERE WE USE THE USUAL TABLE DRIVEN APPROACH. CARE HAS TO BE
+*--TAKEN BECAUSE 1+Z CAN HAVE 67 BITS OF INFORMATION AND WE MUST
+*--PRESERVE ALL THE INFORMATION. BECAUSE 1+Z IS IN [1/2,3/2],
+*--THERE ARE ONLY TWO CASES.
+*--CASE 1: 1+Z < 1, THEN K = -1 AND Y-F = (2-F) + 2Z
+*--CASE 2: 1+Z > 1, THEN K = 0  AND Y-F = (1-F) + Z
+*--ON RETURNING TO LP1CONT1, WE MUST HAVE K IN FP1, ADDRESS OF
+*--(1/F) IN A0, Y-F IN FP0, AND FP2 SAVED.
+
+	MOVE.L	XLNFR(a6),FFRAC(a6)	; <1/4/91, JPO>
+	ANDI.L	#$FE000000,FFRAC(a6)
+	ORI.L	#$01000000,FFRAC(a6)	;...F OBTAINED
+	CMPI.L	#$3FFF8000,D0		;...SEE IF 1+Z > 1
+	BGE.B	KISZERO
+
+KISNEG1:
+	FMOVE.S	TWO,FP0
+	move.l	#$3FFF0000,F(a6)
+	clr.l	F+8(a6)
+	FSUB.X	F(a6),FP0	;...2-F
+	MOVE.L	FFRAC(a6),D0
+	ANDI.L	#$7E000000,D0
+	ASR.L	#8,D0
+	ASR.L	#8,D0
+	ASR.L	#4,D0		;...D0 CONTAINS DISPLACEMENT FOR 1/F
+	FADD.X	FP1,FP1		;...GET 2Z
+	FMOVEm.X FP2/fp3,-(sp)	;...SAVE FP2 
+	FADD.X	FP1,FP0		;...FP0 IS Y-F = (2-F)+2Z
+	LEA	LOGTBL,A0	;...A0 IS ADDRESS OF 1/F
+	ADDA.L	D0,A0
+	FMOVE.S	negone,FP1	;...FP1 IS K = -1
+	BRA.W	LP1CONT1
+
+KISZERO:
+	FMOVE.S	one,FP0
+	move.l	#$3fff0000,F(a6)
+	clr.l	F+8(a6)
+	FSUB.X	F(a6),FP0	;...1-F
+	MOVE.L	FFRAC(a6),D0
+	ANDI.L	#$7E000000,D0
+	ASR.L	#8,D0
+	ASR.L	#8,D0
+	ASR.L	#4,D0
+	FADD.X	FP1,FP0		;...FP0 IS Y-F
+	FMOVEm.X FP2/fp3,-(sp)	;...FP2 SAVED
+	LEA	LOGTBL,A0
+	ADDA.L	D0,A0	 	;...A0 IS ADDRESS OF 1/F
+	FMOVE.S	zero,FP1	;...FP1 IS K = 0
+	BRA.W	LP1CONT1
+
+LP1NEG0:
+*--FPCR SAVED. D0 IS X IN COMPACT FORM.
+;	CMPI.L	#0,D0		; DELETED <3/28/91, JPO>				<T3>
+;	BLT.B	LP1NEG		; DELETED <3/28/91, JPO>				<T3>
+	tst.l	d0		; <3/28/91, JPO>					<T3>
+	bmi.b	LP1NEG		; <3/28/91, JPO>					<T3>
+LP1ZERO:
+	FMOVE.S	negone,FP0
+
+	fmove.l	d1,fpcr
+	bra t_dz
+
+LP1NEG:
+	FMOVE.S	zero,FP0
+
+	fmove.l	d1,fpcr
+	bra	t_operr
+
+
+
+;  slog2
+
+*
+*	slog2.sa 3.1 12/10/90
+*
+*       The entry point slog10 computes the base-10 
+*	logarithm of an input argument X.
+*	slog10d does the same except the input value is a 
+*	denormalized number.  
+*	sLog2 and sLog2d are the base-2 analogues.
+*
+*       INPUT:	Double-extended value in memory location pointed to 
+*		by address register a0.
+*
+*       OUTPUT: log_10(X) or log_2(X) returned in floating-point 
+*		register fp0.
+*
+*       ACCURACY and MONOTONICITY: The returned result is within 1.7 
+*		ulps in 64 significant bit, i.e. within 0.5003 ulp 
+*		to 53 bits if the result is subsequently rounded 
+*		to double precision. The result is provably monotonic 
+*		in double precision.
+*
+*       SPEED:	Two timings are measured, both in the copy-back mode. 
+*		The first one is measured when the function is invoked 
+*		the first time (so the instructions and data are not 
+*		in cache), and the second one is measured when the 
+*		function is reinvoked at the same input argument.
+*
+*       ALGORITHM and IMPLEMENTATION NOTES:
+*
+*       slog10d:
+*
+*       Step 0.   If X < 0, create a NaN and raise the invalid operation
+*                 flag. Otherwise, save FPCR in D1; set FpCR to default.
+*       Notes:    Default means round-to-nearest mode, no floating-point
+*                 traps, and precision control = double extended.
+*
+*       Step 1.   Call slognd to obtain Y = log(X), the natural log of X.
+*       Notes:    Even if X is denormalized, log(X) is always normalized.
+*
+*       Step 2.   Compute log_10(X) = log(X) * (1/log(10)).
+*            2.1  Restore the user FPCR
+*            2.2  Return ans := Y * INV_L10.
+*
+*
+*       slog10: 
+*
+*       Step 0.   If X < 0, create a NaN and raise the invalid operation
+*                 flag. Otherwise, save FPCR in D1; set FpCR to default.
+*       Notes:    Default means round-to-nearest mode, no floating-point
+*                 traps, and precision control = double extended.
+*
+*       Step 1.   Call sLogN to obtain Y = log(X), the natural log of X.
+*
+*       Step 2.   Compute log_10(X) = log(X) * (1/log(10)).
+*            2.1  Restore the user FPCR
+*            2.2  Return ans := Y * INV_L10.
+*
+*
+*       sLog2d:
+*
+*       Step 0.   If X < 0, create a NaN and raise the invalid operation
+*                 flag. Otherwise, save FPCR in D1; set FpCR to default.
+*       Notes:    Default means round-to-nearest mode, no floating-point
+*                 traps, and precision control = double extended.
+*
+*       Step 1.   Call slognd to obtain Y = log(X), the natural log of X.
+*       Notes:    Even if X is denormalized, log(X) is always normalized.
+*
+*       Step 2.   Compute log_2(X) = log(X) * (1/log(2)).
+*            2.1  Restore the user FPCR
+*            2.2  Return ans := Y * INV_L2.
+*
+*
+*       sLog2:
+*
+*       Step 0.   If X < 0, create a NaN and raise the invalid operation
+*                 flag. Otherwise, save FPCR in D1; set FpCR to default.
+*       Notes:    Default means round-to-nearest mode, no floating-point
+*                 traps, and precision control = double extended.
+*
+*       Step 1.   If X is not an integer power of two, i.e., X != 2^k,
+*                 go to Step 3.
+*
+*       Step 2.   Return k.
+*            2.1  Get integer k, X = 2^k.
+*            2.2  Restore the user FPCR.
+*            2.3  Return ans := convert-to-double-extended(k).
+*
+*       Step 3.   Call sLogN to obtain Y = log(X), the natural log of X.
+*
+*       Step 4.   Compute log_2(X) = log(X) * (1/log(2)).
+*            4.1  Restore the user FPCR
+*            4.2  Return ans := Y * INV_L2.
+*
+
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* SLOG2    IDNT    2,1 Motorola 040 Floating Point Software Package
+
+
+slog10d:
+*--entry point for Log10(X), X is denormalized
+;	move.l	(a0),d0		; DELETED <3/28/91, JPO>				<T3> thru next <T3>
+;	blt.w	invalid		; DELETED <3/28/91, JPO>
+	tst.l	(a0)		; <3/28/91, JPO>
+	bmi	t_operr		; <3/28/91, JPO>
+	move.l	d1,-(sp)
+	clr.l	d1
+	bsr	slognd		...log(X), X denorm.					<T3>
+	fmove.l	(sp)+,fpcr
+	fmul.x	INV_L10,fp0
+	bra	t_frcinx
+
+
+slog10:
+*--entry point for Log10(X), X is normalized
+
+;	move.l	(a0),d0		; DELETED <3/28/91, JPO>				<T3> thru next <T3>
+;	blt.b	invalid		; DELETED <3/28/91, JPO>
+	tst.l	(a0)		; <3/28/91, JPO>
+	bmi	t_operr		; <3/28/91, JPO>
+	move.l	d1,-(sp)
+	clr.l	d1
+	bsr	slogn		...log(X), X normal.					<T3>
+	fmove.l	(sp)+,fpcr
+	fmul.x	INV_L10,fp0
+	bra	t_frcinx
+
+
+
+slog2d:
+*--entry point for Log2(X), X is denormalized
+
+;	move.l	(a0),d0		; DELETED <3/28/91, JPO>				<T3> thru next <T3>
+;	blt.b	invalid		; DELETED <3/28/91, JPO>
+	tst.l	(a0)		; <3/28/91, JPO>
+	bmi	t_operr		; <3/28/91, JPO>
+
+	bsr	lognrm		; normalize with exponent adjust in ADJK(A6) <3/28/91, JPO>
+	tst.l	8(a0)		; check for exact integral power of 2 <3/28/91, JPO>
+	bne.b	@1		;   inexact <3/28/91, JPO>
+
+	move.l	4(a0),d0	; <3/28/91, JPO>
+	lsl.l	#1,d0		; <3/28/91, JPO>
+	bne.b	@1		; inexact <3/28/91, JPO>
+
+	move.l	ADJK(a6),d0	; exact. get negative exponent into d0 <3/28/91, JPO>
+	bra.b	slog2ex		; continue below <3/28/91, JPO>
+
+@1:				; label added <3/28/91, JPO>
+	move.l	d1,-(sp)
+	clr.l	d1
+;	bsr	slognd		...log(X), X denorm. - DELETED <3/28/91, JPO>
+	bsr	LOGBGN		; log(X), X norm with negative ADJK			<T3>
+	fmove.l	(sp)+,fpcr
+	fmul.x	INV_L2,fp0
+	bra	t_frcinx
+
+
+slog2:
+*--entry point for Log2(X), X is normalized
+;	move.l	(a0),d0		; DELETED <3/28/91, JPO>				<T3> thru next <T3>
+;	blt.b	invalid		; DELETED <3/28/91, JPO>
+	tst.l	(a0)		; <3/28/91, JPO>
+	bmi	t_operr		; <3/28/91, JPO>
+
+;	move.l	8(a0),d0	; DELETED <3/28/91, JPO>
+	tst.l	8(a0)
+	bne.b	continue	...X is not 2^k
+
+	move.l	4(a0),d0
+	and.l	#$7FFFFFFF,d0
+;	tst.l	d0		; DELETED <3/28/91, JPO>				<T3>
+	bne.b	continue
+
+*--X = 2^k.
+	move.w	(a0),d0
+slog2ex:			; label ADDED <3/28/91, JPO>				<T3> thru next <T3>
+;	and.l	#$00007FFF,d0	; DELETED <3/28/91, JPO>
+;	sub.l	#$3FFF,d0	; DELETED <3/28/91, JPO>
+	sub.w	#$3FFF,d0	; word operation sufficient <3/28/91, JPO>
+	fmove.l	d1,fpcr
+;	fmove.l	d0,fp0		; DELETED <3/28/91, JPO>
+	fmove.w	d0,fp0		; exact result <3/28/91, JPO>
+
+;	bra	t_frcinx	; DELETED
+
+	rts			; return exact result <3/28/91, JPO>			<T3>
+
+continue:
+	move.l	d1,-(sp)
+	clr.l	d1
+	bsr	slogn		;...log(X), X normal.
+	fmove.l	(sp)+,fpcr
+	fmul.x	INV_L2,fp0
+	bra	t_frcinx
+
+;invalid:			; label DELETED <3/28/91, JPO>				<T3>
+;	bra	t_operr		; DELETED <3/28/91, JPO>				<T3>
+
+

@@ -1,0 +1,848 @@
+;
+;	File:		piMAIN.a
+;
+;	Contains:		Pascal Interface for MPP and ATP drivers
+;
+;	Written by:	Gene Tyacke (GRT)
+;		  		Gursharan Sidhu (GSS)
+;		 		Alan Oppenheimer	(ABO)
+;				Rich Andrews (RFA)
+;
+;	Copyright:	© 1984-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 1/29/93	RB		Do not move the SCCLockout value to the status register, always
+;									do an ORI.W with it so that NuKernel works and the stack is not
+;									changed.
+;	   <SM2>	10/28/92	SWC		Changed INCLUDEs to a LOAD of StandardEqu.d.
+;		 <3>	 7/24/91	MH		also: MPPRefNum, ATPRefNum as per <2> below
+;		 <2>	 7/24/91	MH		Added conditional wrapper(s) to prevent duplication of public
+;									interface declarations: tLAPRead, tLAPWrite, tDDPRead,
+;									tDDPWrite, tNBPLookUp, tNBPConfirm, tNBPRegister,
+;									tATPSndRequest, tATPGetRequest, tATPSdRsp, tATPAddRsp,
+;									tATPRequest, tATPResponse
+;
+;_______________________________________________________________________
+;
+;	8/24/84	GRT,GSS  Version  1.0  Developers Release
+;	8/28/84	GRT	Code crunch start on versions P/13,P/14...
+;	9/15/84	GRT	Version 1.1 tested (P/16)
+;	9/20/84	RFA	UnlockAndLinkHdl not building queue right (P/17)
+;	10/3/84	RFA,GRT	Code crunch pass two started (P/18)
+;	11/6/84	GRT	DDP checksum algorithim fixed (PI/1.1C)
+;	11/13/84	GRT	Changed SUBQ.W to SUBQ.B in ATPRqComp's BDS test loop(PI/1.1D)
+;	11/14/84	GRT	BTST in ATP calls changed to test bit 0 and not 1 of Pascal
+;		  		booleans (PI/1.1E)
+;	11/28/84	GRT	In ATPSndRequest, clearing high byte of atpNumRsp field before
+;		  		returning to the user (PI/1.1E)
+;	12/3/84	GRT	NBP 1st pass code crunch; GetHdlAndLock params made into .LONG's
+;	12/14/84	GRT	ATPLoad call checks to make sure MPP is opened before trying to
+;		  		open the ATP driver.  ATPUnload only closes the driver is the
+;		  		system size is 128K.
+;	12/17/84	GRT	CmpEventPost made into two different routines; one for LAP and
+;		  		DDP, and one for NBP and ATP.  The original one did not always
+;		  		post events correctly when using LAP or DDP async calls.
+;	12/17/84	GRT	ATP ioRefNum made into constant (-11) instead of getting it
+;		  		from the driver.	OpenMPP and CloseMPP calls added.
+;	12/18/84	GRT	LAPProtType record packing changed in interface so corresponding
+;		  		change is made here in the assembly.	NBP async completion routines
+;		 		must save A0 (abRecHandle) until post event call is made. (PI/1.1G)
+;	1/3/85	GRT	Changed GetNodeNumber call to GetNodeAddress.  It also returns
+;		  		the network number as well as the node number.
+;	1/4/85	RFA	Added TIDValid bit support so that ATPReqCancel will work, and
+;		  		added SktQElList plus other stuff so that ATPRspCancel works.
+;		  		ListLink is new field in ATP's IOQElement (PI/1.1I)
+;	1/9/85	GRT,ABO  New calls: IsMPPOpen and IsATPOpen added.  Names of
+;		  		OpenMPP and CloseMPP changed to MPPOpen and MPPClose.
+;	1/11/85	GRT	Release 1.2a to Library, testers
+;	1/21/85	GRT	Using new ATalk include file; Changed SPBConfig to SPConfig
+;	1/24/85	GRT	Version number changed to 3.0
+;	2/7/85	GRT	In LAPWrite, LAPProtType offset incorrect
+;	2/11/85	GRT	Removing all occurrances of RTE's in the code
+;	2/16/85	GRT	Final (for now) Developers Release
+;	3/15/85	GRT	Doing actual _RecoverHandle call instead of looking at current
+;		  		zone ptr so Switcher and File Server Dispatcher will work.
+;	4/27/85	GRT	Made code into one .PROC so it can be made into a separate
+;		 		code resource file.
+;	2/20/86	GRT	In ATP; ATPRequest completion munged BDS ptr
+;	4/28/86	GRT	close down code didn't work if app had a IAZNotify proc
+;	4/30/86	GRT	_RecoverHandle trap removed in completion routines
+;	9/11/86   ABO	Convert to MPW
+;	12/10/86	SJF	Made all routines a set of linkable modules. Each major function
+;				is now a code PROC. The 'ATPL' resource is eliminated. Also
+;				removed the use of low-memory location $E0.
+;	12/10/86		fixed _RecoverHandle Bug (DDPRdCancel)
+;	Dec. 86	SJF	Added routine ATPEnter2, Fixed ATPReqCancel and ATPRspCancel
+;				so that they always execute syncronously.
+;	12/4/89	JAL	Removed error codes which are now in SysErr.a and removed 
+;				PrNonPortable equate which is now defined in the Makefile.
+;_______________________________________________________________________
+
+			BLANKS ON
+			STRING ASIS
+			PRINT NOGEN
+			PRINT OFF
+			LOAD	'StandardEqu.d'
+			INCLUDE	'AppleTalk.a'			; appletalk equates
+			PRINT ON
+
+;_______________________________________________________________________
+;
+;	Equates (offsets) for the various fields in the ABusRecord
+;_______________________________________________________________________
+
+abOpCode		 EQU    0 	   ; type of call (enumerated type)
+abResult		 EQU    abOpCode+2	  ; result code
+abUserReference EQU    abResult+2	  ; user defined space
+
+;	* LAP definitions *
+
+lapAddress	EQU	   abUserReference+4  ; level 0 address block
+
+; Offsets into the lapAddress block
+
+lapADest		EQU	  lapAddress	  ; dest byte
+lapASource	EQU	  lapADest+1	  ; source byte  (contents of lapAddress rec)
+lapAType		EQU	  lapASource+1   ; type byte	 {1.1g change}
+
+lapReqCount	EQU	  lapAddress+4   ; request count
+lapActCount	EQU	  lapReqCount+2  ; actual count returned by call
+lapDataPtr	EQU	  lapActCount+2  ; pointer to data buffer
+
+;	* DDP definitions *
+
+;	Any BYTE fields are ODD aligned cause Pascal puts the
+;	byte data into the low order byte of a word in non-packed records.
+
+ddpTypeField	EQU	  abUserReference+5 ; BYTE! level 1 type field
+ddpSocket 	EQU	  ddpTypeField+2 ; BYTE! socket number
+ddpAddrNet	EQU	  ddpSocket+1	  ; address block network number
+ddpAddrID 	EQU	  ddpAddrNet+2   ; address block node ID
+ddpAddrSkt	EQU	  ddpAddrID+1	  ; address block socket number
+ddpReqCount	EQU	  ddpAddrSkt+1   ; request count
+ddpActCount	EQU	  ddpReqCount+2  ; actual count
+ddpDataPtr	EQU	  ddpActCount+2  ; pointer to ddp buffer
+ddpNodeID 	EQU	  ddpDataPtr+5   ; BYTE! for DDPRead, who the pkt was sent to (broadcast?)
+
+;	* NBP definitions *
+
+nbpEntityPtr	EQU	  abUserReference+4 ; pointer to the 3 entity strings
+nbpBufPtr 	EQU	  nbpEntityPtr+4 ; nbp buffer pointer
+nbpBufSize	EQU	  nbpBufPtr+4	  ; size of the above buffer
+nbpDataField	EQU	  nbpBufSize+2   ; misc field for socket num, entry nums
+nbpAddrNet	EQU	  nbpDataField+2 ; address block network number
+nbpAddrID 	EQU	  nbpAddrNet+2   ; address block node ID
+nbpAddrSkt	EQU	  nbpAddrID+1	  ; address block socket number
+nbpRetInterval EQU	  nbpAddrSkt+1   ; retransmission interval
+nbpRetCount	EQU	  nbpRetInterval+1 ; retransmission count
+
+;	* ATP definitions *
+
+atpSktNum 	EQU	  abUserReference+5 ; atp socket number
+atpAddress	EQU	  atpSktNum+1	  ; atp Address block
+atpRCount 	EQU	  atpAddress+4   ; request number of bytes
+atpDataPtr	EQU	  atpRCount+2	  ; ptr to data buffer
+atpRspBDSPtr	EQU	  atpDataPtr+4   ; ptr to BDS
+atpBMap		EQU	  atpRspBDSPtr+4 ; bit map
+atpTID		EQU	  atpBMap+2	  ; transaction ID number
+atpActCount	EQU	  atpTID+2	  ; actual number returned
+atpUserBytes	EQU	  atpActCount+2  ; user defined bytes
+atpXO		EQU	  atpUserBytes+4 ; exactly once bit
+atpEOM		EQU	  atpXO+1 	  ; end of message bit
+atpTimeOut	EQU	  atpEOM+2	  ; time out in seconds
+atpRetries	EQU	  atpTimeOut+2   ; number of times to retry
+atpNumBufs	EQU	  atpRetries+2   ; number of BDS buffers
+atpNumRsp 	EQU	  atpNumBufs+2   ; number of responses recvd
+atpBDSSize	EQU	  atpNumRsp+2	  ; size of bds elements
+atpRspUData	EQU	  atpBDSSize+1   ; UserBytes recvd in Response
+atpRspBuf 	EQU	  atpRspUData+4  ; ptr to resp message buf
+atpRspSize	EQU	  atpRspBuf+4 	  ; size of large resp buf
+
+
+;_______________________________________________________________________
+;
+;	Pascal data structure offsets
+;_______________________________________________________________________
+
+;	NBP EntityName data structure offsets
+
+nbpEntObj 	EQU	  0		  ; start of entity object
+nbpEntTyp 	EQU	  nbpEntObj+34   ; start of entity type
+nbpEntZone	EQU	  nbpEntTyp+34   ; start of entity zone
+
+;	MPP Call Types (for storage in abOpCode of ABusRecord)
+
+				IF &TYPE('__AppleTalk__') = 'UNDEFINED' THEN
+tLAPRead		EQU	  0
+tLAPWrite 	EQU	  1
+tDDPRead		EQU	  2
+tDDPWrite 	EQU	  3
+
+tNBPLookUp	EQU	  4
+tNBPConfirm	EQU	  5
+tNBPRegister	EQU	  6
+
+tATPSndRequest EQU	  7
+tATPGetRequest EQU	  8
+tATPSdRsp 	EQU	  9
+tATPAddRsp	EQU	  10
+tATPRequest	EQU	  11
+tATPResponse	EQU	  12
+				ENDIF
+
+;_______________________________________________________________________
+;
+;	Offsets in the IOQ element block (usually at the end of the normal
+;	IOQ element block)
+;_______________________________________________________________________
+
+;	Write Data Structure Offsets (at the end of the IOQElement Blk)
+
+WDSXtraLAPSize EQU	  26 		  ; size of xtra bytes in IOQ for LAP
+WDSXtraDDPSize EQU	  40 		  ; size of xtra bytes in IOQ for DDP
+xtraNBPSize	EQU	  14 		  ; size of xtra bytes in IOQ for NBP
+
+;
+;	Variables after the IO queue element block
+;
+
+abRecHdl		EQU	  IOQElSize	  ; abRecord handle
+qElHdl		EQU	  abRecHdl+4		 ; handle to queue element
+
+; LAP and DDP
+
+WDS1Start 	EQU	  qElHdl+4	  ; start of the WDS 1 data structure
+WDS2Start 	EQU	  WDS1Start+6		 ; start of the WDS 2nd data structure
+WDSTerm		EQU	  WDS2Start+6		 ; location of the WDS terminator bytes
+ABASyncFlag	EQU	  WDSTerm+2	  ; async flag (if zero then sync)
+WDS1stEntry	EQU	  ABASyncFlag+1	 ; LAP or DDP Entry 1
+
+; DDP only
+
+dLAPHdr		EQU	  WDS1stEntry		 ; beginning of the lap header
+dLength		EQU	  dLAPHdr+3	  ; length bytes
+dCheckSum 	EQU	  dLength+2	  ; long hdr checksum bytes
+dDstNet		EQU	  dCheckSum+2		 ; long hdr dest network number
+dSrcNet		EQU	  dDstNet+2	  ; long hdr src network number
+dDstNodeAddr	EQU	  dSrcNet+2	  ; long hdr dest node addr
+dSrcNodeAddr	EQU	  dDstNodeAddr+1		; long hdr src node addr
+dDstSkt		EQU	  dSrcNodeAddr+1		; long hdr dest socket
+dSrcSkt		EQU	  dDstSkt+1	  ; long hdr source socket
+dType		EQU	  dSrcSkt+1	  ; long hdr type field
+
+sdDstSkt		EQU	  dCheckSum	  ; short hdr dest socket
+sdSrcSkt		EQU	  sdDstSkt+1		 ; short hdr src socket
+sdType		EQU	  sdSrcSkt+1		 ; short hdr type field
+
+; NBP
+
+compactHdl	EQU	  qElHdl+4	  ; hdl to compacted name
+theAsyncFlag	EQU	  compactHdl+4 	 ; async flag for NBPLookUp,etc
+
+; ATP
+
+asyncflg		EQU	  qElHdl+4	  ; caller's async flag
+ListLink		EQU	  asyncflg+2		 ; link to other IOQEls
+bdsHdl		EQU	  ListLink+4		 ; handle to our BDS elements
+IOPBEnd		EQU	  bdsHdl+4	  ; size of this queue element
+
+
+;_______________________________________________________________________
+;
+;	Protocol Handler and Socket Listener Table equates
+;_______________________________________________________________________
+
+maxHndlr  	EQU	  4		   ; currently 4 max handlers
+maxSkts		EQU	  12 		  ; currently 12 max socket listeners
+
+entrySize 	EQU	  6		   ; 6 bytes per handler table entry
+
+;	The LAP protocol table is organized by complete entries and not by types
+;	(i.e., in memory, entry 1 is followed by entry 2, etc). NOTE: This is
+;	my own table, and not the one used internally by MPP.
+
+theHndlr		EQU	  0		   ; offset of the entries' lap type
+theRcvFlag	EQU	  theHndlr+1		 ; ditto for pkt recvd flag
+thePtr		EQU	  theRcvFlag+1 	 ; ditto for next read buffer
+
+;	The DDP socket table is organized exactly as the LAP protocol table.	This
+;	is also only for use by the interface.	The only difference between the tables
+;	is the socket number at offset zero
+
+theSktNum 	EQU	  0		   ; offset into the entries' socket num
+
+
+;	These offsets below are for the new socket table (V1.15 and beyond)
+
+aSktNum		EQU	  0		   ; offset to beginning of socket nums
+aRcvFlag		EQU	  aSktNum+maxSkts	  ; offset to beginning of rcv flags
+aRBPtr		EQU	  aRcvFlag+maxSkts	  ; offset to beginning of read blk ptrs
+
+
+;_______________________________________________________________________
+;
+;	ReadBlock size and offsets (used in LAPRead and DDPRead)
+;_______________________________________________________________________
+
+rbNxPtr		EQU	  0		   ; next element in read link
+rbABHdl		EQU	  4		   ; handle to abRecord associated with read blk
+rbAFlag		EQU	  8		   ; async flag
+rbRetCksErr	EQU	  9		   ; Return checksum errors flag
+rbHdl		EQU	  10 		  ; handle to the read block
+
+rdBlkSize 	EQU	  14 		  ; # bytes in the read blk structure
+
+
+;_______________________________________________________________________
+;
+;	MPP Driver Reference Number (currently static)
+;_______________________________________________________________________
+
+
+				IF &TYPE('__AppleTalk__') = 'UNDEFINED' THEN
+MPPRefNum 	EQU	  -(MPPUnitNum+1)	  ; driver ref number
+ATPRefNum 	EQU	  -(ATPUnitNum+1)	  ; atp driver io ref num
+				ENDIF
+
+;_______________________________________________________________________
+;
+;	Miscellaneous equates
+;_______________________________________________________________________
+
+maxATPBuf 	EQU	  578		  ; max # of ATP data bytes
+
+
+			EJECT
+;___________________________________________________________________________
+;
+;	Local Variables
+;___________________________________________________________________________
+
+			PROC
+			ENTRY	ListEl1,myHndlrTable,theSocketTable,saveArea
+			ENTRY	tmpHandler,myRHALen,tmpHndlrEntry,retAddr
+			ENTRY	returnAddr,SktQElList,MPPName,ATPName
+			ENTRY	NBPLoadStatus,tmpEntityName
+			
+ListEl1		DC.L   	0		; ptr to first removable handle
+myHndlrTable	DCB.B	maxHndlr*entrySize,0 ; protocol handler table
+theSocketTable DCB.B	maxSkts*entrySize,0  ; socket listener table
+saveArea		DCB.B	6,0 	 ; temporary variable locations
+tmpHandler	DC.L   	0		; space for lap proto handler addr
+myRHALen		DC.W   	0		; number of bytes I added to the RHA
+tmpHndlrEntry	DC.W   	0		; entry num of the handler we are using
+retAddr		DC.L   	0		; save place for return address
+returnAddr	DC.L   	0		; place to save the return address
+SktQElList	DC.L   	0		; head of IOQElement list
+MPPName		DC.B   	4		; length of name
+			DC.B    	'.MPP '	  ; driver name (aligned)
+ATPName		DC.B   	4		; Size of ATP name
+			DC.B    	'.ATP '	  ; The name itself (aligned)
+NBPLoadStatus	DC.B   	0		; [NBPLoad] 0=not loaded, 1=loaded
+			ALIGN	2
+tmpEntityName	DCB.B	99,0	  ; space for compacted entity name
+									; (only used by NBPRemove)
+			ENDPROC
+;_______________________________________________________________________
+;
+;		   Misc Routines
+;_______________________________________________________________________
+;
+
+;_______________________________________________________________________
+;
+;	RemoveHdlBlks
+;
+;	This call is made by almost every procedure in the pascal interface.	Its
+;	purpose is to check and see if there are any memory blocks to be disposed
+;	of.	The memory blocks are linked in a list (zero denoting the last).  If
+;	there are any elements in the list, it disposes of the handles.
+;
+;	Interrupts are turned off during part of this routine.
+;
+;	Register Usage
+;	 A0 and D0 are clobbered
+;
+;	Possible errors:
+;	 D0 may have error from memory manager call
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	 8/29/84	 GRT  CMP.L changed to MOVE.L (code crunch;comments changed)
+;	10/01/84	 GRT  Interrupts turned off
+;	10/21/84	 MPH  Fixed interrupt bug
+;
+;_______________________________________________________________________
+
+RemoveHdlBlocks		PROC		EXPORT
+			
+			
+			ENTRY	RemoveHdlBlks
+RemoveHdlBlks
+			MOVEM.L	A1-A2,-(SP)	; Save registers to be conservative
+			LEA		 ListEl1,A1	  ; Address of List Head
+@00
+			MOVE  	SR,-(SP) 	  ; Save old interrupt state
+			ORI.W  	#SCCLockOut,SR	 ; Disable interrupts			<SM2> rb
+			MOVE.L	(A1),A0		 ; First Handle to Free
+			MOVE.L	(A0),A2		 ; Address of Block Text
+			MOVE.L	A0,D0		 ; Is List Empty?
+			BEQ.S	@10
+			MOVE.L	(A2),(A1) 	 ; Get next block to list head.
+@10
+			MOVE  	(SP)+,SR 	  ; Enable interrupts
+			TST.L	D0
+			BEQ.S	@20
+			_DisposHandle			 ; get rid of handle
+			BRA.S	@00			 ; check it
+@20
+			MOVEM.L	(SP)+,A1-A2		; Restore registers
+			RTS			   ; Return to caller
+			ENDPROC
+;___________________________________________________________________________
+;
+;	ExitD0,ExitD3
+;
+;	Common Exit routine for LAP, DDP and NBP
+;
+;	Call:
+;	 D0	 .WORD	 function result
+;	 A2	 .LONG	 return address of routine
+;
+;	ExitD3 also restores D3 from stack
+;
+;___________________________________________________________________________
+
+ExitD3		PROC
+			ENTRY	ExitD0
+			
+			MOVE.L	(SP)+,D3		 ; restore D3
+ExitD0		
+			MOVE  	D0,(SP)		  ; set return code
+			MOVE.L	D2,A1		 ; get return address
+			JMP	 	(A1)		  ; exit
+			ENDPROC
+			
+;_______________________________________________________________________
+;
+;	DoControlCall
+;
+;	Test to see if the call is sync or async and make the appropriate
+;	call to the MPP driver.	In the case of a sync call, the IO completion
+;	routine is called through an indirect subroutine jump of its address
+;	stored in A2.
+;
+;	On Entrance:
+;	 A0 -> IOQ element block
+;	 A2 -> IO completion routine
+;	 D1 = async flag (byte)
+;
+;	On Exit:
+;	 D0 = result of control call
+;_______________________________________________________________________
+
+DoControlCall	PROC
+			MOVE  	#MPPRefNum,IORefNum(A0) ; store driver refnum
+			TST.B	D1		  ; check async flag
+			BEQ.S	@10			 ; if zero then it's sync
+			MOVE.L	A2,IOCompletion(A0) ; store IO completion address
+			_Control	,ASYNC		 ; make async call
+			BRA.S	@20			 ;	and then exit
+@10		 	_Control 		   ; make sync call
+			JSR	 (A2)		  ;	 and call the completion routine
+@20		 	RTS
+			ENDPROC
+;_______________________________________________________________________
+;
+;	CmpEntrance
+;
+;	Code saving subroutine that sets up registers used in the IO completion
+;	routines.  It also unlocks the abRecord handle (which will be returned
+;	back to the user.
+;
+;	On Entrance:
+;	 A0 -> IOQ element block
+;
+;	On Exit:
+;	 A0 =  AB Record handle
+;	 A1 -> AB Record blk
+;	 A2 -> IOQ element block (swapped with A0)
+;	 D0 = result of the unlock call made on the IO queue element
+;
+;_______________________________________________________________________
+
+CmpEntrance	PROC
+			MOVE.L	A0,A2		 ; A2 -> IOQElement blk; A0 is scratch
+			MOVE.L	ABRecHdl(A0),A0	; A1 -> AB Record block
+			MOVE.L	(A0),A1		 ; dereference
+			MOVE  	D0,abResult(A1)	 ; return result code
+			_HUnlock			  ; unlock the ABRecord handle
+			RTS
+			ENDPROC
+;_______________________________________________________________________
+;
+;	UnlockAndLinkHdl
+;
+;	This routine unlocks the handle (making it relocatable) and links
+;	the handle into a list of disposable handles.  The ptr to the first
+;	element is stored in ListEl1.  Each link is stored in the first 4
+;	bytes of the handles' block (not in the master pointer!).  A zero
+;	is stored in the last element denoting the end of the list.
+;
+;	An assumption is made that there are at least 4 bytes of space in the
+;	memory block and that they can be trashed (since I store the link there).
+;
+;	Since this routine is also called by the protocol handler and socket
+;	listener, interrupts must be turned off during the unlink.
+;
+;	Call:
+;	 A0	 .LONG	 handle to unlock and link
+;
+;	Return:
+;	 D0	 .WORD	 error result from _HUnlock call
+;
+;	Possible errors:
+;	 NIL master pointer
+;	 Can't lock free block
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	 8/29/84	 GRT  Interrupts turned off
+;	 9/20/84	 RFA  Changed to add first hdl to queue correctly (P/17)
+;	10/01/84	 RFA,GRT	 Free block now linked at beginning of list
+;	10/22/84	 RFA  Shortened interrupt lockout time by moving instruction
+;
+;_______________________________________________________________________
+
+UnlockAndLinkHdl	PROC
+			MOVE.L	A1,-(SP)		 ; save register
+			_HUnlock			  ; unlock the relocatable blk
+			MOVE.L	(A0),A1		 ; A1 -> memory block
+
+			MOVE  	SR,-(SP) 	  ; turning off interrupts
+			ORI.W  	#SCCLockOut,SR	;						<SM2> rb
+
+			MOVE.L	ListEl1,(A1)		; get first element ptr
+			LEA	 	ListEl1,A1	  ; address of variable
+			MOVE.L	A0,(A1)		 ; insert new list head
+
+			MOVE  	(SP)+,SR 	  ; restore interrupts
+			MOVE.L	(SP)+,A1		 ; restore register
+			RTS
+				ENDPROC
+;_______________________________________________________________________
+;
+;	Cmp1EventPost
+;
+;	Subroutine that is called after any AppleBus call to the MPP driver
+;	is made.	It posts an event on an async call and also places the IO
+;	queue element on the disposable memory block list.
+;
+;	This subroutine only works for LAP and DDP.
+;
+;	On Entrance:
+;	 A0 =  AB record handle
+;	 A2 -> IOQ element block
+;
+;	On Exit:
+;	 D0 = result of the unlock call made on the IO queue element
+;
+;_______________________________________________________________________
+
+Cmp1EventPost	PROC
+			TST.B	ABASyncFlag(A2)	; check async flag
+			BEQ.S	@10			 ; if zero then its a sync call
+			MOVE.L	A0,D0		 ; D0 = event message (ABRecHdl)
+			MOVE  	#networkEvt,A0	 ; this will be a network event
+
+; A0 = handle of the ABRecord  D0 = network event number
+
+			_PostEvent		  ; For D0: 0 = posted, 1 = not posted
+@10		 	MOVE.L	qElHdl(A2),A0 	 ; get the IOQelement block handle
+			JSR		UnlockAndLinkHdl	 ; remove the handle from memory
+			RTS
+			ENDPROC
+;_______________________________________________________________________
+;
+;	CmpEventPost
+;
+;	Subroutine that is called after any AppleBus call to the MPP driver
+;	is made.	It posts an event on an async call and also places the IO
+;	queue element on the disposable memory block list.
+;
+;	This subroutine only works for NBP and ATP.
+;
+;	On Entrance:
+;	 A0 =  AB record handle
+;	 A2 -> IOQ element block
+;
+;	On Exit:
+;	 D0 = result of the unlock call made on the IO queue element
+;
+;_______________________________________________________________________
+
+CmpEventPost	PROC
+			TST.B	theAsyncFlag(A2)	 ; check async flag
+			BEQ.S	@10			 ; if zero then its a sync call
+			MOVE.L	A0,D0		 ; D0 = event message (ABRecHdl)
+			MOVE  	#networkEvt,A0	 ; this will be a network event
+
+; A0 = handle of the ABRecord  D0 = network event number
+
+			_PostEvent		  ; For D0: 0 = posted, 1 = not posted
+@10			MOVE.L	qElHdl(A2),A0 	 ; get the IOQelement block handle
+			JSR	 	UnlockAndLinkHdl	 ; remove the handle from memory
+			RTS
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	GetHdlAndLock
+;
+;	This routine gets a handle to (D0) bytes on the appl heap and locks down
+;	the handle.  This call is register based.
+;
+;	Call:
+;	 D0	 .LONG	 number of bytes to allocate
+;
+;	Return:
+;	 A0	 .LONG	 handle to memory block
+;	 D0	 .WORD	 error result
+;	 Condition codes set upon return
+;
+;	Possible errors:
+;	 Not enough room in zone to allocate memory (NewHandle)
+;	 NIL master pointer (HLock)	    [This shouldn't happen]
+;	 Can't lock free block (HLock)       "
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	 10/1/84	 GRT  Comment changed (we need to pass a long word, not a word)
+;
+;_______________________________________________________________________
+
+GetHdlAndLock	PROC
+			_NewHandle		  ; handle will be in A0
+			TST	 	D0		   ; check for error
+			BNE.S	@10			 ; if non zero then exit
+			_HLock			  ; lock it down
+			TST	 	D0
+@10		 	RTS
+			ENDPROC
+
+			EJECT
+;___________________________________________________________________________
+;
+;	This function checks to see if MPP is open.	The boolean function result
+;	is set to TRUE if it is open, else it will be set to FALSE.
+;
+;	FUNCTION IsMPPOpen : BOOLEAN;
+;
+;	 Returns:  TRUE if MPP is open
+;		  FALSE if MPP is not open
+;
+;	 Uses: D0,D1
+;
+;	Modification History:
+;
+;	1/9/84	ABO,GRT  New Today
+;
+;___________________________________________________________________________
+
+IsMPPOpen 	PROC		EXPORT
+			MOVEQ	#0,D1		 ; clear result (assume FALSE)
+			MOVE.B	PortBUse,D0		; is Port B in use?
+			BMI.S	@90			 ; if not, then just exit
+			AND.B	#$0F,D0		 ; clear high bits of flag
+			SUBQ.B	#UseATalk,D0		; check to see if ATalk is using port
+			BNE.S	@90			 ; if not, then MPP is not open
+			MOVEQ	#1,D1		 ; else set result to TRUE
+@90		 	MOVE.B	D1,4(SP) 	  ; return result back to user
+			RTS
+			ENDPROC
+			
+			EJECT
+;___________________________________________________________________________
+;
+;	GetNodeAddress - Returns my AppleTalk node address stored in MPP variables
+;
+;	FUNCTION GetNodeAddress(VAR myNode,myNet : INTEGER): OSErr;
+;
+;	 Returns:  NoErr
+;		  MPP driver not installed
+;
+;	TOS => .LONG	Return address
+;	   .LONG	 Address of myNet variable
+;	   .LONG	 Address of myNode variable
+;	   .WORD	 Function result code
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	 1/3/85	 GRT  Add the network number also
+;	 1/10/85	 GRT  Removing call to RemoveHdlBlocks so call can be made from asmb
+;
+;___________________________________________________________________________
+
+GetNodeAddress 	PROC	EXPORT
+			MOVE.L	(SP)+,D2		 ; return address popped
+			CLR	 	-(SP)		  ; clear for function result
+			JSR	 	IsMPPOpen	  ; is MPP opened?	(D0,D1 are trashed)
+			TST.B	(SP)+		 ; check result
+			BNE.S	@10			 ; if TRUE then jump and continue
+
+; If driver not installed, just pop off data on stack and jump to exit point
+
+			MOVE  	#NoMPPErr,D0		 ; error constant
+			ADDQ  	#8,SP		  ; pop off data
+			BRA.S	@90
+
+; Grab the requested data from the MPP globals variable location
+
+@10		 	MOVE.L	ABusVars,A0		 ; pointer to MPP variables
+			MOVE.L	(SP)+,A1		 ; address of myNet
+			MOVE  	SysNetNum(A0),(A1)  ; store current net number
+			MOVE.L	(SP)+,A1
+			CLR	 	(A1)		  ; clear entire word out
+			MOVE.B	SysLAPAddr(A0),1(A1) ; stash node number
+			CLR	 	D0		   ; no error
+
+@90		 	MOVE  	D0,(SP) 	   ; store func result
+			MOVE.L	D2,A1		 ; get return address back
+			JMP	 	(A1)		  ; exit
+				ENDPROC
+				
+			EJECT
+;___________________________________________________________________________
+;
+;	This function checks to see if ATP is open.	The boolean function result
+;	is set to TRUE if it is open, else it will be set to FALSE.  Note that
+;	we first check to see if MPP is open since you can't run ATP without MPP.
+;
+;	FUNCTION IsATPOpen : BOOLEAN;
+;
+;	 Returns:  TRUE if ATP is open
+;		  FALSE if ATP is not open
+;
+;	 Uses: D1 (IsMPPOpen uses D0 also)
+;
+;	Modification History:
+;
+;	1/9/84	ABO,GRT  New Today
+;
+;___________________________________________________________________________
+
+IsATPOpen 	PROC		EXPORT
+			CLR	 	-(SP)		  ; result for call
+			BSR	 	IsMPPOpen	  ; check to make sure MPP is open
+			MOVEQ	#0,D1		 ; clear result (assume FALSE)
+			TST.B	(SP)+		 ; is MPP open??
+			BEQ.S	@90			 ;	if not then exit
+			BTST  	#ATPLoadedBit,PortBUse ; check to see if ATP is loaded in
+			BEQ.S	@90			 ;	   if not, then exit
+			MOVEQ	#1,D1		 ; else set result to TRUE
+@90		 	MOVE.B	D1,4(SP) 	  ; return result back to user
+			RTS
+			ENDPROC
+			EJECT
+;___________________________________________________________________________
+;
+;	MPPOpen - Opens the MPP driver. No error is returned if everything goes
+;	OK or MPP is already open.  This routine can (and probably will) be called
+;	by other functions or by the user himself.
+;
+;	FUNCTION MPPOpen : OsErr;
+;
+;	 Returns:  Errors from _Open call
+;		  PortInUse
+;		  PortNotCf
+;		  noErr
+;
+;	If there is not enough memory in the heap to load MPP, the ROM sometimes
+;	returns back a -35 (No such volume exists) error as the function result.
+;	Unfortunately, we can't do anything about it other than watch for it.
+;
+;	Modification History:
+;
+;	12/14/84	GRT	New Today
+;	1/9/85	ABO,GRT  Changed the way we check to see if MPP is loaded.	Using
+;		  PortBUse lomem variable
+;	1/21/85	GRT	Changed SPBConfig to SPConfig (per ABO)
+;
+;___________________________________________________________________________
+
+MPPOpen		PROC		EXPORT
+			CLR	 	-(SP)		  ; func result space
+			JSR	 	IsMPPOpen
+			CLR	 	D0		   ; assume no error
+			TST.B	(SP)+		 ; is mpp open?
+			BNE.S	@90			 ; if already open then just exit
+
+; MPP is not open
+
+			MOVE.B	PortBUse,D1		; is someone else using it?
+			BMI.S	@20			 ; if not then branch
+
+; Someone else is using the port so report the error
+
+			MOVEQ	#PortInUse,D0		; set error
+			BRA.S	@90
+
+@20		 	MOVE.B	SPConfig,D0		 ; get config data
+			AND.B	#$0F,D0		 ; clear high bits
+			SUBQ.B	#UseATalk,D0		; find out if ATalk is using it
+			BLE.S	@30			 ; branch if ATalk or port unconfigured
+
+			MOVEQ	#PortNotCf,D0		; set port not configured correctly
+			BRA.S	@90
+
+; Make the open call to the driver
+
+@30		 	SUB   	#IOQElSize,SP	  ; allocate queue element on stack
+			MOVE.L	SP,A0		 ; put address into A0
+			LEA	 	MPPName,A1	  ; name of driver to open
+			MOVE.L	A1,IOFileName(A0)	; place into IO Q element
+			CLR.B	IOPermssn(A0)
+			_Open			  ; open the .MPP driver
+			ADD	 	#IOQElSize,SP 	 ; deallocate queue element
+									; D0 should be cleared
+@90		 	MOVE  	D0,4(SP)	   ; return function result
+			RTS			   ; that's all folks!
+			ENDPROC
+			
+			EJECT
+;___________________________________________________________________________
+;
+;
+;	FUNCTION MPPClose : OsErr;
+;
+;	 Returns:  Errors from _Close call
+;		  noErr
+;
+;	Modification History:
+;
+;	12/17/84	GRT	New Today
+;
+;___________________________________________________________________________
+
+MPPClose		PROC		EXPORT
+			SUB	 	#IOQElSize,SP 	 ; allocate queue element on stack
+			MOVE.L	SP,A0		 ; put address into A0
+			MOVE  	#MPPRefNum,ioRefNum(A0) ; closing the MPP dirver
+			_Close
+			ADD	 	#IOQElSize,SP 	 ; deallocate queue element
+
+			MOVE  	D0,4(SP) 	  ; return function result
+			RTS			   ; that's all folks!
+			ENDPROC
+			
+			EJECT
+			INCLUDE	':piLAP.a'
+			INCLUDE	':piDDP.a'
+			INCLUDE	':piATP.a'
+			INCLUDE	':piNBP.a'
+			
+			
+			END
+

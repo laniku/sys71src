@@ -1,0 +1,672 @@
+;
+;	File:		ExternalMakeFSSpec.a
+;
+;	Contains:	Code to perform emulation of the MakeFSSpec call
+;				for external file systems that don't support it
+;				themselves.
+;
+;				This file can be assembled into code that relies on an a6 stack
+;				and QMgr.a-style queueing or into a simple subroutine for glue
+;				libraries.  -d MakeGlue=0 should be used in system builds and
+;				-d MakeGlue=1 for glue library builds.
+;
+;	Written by:	Dave Feldman
+;
+;	Copyright:	© 1990-1991, 1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	  6/9/93	pdw		Changed register saving from interruptRegs to pascalRegs in
+;									myCompletionRoutine because it can be called from pascal (as it
+;									is when FileShare is running).  Fixes a FileShare crash that
+;									appears when doing async I/O.
+;		 <4>	 9/13/91	JSM		Cleanup header.
+;		 <3>	 3/17/91	dnf		ppd, #dnf-0013: Use the result code from ioResult(a0) instead of
+;									from d0 to be extra-clean on async calls.
+;		 <2>	 9/22/90	dnf		Put real code in here
+;		 <1>	  8/7/90	dnf		first checked in
+;
+;
+
+	LOAD		'StandardEqu.d'
+	include		'FileMgrPrivate.a'
+
+; Get inspired and move these somewhere
+fsSpecNameLength	equ		63
+pathSeparator		equ		':'				; a colon character
+	
+; Values for d3.b during parsing
+moreSegments		equ		0			; also implies a colon-terminated segment
+finalSegmentColon	equ		1			; no more segments; path ended with a colon
+finalSegmentNoColon	equ		-1			; no more segments; path didn't end with a colon
+
+; For patch or ROM builds we need to include an i/o bottleneck to handle async calls.
+; The bottleneck code assumes QMgr.a-style queueing.
+
+		if not(MakeGlue) then
+	
+		include		'QMgrEqu.a'
+
+;________________________________________________________________________________
+;
+; Routine:	myBottleNeckIO
+;
+; Input: 	a0 points to param block
+; Output: 	d0 contains result code
+;			a1 trash
+;
+; Function:		Make traps which do I/O and do the right thing with completion
+;				routines.
+;________________________________________________________________________________
+; 
+BottleNeckRegs		reg		d1-d7/a1-a5			; async could trash any regs
+
+BottleNeckLocals	record	0, increment
+hasContinued		ds.b	1					; flag byte to watch stack depth
+				align	2
+Lsize			equ		*-BottleNeckLocals
+				endr
+
+myBottleNeckIO		proc
+	import			GetQMRecPtr
+	entry			myCompletionRoutine
+	export			myContCompatThread			; should be entry, but patch linker is dumb
+	export			myContAppThread				; should be entry, but patch linker is dumb
+	movem.l			BottleNeckRegs, -(a6)		; save our regs on hfs stack
+	with			BottleNeckLocals
+	subq.w			#Lsize, a6
+
+	bclr.b			#0, hasContinued(a6)		; initialize completion routine flag
+	lea.l			myCompletionRoutine, a1		; get our ioCompletion routine address
+	move.l			a1, ioCompletion(a0)		; and install it into the param block	
+
+	move.w			#fsCompatQType, d2			; our queue type/refnum
+	bsr				GetQMRecPtr					; a1 = ptr(QMRec)
+	move.l			a6, QMRec.curStack(a1)		; save current alt stack pointer
+	; ¥¥ do high water mark checking here
+	
+	btst.b			#asyncCall, QMRec.qmFlags(a1)	; is this call async?	
+
+	rts											; return to specific trap handling routine
+
+; Some drivers have the nasty habit of calling their completion routines before returning
+; from the trap that called them.  This might lead to unbounded stack buildup from 
+; successive calls.  To solve this we have a bit (in hasContinued) which is set both
+; in the completion routine and after the trap.  
+
+; Case 1: The completion routine is called before we return from the trap.  In this case
+; we just cruise back to the driver, since we'll get control again when the driver
+; rts's from our trap.  When that happens we can just continue our call.
+
+; Case 2: We get returned to before the completion routine is run (truly asynchronous).  
+; We rts to the app (giving back the async time) and we know we'll get control again
+; at the completion routine.  When we continue from here we need to save the 
+; appropriate interrupt registers.
+
+; This little scheme is, of course, a critical section, but we're single threaded right now,
+; so it doesn't matter.
+
+myCompletionRoutine:
+	move.w			#fsCompatQType, d2		; our queue type/refnum
+	bsr				GetQMRecPtr				; a1 = ptr(QMRec)
+	move.l			a6, -(sp)				; save a6 for a sec
+	movea.l			QMRec.curStack(a1), a6	; get our a6 back
+	bset.b			#0, hasContinued(a6)	; mark that we've been back
+	movea.l			(sp)+, a6				; restore a6			
+	beq.s			anRTSInstruction		; if we haven't returned from the trap, rts to driver
+
+	movem.l			pascalRegs, -(sp)		; save all regs that pascal callers need saved	<LW2>pdw
+	pea				restorePascalRegs		; and get in the chain to restore them later	<LW2>pdw
+				
+myContCompatThread:
+	move.w			#fsCompatQType, d2		; our queue type/refnum
+	bsr				GetQMRecPtr				; a1 = ptr(QMRec)
+	movea.l			QMRec.curStack(a1), a6	; restore alt stack pointer
+	adda.w			#Lsize, a6				; clear off the locals
+	movem.l			(a6)+, BottleNeckRegs	; restore compatibility layer thread registers	
+	move.l			(a6)+, -(sp)			; push compatibility layer thread return address
+	move.w			ioResult(a0),d0			; set the ol' status register						<3>
+anRTSInstruction:
+	rts										; and return to caller
+
+myContAppThread:		
+	; ¥¥ we're ignoring the possibility of immediate errors
+	bset.b			#0, hasContinued(a6)	; mark that we've returned 
+	bne.s			myContCompatThread		; if we already ran the completion routine, then
+											; continue without saving registers
+	rts										; return async time to application
+
+restorePascalRegs:							;												<LW2>pdw
+	movem.l			(sp)+, pascalRegs		; restore the regs that we saved last time through
+	rts										; back to the app thread
+	endproc
+
+;________________________________________________________________________________
+;
+; Routine:	DoAnA060Trap
+;
+; Input:	a0 - paramblock
+;			d0 - HFSDispatch selector
+;
+; Output:	a0 - paramblock
+;			d0 - result code
+;
+; Function:	Fire off an a060 call
+;
+; Note: After myBottleNeckIO, Z = 1 -> async, Z = 0 -> sync.
+;________________________________________________________________________________
+DoAnA060Trap:	proc
+				move.l		(sp)+, -(a6)	; save  thread ret addr on a6
+				bsr			myBottleNeckIO	; do common set up
+				bne.s		@1				; zero flag set if async
+				_HFSDispatch				; sync trap 
+				jmp			myContCompatThread; keep going with this call
+@1:				_HFSDispatch	async			; async trap
+				jmp			myContAppThread	; keep going, but give async time to app
+				endproc
+				
+; Macro for generating code that executes a synchronous or asynchronous trap 
+; based on the value of the zero flag.  Zero set = async, zero clear = sync.
+				macro
+				doSomeTrap	&theTrap
+				move.l		(sp)+, -(a6)	; save desktop thread ret addr on a6
+				bsr			myBottleNeckIO	; do common set up
+				bne.s		@1				; zero flag set if async
+				_&theTrap					; sync trap 
+				jmp			myContCompatThread; keep going with this desktop call
+@1:				_&theTrap	async			; async trap
+				jmp			myContAppThread	; keep going, but give async time to app
+				endm
+
+doGetCatInfo:	proc
+				move.w		#selectGetCatInfo, d0
+				jmp			DoAnA060Trap
+				endproc
+				
+doGetWDInfo:	proc
+				move.w		#selectGetWDInfo, d0
+				jmp			DoAnA060Trap
+				endproc
+				
+doGetVolInfo:	proc
+				doSomeTrap		GetVolInfo
+				endproc
+
+doHGetVol:		proc
+				doSomeTrap		HGetVol
+				endproc
+				
+				macro
+				go_GetCatInfo
+				bsr	doGetCatInfo
+				endm
+
+				macro
+				go_GetWDInfo
+				bsr	doGetWDInfo
+				endm
+
+				macro
+				go_GetVolInfo
+				bsr	doGetVolInfo
+				endm
+
+				macro
+				go_HGetVol
+				bsr	doHGetVol
+				endm
+				
+; For glue we can go straight to traps	
+				else
+
+				macro
+				go_GetCatInfo
+				_GetCatInfo
+				endm
+
+				macro
+				go_GetWDInfo
+				_GetWDInfo
+				endm
+
+				macro
+				go_GetVolInfo
+				_GetVolInfo
+				endm
+
+				macro
+				go_HGetVol
+				_HGetVol
+				endm
+				endif
+				
+;________________________________________________________________________________
+;
+; Routine:	ResetPathnameParser
+;
+; Input:	a4 - caller's param block (uses ioNamePtr)
+;
+; Output:	d1.l - number of characters in string (could be zero)
+;			a1   - pointer to first character in string (or nil)
+;
+; Function:	Set registers used by parser to cause it to start at the beginning
+;			of the string when it is next called.
+;________________________________________________________________________________
+ResetPathnameParser:	proc
+
+		moveq.l	#0, d1								; clear high bytes
+		move.l	ioNamePtr(a4), d0					; grab pathname pointer and set ccr's
+		movea.l	d0, a1								; move to a1 even if it's nil
+		beq.s	@Exit
+		move.b	(a1)+, d1							; get the length and point at 1st char
+@Exit:
+		rts
+		endproc
+			
+;________________________________________________________________________________
+;
+; Routine:	ParseNextSegment
+;
+; Input:	a1 - current location along pathname string 
+;			a2 - pointer to FSSpec under construction
+;
+;			d1.w - characters remaining in string in front of a1
+;
+; Output:	a1 - update to new position along pathname string
+;			a2 - pointer to FSSpec under construction
+;
+;			d0.w - error code (negative)
+;			d1.w - characters remaining in string in front of a1
+;			
+;			d3.l - stuff
+;				0 	moreSegments		implies a colon-terminated segment
+;				1	finalSegmentColon	no more segments; path ended with a colon
+;				-1	finalSegmentNoColon	no more segments; path didn't end with a colon
+;
+;			Z
+;				set - saw an empty segment
+;				clear - saw a non-empty segment or an error occurred
+;
+;			N
+;				set - error code in d0
+;				clear - success
+;
+; Function:	
+;			Parse through the characters at (a1) and copy the
+;			next leaf (i.e. file/directory) name into FSSpec.name.
+;
+;			Use the Z flag to indicate the presense of a '::' in the path
+;
+; Input: 
+;	if d1 > 0 then
+;		a1 must point to the first character in the new segment
+;	
+;________________________________________________________________________________
+; ParseNextSegmentRegs	reg		a0
+ParseNextSegment:	proc
+	
+		move.l		a0, -(sp)					; save one register
+		move.w		d2, -(sp)					; only low word
+		
+		moveq.l		#0, d0						; no chars in this segment yet
+		lea.l		FSSpec.name+1(a2), a0		; address of 1st char in leaf name buffer
+		
+		subq.b		#1, d1						; subtract one for dbra
+		cmp.b		#pathSeparator, (a1)		; is this a colon?
+		beq.s		@DoubleColon				; that means there's been 2 in a row
+
+@Loop:
+		move.b		(a1)+, d2					; get the next character
+		cmp.b		#pathSeparator, d2			; is this a colon?
+		beq.s		@SingleColon				; if so, we've got a whole segment
+
+		addq.b		#1, d0						; count the character
+		cmp.b		#fsSpecNameLength, d0		; are we overflowing FSSpec.name?
+		bhs.s		@Overflow					; we overflowed, run for our lives...
+
+		move.b		d2, (a0)+					; copy the char into leaf buffer
+
+		dbra		d1, @Loop					; while more characters keep going
+
+		moveq.l		#finalSegmentNoColon, d3	; we fell off the end, implying no colon there
+		bra.s		@Success
+		
+@DoubleColon:
+		addq.l		#1, a1						; skip past the colon	
+@SingleColon:
+		moveq.l		#moreSegments, d3			; pretend we have more
+		tst.w		d1							; was the colon also the last character?
+		bne.s		@Success					; if not, keep going
+		moveq.l		#finalSegmentColon, d3		; indicate our fate (done, with a colon)
+
+@Success:
+		move.b		d0, FSSpec.name(a2)			; turn FSSpec.name into a PString
+@Exit:
+		move.w		(sp)+, d2					; restore low word
+		movea.l		(sp)+, a0					; restore one register
+		tst.w		d0							; Z if empty string, N if error
+		rts
+
+@Overflow:
+		moveq.l		#bdNamErr, d0				; bummer - too many characters in file name
+		bra.s		@Exit
+		endproc
+		
+;________________________________________________________________________________
+;
+; Routine:	DetermineVolume
+;
+; Input:
+;			a1 - beginning of pathname (or nil)
+;			a2 - pointer to FSSpec under construction
+;			a4 - caller's param block (uses ioVRefNum and ioDirID)
+;
+;			d1 - # of characters in string (could be zero)
+; Output:
+;			FSSpec.vRefNum contains volume reference number
+;
+;			d1.w - number of characters left in pathname
+;			d4.l - dirID of selected directory
+;			a1   - place to start parsing pathname from
+;			a2   - pointer to FSSpec under construction
+;			a4   - caller's param block (uses ioVRefNum and ioDirID)
+;
+; Function:	Parse up ioVRefnum, ioNamePtr and ioDir to find the volume/directory
+;			pair.  Set the FSSpec to describe the vol/dir pair, and return the 
+;			dirID of the directory in question in d4.
+;
+;			Handle all of the no-path-to-parse cases here:
+;				no vRef, dirID or path
+;				just a vRef
+;				just a wdRef
+;				just a vRef+dirID
+;				a colon for a pathname
+;				
+;________________________________________________________________________________
+DetermineVolume:		proc
+@DetermineVolumeRegs:	reg	d2/a0/a3
+		movem.l	@DetermineVolumeRegs, -(a6)
+		suba.w	#ioHVQElSize, a6					; allocate a volume param block on a6
+		move.l	a6, a0								; leave pb in a0	
+
+; Check to see if there is a non-nil, non-zero length pathname
+		moveq.l	#finalSegmentColon, d3				; assume we have nothing to parse
+		tst.b	d1									; do we have a nil ptr or zero length name?
+		beq.s	@UseVRefAndDirID					; if so, go use vRef+dirID
+
+		bsr		ParseNextSegment					; parse next segment into FSSpec.name
+		bmi.s	@Exit								; can't party if the parser don't want to
+		beq.s	@UseVRefAndDirID					; initial colon implies vRef+dirID
+		
+		tst.l	d3									; check parser results
+		bpl.s	@VolumeNamePresent					; if it ended with a colon, it's a vol name
+		
+; We've got a special case - the pathname is a solo cname.  Reset the path parser
+; so that we'll see it again.
+		bsr		ResetPathnameParser
+		moveq.l	#moreSegments, d3					; make sure they look at this again
+		bra.s	@UseVRefAndDirID					; and go use the vRef and dirID fields
+
+@VolumeNamePresent:
+		clr.w	ioVRefNum(a0)						; use pathname, please
+		move.w	#-1, ioFDirIndex(a0)				; use pathname, please
+		
+		lea.l	FSSpec.name(a2), a3					; get the address of the just-parsed segment
+		move.l	a3, ioNamePtr(a0)					; use caller's pathname
+
+		; slam a colon on because HFS sucks rocks
+
+		addq.b	#1,d0								; add a colon on to the end
+		cmp.b	#fsSpecNameLength,d0				; ooops! no space
+		bhs.s	@BadNameError
+		move.b	d0, (a3)							; jam the longer length
+		move.b	#pathSeparator, (a3, d0.w)			; put in the lovely separator for the pleasure of Dirks
+
+		go_GetVolInfo
+		bne.s	@Exit								; run away
+		move.w	ioVRefNum(a0), FSSpec.vRefNum(a2)	; this is the volume
+		move.l	#fsRtDirID, d4						; use the root if we need to keep going
+		bra.s	@Exit								; and we're done
+
+; We don't have a volume name ('cause the path starts with a colon, the path is a
+; solo file/directory name, or there's no path), so use the ioVRefNum and ioDirID
+; fields to establish the volume and directory to start parsing from.
+@UseVRefAndDirID:
+		clr.l	ioNamePtr(a0)						; we don't need the name here	
+		move.w	ioVRefNum(a4), ioVRefNum(a0)		; use caller's vRef/WDRef
+		beq.s	@HandleDefaultCase					; GetWDInfo has no clue about default directories
+		
+		clr.w	ioWDIndex(a0)						; no indexing, please
+		clr.l	ioWDProcID(a0)						; any proc ID will do
+		clr.w	ioWDVRefNum(a0)						; any volume will do
+		go_GetWDInfo
+		bne.s	@Exit								; punt on errors
+		bra.s	@GotVolAndDir
+
+@HandleDefaultCase:
+		go_HGetVol
+		bne.s	@Exit
+		
+@GotVolAndDir:
+		move.w	ioWDVRefNum(a0), FSSpec.vRefNum(a2)	; use the volume from GetWDInfo
+		move.l	ioDirID(a4), d4						; are we overriding with the user's dirID?
+		bne.s	@Exit								; if so, stop thinking now
+		move.l	ioWDDirID(a0), d4					; use dirID from vRef/wdRef or pathname		
+@Exit:
+		adda.w	#ioHVQElSize, a6					; deallocate volume param block on a6		
+		movem.l	(a6)+, @DetermineVolumeRegs
+		tst.w	d0
+		rts
+
+@BadNameError:
+		moveq.l		#bdNamErr, d0				; bummer - too many characters in file name
+		bra.s		@Exit
+		endproc
+
+;________________________________________________________________________________
+;
+; Routine:	CorrectCapitals
+;
+; Input:	a2 - pointer to FSSpec with leaf name
+;
+; Output:	a2 - FSSpec has correct (same-as-catalog) spelling of leaf name
+;			d0 - result code
+;
+; Function:	Replace the leaf name in FSSpec.name(a2) with the spelling as it
+;			is stored in the catalog.
+;________________________________________________________________________________
+CorrectCapitalsRegs	reg	a0/a1
+CorrectCapitals		proc
+		move.l		(sp)+, -(a6)					; ret addr to local stack
+		movem.l		CorrectCapitalsRegs, -(a6)
+		suba.w		#ioHVQElSize, a6				; allocate a pb
+		movea.l		a6, a0
+		suba.w		#256, a6						; max name length is 256 bytes
+		movea.l		a6, a1							; a1 = ptr(name buffer)
+		
+		move.l		a1, ioFileName(a0)				; provide space for name output
+		move.w		FSSpec.vRefNum(a2), ioVRefNum(a0)	; use the right volume
+		move.l		FSSpec.parID(a2), d0			; get parent directory
+		cmp.l		#fsRtParID, d0					; are we looking for the root's name?
+		beq.s		@RootName
+		
+		move.w		#1, ioFDirIndex(a0)				; start indexing at 1
+		move.l		d0, ioDirID(a0)					; use the right directory
+		
+@IndexLoop:
+		go_GetCatInfo
+		bne.s		@Exit							; punt on errors
+
+		move.l		a0,-(sp)						; stash regs
+		move.l		a1,-(sp)
+		lea			FSSpec.name(a2), a0				; point to source name
+		moveq.l		#0, d0							; clear everything
+		move.b		(a0)+, d0						; length of caller's string
+		swap		d0								; up high where _RelString likes it
+		move.b		(a1)+, d0						; length of catalog's string
+		_FSRelString								; compare 'em
+		movea.l		(sp)+, a1						; restore regs
+		movea.l		(sp)+, a0
+		beq.s		@Hit							; cruise when they match
+		add.w		#1, ioFDirIndex(a0)				; check out the next one
+		move.l		FSSpec.parID(a2), ioDirID(a0)	; use the right directory
+		bra.s		@IndexLoop
+
+; GetCatInfo seems to not want to return info about the root directory when asked for 
+; the first item (indexed) in fsRtParID.  Thus, we hack.
+@RootName:
+		clr.w		ioVolIndex(a0)					; no indexing for us
+		go_GetVolInfo
+		bne.s		@Exit
+
+@Hit:
+		moveq.l		#0, d0							; clear everything
+		lea.l		FSSpec.name(a2),a0				; a0 target FSSpec
+		move.b		(a1), d0						; get length of catalog-spelled name
+		cmp.b		#63, d0							; a massive MFS name?
+		bls.s		@1								; if length <= 63, we've enough room
+		moveq.l		#63, d0							; sorry; you only get the 1st 63 chars
+@1:
+		move.b		d0, (a1)						; set clipped string length back into source
+@loop:
+		move.b		(a1)+, (a0)+					; set chars into FSSpec.name
+		dbra		d0, @loop
+		
+		moveq.l		#noErr, d0						; yay! 
+@Exit:
+		adda.w		#ioHVQElSize+256,a6				; deallocate the pb and name buffer
+		movem.l		(a6)+, CorrectCapitalsRegs
+		move.l		(a6)+, -(sp)					; ret addr back
+		tst.w		d0
+		rts
+		endproc
+;________________________________________________________________________________
+;
+; Routine:	ExternalMakeFSSpec
+;
+; Input:	a0	- caller's param block (uses ioVRefNum, ioNamePtr, ioDirID and ioMisc)
+;
+; Output:	FSSpec (pointed to by ioMisc) is properly set
+;			d0  - result code
+;
+; Function:	Parse up ioVRefnum, ioNamePtr and ioDir to make an FSSpec
+;
+; register usage:
+;	a0 - our working parameter block
+;	a1 - current place along the caller's pathname
+;	a2 - FSSpec record
+;	a4 - caller's param block
+;	d1 - characters left in pathname in front of a1
+;
+; Assumes that suitably big a6 (Å800 bytes) is set up (presumably the compatibility layer)
+; This routine follows all of the conventions to be called in the compatibility layer 
+; but would also run fine as glue if someone aims a6 at a stack.
+;________________________________________________________________________________
+ExternalMakeFSSpecRegs	reg	a2-a4/d3-d4
+ExternalMakeFSSpec:	proc	export
+
+		move.l	(sp)+, -(a6)						; we do i/o
+		movem.l	ExternalMakeFSSpecRegs, -(a6)
+		movea.l	a0, a4								; save caller's pb pointer in a safe reg
+		sub.w	#ioHVQElSize, a6					; allocate a (big) param block on a6
+		movea.l	a6, a0								; keep a pointer to it around in a0
+
+		move.l	ioFSSpecPtr(a4), a2					; a2 = ptr(Caller's FSSpec record)
+		lea.l	FSSpec.name(a2), a3					; use FSSpec.name for path segment name storage
+		move.l	a3, ioNamePtr(a0)					; have 
+		bsr		ResetPathnameParser					; get ready to parse pathname
+
+		bsr		DetermineVolume						; go get the volume and directory established
+		bne		@ErrorExit
+
+		move.w	FSSpec.vRefNum(a2), ioVRefNum(a0)	; we know the volume now
+
+@DirIDButNoCatInfo:
+		move.l	d4, ioDirID(a0)						; remember this so we can recognize our parents
+		tst.l	d3									; check result of last parse
+		bne.s	@GetCatInfoByDirID					; no more segments? Get the name and par of this dir
+		
+@ParseSegments:
+		bsr		ParseNextSegment					; using a1/d1 return next segment
+		bmi		@ErrorExit							; splitsville if the parser won't dance
+		beq.s	@DoubleColon						; handle double colon case
+
+		clr.w	ioFDirIndex(a0)						; use dirID and name, please
+		go_GetCatInfo								; look and see if we can find anything
+
+		; There are two reasons that the following code rejects files when a colon is present:
+		;	1) a file in the middle of a path is an error, and its ioDirID is not a dirID
+		;	2) a file at the end of a colon-terminated path is an error, too (Bill B. sez)
+
+		bne.s	@WeLikeItFine						; an error happened, so we canÕt be picky
+		btst.b	#ioDirFlg, ioFlAttrib(a0)			; was the thing we found a directory?
+		bne.s	@WeLikeItFine						; yes, and weÕre always happy to find directories
+		tst.l	d3									; did we have a colon?
+		bmi.s	@WeLikeItFine						; no, and that is correct for a file
+		moveq.l	#dirNFErr, d0						; silly rabbi, colons are for directories
+		bra.s	@ErrorExit
+@WeLikeItFine:
+
+		tst.l	d3									; are we out of segments?
+		bne.s	@DoneParsing						; if so, got to get out
+
+		tst.w	d0									; did we have trouble getting through the directory
+		bne.s	@ErrorExit							; errors are our cue to cruise
+
+		move.l	ioDirID(a0), d4						; now, look within this directory
+		bra.s	@ParseSegments
+
+@DoubleColon:
+		cmp.l	#fsRtDirID, d4						; are we trying to go higher than the root?
+		beq.s	@DirNFExit							; yes, we canÕt (even though GetCatInfo would)
+		move.w	#-1, ioFDirIndex(a0)				; we need this guy's parent
+		go_GetCatInfo
+		bne.s	@ErrorExit							; barf on badness
+		move.l	ioFlParID(a0), d4					; get parent because we are done
+		bra.s	@DirIDButNoCatInfo
+
+@GetCatInfoByDirID:
+		move.w	#-1, ioFDirIndex(a0)				; we need this guy's parent
+		go_GetCatInfo
+		bne.s	@ErrorExit							; barf on badness
+		move.l	ioFlParID(a0), d4					; get parent because we are done
+
+@DoneParsing:
+		move.l	d4, FSSpec.parID(a2)				; use the parent from the last GetCatInfo
+		tst.w	d0									; did we get an error here?
+		beq.s	@FoundSomething						; if not, we found something real
+		cmp.w	#fnfErr, d0							; did we get fnfErr, a perfectly acceptable error?
+		bne.s	@ErrorExit							; no, it was another error, report it
+
+; GetCatInfo returns an fnfErr instead of a dirNFErr when given a bad directory ID.  Since an fnfErr
+; from MakeFSSpec is an invitation to call _Create, we filter out bad directories here.
+		move.w	#-1, ioFDirIndex(a0)				; info about directory
+		clr.l	ioNamePtr(a0)						; we don't want the name back
+		move.l	FSSpec.parID(a2), ioDirID(a0)		; use the directory we're about to return
+		go_GetCatInfo
+		bne.s	@ErrorExit							; an error implies a bad directory
+		moveq.l	#fnfErr, d0							; good directory, so restore the fnfErr
+		cmp.l	#fsRtParID, d4						; were we searching in the rootÕs parent?
+		bne.s	@Exit								; no, we can return safely (can't create in fsRtParID)
+
+@ErrorExit:	
+		cmp.w	#fnfErr, d0							; if an fnfErr made it here, it is really a dirNFErr
+		bne.s	@notFNF
+@DirNFExit:
+		moveq.l	#dirNFErr, d0						; return a dirNFErr instead
+@notFNF:
+		clr.w	(a2)+								; clear the FSSpec.vRefNum
+		clr.l	(a2)+								; clear the FSSpec.parID
+		clr.b	(a2)+								; clear the FSSpec.name length byte
+		bra.s	@Exit
+
+@FoundSomething:
+		bsr		CorrectCapitals						; Get correct spelling of leaf name
+@Exit:
+		adda.w	#ioHVQElSize, a6					; deallocate param block
+		movem.l	(a6)+, ExternalMakeFSSpecRegs
+		move.l	(a6)+, -(sp)
+		tst.w	d0
+		rts
+		endproc
+		end

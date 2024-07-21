@@ -1,0 +1,582 @@
+;
+;	File:		SecondaryInit.a
+;
+;	Written by:	Mike Puckett, October 3, 1991
+;
+;	Copyright:	© 1988-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM5>	12/13/93	PN		Roll in KAOS and Horror to add support for Malcom and AJ
+;	   <SM4>	08-03-93	jmp		Updated sources to reflect necessary changes from HORROR.
+;	   <SM3>	01-11-93	jmp		Updated various BoxFlag names.
+;	   <SM2>	10/28/92	SWC		Changed VideoEqu.a->Video.a and ShutdownEqu.a->Shutdown.a.
+;		 <1>	 10/6/92	GDW		New location for ROMLink tool.
+;	   <SM5>	09-03-92	jmp		(jmp,H9) Corrected .s vs. non-.s branches and odd-alignment
+;									problems.
+;									(ag,H8) Change to use new power manger calling convention.
+;									(jmp,H7) Needed to add Wombat-class CPUs to those that need to
+;									run the Sound-Input VBL-killer code.
+;	   <SM4>	  6/4/92	KW		(djw,H6) moved power mgr code to after EndSecondaryInit label so
+;									the code would be called. (ag,H5) Added call to power dispatch
+;									to allow power manager code execution at secondary init time.
+;	   <SM3>	 5/16/92	kc		Roll in Horror Changes. Comments follow:
+;		<H4>	01/29/92	jmp		(jmp,Z4) Added in some code that eliminates the System 7 Tuner’s
+;									secure-mode unfriendly keyboard patches.
+;		 <2>	 3/31/92	JSM		Rolled this file into Reality.
+;		<H3>	01/27/92	jmp		(BG,Z3) Added miscellaneous Zydeco-specific SoundMgr fixes.
+;		<H2>	01/22/92	jmp		(jmp,Z2) Added a way to temporarily disable the altsense code.
+;		<H1>	10/24/91	jmp		first checked in
+
+				
+;---------------------------------------------------------------------
+
+				STRING 	C
+
+				PRINT	OFF
+				LOAD	'StandardEqu.d'
+
+				INCLUDE 'DockingEqu.a'
+				INCLUDE	'EgretEqu.a'
+				INCLUDE	'GestaltEqu.a'
+				INCLUDE	'GestaltPrivateEqu.a'
+				INCLUDE 'HardwarePrivateEqu.a'
+				INCLUDE	'IOPrimitiveEqu.a'
+				INCLUDE	'PowerPrivEqu.a'
+				INCLUDE 'ROMEqu.a'
+				INCLUDE	'Video.a'
+				INCLUDE	'SlotMgrEqu.a'
+				INCLUDE	'ShutDown.a'
+				INCLUDE	'SonicEqu.a'
+				INCLUDE	'UniversalEqu.a'
+				
+				INCLUDE	'DepVideoEqu.a'
+				PRINT	ON
+
+
+				SEG		'_sSecondaryInitRec'
+				MACHINE	MC68020
+LSecondaryInit	PROC
+				
+;---------------------------------------------------------------------
+;	Header
+;---------------------------------------------------------------------
+
+				Dc.b	sExec2							; code revision
+				Dc.b	sCPU68020						; CPU type is 68020	
+				Dc.w	0								; reserved
+				DC.L	BeginSecondaryInit-*			; offset to code
+				
+;---------------------------------------------------------------------
+;	Local variables, definitions, etc....
+;---------------------------------------------------------------------
+
+SInitStackFrame	Record	{A6Link},Decrement
+Return			Ds.l	1								; Return address.
+A6Link			Ds.l	1								; Saved A6.
+spBlk			Ds		SpBlock							; SpBlock for generic use.
+sPRAMBlk		Ds.b	SizesPRAMRec					; SpRAMRec for generic use.
+theDrHwID		Ds.w	1								; The DrHwID in use.
+theBoardID		Ds.b	1								; The boardID in use.
+				Ds.b	1								; <pad>
+SInitStackSize	Equ		*
+				Endr
+
+GestaltSelectorFrame	Record	{A6Link},Decrement
+Result			Ds.w	1								; The Gestalt OSErr result.
+GSFStartParams	Equ		*
+Selector		Ds.l	1								; Selector, OSType.
+ResponsePtr		Ds.l	1								; Response, VAR-type.
+GSFParamSize	Equ		GSFStartParams-*
+Return			Ds.l	1								; Return address.
+A6Link			Ds.l	1								; Save A6.
+				Org
+GSFSize			Equ		*
+				ENDR
+
+;---------------------------------------------------------------------
+;	Data
+;---------------------------------------------------------------------
+
+;	This is the VBL from System 7.0.1 ({SoundMgr}SoundMgrPatch.a) that is unnecessary
+;	on the Quadra 950.
+
+SndVBLTask												; 7.0.1 System Disk Sound VBL Task (stored as data here)
+				dc.w		$317C, $001E, $000A			; MOVE.W     #$001E,$000A(A0)
+				dc.w		$2278, $0CC0				; MOVEA.L    $0CC0,A1
+				dc.w		$40E7						; MOVE       SR,-(A7)
+				dc.w		$007C, $0700				; ORI.W      #$0700,SR
+				dc.w		$4A29, $0F09				; TST.B      $0F09(A1)
+				dc.w		$6706						; BEQ.S      *+$0008
+				dc.w		$4A29, $0F29				; TST.B      $0F29(A1)
+				dc.w		$661A						; BNE.S      *+$001C
+				dc.w		$137C, $0001, $0F09			; MOVE.B     #$01,$0F09(A1)
+				dc.w		$137C, $0001, $0F29			; MOVE.B     #$01,$0F29(A1)
+				dc.w		$4229, $0F09				; CLR.B      $0F09(A1)
+				dc.w		$4229, $0F29				; CLR.B      $0F29(A1)
+				dc.w		$317C, $0001, $000A			; MOVE.W     #$0001,$000A(A0)
+				dc.w		$46DF						; MOVE       (A7)+,SR
+				dc.w		$4E75						; RTS        
+SndVBLSize		equ			*-SndVBLTask				;
+
+;	The System 7.0 Tuner is not secure-switch friendly.  So, we need to tell it to not apply the
+;	“putter” keyboard fixes.  This routine is installed into the System heap as a Gestalt proc; it
+;	is not executed from within this file.
+;
+
+				With		GestaltSelectorFrame
+FixKBFix
+				Link		A6,#GSFSize					; Set up a Gestalt-style stackframe.
+					
+				Move.l		ResponsePtr(A6),A0			; Get a pointer to the response variable.
+				Move.l		#(1<<gestaltKeyboardFix),D0 ; Say that the keyboard fix is unnecessary.
+				Move.l		D0,(A0)						; Return it.
+				
+				Move.w		#noErr,Result(A6)			; We don’t need to return an error here.
+				Unlk		A6							; Clean up the stackframe.
+				Move.l		(Sp)+,A0					; Get the return address.
+				addq		#GSFParamSize,Sp			; Do Pascal-stlye clean up.
+				Jmp			(A0)						; Return to caller.
+EndKBFix
+				Endwith
+				
+;	On the sucky FSTN LCD Panels, we want to alert the System (for WDEFs, CDEFs, etc…) that they
+;	may not want to do deep gray drawing in wide areas.  This routine is used as either
+;	a new Gestalt selector or a replacement if it already exists.  It doesn’t get called
+;	from within this file, so it’s just data here.
+;
+
+				With		GestaltSelectorFrame
+NewGraysFlicker
+				Link		A6,#GSFSize					; Set up a Gestalt-style stackframe.
+				
+				Lea			OldGraysFlicker,A0			; Point to the holder of the original response.
+				Move.l		(A0),D0						; Get that value.
+				Movea.l		ResponsePtr(A6),A0			; Get a pointer to the response variable.
+				Ori.l		#(1<<0),D0					; Say that the Slot 0 screen flickers.
+				Move.l		D0,(A0)						; Return it.
+				
+				Move.w		#noErr,Result(A6)			; We don’t need to return an error here.
+				Unlk		A6							; Clean up the stackframe.
+				Move.l		(Sp)+,A0					; Get the return address.
+				addq		#GSFParamSize,Sp			; Do Pascal-stlye clean up.
+				Jmp			(A0)						; Return to caller.
+
+OldGraysFlicker	Dc.l		0							; Previous value.
+EndNewGraysFlicker
+				Endwith
+
+;---------------------------------------------------------------------
+;	Utils
+;---------------------------------------------------------------------
+						
+;---------------------------------------------------------------------
+;
+;	Routine:	ChkScrn
+;
+;	Inputs:		D0.w - contains theDrHwID
+;
+;	Outputs:	None
+;
+;	Destroys: 	A0-A2/D0-D1
+;
+;	Function:	Classically, the Monitors control panel writes out an
+;				'scrn' resource that would flip us into 1bpp (i.e.,
+;				mode $80) on family mode changes.  We attempt to
+;				solve that problem here by re-writing the appropriate
+;				value into the 'scrn' resource itself.
+;
+;	Note:		Because this is a shared SecondaryInit, we do all of
+;				this somewhat obscurely by using the ScrnInval (VidType)
+;				and VidMode lo-memory globals as a single word-sized
+;				value.  It is the job of the individual PrimaryInits
+;				to write out the appropriate DrHwID if a family
+;				mode change has occurred since the last re-boot.  Since
+;				all of our DrHwIDs are actually byte-sized, the ScrnInval
+;				byte is generally cleared, which keeps the ROM version
+;				of CheckDevicesInit from whacking us back into 1bpp.
+;				If this weren’t a shared SecondaryInit we would (more
+;				appropriately) use Slot PRAM for this sort of thing.
+;
+;				ScrnInval & VidMode aren’t used during the boot-up
+;				process so this sort of hacking is okay.
+;---------------------------------------------------------------------
+
+				With	SInitStackFrame,SpBlock,ScrnRecord,SP_Params
+
+ChkScrn			Cmp.w	ScrnInval,D0						; If 'scrn' resource doesn’t need validating by us,
+				Bne		@EndScrn							;	then just go on.
+				
+				Move.w	#-1,ScrnInval						; Clean up after ourselves.
+				
+; Check to see that Slot 0 video is actually running…
+;
+				Lea		spBlk(A6),A0						; Point to our spBlock.
+				Clr.b	spId(A0)							; Begin at id 0.
+				Clr.b	spTBMask(A0)						; No mask in search.
+				Move.w	#catDisplay,spCategory(A0)			; Look for: Display,
+				Move.w	#typVideo,spCType(A0)				;			Video,
+				Move.w	#drSwApple,spDrvrSW(A0)				;			Apple,
+				Move.w	D0,spDrvrHW(A0)						;			<DrHwID>.
+				Clr.l	spParamData(A0)						; Look only for enabled sRsrcs.
+				_GetTypeSRsrc								; If we didn’t find ourselves,
+				Bne.s	@EndScrn							;	then just go on.
+
+; Check to see if there’s an 'scrn' resource available…
+;
+				Clr.l	-(Sp)								; Make room for the function result.
+				Move.l	#'scrn',-(Sp)						; Push desired resource type.
+				Clr.w	-(Sp)								; Resource ID = 0.
+				_GetResource								; Get the resource.
+				Move.l	(Sp)+,D0							; Get the resource handle.
+				Beq.s	@EndScrn							; If nil, then just go on.
+				
+				Move.l	D0,-(Sp)							; Save Handle for _ReleaseResource call.
+				Movea.l	D0,A2								; Save it for easy access later on.
+				Movea.l	D0,A0								; Set up to lock it down for now.
+				_HNoPurge									; Make it non-purgeable and…
+				_HLock										; …lock it down.
+				
+; Check to see if we’re in the 'scrn' resource…
+;
+				Movea.l	(A0),A0								; Get a pointer to the 'scrn' resource.
+				Move.w	(A0)+,D0							; Get the number of 'scrn' records to search.
+				Subq	#1,D0								; Make it zero-based.
+				
+@ScrnLoop		Tst.w	srSlot(A0)							; If this entry is for Slot 0,
+				Beq.s	@ChkDrHwID							;	then check the drHwID.
+				Adda.w	#ScrnRecSize,A0						; Otherwise, point A0 at the next entry.
+				Dbra	D0,@ScrnLoop						; Loop until done.
+				Bra.s	@EndScrnChk							; We couldn’t find our 'scrn' entry, so just go on.
+				
+@ChkDrHwID		Move.w	theDrHwID(A6),D0					; Get our drHwID back into D0.
+				Cmp.w	srDrvrHW(A0),D0						; If the drHwIDs don’t match,
+				Bne.s	@EndScrnChk							;	then just go on.
+				
+; Make sure the depth (mode) setting is correct…
+;
+				Lea		sPRAMBlk(A6),A1						; Point to our sPRAM block.
+				Moveq	#0,D0								; Clear D0 for good measure.
+				Move.b	SP_Depth(A1),D0						; Get the mode we’d like to be at.
+				Cmp.w	srMode(A0),D0						; If the modes match,
+				Beq.s	@EndScrnChk							;	then just go on.
+				Move.w	D0,srMode(A0)						; Otherwise, write out what we want.
+							
+				Move.l	A2,-(Sp)							; Set up to mark our change.
+				_ChangedResource							; Do it.
+				Move.l	A2,-(Sp)							; Set up to write our change out.
+				_WriteResource								; Do it.
+
+; Clean up and go home…
+;
+@EndScrnChk		_ReleaseResource							; Release the ‘scrn’ resource.
+@EndScrn		Rts											; And return home.
+						
+				Endwith		
+				
+;---------------------------------------------------------------------
+;	Main
+;---------------------------------------------------------------------
+				
+				With		SInitStackFrame,SEBlock,SpBlock
+				
+BeginSecondaryInit
+
+				Link		A6,#SInitStackSize			; Allocate some space on the stack.
+				Move.w		#seSuccess,seStatus(A0)		; No reason to fail here.
+
+; Perform some generic intializations.
+				
+				Clr.b		spBlk.spSlot(A6)			; This is always a slot 0 SecondaryInit.
+				Clr.b		spBlk.spExtDev(A6)			; Don’t ask why, always clear this guy.
+
+				With		ProductInfo,VideoInfo,SP_Params
+				
+				Lea			spBlk(A6),A0				; Point to our spBlock.
+				Lea			sPRAMBlk(A6),A2				; Point to a sPRAM block.
+				Move.l		A2,spResult(A0)				; Set up read buffer.
+				_sReadPRAMRec							; Read Slot 0’s pRAM.
+				
+				Movea.l		UnivInfoPtr,A0				; Point to the ProductInfo record.
+				Adda.l		VideoInfoPtr(A0),A0			; Point to the VideoInfo record.
+				Move.w		DrvrHwID(A0),D0				; Get the DrHwID.
+				Move.w		D0,theDrHwID(A6)			; Remember it for later.
+				Move.b		BoardSRsrcID(A0),theBoardID(A6) ; Remember the board ID.
+				
+				Endwith
+				
+; For built-in video’s that support it, go seek out and cleanse the 'scrn' resource if it is
+;	invalid.  Note:  This is generally used to prevent family-mode swapping from forcing the
+;	screen back to 1bpp due to a historical oversight on the part of the Monitors control
+;	panel.
+;
+				Bsr.s		ChkScrn						; D0.w contains theDrHwID.
+
+; We can’t read the keyboard without lots of non-generic stuff during PrimaryInit, so we do that
+;	here.  The reason we are doing this is to temporarily disable the type-6 multimode support.
+;	To be consistent with the System, we use the shift key to disable.
+;
+				With		SP_Params,SpBlock
+				
+				Cmpi.w		#drHwDAFB,theDrHwID(A6)		; If we’re using the DAFB driver,
+				Beq.s		@AltSense					;	then do the AltSense stuff.
+				Cmpi.w		#drHwSonora,theDrHwID(A6)	; If we’re using the Sonora driver,
+				Beq.s		@AltSense					;	then do the AltSense stuff.
+				Bra.s		@EndAltSense				; Otherwise, keep going.
+				
+@AltSense		Lea			sPRAMBlk(A6),A2				; Point to a sPRAM block.
+				Lea			spBlk(A6),A0				; Point to our spBlock.
+				
+				Move.b		SP_AltSense(A2),D0			; Get the alternate senseID pRAM byte into D0.
+				Move.b		D0,D4						; Save it for later.
+				
+				Andi.b		#spAltSenseValidMask,D0		; If the alternate senseID is not valid,
+				Beq.s		@ChkForRestore				;	just go on.
+				
+				Movem.l		KeyMap,D0-D3				; Get the KeyMap.
+				Bclr		#7,D3						; Clear off the power key.
+				Bclr		#1,D1						; Clear off capslock key.
+				Bclr		#0,D1						; Clear off and test the shift key.
+				Beq.s		@EndAltSense				; Don’t disable if shift key is not held down.
+				Or.l		D1,D0						; Also, don’t disable if
+				Or.l		D2,D0						;	various other stray
+				Or.l		D3,D0						;	keys are being.
+				Bne.s		@EndAltSense				;	held down
+
+				Move.b		D4,D0						; Get the alternate senseID pRAM byte again.
+				Andi.b		#spAltSenseMask,D0			; Strip off the validation code.
+				Ori.b		#spAltSenseDisable,D0		; Temporarily disable the alternate senseID.
+				Move.b		D0,SP_AltSense(A2)			;
+
+				Move.l		A2,spsPointer(A0)			; Set up parameter block.
+				_sPutPRAMRec							; Write pRAM out.
+				_SDRestart								; Restart the machine.
+				
+@ChkForRestore	Move.b		D4,D0						; Get the alternate senseID pRAM byte again.
+				Andi.b		#spAltSenseDisable,D0		; If it is not the temporary disable code,
+				Beq.s		@EndAltSense				;	then just go on.
+
+				Move.b		D4,D0						; Get the alternate senseID pRAM byte again.
+				Andi.b		#spAltSenseMask,D0			; Strip off the validation bits.
+				Ori.b		#spAltSenseValidMask,D0		; Re-validate the alternate senseID byte.
+				Move.b		D0,SP_AltSense(A2)			;
+				
+				Move.l		A2,spsPointer(A0)			; Set up parameter block.
+				_sPutPRAMRec							; Write pRAM out.
+
+				EndWith
+
+@EndAltSense
+
+; We only want the following to execute on CPUs with caboose keyswitches.  We are telling the
+;	System 7 Tuner to not load it’s secure-mode unfriendly version of the Keyboard fixes.
+;
+; Note:  The method used below to “fix” the System 7 Tuner is actually incomplete.  We really
+;	should check to see if the gestaltBugFixAttrs selector actually exists, and if so, use
+;	_ReplaceGestalt to OR-in the fact that we don’t want the keyboard fix (gestaltKeyboardFix)
+;	to be applied.  Instead, we “know” that if the gestaltBugFixAttrs does exist, then the
+;	problem we are addressing here must have already been fixed.
+
+				Move.l		#KeySwMask,D0				; Get isolation mask ready.											<4>
+				And.l		UnivROMFlags,D0				; Grab keyswitch bits in UnivROMFlags.								<4>
+				Sub.l		#KeyswCaboose,D0			; Do we have a Keyswitch?											<4>
+				Bne.s		@EndKBFixes					; No, skip keyboard fixes.											<4>
+	
+				Move.l		#gestaltBugFixAttrs,D0		; Setup to load the bug-fix selector.
+				_Gestalt								; Try to load it.
+				Beq.s		@EndKBFixes					; If it’s there, assume it’s okay.
+				
+				Lea			FixKBFix,A1					; Point to the beginning of the keyboard fix.
+				Lea			EndKBFix,A0					; Point to the end of the keyboard fix.
+				Sub.l		A1,A0						; Determine the keyboard fix size.
+				Move.l		A0,D0						; Set up for _NewPtr (size in D0).
+				Move.l		D0,D1						; Save the size for BlockMove.
+				_NewPtr		Sys							; Attempt to get a block in the System heap.
+				Bne.s		@EndKBFixes					; If failed, just go on.
+				Lea			FixKBFix,A1					; Otherwise, point back at keyboard fix.
+				Exg			A0,A1						; Set up for BlockMove (A0=Src,A1=Dest).
+				Move.l		D1,D0						; D0 is size of block to move.
+				_BlockMove								; Do it.
+				Move.l		A1,D2						; Save System heap address for later if necessary.
+				
+				Move.l		#gestaltBugFixAttrs,D0		; Setup to install bug-fix selector.
+				Exg			A1,A0						; Point to keyboard fix in System heap.
+				_NewGestalt								; Do it.
+@ChkForErr		Beq.s		@EndKBFixes					; If the call worked, just go on.
+				Movea.l		D2,A0						; Otherwise, point to System heap code.
+				_DisposPtr								; And throw it away.
+
+@EndKBFixes
+
+; There are two parts to the following pieces of code.  For the first piece, we want to execute on the
+;	Quadra 950 and the Wombat-class machines running the System 7.0.1 version of the Sound Manager.
+;	Supposed, the problem that this code addresses will be fixed in Cube-E.  For the second piece,
+;	we only want to run on the Qudara 950.
+;
+kSndMgrVersion	EQU			$02018000					; System 7.0.1 Version of the Sound Manager.
+
+				TestFor		djMEMCChipBit				; If we’re on a Wombat-class CPU, then
+				Bne.s		@StrtSndFix					;	apply this fix.
+				cmpi.b		#boxQuadra950,BoxFlag		; are we a Quadra 950?
+				Bne.s		@EndSoundFixes				; nope ... we're outta here
+
+@StrtSndFix
+				clr.l		-(sp)						; make room for PASCAL return value
+				_SndSoundManagerVersion					; get current soundMgr version
+				move.l		(sp)+,d0					; retrieve returned value
+				cmpi.l		#kSndMgrVersion,d0			; are we the 7.0.1 soundmgr?
+				bne.s		@EndSoundFixes				; nope ... we're outta here
+;	
+;	This will go and hunt down the Sound VBL Task and kill it.  The reason for that is
+;	that in the Zydeco ROM, the "problem" this attempted to fix is fixed for real, so
+;	this VBL is no longer needed.
+
+				move		sr,-(a7)					; save the status register
+				ori.w		#$0100,sr					; mask off vbl interrupts
+
+				lea 		VBLQueue,a1 				; A1 points to the queue
+				lea			qHead-vblink(a1),a0			; setup to fetch head of list
+				
+@VBLloop 		move.l		vblink(a0),d0				; advance to next block
+				beq.s		@VBLDone					; if queue is empty, exit
+
+				movea.l		d0,a0						; get pointer to next VBL control block
+
+				move.l		vblAddr(a0),a1				; get pointer to their code
+				lea			SndVBLTask,a2				; get pointer to our code
+				move.w		#(SndVBLSize/2-1),d0		; size of code
+
+@checkLoop		cmp.w		(a1)+,(a2)+					; compare source bytes
+				dbne		d0,@checkLoop				; until not equal or out of bytes to check
+				bne.s		@VBLloop					; not found - keep looking
+
+				_VRemove								; REMOVE the VBL				
+
+@VBLDone		move		(a7)+,sr					; restore interrupts
+
+;	We also want to UNpatch the InputSelect routine for the Quadra 950, since it
+;	shouldn't have been patched out in 7.0.1 ANYWAY, and we fixed a problem in the
+;	Q950 ROM routine, so we should use that one.
+
+				cmpi.b		#boxQuadra950,BoxFlag		; are we a Quadra 950?
+				bne.s		@EndSoundFixes				; nope ... we're outta here
+				
+				With		ExpandMemRec,ProductInfo
+				
+				Move.l		UnivInfoPtr,A0				; Point to the ProductInfo table.
+				Adda.l		SndControlPtr(A0),A0		; Point to the sound primitives.
+				Adda.l		sndInputSelect*4(A0),A0		; Point to the input-select routine.
+				Move.l		A0,D0						; Save pointer.
+				
+				movea.l		expandMem,a0				; get base of ExpandMemRec
+				movea.l		emSndPrimitives(a0),a0		; get base of SoundMgr Primitives Tbl
+				move.l		D0,sndInputSelect*4(a0) 	; replace input select mechanism with ROM one
+				
+				Endwith
+
+@EndSoundFixes
+
+;	The Standard WDEF that shipped in the gybly for the Darts and DBLite had a fix which explicitely
+;	looked for the GSC hardware and then for a particular kind of screen.  We’re replacing that
+;	kind of thing with a Gestalt call that returns whether or not the screen sucks.  We do that
+;	here.  Since the Darts and DBLite have already shipped, we don’t include them here.
+;
+;	Note:  If we’re on an Escher/Yeager and we’re docked to an Atlantis or DuoDock, then we’ve already
+;	shut the CSC down at this point, and we’ll get a bus error if we try to talk to it.  So,
+;	we first check to see if the CSC has been reset or not.  If it hasn’t, then we just skip
+;	all this.
+;
+				With		ProductInfo,DecoderInfo
+
+				Cmpi.w		#drHwCSC,theDrHwID(A6)		; If we’re not using the CSC driver,
+				Bne			@EndScreenSucks				;	then just leave.
+
+				Movea.l		UnivInfoPtr,A0				; Point to the ProductInfo table.
+				Adda.l		DecoderInfoPtr(A0),A0		; Point to the base address table.
+								
+				TestFor		MSCChipBit					; If we have an MSC,
+				Bne.s		@MSC						;	then hop to it.
+				TestFor		PrattExists					; If we have a Pratt,
+				Bne.s		@Pratt						;	then hop to it.
+				Bra.s		@EndScreenSucks				; Otherwise, just leave.
+
+@MSC			Movea.l		RBVAddr(A0),A1				; Point to the MSC’s base address.
+				Btst		#MSCLCDReset,MSCClkCntl(A1)	; If CSC hasn’t been reset,
+				Beq.s		@EndScreenSucks				;	then just leave.
+				
+				Movea.l		VDACAddr(A0),A1				; Point to the CSC base address.
+				Move.b		CSCPanelID(A1),D0			; Read the panel ID.
+				Cmpi.b		#isG_D_STN_640x400,D0		; If we’re are using the sucky screen,
+				Beq.s		@FixIt						;	then say so.
+				Bra.s		@EndScreenSucks				; Otherwise, just leave.
+				
+@Pratt			Movea.l		VDACAddr(A0),A1				; Point to the CSC base address.
+				Move.b		CSCPanelID(A1),D0			; Read the panel ID.
+				Cmpi.b		#isG_D_STN_640x480,D0		; If we aren’t using the sucky screen,
+				Bne.s		@EndScreenSucks				;	then just leave.
+
+@FixIt			Moveq		#0,D2						; Assume we won’t be replacing the selector.
+				Move.l		#gestaltGraysFlicker,D0		; Setup to load the sucky-screen selector.
+				_Gestalt								; If it’s not already loaded, then
+				Bne.s		@AddInNew					; 	just add it in.
+				
+				Lea			OldGraysFlicker,A1			; Point to the old-response value holder.
+				Move.l		A0,(A1)						; Fill it up with the old response.
+				Moveq		#1,D2						; Remember that we’ll be replacing.
+@AddInNew		Lea			NewGraysFlicker,A1			; Point to the beginning of the flicker code.
+				Lea			EndNewGraysFlicker,A0		; Point to its end.
+				Sub.l		A1,A0						; Determine the size.
+				Move.l		A0,D0						; Set up for _NewPtr (size in D0).
+				Move.l		D0,D1						; Save the size for BlockMove.
+				_NewPtr		Sys							; Attempt to get a block in the System heap.
+				Bne.s		@EndScreenSucks				; If failed, just go on.
+				Lea			NewGraysFlicker,A1			; Otherwise, point back at the code.
+				Exg			A0,A1						; Set up for BlockMove (A0=Src,A1=Dest).
+				Move.l		D1,D0						; D0 is size of block to move.
+				_BlockMove								; Do it.
+				Move.l		A1,D3						; Save System heap address for later if necessary.
+				
+				Move.l		#gestaltGraysFlicker,D0		; Setup to install the new/replacement selector.
+				Exg			A1,A0						; Point to the code in the System heap.
+				Tst.l		D2							; If we’re supposed to be replacing,
+				Bne.s		@ReplaceIt					;	then call the replacement trap.
+				_NewGestalt								; Otherwise, call new.
+				Bra.s		@ChkForErr					; See if there was an error.
+@ReplaceIt		_ReplaceGestalt							; Call replace.
+@ChkForErr		Beq.s		@EndScreenSucks				; If the call worked, just go on.
+				Movea.l		D3,A0						; Otherwise, point to System heap code.
+				_DisposPtr								; And throw it away.
+
+@EndScreenSucks
+
+				Endwith
+
+;---------------------------------------------------------------------
+;		
+;	<H5> Call Powermanager Secondary Init.  Power manager uses this entry point
+;	to execute code which MUST be run after patches.
+;
+		IF hasPwrControls THEN				
+PowerMgr2Init
+			IF isUniversal THEN
+				TestFor	hwCbPwrMgr			; check for power manager
+				beq.s	@exitPwrMgr			; if no pmgr skip
+			ENDIF
+
+				With	PowerDispRec,PMgrHookDispRec
+
+				moveq	#((PSecondaryInit << 16) | \; secondary init selector								<H8>
+							(PMgrHookDisp << 0)),d0	; call pmgr hook										<H8>
+				_PowerDispatch				; call power manager
+
+				Endwith
+@exitPwrMgr
+		ENDIF
+
+				Unlk	A6								; Restore link.
+				Rts										; Go home.
+				
+_EndsSecondaryInitRec
+				ENDP
+				
+				END

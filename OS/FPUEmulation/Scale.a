@@ -1,0 +1,507 @@
+;
+;	File:		Scale.a
+;
+;	Contains:	Emulation of the FSCALE unimplemented instruction
+;
+;	Originally Written by:	Motorola Inc.
+;	Adapted to Apple/MPW:	Jon Okada
+;
+;	Copyright:	© 1990, 1991 by Apple Computer, Inc., all rights reserved.
+;
+;   This file is used in these builds:   Mac32
+;
+;	Change History (most recent first):
+;
+;		<1+>	 6/24/91	BG		Modified "src_small" not to set STORE_FLG (in case
+;							rounding precision is narrower than extended) and not
+;							to set UNFL bit in USER_FPSR (since t_resdnrm will do it).
+;		 <1>	 3/30/91	BG		First checked into TERROR/BBS.
+;
+
+;  scale.a
+
+;  Based upon Motorola file 'scale.sa'.
+
+;  CHANGE LOG:
+;  07 Jan 91	JPO	Deleted unreferenced labels "src_small", "den_done",
+;			  "src_pos", "zer_rp", "zer_rp2", "neg_zero", and
+;			  "res_pos".  Renamed labels "ovfl", "denorm",
+;			  "not_zero", and "pos_zero" to "sc_ovfl", "sc_denorm",
+;			  "sc_notzero", and "sc_poszero", respectively, to avoid
+;			  duplicate symbols.
+;  07 Feb 91	JPO	Modified "fix_dnrm" routine to keep track of guard/round
+;			  bits in order to correctly round the result.  For
+;			  inexact underflows, set unfl/aunfl/inex2/inex bits
+;			  in USER_FPSR(a6).  Modified order of tests in "dst_loop"
+;			  in order to avoid spurious underflow signaling for 
+;			  normal FSCALE results with zero exponent resulting
+;			  from nonnegative scale factors.
+;  08 Feb 91	JPO	Prior to calling "t_resdnrm", put subnormal results in
+;			  FPTEMP(a6) and set a0 to point to FPTEMP(a6).  This
+;			  avoids clobbering of ETEMP with result value.
+;
+
+*
+*	scale.sa 3.1 12/10/90
+*
+*	The entry point sSCALE computes the destination operand
+*	scaled by the source operand.  If the absolute value of
+*	the source operand is (>= 2^14) an overflow or underflow
+*	is returned.
+*
+*	The entry point sscale is called from do_func to emulate
+*	the fscale unimplemented instruction.
+*
+*	Input: Double-extended destination operand in FPTEMP, 
+*		double-extended source operand in ETEMP.
+*
+*	Output: The function returns scale(X,Y) to fp0.
+*
+*	Modifies: fp0.
+*
+*	Algorithm:
+*		
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* SCALE    IDNT    2,1 Motorola 040 Floating Point Software Package
+
+
+	
+SRC_BNDS dc.w	$3fff,$400c
+
+*
+* This entry point is used by the unimplemented instruction exception
+* handler.
+*
+*
+*
+*	FSCALE
+*
+
+sscale:
+	fmove.l	#0,fpcr		;clr user enabled exc
+	clr.l	d1
+	move.w	FPTEMP(a6),d1	;get dest exponent
+	smi	L_SCR1(a6)	;use L_SCR1 to hold sign
+	andi.l	#$7fff,d1	;strip sign
+	move.w	ETEMP(a6),d0	;check src bounds
+	andi.w	#$7fff,d0	;clr sign bit
+	cmp2.w	SRC_BNDS,d0
+	bcc.b	src_in
+	cmpi.w	#$400c,d0	;test for too large
+	bge.w	src_out
+*
+* The source input is below 1, so we check for denormalized numbers
+* and set unfl.
+*
+;src_small:			; label not referenced <1/7/91, JPO>
+	move.b	DTAG(a6),d0
+	andi.b	#$e0,d0
+	tst.b	d0
+	beq.b	no_denorm
+;	st	STORE_FLG(a6)	;dest already contains result - DELETED <6/13/91, JPO>		<T2>
+;	or.l	#unfl_mask,USER_FPSR(a6) ;set UNFL - DELETED <6/13/91, JPO>			<T2>
+;den_done:			; label not referenced <1/7/91, JPO>
+	lea.l	FPTEMP(a6),a0
+	bra	t_resdnrm
+no_denorm:
+	fmove.l	USER_FPCR(a6),FPCR
+	fmove.x	FPTEMP(a6),fp0	;simply return dest
+	rts
+
+
+*
+* Source is within 2^14 range.  To perform the int operation,
+* move it to d0.
+*
+src_in:
+	fmove.x	ETEMP(a6),fp0	;move in src for int
+	fmove.l	#rz_mode,fpcr	;force rz for src conversion
+	fmove.l	fp0,d0		;int src to d0
+	fmove.l	#0,FPSR		;clr status from above
+	tst.w	ETEMP(a6)	;check src sign
+	blt.w	src_neg
+*
+* Source is positive.  Add the src to the dest exponent.
+* The result can be denormalized, if src = 0, or overflow,
+* if the result of the add sets a bit in the upper word.
+*
+;src_pos:			; label not referenced <1/7/91, JPO>
+	tst.w	d1		;check for denorm
+	beq.w	dst_dnrm
+	add.l	d0,d1		;add src to dest exp
+	beq.b	sc_denorm	;if zero, result is denorm - label renamed <1/7/91, JPO>
+	cmpi.l	#$7fff,d1	;test for overflow
+	bge.b	sc_ovfl		; label renamed <1/7/91, JPO>
+	tst.b	L_SCR1(a6)
+	beq.b	spos_pos
+	or.w	#$8000,d1
+spos_pos:
+	move.w	d1,FPTEMP(a6)	;result in FPTEMP
+	fmove.l	USER_FPCR(a6),FPCR
+	fmove.x	FPTEMP(a6),fp0	;write result to fp0
+	rts
+sc_ovfl:			; label renamed <1/7/91, JPO>
+	tst.b	L_SCR1(a6)
+	beq.b	sovl_pos
+	or.w	#$8000,d1
+sovl_pos:
+	move.w	FPTEMP(a6),ETEMP(a6)	;result in ETEMP
+	move.l	FPTEMP_HI(a6),ETEMP_HI(a6)
+	move.l	FPTEMP_LO(a6),ETEMP_LO(a6)
+	bra	t_ovfl2
+
+sc_denorm:				; label renamed <1/7/91, JPO>
+	tst.b	L_SCR1(a6)
+	beq.b	den_pos
+	or.w	 #$8000,d1
+den_pos:
+	tst.l	FPTEMP_HI(a6)		;check j bit
+	blt.b	nden_exit		;if set, not denorm
+;;;	move.w	d1,ETEMP(a6)		;input expected in ETEMP - DELETED <2/8/91, JPO>
+	move.w	d1,FPTEMP(a6)			; input can be in FPTEMP <2/8/91, JPO>
+;;;	move.l	FPTEMP_HI(a6),ETEMP_HI(a6)	; DELETED <2/8/91, JPO>
+;;;	move.l	FPTEMP_LO(a6),ETEMP_LO(a6)	; DELETED <2/8/91, JPO>
+;	or.l	#unfl_bit,USER_FPSR(a6)	;set unfl - DELETED <2/7/91, JPO>
+	or.l	#unfl_mask,USER_FPSR(a6)	; set unfl <2/7/91, JPO>
+;;;	lea.l	ETEMP(a6),a0		; DELETED <2/8/91, JPO>
+	lea.l	FPTEMP(a6),a0		; <2/8/91, JPO>
+	bra	t_resdnrm
+nden_exit:
+	move.w	d1,FPTEMP(a6)		;result in FPTEMP
+	fmove.l	USER_FPCR(a6),FPCR
+	fmove.x	FPTEMP(a6),fp0		;write result to fp0
+	rts
+
+*
+* Source is negative.  Add the src to the dest exponent.
+* (The result exponent will be reduced).  The result can be
+* denormalized.
+*
+src_neg:
+	add.l	d0,d1		;add src to dest
+	beq.b	sc_denorm	;if zero, result is denorm - label renamed <1/7/91, JPO>
+	blt.b	fix_dnrm	;if negative, result is 
+*				;needing denormalization
+	tst.b	L_SCR1(a6)
+	beq.b	sneg_pos
+	or.w	#$8000,d1
+sneg_pos:
+	move.w	d1,FPTEMP(a6)	;result in FPTEMP
+	fmove.l	USER_FPCR(a6),FPCR
+	fmove.x	FPTEMP(a6),fp0	;write result to fp0
+	rts
+
+
+*
+* The result exponent is below denorm value.  Test for catastrophic
+* underflow and force zero if true.  If not, try to shift the 
+* mantissa right until a zero exponent exists.
+*
+fix_dnrm:
+;	cmpi.w	#$ffc0,d1	;lower bound for normalization - DELETED <2/7/91>
+;	blt.w	fix_unfl	;if lower, catastrophic unfl - DELETED <2/7/91>
+	move.w	d1,d0		;use d0 for exp
+;	move.l	d2,-(a7)	;free d2 for norm - DELETED <2/7/91>
+	movem.l	d2-d3,-(a7)	; free d2/d3 for norm <2/7/91>
+	move.l	FPTEMP_HI(a6),d1
+	move.l	FPTEMP_LO(a6),d2
+;	clr.l	L_SCR2(a6)	; DELETED <2/7/91>
+	clr.l	d3		; initialize stickies <2/7/91>
+	cmpi.w	#$ffe0,d0	; shift count >= 32 bits? <2/7/91>
+	bgt.b	fix_loop	; no, do shift <2/7/91>
+
+	move.l	d2,d3		; yes, shift 32 bits <2/7/91>
+	move.l	d1,d2		; <2/7/91>
+	clr.l	d1		; high significand is zero <2/7/91>
+	add.w	#32,d0		; adjust shift counter <2/7/91>
+	beq.b	done_fix	; don't shift if zero <2/7/91>
+
+	cmpi.w	#$ffe0,d0	; new shift count > 32 bits? <2/7/91>
+	bge.b	fix_loop	; no, do shift <2/7/91>
+
+	clr.l	d2		; yes, result is 0 with a sticky <2/7/91>
+	moveq.l	#1,d3		; <2/7/91>
+	bra.b	done_fix	; <2/7/91>
+	
+fix_loop:
+;	add.w	#1,d0		;drive d0 to 0 - DELETED <2/7/91>
+	lsr.l	#1,d1		;while shifting the
+	roxr.l	#1,d2		;mantissa to the right
+	roxr.l	#1,d3		; into the guard/stickies (d3)
+	bcc.b	no_carry
+;	st	L_SCR2(a6)	;use L_SCR2 to capture inex - DELETED <2/7/91>
+	ori.b	#1,d3		; don't lose low sticky <2/7/91>
+no_carry:
+;	tst.w	d0		;it is finished when - DELETED <2/7/91>
+;	blt.b	fix_loop	;d0 is zero or the mantissa - DELETED <2/7/91>
+	add.w	#1,d0		; drive loop count in d0 to 0 <2/7/91>
+	bne.b	fix_loop	; <2/7/91>
+
+done_fix:			; label added <2/7/91>
+;	tst.b	L_SCR2(a6)	; DELETED <2/7/91>	
+;	beq.b	tst_zero	; DELETED <2/7/91>
+;	or.l	#unfl_inx_mask,USER_FPSR(a6)	; DELETED <2/7/91>
+*				;set aunfl, aunfl, ainex
+*
+* Test for zero. If zero, simply use fmove to return +/- zero
+* to the fpu.
+*
+;tst_zero:			; label DELETED <2/7/91>
+	clr.w	FPTEMP_EX(a6)
+	tst.b	L_SCR1(a6)	;test for sign
+;	beq.b	tst_con		; DELETED <2/7/91>
+	beq.b	sc_round	; new label <2/7/91>
+	or.w	#$8000,FPTEMP_EX(a6) ;set sign bit
+
+;
+; Round result to extended precision, honoring rounding direction
+; in USER_FPCR(a6) and setting appropriate exceptions - <2/7/91>
+;
+sc_round:				; new label <2/7/91>
+	or.l	#unfl_mask,USER_FPSR(a6) ; set unfl at very least <2/7/91>
+	tst.l	d3			; check for inexact <2/7/91>
+	beq.b	sc_rddone		; exact, no rounding necessary <2/7/91>
+;
+; Inexact result may require rounding tweak
+;
+	or.l	#unfinx_mask,USER_FPSR(a6) ; set unfl/aunfl/inex2/ainex, also <2/7/91>
+	bfextu	FPCR_MODE(a6){2:2},d0	; rounding direction in d0.low <2/7/91>
+	beq.b	sc_rn			; to nearest mode <2/7/91>
+	btst.l	#1,d0			; check for round toward ±inf <2/7/91>
+	beq.b	sc_rddone		; toward zero rounding -> done <2/7/91>
+	
+	btst.l	#0,d0			; round toward +inf or -inf? <2/7/91>
+	bne.b	sc_rp			;   +inf <2/7/91>
+;
+; Rounding toward -inf.  Increment significand if sign is negative <2/7/91>
+;
+	tst.b	L_SCR1(a6)		; check sign <2/7/91>
+	bne.b	sc_rdinc		; negative -> incr signif <2/7/91>
+	bra.b	sc_rddone		; positive -> done <2/7/91>
+;
+; Rounding toward +inf.  Increment significand if sign is positive <2/7/91>
+;
+sc_rp:					; <2/7/91>
+	tst.b	L_SCR1(a6)		; check sign <2/7/91>
+	beq.b	sc_rdinc		; positive -> incr signif <2/7/91>
+	bra.b	sc_rddone		; negative -> done <2/7/91>
+;
+; Round to nearest mode <2/7/91>
+;
+sc_rn:					; <2/7/91>
+	tst.l	d3			; test guard bit <2/7/91>
+	bpl.b	sc_rddone		; clear -> done <2/7/91>
+
+	bftst	d3{1:31}		; test stickies <2/7/91>
+	bne.b	sc_rdinc		; set -> incr signif <2/7/91>
+
+	btst.l	#0,d2			; test lowest bit of signif <2/7/91>
+	beq.b	sc_rddone		; clear -> done <2/7/91>
+
+;
+; Rounding requires increment of significand <2/7/91>
+;
+sc_rdinc:				; <2/7/91>
+	clr.l	d0			; clear d0 <2/7/91>
+	addq.l	#1,d2			; incr signif <2/7/91>
+	addx.l	d0,d1			; high result will not generate carry <2/7/91>
+;
+; Rounding done.  Store significand result in FPTEMP and test
+; for zero result.
+;
+;tst_con:				; label deleted <2/7/91>
+sc_rddone:				; new label <2/7/91>
+	move.l	d1,FPTEMP_HI(a6)
+	move.l	d2,FPTEMP_LO(a6)
+	move.l	d2,d0		; save low signif in d0 <2/7/91>
+;	move.l	(a7)+,d2	; DELETED <2/7/91>
+	movem.l	(a7)+,d2-d3	; restore d2/d3
+;	tst.l	d1		; DELETED <2/7/91>
+;	bne.b	sc_notzero	; label renamed <1/7/91, JPO> - DELETED <2/7/91>
+;	tst.l	FPTEMP_LO(a6)	; DELETED <2/7/91>
+
+	or.l	d1,d0		; zero result? <2/7/91>
+	bne.b	sc_notzero	; no - label RENAMED <1/7/91, JPO>
+	
+*
+* Result is zero.  Check for rounding mode to set lsb.  If the
+* mode is rp, and the zero is positive, return smallest denorm.
+* If the mode is rm, and the zero is negative, return smallest
+* negative denorm.
+*
+;	btst.b	#5,FPCR_MODE(a6) ;test if rm or rp - DELETED <1/7/91, JPO>
+;	beq.b	no_dir		; DELETED <1/7/91, JPO>
+;	btst.b	#4,FPCR_MODE(a6) ;check which one - DELETED <1/7/91, JPO>
+;	beq.b	zer_rm		; DELETED <1/7/91, JPO>
+;zer_rp:			; label not referenced <1/7/91, JPO> - DELETED <1/7/91, JPO>
+;	tst.b	L_SCR1(a6)	;check sign - DELETED <1/7/91, JPO>
+;	bne.b	no_dir		;if set, neg op, no inc - DELETED <1/7/91, JPO>
+;	move.l	#1,FPTEMP_LO(a6) ;set lsb - DELETED <1/7/91, JPO>
+;	bra.b	sm_dnrm		; DELETED <1/7/91, JPO>
+;zer_rm:			; label DELETED <1/7/91, JPO>
+;	tst.b	L_SCR1(a6)	;check sign - DELETED <1/7/91, JPO>
+;	beq.b	no_dir		;if clr, neg op, no inc - DELETED <1/7/91, JPO>
+;	move.l	#1,FPTEMP_LO(a6) ;set lsb - DELETED <1/7/91, JPO>
+;	or.l	#neg_mask,USER_FPSR(a6) ;set N - DELETED <1/7/91, JPO>
+;	bra.b	sm_dnrm		; DELETED <1/7/91, JPO>
+;no_dir:			; label DELETED <1/7/91, JPO>
+
+	fmove.l	USER_FPCR(a6),FPCR
+	fmove.x	FPTEMP(a6),fp0	;use fmove to set cc's
+	rts
+
+*
+* The rounding mode changed the zero to a smallest denorm. Call 
+* t_resdnrm with exceptional operand in ETEMP.
+*
+;sm_dnrm:			; label DELETED <1/7/91, JPO>
+;	move.l	FPTEMP_EX(a6),ETEMP_EX(a6)	; MOVED below "fix_exit" below <1/7/91, JPO>
+;	move.l	FPTEMP_HI(a6),ETEMP_HI(a6)	; <1/7/91, JPO>
+;	move.l	FPTEMP_LO(a6),ETEMP_LO(a6)	; <1/7/91, JPO>
+;	lea.l	ETEMP(a6),a0			; <1/7/91, JPO>
+;	bra	t_resdnrm			; <1/7/91, JPO>
+
+*
+* Result is still denormalized.
+*
+sc_notzero:					;label renamed <1/7/91, JPO>
+	or.l	#unfl_mask,USER_FPSR(a6)	;set unfl
+	tst.b	L_SCR1(a6)			;check for sign
+	beq.b	fix_exit
+	or.l	#neg_mask,USER_FPSR(a6) 	;set N
+fix_exit:
+;	bra.b	sm_dnrm				; DELETED <1/7/91, JPO>
+
+;;;	move.l	FPTEMP_EX(a6),ETEMP_EX(a6)	; MOVED from above <1/7/91, JPO> - DELETED <2/8/91, JPO>
+;;;	move.l	FPTEMP_HI(a6),ETEMP_HI(a6)	; <1/7/91, JPO> - DELETED <2/8/91, JPO>
+;;;	move.l	FPTEMP_LO(a6),ETEMP_LO(a6)	; <1/7/91, JPO> - DELETED <2/8/91, JPO>
+;;;	lea.l	ETEMP(a6),a0			; <1/7/91, JPO> - DELETED <2/8/91, JPO>
+	lea.l	FPTEMP(a6),a0			; exceptional op in FPTEMP <2/8/91, JPO>
+	bra	t_resdnrm			; <1/7/91, JPO>
+
+	
+*
+* The result has underflowed to zero. Return zero and set
+* unfl, aunfl, and ainex.  DELETED <1/7/91, JPO>
+*
+;fix_unfl:					; DELETED routine <1/7/91, JPO>
+;	or.l	#unfl_inx_mask,USER_FPSR(a6)
+;	btst.b	#5,FPCR_MODE(a6)	;test if rm or rp
+;	beq.b	no_dir2
+;	btst.b	#4,FPCR_MODE(a6)	;check which one
+;	beq.b	zer_rm2
+;zer_rp2:				; label not referenced <1/7/91, JPO>
+;	tst.b	L_SCR1(a6)		;check sign
+;	bne.b	no_dir2			;if set, neg op, no inc
+;	clr.l	FPTEMP_EX(a6)
+;	clr.l	FPTEMP_HI(a6)
+;	move.l	#1,FPTEMP_LO(a6)	;set lsb
+;	bra.b	sm_dnrm			;return smallest denorm
+;zer_rm2:
+;	tst.b	L_SCR1(a6)	;check sign
+;	beq.b	no_dir2		;if clr, neg op, no inc
+;	move.w	#$8000,FPTEMP_EX(a6)
+;	clr.l	FPTEMP_HI(a6)
+;	move.l	#1,FPTEMP_LO(a6) ;set lsb
+;	or.l	#neg_mask,USER_FPSR(a6) ;set N
+;	bra.w	sm_dnrm		;return smallest denorm
+;
+;no_dir2:
+;	tst.b	L_SCR1(a6)
+;	bge.b	sc_poszero	; label renamed <1/7/91, JPO>	
+;neg_zero:			; label not referenced <1/7/91, JPO>
+;	fmove.s	#"$80000000",fp0
+;	rts
+;sc_poszero:			; label renamed <1/7/91, JPO>
+;	fmove.s	#"$00000000",fp0
+;	rts
+
+*
+* The destination is a denormalized number.  It must be handled
+* by first shifting the bits in the mantissa until it is normalized,
+* then adding the remainder of the source to the exponent.
+*
+dst_dnrm:
+	movem.l	d2/d3,-(a7)	
+	move.w	FPTEMP_EX(a6),d1
+	move.l	FPTEMP_HI(a6),d2
+	move.l	FPTEMP_LO(a6),d3
+dst_loop:
+;	tst.l	d0		;check if src is zero - test MOVED below following test <1/7/91, JPO>
+;	beq.b	dst_fin		; <1/7/91, JPO>
+	tst.l	d2		;test for j-bit set
+	blt.b	dst_norm
+	tst.l	d0		;check if src is zero - test MOVED from above <1/7/91, JPO>
+	beq.b	dst_fin		; <1/7/91, JPO>
+	subi.l	#1,d0		;dec src
+	lsl.l	#1,d3
+	roxl.l	#1,d2
+	bra.b	dst_loop
+*
+* Destination became normalized.  Simply add the remaining 
+* portion of the src to the exponent.
+*
+dst_norm:
+	add.w	d0,d1		;dst is normalized; add src
+	tst.b	L_SCR1(a6)
+	beq.b	dnrm_pos
+	or.l	#$8000,d1
+dnrm_pos:
+	movem.w	d1,FPTEMP_EX(a6)
+	movem.l	d2,FPTEMP_HI(a6)
+	movem.l	d3,FPTEMP_LO(a6)
+	fmove.l	USER_FPCR(a6),FPCR
+	fmove.x	FPTEMP(a6),fp0
+	movem.l	(a7)+,d2/d3
+	rts
+
+*
+* Destination remained denormalized.  Call t_excdnrm with
+* exceptional operand in ETEMP.  MOVED EXC OP TO FPTEMP <2/8/91, JPO>
+*
+dst_fin:
+	tst.b	L_SCR1(a6)		;check for sign
+	beq.b	dst_exit
+	or.l	#neg_mask,USER_FPSR(a6) ;set N
+	or.l	#$8000,d1
+dst_exit:
+;;;	movem.w	d1,ETEMP_EX(a6)		; DELETED <2/8/91, JPO>
+;;;	movem.l	d2,ETEMP_HI(a6)		; DELETED <2/8/91, JPO>
+;;;	movem.l	d3,ETEMP_LO(a6)		; DELETED <2/8/91, JPO>
+	movem.w	d1,FPTEMP_EX(a6)	; result in FPTEMP <2/8/91, JPO>
+	movem.l	d2,FPTEMP_HI(a6)	; <2/8/91, JPO>
+	movem.l	d3,FPTEMP_LO(a6)	; <2/8/91, JPO>
+	or.l	#unfl_mask,USER_FPSR(a6)	;set unfl
+	movem.l	(a7)+,d2/d3
+;;;	lea.l	ETEMP(a6),a0		; DELETED <2/8/91, JPO>
+	lea.l	FPTEMP(a6),a0		; point to result <2/8/91, JPO>
+	bra	t_resdnrm
+
+*
+* Source is outside of 2^14 range.  Test the sign and branch
+* to the appropriate exception handler.
+*
+src_out:
+	tst.b	L_SCR1(a6)
+	beq.b	scro_pos
+	or.l	#$8000,d1
+scro_pos:
+	move.l	FPTEMP_HI(a6),ETEMP_HI(a6)
+	move.l	FPTEMP_LO(a6),ETEMP_LO(a6)
+	tst.w	ETEMP(a6)
+	blt.b	res_neg
+;res_pos:				; label not referenced <1/7/91, JPO>
+	move.w	d1,ETEMP(a6)		;result in ETEMP
+	bra	t_ovfl2
+res_neg:
+	move.w	d1,ETEMP(a6)		;result in ETEMP
+	lea.l	ETEMP(a6),a0
+	bra	t_unfl
+
+

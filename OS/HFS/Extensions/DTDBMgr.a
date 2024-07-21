@@ -1,0 +1,3452 @@
+;
+;	File:		DTDBMgr.a
+;
+;	Contains:	Desktop Database manager routines
+;
+;	Written by: 		Patrick W. Dirks, July 6 1986.
+;	Rewritten by:		David Feldman, April 7, 1989.
+;
+;	Copyright:	© 1986-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM4>	  6/9/93	pdw		Changed register saving from interruptRegs to pascalRegs in
+;									completionRoutine because it is supposed to be using this
+;									convention.
+;	   <SM3>	10/27/92	CSS		Changed some word bsrs to bigjsrs.
+;	   <SM2>	10/27/92	CSS		Changed short branch to word branch.
+;	   <SM1>	 4/1/92		kc		Copied the routines DesktopCloseDownProc, CheckDesktopSupport and  DTDBMgrInit
+;									from FileMgrPatches.a. Removed the "ROM" prefix from the RomBind routines.
+
+;									• Pre-SuperMario comments follow •
+;		<32>	 9/13/91	JSM		Cleanup header.
+;		<31>	 5/23/91	dba		MPW 3.2 assembler no longer supports local labels for records
+;		<30>	 3/28/91	dnf		ewa, #SetFileAttribsIsntAsyncSafe: The SetFileAttribs subroutine
+;									doesn't save its return address on the a6 stack, causing crashes
+;									when doing async I/O.
+;		<29>	 3/20/91	dnf		sad, #DTGetInfoConsumesGranite: Fix DTGetInfo so that the
+;									AddFileSizes routine that it calls actually works. It is good to
+;									know that someone is now actually using this call.
+;		<28>	 3/19/91	dnf		dba, #dnf: Don’t clobber Z bit when restoring return addresses
+;									from the a6 stack.
+;		<27>	 3/17/91	dnf		ppd, #dnf-0013: Use the result code from ioResult(a0) instead of
+;									from d0 to be extra-clean on async calls.
+;		<26>	 3/17/91	dnf		dba, dty, #84670, #82944: Change more routines to make them work
+;									in an asynchronous world. The desktop manager now does all of
+;									its I/O synchronously (except for _FindFolder, a gaping time
+;									bomb)
+;		<25>	 2/12/91	dnf		gbm, #81716: Move the call to DTCloseDown from the Process
+;									Manager's notification hook to a patch to _Unmount (in
+;									FileMgrPatches.a) so that it will come after we know that
+;									nobody on the hook has rejected the unmount. Also put in tweak
+;									for brc #81858 (replace #fnfErr with #afpItemNotFound)
+;		<24>	 1/22/91	dnf		(ppd, tgh) Force DTOpenInform, DTGetPath and DTCloseDown to be
+;									synchronous. Don’t use MakePBLookAsync anymore.
+;		<23>	 1/17/91	dnf		(pwd) Make sure that FindDTFiles has the volume info before it
+;									tries to decide if the volume is locked or not.
+;		<22>	12/21/90	dnf		(dfh) Move substitution of volume name + shadow for the standard
+;									name until after we're sure we're not going to create files with
+;									the standard name. Restore the pb ptr after enqueue the
+;									DTDBQElt.
+;		<21>	12/18/90	dnf		(dba) Save a hint for each desktop database b-tree file in the
+;									DTDBQElt, and pass it to all BTree Manager calls. Looks for and
+;									creates shadow desktop folders in the preferences folder. Also
+;									rewrote FindDTFiles to be simpler and smaller. Did _Allocate of
+;									clump size in RealOpenDT and in ResetDT to minimize
+;									fragmentation. Used HGetFileInfo/HSetFileInfo instead of
+;									Get/SetCatInfo to be more specific about files vs. directories.
+;									FlushVol instead of FlushFile.
+;		<20>	12/16/90	dnf		(dba) Fix OpenDTInform bug by getting RealDTOpen to return a
+;									valid result. Get rid of code that was never executed that made
+;									a lame attempt to update the key descriptor.
+;		<19>	 12/5/90	dnf		(with dba) Have RemoveAPPL look at AppSpec.parID instead of
+;									ioDirID from the DTParamBlock. Have AddAPPL do this too.
+;		<18>	 12/5/90	dnf		(with dba) Fixed three places where we didn’t move the return
+;									address to the a6 stack before calling potentially async
+;									routines. Expand the size of a volume name storage to 32 bytes,
+;									since it is really the root directory name, and is not
+;									necessarily 28 bytes or smaller. Started work on Preferences
+;									folder support, but it is still IF’d out for this check-in.
+;		<17>	 9/25/90	dnf		(dnf/pwd) Set up FSVars.dtOwnCall to point to each parameter
+;									block used by the desktop manager so that FileShare can allow
+;									these calls to pass unmolested.
+;		<16>	 9/22/90	dnf		(dnf/pwd) Remove include of QMgr.a; it's now a separate file.
+;									Dispatch desktop calls to external file systems by transferring
+;									them to the file system queue and returning an #extFSErr.
+;		<15>	  8/6/90	dnf		Make DTAddIcon canonify files before putting them into the
+;									database. Have DTGetInfo return the volume containing the files
+;									in ioVRefNum. Revert to using local key compare routine instead
+;									of a (special) key descriptor.
+;		<14>	 7/30/90	dnf		Change all bsr and jsr instructions that point at Rom bind
+;									symbols into jsrRom macros.
+;		<13>	  6/2/90	gbm		Fix Dave’s eensy weensy little mistake of CHECKING IN x xxxx xx
+;									xxxx’x xxxxxxxxx!!!! (Appropriate slime deleted anyway. <dnf 15>)
+;		<12>	  6/2/90	dnf		Make DTDeleteAPPL move the next-newest app to the front of the
+;									list
+;		<11>	 5/15/90	dnf		Make sure that StandardLocals always returns an even-sized
+;									locals block
+;		<10>	 4/24/90	dnf		Fix signed compare bug in GetComment
+;		 <9>	 4/22/90	dnf		Fix reopening of shadow databases
+;		 <8>	 4/20/90	dnf		Add creator type check to RemoveAPPL
+;		 <7>	 4/13/90	dnf		Fix AddAPPL swap case.
+;		 <6>	 4/10/90	dnf		Clip GetComment ioActCounts. Look in server folder for
+;									databases. Change routine names to match public call titles
+;									Rework APPL algorithms to improve speed.
+;		 <5>	  2/9/90	DNF		Set up a4 on entry to DTSetUp in DTClose; Set ioReqCount with a
+;									long in RmvAPPL
+;		 <4>	  2/8/90	dnf		Change FindDTVol to save regs on a7
+;		 <3>	  2/4/90	DNF		Add shadow support, implement xOpenDT
+;		 <2>	  1/9/90	DNF		Add xOpenDT call
+;	   <2.0>	 12/8/89	dnf		Added dangling DTDBQElt check on OpenDT
+;	   <1.9>	11/17/89	dnf		Volume notification for both Offline and Unmount. OpenDT checks
+;									GetVolParms
+;	   <1.8>	11/10/89	dnf		Save all async-trashable regs at I/O bottleneck
+;	   <1.7>	 11/8/89	dnf		Clear filler byte on IconKeys, set length correctly, add Unmount
+;									notification
+;	   <1.6>	10/17/89	dnf		Fix data rec allocation on APPL calls
+;	   <1.5>	10/11/89	dnf		Async bottleneck for I/O, FindDTVol, file refs for DTRefNum,
+;	   <1.4>	 9/18/89	dnf		Fix bug in GetAPPL, map btRecNotFnd to afpItemNotFnd, new
+;									dispatcher
+;	   <1.3>	  9/1/89	dnf		Get proper pointer in a1 for DTClose's call to _Dequeue, test
+;									the result
+;	   <1.2>	  8/7/89	dnf		Change IconRec to IconDRec to avoid collisions with QD equates
+;	   <1.1>	  7/6/89	dnf		Complete alpha code, start of testing
+;	   <1.0>	 5/30/89	dnf		Integrate CatSearch, FileID's and Desktop Database Mgr into one
+;									ptch
+;				  4/7/89	DNF		Rewritten to use newly exported Btree manager calls, new DT data
+;									structures, new DT dispatching, and new external file system
+;									handling. This rewrite uses almost all of the existing logic for
+;									the service routines.
+;				 5/23/88	PWD		Changed AddAPPL to use DTContd flag logic for complete cycle
+;									(FindRecord as well as subsequent GetRecords); the entire
+;									AddAPPL now unfolds into a true loop instead of burrowing its
+;									way down the stack with successive serial number retries.
+;				  5/3/88	PWD		Added code to set up DTORefNum and DTVRefNum at open time; fixed
+;									MapCSpec to use new DTORefNum to do _GetCatInfo, fixing a bug
+;									where comment calls on CD ROM volumes would try the mapping with
+;									the wrong VRefNum.
+;				 4/25/88	PWD		Changed all interrupt-lockout code to use $0600 instead of $0300
+;									or HiIntMask.
+;				  3/1/88	PWD		Changed to free reserved space at first DTOpen call made.
+;				10/23/87	PWD		Fixed AddIcon to rewrite B*-Tree entry with new TagInfo if an
+;									icon is overwritten with a new icon image.
+;				 10/8/87	PWD		Changed to use common routine (FindDT) to check whether DB
+;									exists in DTOpen and GtMetaInfo. For CD-ROM volumes, only
+;									indicate DB support if the Desktop DB file already exists.
+;				 9/16/87	PWD		Changed to set Type & Creator on Desktop datafile.
+;				 8/13/87	PWD		Changed to use shadow-Desktop in System Folder of BootDrive if
+;									volume is locked and no Desktop DB exists.
+;				 7/27/87	CRZ		Changed some branches to short branches and vice versa.
+;				 6/26/87	PWD		Changed version number from 1 to 2 to indicate DTClose bug
+;									fixed, FSQueueHook support in.
+;				 6/17/87	PWD		Fixed bug in DTClose where it RTS-ed instead of branching to
+;									DTDone when DTSetup returned VolOfflinErr. Changed to use AFP
+;									error message names. Added code to invoke FSQueueHook on all
+;									calls.
+;				  1/6/87	PWD		Changed DTFlags to DTFFlags to avoid conflict with Deferred Task
+;									Manager equate
+;				  1/2/87	PWD		Changed to retry call if Server Folder ID is set in Finder info
+;									but no such folder is found.
+;				 12/8/86	PWD		Changed to skip completion routines called synchronously to save
+;									stack space.
+;				 12/1/86	PWD		Changed to clump out data file by explicit _Allocate calls
+;									before an icon is written out instead of modifying FCBClpSize.
+;				11/20/86	PWD		Changed to clear hint before re-inserting entry after BTDelete
+;									in InsEntry. Changed key comparison to ignore length of trial
+;									key (padded out in index nodes). Changed all routines to pass
+;									full-length keys (Getxxx would get fouled up by passing
+;									partial-length keys to new key comparison routine.
+;				11/17/86	PWD		Fixed GetMetaInfo call to return right bit for DT support
+;									Changed to check refNum in detail only for local operation
+;				11/13/86	PWD		Fixed dispatch logic to properly preserve A1 after DTDone
+;				11/12/86	PWD		Fixed async return code. Always RTS after async I/O initiation
+;									Incorporated various small modifications per Rich's suggestions
+;									Changed to use GetTrapAddress/SetTrapAddress on install and
+;									remove.
+;				 11/2/86	PWD		Changed to support only drives 3 and up to prevent the
+;									proliferation of Desktop databases on diskettes. Changed DTOpen
+;									to set invisible and system (name lock) bits on both files.
+;									Changed AddAPPL to stop re-writing B*-Tree records if a
+;									duplicate entry is requested with the same tag. Added DTReset
+;									and DTStatus calls. Changed GetIcon and GtIcnInfo to return icon
+;									position in ioPosOffset. Changed GetIcon to take a hint when
+;									given. Changed serial number assignment algorithm in AddAPPL to
+;									return last entries added first.
+;				10/28/86	PWD		Fixed GetIcon to handle _Read errors correctly.
+;				10/23/86	PWD		Converted for use under MPW.
+;				10/15/86	PWD		Changed GetIcon to stop using ioIconDefault field. Changed to
+;									return new meta-info indicating new DT support present.
+;				10/13/86	PWD		Added code to set up ReqstVol on ExtFSErr returns.
+;				10/12/86	PWD		Fixed similar bugs in AddAPPL and RmvAPPL which caused name
+;									comparisons between the B*-Tree record and PB Record to fail.
+;									Fixed bug in RfnChk (failed to set condition codes on exit).
+;									Added code to force clump size for Desktop Datafile.
+;				10/10/86	PWD		Fixed to check for offline volumes before starting any
+;									operation. Fixed bug which clobbered lo-mem due to bogus
+;									ioOwnBuf on _HOpen. Added code to do a BTFlush.
+;				 10/6/86	PWD		Fixed to locate target VCB correctly under all circumstances
+;									Changed DTGetAPPL to special case index=0; treat like index=1
+;									Fixed calls to MapCSpec to handle errors correctly.
+;				 10/4/86	PWD		Fixed to properly set up ioTrap field on all calls.
+;				 10/2/86	PWD		Fixed bug in DTOpen: don't use user's PB for _HOpen call.
+;									Changed to repond to GetVolMetaInfo calls to indicate new
+;									desktop support.
+;				 9/24/86	PWD		Changed to use new key structure
+;				 8/21/86	PWD		Changed to remove patch installation code and local storage
+;				  8/5/86	PWD		Added code to convert internal B*-Tree error codes to AFP
+;									errors, and filter out other positive error returns
+;				 7/17/86	PWD		Separated out from DTMgr to allow DTSvcs to be included in patch
+;									code (where it's in blank seg) and FSCP, where it sits with the
+;									B*-Tree manager in the BTMgr segment.
+;
+
+			print		push
+			print		off
+			LOAD		'StandardEqu.d'
+			INCLUDE 	'BTreeEqu.a'
+			INCLUDE 	'DTDBMgrEqu.a'
+			INCLUDE		'DTDBMgrPriv.a'
+			include		'LinkedPatchMacros.a'
+			include		'QMgrEqu.a'
+			include		'FileMgrPrivate.a'
+			include		'MFPrivate.a'
+			include		'HardwarePrivateEqu.a'
+			include		'Folders.a'
+			include		'InternalOnlyEqu.a'				; <SM3> CSS
+			print		pop
+
+			BLANKS ON
+			STRING ASIS
+
+			entry		DequeueDTDBQElt
+			entry		deepShitError
+			import		GetQMRecPtr
+
+			macro
+			MakeLocals
+			endm
+
+; All of the routines in the desktop manager that have a parameter block as one of their
+; locals have one of size DTBigPBSize, and it is always the first local on a6.
+
+; All of the service routines of the DTMgr use a very similar local variable layout
+; The only difference among the routines is the size of the Data block they need.
+; This macro takes a label name (for the locals record) and a size for the data block
+; in that record.
+			macro
+			StandardLocals	&name, &datalen
+&name		record		0, increment
+bigPB		ds.b		DTBigPBSize			; big enough for any call made from the DT routines
+Key			ds.b		DTMaxKeySize		; enough space to form any DT key
+			align		2					; max key length could be odd
+Data		ds.b		&datalen			; enough space for a data record of requested length
+			align		2					; data size could be odd
+LSize		equ			*-bigPB
+			endr
+			endm
+
+; The key descriptor we use for our BTrees simply tells the btree manager that we'll
+; always be using our own key descriptor routine.
+DTKeyDescriptor:	proc
+	dc.b		2								; length of descriptor
+	dc.b		kdUseKCProc						; we'll always be using a compare proc
+	dc.b		1								; just one of them
+	align		2								; line things up
+	endproc
+
+; so desktop symbols start from here
+			proc
+			_DTDebugRts	'DTDBQueueManager', 0
+			endproc
+;________________________________________________________________________________	<SM1>
+; <36>
+; Routine:		DesktopCloseDownProc
+;
+; Inputs 		param block to _Unmount
+;
+; Outputs:		(none)
+;
+; Function:		Close the desktop database on _Unmount calls
+;
+;________________________________________________________________________________
+; Rolled into TFS.a for SuperMario <SM1> FM
+; Called by UnMountVol in TFSVol.a
+
+DesktopCloseDownProc Proc Export
+			import		FindDTVol
+@regs		reg			a0/a1/a3/d0/d1					;										<43>
+
+			movem.l		@regs, -(sp)
+
+			movea.l		a0,a3							; save the user's pb					<42>
+
+;	d0 - pascal length byte of string															<43>
+;	d1 - size of string allocated on stack														<43>
+
+			moveq.l		#0,d1							; assume no string on stack				<43>
+			move.l		ioNamePtr(a3),d0				; d0 = caller’s name ptr				<43>
+			beq.s		@noName							; bail on nil							<43>
+			movea.l		d0,a0							; get ready to copy						<43>
+			moveq.l		#0,d0							; clear high bytes						<43>
+			move.b		(a0),d0							; d0 = string length					<43>
+			beq.s		@noName							; bail on zero length (d0.l has nil)	<43>
+
+			move.b		d0,d1							; d1 = copy of string length byte		<43>
+			addq.b		#2,d1							; add length byte and rounding fodder	<43>
+			bclr.l		#0,d1							; make it even							<43>
+			suba.w		d1,sp							; allocate a string of the right length	<43>
+			movea.l		sp,a1							; point to it							<43>
+
+@1:			move.b		(a0)+,(a1)+						;										<43>
+			dbra		d0,@1							; copy string length+1 bytes			<43>
+
+			move.l		sp,d0							; point to it again						<43>
+
+@noName:
+			suba.w		#ioHVQElSize,sp					; get a pb								<42>
+			movea.l		sp,a0							; point to it							<42>
+			move.w		ioVRefNum(a3),ioVRefNum(a0)		; copy caller's vRefNum					<42>
+			move.l		d0,ioNamePtr(a0)				; our version of the caller's name		<42>
+			move.w		#-1,ioVolIndex(a0)				; by name&vRef, please					<42>
+			_GetVolInfo									;										<42>
+			bne.s		@done							;										<42>
+
+			move.w		ioVRefNum(a0), d0				; grab the volume that's going away
+			bsr			FindDTVol						; try to find a DTDBQElt for this volume
+			bne.s		@done							; no work to do if the DTDB is closed
+			sub.w		#ioDTQElSize, sp				; allocate a DT param block
+			movea.l		sp, a0
+			move.w		DTDBQElt.DTRefNum(a3), ioRefNum(a0)	; stash the DTRefNum for this volume
+			_DTCloseDown
+			add.w		#ioDTQElSize, sp				; deallocate the param block
+
+@done:
+			adda.w		#ioHVQElSize,sp					; deallocate the pb						<42>
+			adda.w		d1,sp							; deallocate the string					<43>
+			movem.l		(sp)+, @regs
+			rts
+			endproc
+;__________________________________________________________________________________
+;
+; Allocate the DTDBMgr's globals block
+;
+; FSVars has been allocated by btree patches.  
+;__________________________________________________________________________________	<SM1>
+DTDBMgrInit			proc	export
+					export	QMInit
+
+		move.l			#DTGlobals.size, d0			; we need this much space for DT manager
+		_NewPtr			sys, clear
+		bne				@fail						; no? Run away.
+		move.l			FSVarsPtr, a1				; a1 = ptr(FSVars block)
+		move.l			a0, FSVars.DTDBMgr(a1)		; stuff ourselves into our slot in FSVars
+		rts
+
+@fail
+		moveq.l			#dsMemFullErr, d0			; sys heap is full, so punt
+		_SysError
+
+; Allocate the Queue Manager's globals block
+QMInit			
+
+; Allocate a block big enough of all of the Queue Manager's needs:
+;	Queue manager globals
+;	Desktop manager QMRec
+;	Compatibility layer QMRec
+;	Desktop manager stack
+;	Compatibility layer stack
+
+		move.l			#QMGlobals.size+QMRec.size*2+DTStackSize+clStackSize, d0
+		_NewPtr			sys, clear
+		bne.s			@fail						; fail if we can't get memory
+
+		move.l			FSVarsPtr, a1				; a1 = ptr(FSVars block)
+		move.l			a0, FSVars.QMgr(a1)			; leave a pointer to globals in FSVars
+		move.l			a0, a1						; a1 = ptr(FSVars.QMgr)
+		adda.l			#QMGlobals.size, a0			; skip over globals
+		move.l			a0, QMGlobals.DTQueuePtr(a1); stuff pointer to DTMgr's QMRec
+		adda.l			#QMRec.size, a0				; skip over DTMgr's QMRec
+		move.l			a0, QMGlobals.CLQueuePtr(a1); stuff pointer to Comp Layer's QMRec
+
+		adda.l			#QMRec.size+DTStackSize, a0		; skip over QMRec and Stack
+		move.l			QMGlobals.DTQueuePtr(a1), a1	; a1 = ptr(DTMgr's QMRec)
+		move.l			a0, QMRec.stackBase(a1)			; store stack address (stack grows down)
+		move.w			#desktopQType, QMRec.qType(a1)	; set queue type/refnum
+
+		adda.l			#CLStackSize, a0				; skip to end of CLStack
+		move.l			FSVarsPtr, a1					; a1 = ptr(FSVars)
+		move.l			FSVars.QMgr(a1), a1				; a1 = ptr(QM globals)
+		move.l			QMGlobals.CLQueuePtr(a1), a1	; a1 = ptr(Comp Layer's QMRec)
+		move.l			a0, QMRec.stackBase(a1)			; store stack address (stack grows down)
+		move.w			#fsCompatQType, QMRec.qType(a1)		; set queue type/refnum
+
+		rts
+
+@fail:
+		moveq.l			#dsMemFullErr, d0			; sys heap is full, so punt
+		_SysError
+		endproc
+
+; <SM1> FM needed for GetVolParms
+;________________________________________________________________________________	<SM1>
+;
+; Routine:		CheckDesktopSupport													
+;
+; Input:		a2 - pointer to local volume's vcb
+; Output:		zero flag clear if we support the desktop on this volume
+;				zero flag set if we don't
+;
+; Function: 	Indicate whether a volume can support the desktop manager calls
+;
+; Only call this on local hfs volumes
+;
+; The rule:		A local volume gets desktop support if it is either
+;					1) non-ejectable
+;					2) ejectable but bigger than DTMinVolSize
+;
+; AlkBlkSiz is stored as a long and used as a word throughout HFS
+;________________________________________________________________________________
+CDSRegs			reg			d0/d1/a1
+CheckDesktopSupport	proc	export	
+
+			movem.l	CDSRegs, -(sp)
+
+;
+; Is this an MFS volume?
+;
+			cmp.w	#SigWord,vcbSigWord(a2)	; is this an MFS volume?
+			beq.s	@NoSupport			; yes, so use the exciting resource file technique
+;
+; Is this volume bigger than DTMinVolSize?
+;
+			move.w	vcbNmBlks(a2), d0	; d0 = # of allocation blocks on this volume
+			move.w	vcbAlBlkSiz+2(a2), d1	; d1 = allocation block size
+										; AlkBlkSiz is used as a word throughout HFS
+			mulu.w	d1, d0				; d0 = # bytes on this volume
+			cmp.l	#DTMinVolSize, d0	; is this a big volume?
+			bhs.s	@SupportsDT			; then we always support the DTDB
+;
+; It's not a big volume, but check and see if the volume is ejectable
+;
+			move.l	DrvQHdr+qHead, a1	; a1 = ptr (1st drive in Drive Queue)
+
+			move.w	vcbDrvNum(a2), d0	; d0 = drive number for this volume (if online)
+			bne.s	@SearchDrvQ			; if it's online, we can go straight to the search
+
+			move.w	vcbDRefNum(a2), d1	; d1 = + or - DrvNum (since we know we're not online)
+			cmp.w	d0, d1				; = means volume is ejected
+			beq.s	@NoSupport			; which means it gets no DT support
+			move.w	d1, d0				; d0 now = -DrvNum (since we know it's offline)
+			neg.w	d0					; d0 now = DrvNum, so we can search the drive Q
+;
+; We now have the drive number in d0, and we know that the drive is not big enough to
+; automatically get DT support.  We need to see if it is ejectable, and if it is a small
+; non-ejectable volume (say, a ramdisk) we support it.
+;
+@SearchDrvQ:
+			cmp.w	dQDrive(a1), d0		; is this the dQ entry we want?
+			beq.s	@GotDQ
+			move.l	qLink(a1), d1		; get the next dQ entry (test for zero)
+			movea.l	d1, a1				; move to an A reg where we can use it
+			bne.s	@SearchDrvQ			; and keep going if there is one
+			move.w	#nsvErr, d0			; if we have a real vcb, we should find a dQ entry
+			bra.s	@NoSupport			; but if we ever don't, let's return 'no support'
+
+@GotDQ:
+			cmp.b	#8, -3(a1)			; drive queue entry flag bytes => 8 (signed) are non-ejectable <19><51>
+			blt.s	@NoSupport			; we don't support DT on small ejectable volumes
+
+@SupportsDT:
+			moveq.l	#1, d0				; clear the zero flag
+			bra.s	@CDSExit
+
+@NoSupport:
+			moveq.l	#0, d0				; set the zero flag
+@CDSExit:	movem.l	(sp)+, CDSRegs
+			rts
+			endproc
+;________________________________________________________________________________
+;
+; Routine:		BottleNeckIO
+;
+; Input: 	a0 points to dt's ioParam or BTioParam
+; Output: 	d0 contains result code
+;			a1 trash
+;
+; Function:		Make traps which do I/O and do the right thing with completion
+;				routines.
+;________________________________________________________________________________
+;
+BottleNeckRegs		reg		d1-d7/a1-a5			; async could trash any regs
+
+BottleNeckLocals	record	0, increment
+hasContinued		ds.b	1					; flag byte to watch stack depth
+				align	2
+Lsize			equ		*-BottleNeckLocals
+				endr
+
+BottleNeckIO		proc	export
+
+	movem.l			BottleNeckRegs, -(a6)	; save our regs on hfs stack
+	with			BottleNeckLocals
+	subq.w			#Lsize, a6
+
+	bclr.b			#0, hasContinued(a6)	; initialize completion routine flag
+	lea.l			completionRoutine, a1	; get our ioCompletion routine address
+	move.l			a1, ioCompletion(a0)	; and install it into the param block
+
+	movea.l			FSVarsPtr, a1			;									<17>
+	move.l			a0, FSVars.dtOwnCall(a1); leave a bread crumb for FileShare <17>
+
+	moveq.l			#desktopQType, d2		; our queue type/refnum
+	move.l			a4,-(sp)				; save a4 <SM3> CSS
+	bigjsr			GetQMRecPtr,a4			; a1 = ptr(QMRec) <SM3> CSS
+	move.l			(sp)+,a4				; recover a4 <SM3> CSS
+	move.l			a6, QMRec.curStack(a1)	; save current alt stack pointer
+	; •• do high water mark checking here
+
+	btst.b			#asyncCall, QMRec.qmFlags(a1)	; is this call async?
+
+	rts										; return to specific trap handling routine
+
+	_DTDebugTail	'TheBottleNeck', 0
+
+; Some drivers have the nasty habit of calling their completion routines before returning
+; from the trap that called them.  This might lead to unbounded stack buildup from
+; successive calls.  To solve this we have a bit (in hasContinued) which is set both
+; in the completion routine and after the trap.
+
+; Case 1: The completion routine is called before we return from the trap.  In this case
+; we just cruise back to the driver, since we'll get control again when the driver
+; rts's from our trap.  When that happens we can just continue our call.
+
+; Case 2: We get returned to before the completion routine is run (truly asynchronous).
+; We rts to the app (giving back the async time) and we know we'll get control again
+; at the completion routine.  When we continue from here we need to save the
+; appropriate interrupt registers.
+
+; This little scheme is, of course, a critical section, but we're single threaded right now,
+; so it doesn't matter.
+
+completionRoutine:
+	moveq.l			#desktopQType, d2		; our queue type/refnum
+	MACHINE			mc68020
+	move.l			a4,-(sp)				; save a4 <SM3> CSS
+	bigjsr			GetQMRecPtr,a4			; a1 = ptr(QMRec) <SM3> CSS
+	move.l			(sp)+,a4				; recover a4 <SM3> CSS
+	move.l			a6, -(sp)				; save a6 for a sec
+	movea.l			QMRec.curStack(a1), a6	; get our a6 back
+	bset.b			#0, hasContinued(a6)	; mark that we've been back
+	movea.l			(sp)+, a6				; restore a6
+	beq.s			anRTSInstruction		; if we haven't returned from the trap, rts to driver
+
+	movem.l			pascalRegs, -(sp)		; save all regs that pascal callers need saved	<SM4>pdw
+	pea				restorePascalRegs		; and get in the chain to restore them later	<SM4>pdw
+
+contDeskThread:
+	moveq.l			#desktopQType, d2		; our queue type/refnum
+	MACHINE			mc68020
+	move.l			a4,-(sp)				; save a4 <SM3> CSS
+	bigjsr			GetQMRecPtr,a4			; a1 = ptr(QMRec) <SM3> CSS
+	move.l			(sp)+,a4				; recover a4 <SM3> CSS
+	movea.l			QMRec.curStack(a1), a6	; restore alt stack pointer
+	adda.w			#Lsize, a6				; clear off the locals
+	movem.l			(a6)+, BottleNeckRegs	; restore desktop thread registers
+	move.l			(a6)+, -(sp)			; push desktop thread return address
+	move.w			ioResult(a0),d0			; get the real error code and set ccr's				<27>
+anRTSInstruction:
+	rts										; and return to caller
+
+contAppThread:
+	bset.b			#0, hasContinued(a6)	; mark that we've returned
+	bne.s			contDeskThread			; if we already ran the completion routine, then
+											; continue without saving registers
+	rts										; return async time to application
+
+restorePascalRegs:							;												<SM4>pdw
+	movem.l			(sp)+, pascalRegs		; restore the regs that we saved last time through
+	rts										; back to the app thread
+
+	_DTDebugTail	'Completion',0
+
+; Macro for generating code that executes a synchronous or asynchronous trap
+; based on the value of the zero flag.  Zero set = async, zero clear = sync.
+				macro
+&sym:			doSomeTrap	&theTrap
+				entry		&sym
+&sym:
+				move.l		(sp)+, -(a6)	; save desktop thread ret addr on a6
+				bsr.s		BottleNeckIO	; do common set up
+				bne.s		@async			; branch if Z = 0 (async call)
+				_&theTrap					; sync trap
+				bra			contDeskThread	; keep going with this desktop call
+@async:			_&theTrap	async			; async trap
+				bra			contAppThread	; keep going, but give async time to app
+				_DTDebugRts	'do&theTrap',0
+				endm
+
+; Macro for generating code that executes a synchronous or asynchronous hfsdispatch
+; based on the value of the zero flag.  Zero set = async, zero clear = sync.
+				macro
+&sym:			doSomeA060Trap	&theTrap, &theDispatch
+				entry		&sym
+&sym:
+				move.l		(sp)+, -(a6)	; save desktop thread ret addr on a6
+				bsr.s		BottleNeckIO	; do common set up
+				bne.s		@async			; branch if Z = 0 (async call)
+				moveq.l		#&theDispatch, d0	; tell'em which HFS dispatch to do
+				_HFSDispatch				; sync trap
+				bra			contDeskThread	; keep going with this desktop call
+@async:			moveq.l		#&theDispatch, d0	; tell'em which HFS dispatch to do
+				_HFSDispatch async			; async trap
+				bra			contAppThread	; keep going, but give async time to app
+				_DTDebugRts	'do&theTrap',0
+				endm
+
+; Macro for generating code that executes a synchronous or asynchronous hfsdispatch
+; based on the value of the zero flag.  Zero set = async, zero clear = sync.
+				macro
+&sym:			doSomeA08ETrap	&theTrap, &theDispatch
+				entry		&sym
+&sym:
+				move.l		(sp)+, -(a6)	; save desktop thread ret addr on a6
+				bsr.s		BottleNeckIO	; do common set up
+				bne.s		@async				; branch if Z = 0 (async call)
+				moveq.l		#&theDispatch, d0	; tell'em which HFS dispatch to do
+				dc.w		$A08E			; sync trap
+				bra			contDeskThread	; keep going with this desktop call
+@async:			moveq.l		#&theDispatch, d0	; tell'em which HFS dispatch to do
+				dc.w		$A48E			; async trap
+				bra			contAppThread	; keep going, but give async time to app
+				_DTDebugRts	'do&theTrap',0
+				endm
+
+doHOpen:			doSomeTrap		HOpen
+doHDelete:			doSomeTrap		HDelete
+doClose:			doSomeTrap		Close
+doRead				doSomeTrap		Read
+doWrite:			doSomeTrap		Write
+doGetCatInfo:		doSomeA060Trap	GetCatInfo, selectGetCatInfo
+doHGetVInfo:		doSomeTrap		HGetVInfo
+doHGetFileInfo:		doSomeTrap		HGetFileInfo
+doHSetFileInfo:		doSomeTrap		HSetFileInfo
+doHCreate:			doSomeTrap		HCreate
+doAllocate:			doSomeTrap		Allocate
+doSetEOF:			doSomeTrap		SetEOF
+doGetEOF:			doSomeTrap		GetEOF
+doGetFCBInfo:		doSomeA060Trap	GetFCBInfo, selectGetFCBInfo
+doFlushVol:			doSomeTrap		FlushVol
+doMakeFSSpec:		doSomeA060Trap	MakeFSSpec, selectMakeFSSpec
+doGetVolParms:		doSomeA060Trap	GetVolParms, selectGetVolParms
+
+doBTSearch:			doSomeA08ETrap	BTSearch, 6
+doBTGetRec:			doSomeA08ETrap	BTGetRec, 7
+doBTSetRec:			doSomeA08ETrap	BTSetRec, 4
+doBTReplRec:		doSomeA08ETrap	BTReplRec, 5
+doBTDelRec:			doSomeA08ETrap	BTDelRec, 8
+doBTFlush:			doSomeA08ETrap	BTFlush, 10
+
+	endproc
+
+;
+; A little wrapper for Begin/EndSystemMode to save regs including CCR
+;
+
+myBeginSystemMode:		proc
+myBeginSystemModeRegs	reg		d0-d2/a0/a1
+		move.w		sr,-(sp)
+		movem.l		myBeginSystemModeRegs, -(sp)	; pascal call trashes these
+		suba.w		#2, sp					; space for output
+		_BeginSystemMode
+		adda.w		#2, sp					; ignore the error
+		movem.l		(sp)+, myBeginSystemModeRegs
+		rtr
+		_DTDebugTail	'myBeginSystemMode',0
+		endproc
+
+myEndSystemMode:	proc
+myEndSystemModeRegs		reg		a0/a1/d0-d2
+		move.w		sr,-(sp)
+		movem.l		myEndSystemModeRegs, -(sp)		; pascal call trashes these
+		suba.w		#2, sp					; space for output
+		_EndSystemMode
+		adda.w		#2, sp					; ignore the error
+		movem.l		(sp)+, myEndSystemModeRegs
+		rtr
+		_DTDebugTail	'myEndSystemMode',0
+		endproc
+
+;________________________________________________________________________________
+;
+; Routine:		DeskMgrQueue
+;
+; input:		user's DTparam in a0
+; output:		a1 - trashed
+;
+; Function: 	We're always called here while on the file system queue (upon which we
+;				checked for calls to external file systems).  We first extricate ourselves
+;				from the file system queue and then enqueue ourselves on the desktop manager
+;				queue, setting up our own alternate (a6) stack and leaving all set to
+;				process the call.
+;
+;				Note that we jump to QMEnqueue so that we leave only one level of
+;				return address on top of the stack.
+;________________________________________________________________________________
+;
+
+		entry		DTDone
+DeskMgrQueue:	proc
+		import		UnMungeTrapWord, MakePBLookAsync, GetOffFSQueue
+		import		QMEnqueue
+
+		jsr			GetOffFSQueue			; Get a0 (now FSQHead) off FSQueue
+
+		moveq.l		#desktopQType, d2		; the dtqueue refnum
+;		bsr			MakePBLookAsync			; adjust for the fact that we could be async now
+		jsr			UnMungeTrapWord			; leave true trap word and dispatch in d1/d0
+		jmp			QMEnqueue				; get queued up, dispatched to. CmdDone addr on a6 stack
+
+		_DTDebugRts	'DeskMgrQueue',0
+		endp
+
+DTDone:	proc
+		import		UnMungeTrapWord, FSQUEUE   , CMDDONE   
+		move.l		(a6)+, a1				; get completion address from a6 stack
+
+; error mapping - the original implementation of the desktop manager returned afp error
+; codes, so we need to continue to do so.
+@MapErrors:
+		cmp.w	#btRecNotFnd, d0			; did we get a btRecNotFnd error?				<dnf 1.4>
+		bne.s	@notBtRecNotFnd				; no - go check the next error
+		move.w	#afpItemNotFound, d0		; yes - then replace it with the right afp error<dnf 1.4>
+		bra.s	@justLeave
+@notBtRecNotFnd:
+
+		cmp.w	#btEofErr, d0				; did we get run into the end of the btree file?
+		bne.s	@notBtEofErr				; no - go check the next error
+		move.w	#afpItemNotFound, d0		; yes - tell'em about it in afp style
+		bra.s	@justLeave
+@notBtEofErr:
+
+		cmp.w	#fnfErr, d0 				; #fnfErr is an HFS error code					<25>
+		bne.s	@notFnfErr					; no - go check the next thing					<25>
+		move.w	#afpItemNotFound, d0		; be true to our afp roots						<25>
+@notFnfErr:
+
+@justLeave:
+		jmp		(a1)
+
+		_DTDebugRts	'DTDone', 4
+		endp
+
+;________________________________________________________________________________
+;
+; Routine:		DTVolExtFSCheck
+;
+; Function:		Check whether this desktop call should be routed to an external
+;				file system.  We're always called here already on the file system
+;				queue.  That gives us the right to peek around lomem looking for
+;				our volume.  If the call turns out to be for an external file system
+;				we strip one return address (the one back to the DTMgr routine which
+;				called us), set ReqstVol and return an #extFSErr to CMDDONE   , which
+;				dutifully dispatches it down the toExtFS chain.
+;
+;				If the call turns out to be local, we rts to the DTMgr routine which
+;				called us.  The DTMgr routine will then call DTMgrQueue, which knows
+;				the the param block it is attempting to enqueue on the desktop manager
+;				queue needs to be removed from the file system queue first.
+;
+; Inputs:		a0 - caller's desktop manager param block
+;
+;________________________________________________________________________________
+DTVolExtFSCheck:	proc
+		jsrROM	DTRMV3   						; Excuse me, Mr. FS, please find us a volume
+		bne.s	@LocalErr						; early trouble is a sign to leave
+
+		tst.w	vcbFSID(a2)						; is this a local volume?
+		beq.s	@LocalVolume
+
+		move.l	a2, ReqstVol					; inform external file systems of our volume choice
+
+		move.b	ioTrap+1(a0), d0				; grab our dispatch selector
+		cmp.b	#selectDTGetPath, d0			; was it DTGetPath?
+		beq.s	@GrabAnFCB						; externals expect an FCB on a DTOpen
+		cmp.b	#selectDTOpenInform, d0			; was it DTOpenInform?
+		bne.s	@ExternalExit					; if not, just let'em have the call
+
+@GrabAnFCB:
+		jsrROM	GT1STFCB   						; get (A1,D1) pointing to first FCB
+@1		tst.l	FCBFlNm(a1,d1)					; FCB unused?
+		beq.s	@GotFCB							; br if so
+		jsrROM	GTNXTFCB   						; get next one until we run out
+		bcs.s	@1
+
+		moveq.l	#TMFOErr,d0 					; too many files open
+		clr.w	IORefNum(a0)					; make refnum invalid
+		bra.s	@LocalErr						; don't bother to pass this one along
+
+@GotFCB:
+		add.l	a1,d1							; Point to the FCB
+
+@ExternalExit:
+		moveq.l	#extFSErr, d0					; tell'em we can't handle it
+
+@LocalErr:
+		tst.l	(sp)+							; discard the return address to DTMgr caller
+		jmpROM	CMDDONE   						; leave through the file system
+
+@LocalVolume:
+		move.l	FSVarsPtr, a3					; a3 = ptr(file system global area)
+		move.l	FSVars.DTDBMgr(a3), a3			; a3 = ptr(DTDB manager's global area)
+		move.w	vcbVRefNum(a2), DTGlobals.targetVRef(a3)		; save our volume for later
+		rts										; this call is for us
+		endproc
+
+;________________________________________________________________________________
+;
+; Routine:		DTRfnExtFSCheck
+;
+; Function:		Check whether this desktop call should be routed to an external
+;				file system.  We're always called here already on the file system
+;				queue.  That gives us the right to peek around lomem looking for
+;				our volume.  If the call turns out to be for an external file system
+;				we strip one return address (the one back to the DTMgr routine which
+;				called us), set ReqstVol and return an #extFSErr to CMDDONE   , which
+;				dutifully dispatches it down the toExtFS chain.
+;
+;				If the call turns out to be local, we rts to the DTMgr routine which
+;				called us.  The DTMgr routine will then call DTMgrQueue, which knows
+;				the the param block it is attempting to enqueue on the desktop manager
+;				queue needs to be removed from the file system queue first.
+;
+; Inputs:		a0 - caller's desktop manager param block
+;
+;________________________________________________________________________________
+DTRfnExtFSCheck:	proc
+		import	RefNumCheck
+
+		move.w	ioRefNum(a0), d0				; get the refnum in question
+		move.w	d0, d1							; save a copy for later
+		jsr		RefNumCheck						; see if we like this refnum
+		bne.s	@LocalErr						; early trouble is a sign to leave
+
+		movea.l	FCBSPtr, a1						; point to the FCBs
+		movea.l	fcbVPtr(a1, d1.w), a2			; get the VCB in question
+		tst.w	vcbFSID(a2)						; is this a local volume?
+		beq.s	@LocalVolume
+
+		move.l	a2, ReqstVol					; inform external file systems of our volume choice
+		moveq.l	#extFSErr, d0					; tell'em we can't handle it
+
+@LocalErr:
+		tst.l	(sp)+							; discard the return address to DTMgr caller
+		jmpROM	CMDDONE   						; leave through the file system
+
+@LocalVolume:
+		rts										; this call is for us
+		endproc
+
+;________________________________________________________________________________
+; <21>
+; Routine:		SaveHintInDTDBQElt				param block -> dtqelt
+;
+; Function:		Gets the btree hint out of the current param block and
+;				stores it in the globabls for the database that the
+;				current call is running on.
+;
+; Inputs:		a0 - btioParam block
+;				a3 - pointer to current DTDBQElt
+;
+; Outputs:		a0 - pointer to BTParam
+;				a3 - pointer to current DTDBQElt
+;				also preserves CCR
+;
+;________________________________________________________________________________
+SaveHintInDTDBQElt	proc
+
+Registers	reg		a1/a2
+
+			movem.l	Registers,-(sp)
+			lea.l	DTDBQElt.lastHint(a3), a1	; a1 = ptr(recent bt hint in DTDBQElt)
+			lea.l	ioBTHint(a0), a2			; a2 = ptr(bt hint in param block)
+			move.l	(a2)+,(a1)+					; a hint is 16 bytes
+			move.l	(a2)+,(a1)+
+			move.l	(a2)+,(a1)+
+			move.l	(a2)+,(a1)+
+			movem.l	(sp)+,Registers
+			rts
+
+			endproc
+
+;________________________________________________________________________________
+; <21>
+; Routine:		GetHintFromDTDBQElt			dtqelt -> param block
+;
+; Function:		Gets the btree hint out of the the globabls for the database
+;				that the current call is running on and stores it into the
+;				btioParam on a0.
+;
+; Inputs:		a0 - btioParam block
+;				a3 - pointer to current DTDBQElt
+;
+; Outputs:		a0 - pointer to BTParam
+;				a3 - pointer to current DTDBQElt
+;
+;________________________________________________________________________________
+GetHintFromDTDBQElt	proc
+
+Registers	reg		a1/a2
+
+			movem.l	Registers,-(sp)
+			lea.l	DTDBQElt.lastHint(a3),a1	; a1 = ptr(recent bt hint in DTDBQElt)
+			lea.l	ioBTHint(a0),a2				; a2 = ptr(bt hint in param block)
+			move.l	(a1)+,(a2)+					; a hint is 16 bytes
+			move.l	(a1)+,(a2)+
+			move.l	(a1)+,(a2)+
+			move.l	(a1)+,(a2)+
+			movem.l	(sp)+,Registers
+			rts
+
+			endproc
+
+;________________________________________________________________________________
+;
+; Routine:		SetUpBTPB
+;
+; Function:		Gets a param block on a0, and then fills in BTRefNum, key and data pointers
+;				based on the standard locals layout.
+;
+; Inputs:		a3 - pointer to current DTDBQElt
+;				a6 - pointer to executing routine's locals
+;
+; Outputs:		a0 - pointer to BTParam
+;				a2 - pointer to space to build the BTree key
+;				a3 - pointer to current DTDBQElt
+;
+;________________________________________________________________________________
+SetUpBTPB:	proc
+
+			StandardLocals BTDummy, 2			; just to get key and data offsets
+
+			with BTDummy						; Key and Data refer to locals
+
+			lea.l	bigPB(a6), a0				; a0 = ptr(param block)
+			bsr		GetHintFromDTDBQElt			; get the hint <21>
+
+			move.w	DTDBQElt.DBRefNum(a3), ioRefNum(a0)	; use the btree refnum
+
+			lea.l	Data(a6), a2				; standard location of BTree record data buffer
+			move.l	a2, ioBuffer(a0)			; tell the param block about it
+			lea.l	Key(a6), a2					; a2 = ptr(place to build key)
+			move.l	a2, ioBTKeyPtr(a0)			; tell the param block about it
+			rts
+
+			endwith
+			_DTDebugTail	'SetUpBTPB',0
+			endproc
+
+;________________________________________________________________________________
+; <21>
+; Routine:		DoneBTPB
+;
+; Function:		Gets the btree hint out of the current param block and
+;				stores it in the globabls for the database that the
+;				current call is running on.
+;
+; Inputs:		a3 - pointer to current DTDBQElt
+;				a6 - pointer to executing routine's locals
+;				also preserves CCR
+;________________________________________________________________________________
+DoneBTPB		proc
+
+			StandardLocals BTDummy, 2			; just to get key and data offsets
+
+			with BTDummy						; Key and Data refer to locals
+
+			move.w	sr,-(sp)					; save CCR
+			move.l	a0,-(sp)
+			lea.l	bigPB(a6), a0				; a0 = ptr(param block)
+			bsr		SaveHintInDTDBQElt
+			move.l	(sp)+,a0
+			rtr									; restore CCR
+
+			endwith
+			_DTDebugTail	'DoneBTPB',0
+			endproc
+
+;________________________________________________________________________________
+;
+; Routine:		SetUpDFPB
+;
+; Function:		Gets a param block on a0, and then fills in DFRefNum
+;
+; Inputs:		a3 - pointer to current DTDBQElt
+;				a6 - pointer to current StandardLocals
+;
+; Outputs:		a0 - pointer to param block
+;
+;________________________________________________________________________________
+SetUpDFPB:	proc
+
+			StandardLocals DFDummy, 0			; just to get offsets
+
+			with DFDummy
+
+			lea.l	bigPB(a6), a0				; a0 = ptr(param block)
+			move.w	DTDBQElt.DFRefNum(a3), ioRefNum(a0)		; use icon data file refNum
+			rts
+			_DTDebugTail	'SetUpDFPB',0
+			endwith
+			endproc
+
+;________________________________________________________________________________
+;
+; Routine:		FindDTVol
+;
+; Function: 	See if a desktop database is open for a given VRefNum
+;
+; Inputs:		d0 = user's VRefNum
+;
+; Output:		d0 = noErr or rfNumErr
+;				a3 = Pointer to DTDBQElt block for selected database
+;
+; All other registers preserved.
+; Note that the DesktopCloseDownProc in FileMgrPatches.a calls this routine.
+;________________________________________________________________________________
+;
+FindDTVol: proc	export							; 				<25> added the export 
+			move.l	d1, -(sp)					; save d1 around call
+			move.l	FSVarsPtr, a3				; a3 = ptr(file system global area)
+			move.l	FSVars.DTDBMgr(a3), a3		; a3 = ptr(DTDB manager's global area)
+			move.l	DTGlobals.qHead(a3), a3		; a3 = ptr(1st open database)
+			bra.s	@nextPtr					; check for nil (no open databases)
+
+@WalkQueue:
+			cmp.w	DTDBQElt.XVRefNum(a3), d0	; is this the right volume?
+			beq.s	@foundIt					; yes? Then stop looking
+			move.l	DTDBQElt.qLink(a3), a3		; move on to the next one
+@nextPtr:
+			move.l	a3, d1						; set condition codes to check for nil
+			bne.s	@WalkQueue					; something there? keep looking.
+
+; If we get here, then we saw a nil pointer, which means none of the open databases
+; matched the user's volume.  Return a rfNumErr
+
+			move.w	#rfNumErr, d0				; set result code
+			bra.s	@leave
+
+@foundIt:	move.w	#0, d0						; no errors
+@leave:		move.l	(sp)+, d1					; restore d1
+			tst.w	d0							; set the result code
+			rts
+			_DTDebugTail	'FindDTVol',0
+			endproc
+
+;________________________________________________________________________________
+;
+; Routine:		DTSetup
+;
+; Function: 	Setup common to all desktop manager operations which take a DTRefNum.
+;
+; Inputs:		a4 = DT Parameter block
+;				a6 = alt stack
+; Output:		d0 = error code (from FindDTVars).
+;				a3 = Pointer to DTQElt block (if DTRef checked out)
+;				a6 = alt stack
+;
+; All other registers preserved.
+;________________________________________________________________________________
+;
+DTSetup:	proc
+			move.l	d1, -(a6)					; save d1 around call
+			move.w	ioDTRefNum(a4), d0			; extract DTRefNum from user's param block
+
+			move.l	FSVarsPtr, a3				; a3 = ptr(file system global area)
+			move.l	FSVars.DTDBMgr(a3), a3		; a3 = ptr(DTDB manager's global area)
+			move.l	DTGlobals.qHead(a3), a3		; a3 = ptr(1st open database)
+			bra.s	@nextPtr					; check for nil (no open databases)
+
+@WalkQueue:
+			cmp.w	DTDBQElt.DTRefNum(a3), d0	; is this the right database?
+			beq.s	@foundIt					; yes? Then stop looking
+			move.l	DTDBQElt.qLink(a3), a3		; move on to the next one
+@nextPtr:
+			move.l	a3, d1						; set condition codes to check for nil
+			bne.s	@WalkQueue					; something there? keep looking.
+
+; If we get here, then we saw a nil pointer, which means none of the open databases
+; matched the user's DTRefNum.  Return a rfNumErr
+
+			move.w	#rfNumErr, d0				; set result code
+			bra.s	@leave
+
+@foundIt:	move.w	#0, d0						; no errors
+@leave:		move.l	(a6)+, d1					; restore d1
+			tst.w	d0							; set the result code
+			rts
+			_DTDebugTail	'DTSetUp',0
+			endproc
+
+;________________________________________________________________________________
+;
+; Routine:		CheckCSpec
+;
+; Function: 	Get info on a CNodeID in the catalog.  Translate the user's
+;				DTRefNum into the right volume for the check.
+;
+; Inputs:		a3 = DTDBQElt block for current database
+;				a4 = User's DTParam block
+;
+; Outputs:		d0 = result code from _GetCatInfo on CNode
+;				d1 = CNodeID of the CNode we just checked
+;
+;________________________________________________________________________________
+CheckCSpec:		proc
+
+CCSLocals		record	0, increment
+bigPB			ds.b		DTBigPBSize					; big enough to make any HFS or Btree call
+LSize			equ			*-bigPB
+				endr
+
+@CCSRegs		reg		a0/a1
+
+			with	CCSLocals
+			move.l	(sp)+, -(a6)						; save desktop return addr around i/o
+			movem.l	@CCSRegs, -(a6)						; save regs
+			suba.w	#LSize, a6							; allocate locals on a6
+
+			lea.l	bigPB(a6), a0						; a0 = ptr(param block)
+			move.l	ioFileName(a4), ioFileName(a0)		; use user's name ptr
+			move.w	DTDBQElt.XVRefNum(a3), ioVRefNum(a0)	; use correct volume ref
+			clr.w	ioFDirIndex(a0)						; no indexing
+			move.l	ioDirID(a4), ioDirID(a0)			; use user's DirID
+			go_GetCatInfo 								; Look up this CNode's CNID
+			move.l	ioDirID(a0), d1						; ioDirID now contains CNodeID, so return it
+			add.w	#LSize, a6							; deallocate locals
+			movem.l	(a6)+, @CCSRegs
+			move.l	(a6)+, -(sp)						; restore desktop return address
+			tst.w	d0
+			rts
+			endwith
+			_DTDebugTail	'CheckCSpec',0
+			endproc
+
+;________________________________________________________________________________
+; <21>
+; Routine:		MyFindFolder/MyMakeFolder
+;
+; A little wrapper for FindFolder that is register-based.
+; Currently, we implement two extra specialties the are handy for us
+;		'root'	returns the root directory
+;		'serv'	returns the server directory	(we won't create this, though)
+;
+; Inputs:
+;	d1.w	vRefNum or wdRefNum we're interested in
+;	d2.l	folder specialty
+;
+; Outputs:
+;	d0.w	error code (ccr set)
+;	d1.w	vRefNum
+;	d2.l	directory ID
+;________________________________________________________________________________
+MyMakeFolder:	proc
+	entry	myFindFolder
+	moveq.l	#kCreateFolder,d0
+	bra.s	MakeFindCommon
+MyFindFolder:
+	moveq.l	#kDontCreateFolder,d0
+
+MakeFindLocals			record		0, increment
+vRef		ds.w		1				; stores the vRefNum of the volume under consideration
+dirID		ds.l		1				; stores the directory ID of the directory we're looking in
+bigPB		ds.b		ioHVQElSize		; enough for an HGetVolInfo
+LSize		equ			*
+			endr
+
+MakeFindRegs	reg		a0/a1
+FolderMgrSupportsRootAndServ	equ	0
+
+	with	MakeFindLocals
+
+MakeFindCommon:
+	move.l	(sp)+,-(a6)					; we do I/O												<26>
+	movem.l	MakeFindRegs, -(a6)			; so we save on the A6 stack							<26>
+	sub.w	#LSize,a6
+
+	if not(FolderMgrSupportsRootAndServ) then
+
+	cmp.l	#'root',d2					; looking for the root directory?
+	beq.s	@mine
+	cmp.l	#'serv',d2					; looking for the server folder?
+	bne.s	StandardFind
+
+@mine:
+	cmp.w	#kOnSystemDisk, d1			; folder manager's special system disk indicator?
+	bne.s	@useTheVolume
+	
+	move.w	BootDrive, d1				; try the boot drive (a.k.a where the active system is)
+
+@useTheVolume:
+	lea.l	bigPB(a6),a0				; a0 = ptr(param block)
+	clr.l	ioFileName(a0)				; we don't want the volume name
+	move.w	d1,ioVRefNum(a0)			; VRef of volume to look at
+	clr.w	ioVolIndex(a0)				; no indexing; use VRef only
+	go_HGetVInfo
+	bne.s	@error						; punt on errors
+	move.w	ioVRefNum(a0),d1			; HGetVInfo extracts vRefs from wdRefs
+	cmp.l	#'root',d2					; looking for the root directory?
+	beq.s	@root
+	move.l	ioVFndrInfo+28(a0),d2		; d2 = DirID of server folder
+	bne.s	@test						; got one, success
+	moveq.l	#fnfErr,d0					; just like the folder manager
+@error:
+@test:
+	bra.s	Done
+
+@root:
+	moveq.l	#fsRtDirID,d2
+	bra.s	Done						; get out of here, and test the result code				<28>
+
+StandardFind:
+
+	endif
+
+	subq.l	#2,sp						; allocate a word for error code
+	move.w	d1,-(sp)					; look for the folder on this volume
+	move.l	d2,-(sp)					; look for this folder
+	move.w	d0,-(sp)					; tell whether to create
+	pea.l	vRef(a6)					; stuff the volume in here
+	pea.l	dirID(a6)					; and the directory here
+
+; Note: This is call will do synchronous I/O, which is strictly illegal in 
+; the Desktop Manager, since Desktop Manager calls can trigger requests on
+; the front the File System queue (which could themselves be Desktop Manager
+; calls) and a executing a syncwait for the triggered call could hang the
+; system.  The only solace we can take is that this call is executed only
+; when a volume is mounted, so it won't hang the system very often.
+
+	_FindFolder
+	move.w	vRef(a6),d1					; grab the volume
+	move.l	dirID(a6),d2				; grab the directory
+	move.w	(sp)+,d0					; grab the error
+Done:
+	add.w	#LSize,a6
+	movem.l	(a6)+,MakeFindRegs			; get the stuff back									<26>
+	move.l	(a6)+,-(sp)					; we did I/O											<26>
+	tst.w	d0							; make sure we set the ccr								<28>
+	rts
+	endwith
+	endproc
+
+;________________________________________________________________________________
+; <21>
+; Routine:		FindDTFiles
+;
+; Find the desktop database files, if they exist.  If they don't exist, return the
+; appropriate location and name for them.
+;
+; The desktop database files are always a pair of files with names that differ
+; only in the last character.  For normal desktop files, the names are 'Desktop DB'
+; and 'Desktop DF'.  DB is a btree file, DF is a data file with icons in it.  For
+; shadow desktops (databases maintained on a different volume to support a volume that
+; isn't writeable) the files are named '<volume name> DDB' and '<volume name> DDF'
+;
+; The idea: On unlocked volumes, we'll look for a database file in the root (the normal spot),
+;			then server folder (in case the volume is a server that had a file created
+;			there by the old desktop manager), and the system folder (in case the volume is a
+;			regular hard drive and the user was running the old Desktop Manager INIT).
+;			If we don't find one, we'll return the root as the place to create one.
+;
+;			On locked volumes, we'll do the first part of above, then take a look
+;			in the currently active preferences folder and system folder for a shadow database.
+;			If we strike out both above and in the active system folder, we'll return the active
+;			preferences folder as the place to create the shadow database.
+;
+; Inputs:	a1.l -	pointer to 32 character buffer
+;			d0.w -	vRefNum of volume to open DT on
+;
+; Outputs:	a0.l -	preserved
+;			a1.l -	ptr(Name for btree file).  Datafile name is always formed from btree file name
+;					by changing the last character from a 'B' to an 'F'
+;			d0.w -	result code (error invalidates d1/d2/d3)
+;			d1.w -	VRefNum of volume containing actual database files
+;			d2.l -	ParID of directory containing actual database files
+;			d3.b -  Set true if the files exist, false if they don't
+;					If the files don't exist, they should be created in d1/d2 w/name (a1)
+;________________________________________________________________________________
+FindDTFiles:		proc
+
+FindDTLocals			record		0, increment
+bigPB		ds.b		DTBigPBSize		; big enough for all HFS calls
+LSize		equ			*
+			endr
+
+FindDTRegs	reg			d4/a0/a2/a3
+
+	with	FindDTLocals
+	move.l	(sp)+,-(a6)					; we do I/O												<26>
+	movem.l	FindDTRegs,-(a6)			; save regs												<26>
+	sub.w	#LSize,a6					; allocate locals
+	move.w	d0,d3						; save caller's requested volume
+
+; Use the standard dt btree file name.
+	lea.l	StandardName, a0			; a0 = ptr(the standard btree file name)
+	moveq.l	#0, d0						; clear high bytes
+	move.b	(a0), d0					; get length of string
+	addq.b	#1, d0						; add one for the length byte
+	_BlockMove							; copy standard name into caller's (a1) buffer
+
+	move.l	#'root',d2					; try the root first
+	bsr		CheckDTExists
+	beq		Found
+
+	move.l	#'serv',d2					; try the server folder next
+	bsr		CheckDTExists
+	beq		Found
+
+	move.l	#kSystemFolderType,d2		; try the server folder next
+	bsr		CheckDTExists
+	beq		Found
+
+	lea.l	bigPB(a6),a0				; a0 = ptr(param block)
+	clr.l	ioFileName(a0)				; we don't want the volume name
+	move.w	d3,ioVRefNum(a0)			; vRef of volume to look at
+	clr.w	ioVolIndex(a0)				; no indexing; use VRef only
+	go_HGetVInfo
+	bne 	Error						; punt on errors <SM2> CSS
+	
+	move.w	bigPB+ioVAtrb(a6), d0		; get the volume attributes
+	btst.l	#15, d0						; software locked?
+	bne.s	VolLocked
+	btst.l	#7, d0						; hardware locked?
+	bne.s	VolLocked					; if not, then we need to make new files
+
+	move.l	#'root',d2					; make it in the root
+	bra.s	Create
+
+VolLocked:
+
+; Replace the standard name with the name of the volume we're shadowing
+	lea.l	bigPB(a6),a0				; a0 = ptr(param block)
+	move.l	a1,ioFileName(a0)			; tell the param block where to store the vol. name
+	move.w	d3,ioVRefNum(a0)			; vRef of volume to look at
+	clr.w	ioVolIndex(a0)				; no indexing; use VRef only
+	go_HGetVInfo
+	bne.s	Error						; punt on errors
+
+; Transform volume name into shadow btree file name by adding StandardShadow to it.
+	moveq.l	#0,d0						; clear high bytes
+	moveq.l	#0,d2
+	movea.l	a1, a2						; save base address of name string
+	lea.l	StandardShadow,a0			; a0 = ptr(shadow pstring)
+	move.b	(a0)+,d0					; d0 = number of characters to copy
+	move.b	(a1),d2						; d2 = length of volume name
+	add.b	d0,(a1)+					; update length to include shadow characters
+	add.w	d2,a1						; point to end of volume name
+	_BlockMove
+	movea.l	a2, a1						; restore a1 to point as base of string
+	
+	move.w	#kOnSystemDisk,d3			; now we're looking on the system disk for shadow databases
+	move.l	#kPreferencesFolderType,d2	; try the preferences folder first
+	bsr.s	CheckDTExists
+	beq.s	Found
+
+	move.l	#'serv',d2					; try the server folder next
+	bsr		CheckDTExists
+	beq.s	Found
+
+	move.l	#kSystemFolderType,d2		; try the system folder last
+	bsr.s	CheckDTExists
+	beq.s	Found
+
+	move.l	#kPreferencesFolderType,d2	; make it in the preferences folder
+
+Create:
+	move.w	d3,d1						; get volume to create on
+	bsr		MyMakeFolder
+	bne.s	Error
+	moveq.l	#0,d3						; indicate files don't exist
+	bra.s	Done
+
+Found:
+	moveq.l	#1,d3						; indicate that files exist
+	
+Error:
+Done:
+	add.w	#LSize,a6
+	movem.l	(a6)+,FindDTRegs			; restore												<26>
+	move.l	(a6)+,-(sp)					; we did I/O											<26>
+	tst.w	d0							; be nice and set up flags								<28>
+	rts
+
+; This  routine assumes the a6 stack from FindDTFiles
+;
+;	input:	d3.w			the volume to check
+;			d2.l			the special folder to check
+;			a1.l			ptr(name to look for)
+;
+;	output:	d1.w			volume found on
+;			d2.l			directory found in
+;			d0.w			error code
+
+CheckDTExists:
+	move.l	(sp)+,-(a6)					; we do I/O												<26>
+	move.w	d3,d1
+	bsr		myFindFolder				; convert d2 from specialty to dirID
+	bne.s	@error
+	lea.l	bigPB+4(a6), a0				; a0 = ptr(param block) (add 4 for ret. addr. on a6)	<28>
+	move.l	a1,ioFileName(a0)			; we want info on this file
+	move.w	d1,ioVRefNum(a0)			; look on our current volume
+	clr.w	ioFDirIndex(a0)				; no indexing; look by dirID and CName only
+	move.l	d2,ioDirID(a0)				; in the proper directory
+	go_HGetFileInfo
+@error:
+	move.l	(a6)+,-(sp)					; we did I/O											<26>
+	tst.w	d0							; make sure we set the ccr's							<28>
+	rts
+
+	_DTDebugTail 'FindDTFiles',18		; the names = 18 bytes
+
+	endwith
+
+	string	pascal
+StandardName:
+	dc.b	'Desktop DB'				; of the standard name for the desktop database btree file
+	align
+StandardShadow:
+	dc.b	' DDB'						; suffix for shadow i.e. 'Hard Disk' becomes 'Hard Disk DDB'
+	align
+	string	asis
+
+	endproc
+
+;________________________________________________________________________________
+; <1.7><1.9><25>
+; Routine:		DesktopNotifyProc
+;
+; Inputs 		notifyFrame stack frame
+;
+; Outputs:		result from CloseDT call (normally noErr)
+;				We don't do anything if FindDTVol shows that desktop database is closed
+;
+; Function:		Flush the desktop database on Offline calls
+;				Flush the desktop database on Unmount calls
+;
+;________________________________________________________________________________
+DesktopNotifyProc:	proc
+@DesktopNotifyProcRegs	reg		a1/a3/d0
+
+	link		a6, #0							; set up a stack frame
+	movem.l		@DesktopNotifyProcRegs, -(sp)
+
+	with		notifyFrame
+	move.l		vnbPtr(a6), a1					; a1 = ptr(volume notice block)
+	move.w		VNBNotice(a1), d0				; d0 = notice value
+	cmp.w		#VNAboutToGoOffline, d0			; is this an offline notification?
+	beq.s		@DoOfflineAction				; go do our stuff
+	cmp.w		#VNAboutToUnmount, d0			; is this an unmount notification?
+	bne.s		@SuccessExit					; no? then leave
+
+; This is an offline or unmount notification.  Try to flush the desktop database for the
+; indicated volume.
+@DoOfflineAction:
+	move.w		VNBVolume(a1), d0				; get the volume for which we're being notified
+	bsr			FindDTVol						; try to find a DTDBQElt for this volume
+	bne.s		@SuccessExit					; no database? Smile and leave
+
+	sub.w		#ioDTQElSize, sp				; allocate a DT param block
+	movea.l		sp, a0							; a0 = ptr(our DT param block)
+	move.w		DTDBQElt.DTRefNum(a3), ioRefNum(a0)		; stash the DTRefNum for this volume
+	_DTFlush
+	move.w		d0, theErr(a6)					; return the error from CloseDT
+	add.w		#ioDTQElSize, sp				; deallocate the DT param block
+	bra.s		@Exit							; and leave
+
+@SuccessExit:
+	move.w		#noErr, theErr(a6)				; indicate no problems
+
+@Exit:
+	movem.l		(sp)+, @DesktopNotifyProcRegs
+	unlk		a6								; undo the stack frame
+	move.l		(sp)+, a0						; get the return address
+	add.w		#4, sp							; blow away the input parameter
+	jmp			(a0)							; return to caller
+	_DTDebugRts	'DesktopNotifyProc', 0
+	endproc
+
+;________________________________________________________________________________
+;
+; Routine:		RealOpenDT
+;
+; Inputs:		a0 - pointer to caller's DT param block
+;							uses only ioVRefNum
+;
+; Outputs:		d0 - result code
+;				d1.b - file exists flag
+;					true = files existed before this open call; they were just opened
+;					false = files did not exist before call; they were just created
+;
+; Function: 	Open an access path to the Desktop database.  If the database is already
+;				open for the specified volume, return its refNum.
+;
+;				This call is synchronous only.  Yes, those move.l (sp)+, -(a6) lines
+;				could be removed someday.
+;________________________________________________________________________________
+
+RealOpenDTLocals	record	0, increment
+bigPB			ds.b		DTBigPBSize			; big enough to make any HFS or Btree call
+userVRef		ds.w		1					; User's requested vRefNum
+dbName			ds.b		32					; Space for name of database files
+volParmBuf		equ			dbName				; 32 bytes is fine for a _GetVolParms buffer	<20>
+existsFlag		ds.b		1					; true if the files already existed
+	align
+LSize			equ			*-bigPB
+				endr
+
+	entry		SetFileAttribs
+	entry		DTKeyCmp
+
+RealOpenDT:			proc export
+
+@OpenDTRegs		reg			a0-a4/d2
+
+	with		RealOpenDTLocals
+	move.l		(sp)+, -(a6)					; we do i/o
+	movem.l		@OpenDTRegs, -(a6)
+	suba.w		#LSize, a6
+	movea.l		a0, a4							; move user's DTParam to a safe register
+
+;
+; Grab the volume that this call is aimed at (determined when checking for external file systems)
+;
+	move.l		FSVarsPtr, a3					; a3 = ptr(file system global area)
+	move.l		FSVars.DTDBMgr(a3), a3			; a3 = ptr(DTDB manager's global area)
+	move.w		DTGlobals.targetVRef(a3),userVRef(a6)	; pick up caller's requested volume (true vRef)
+
+;
+; First, check to make sure that this volume's DT isn't already open
+;
+	move.w		userVRef(a6), d0				; is this volume's database already open?
+	bsr			FindDTVol						; go look for DT files (DTDBQElt ptr in a3 if success)
+	bne.s		@NotAlreadyOpen					; if not, we'll have to open it
+
+;
+; Everything's cool - this really is an already opened database.
+;
+	move.w		DTDBQElt.DTRefNum(a3), ioDTRefNum(a4)	; put the DTRefNum into user's PB
+	st.b		existsFlag(a6)					; say we got it open, and it was already there	<20>
+	bra			@SuccessExit					; get out										<20>
+
+;
+; The database is not currently open on the given volume.  Go open it.
+;
+@NotAlreadyOpen:
+; <1.9>
+; Make sure that this volume supports a desktop database
+;
+	lea.l		bigPB(a6), a0					; a0 = ptr(param block)
+	move.w		userVRef(a6), ioVRefNum(a0)		; fill in the volume ref
+	clr.l		ioNamePtr(a0)					; no volume name
+	lea.l		volParmBuf(a6), a1				; big enough for dumb _GetVolParms implementors	<20>
+	move.l		a1, ioBuffer(a0)				; and fill it in
+	move.l		#vMAttrib+4, ioReqCount(a0)		; and say much we want							<20>
+	go_GetVolParms
+	bne			@NoSupportExit					; punt on errors								<20>
+	move.l		vMAttrib(a1), d0				; get the volume bits
+	btst.l		#bHasDesktopMgr, d0				; desktop database support?
+	beq			@NoSupportExit					; no? Then don't open
+
+;
+; See if the files exist already
+;
+	lea.l		dbName(a6), a1					; a1 = ptr(space for btree file name)
+	move.w		userVRef(a6), d0				; d0 = volume to look for files for
+	bsr			FindDTFiles						; go look for DT files (d1 = vol, d2 = dir, d3 = flg)
+	bne			@OpenDTExit						; punt on serious errors
+	move.b		d3, existsFlag(a6)				; do the files need to be created? (i.e. d3 = false)
+	bne			@OpenFiles						; If they don't, go open them now
+;
+; The files didn't exist, but d1 has the vRef to create them on, d2 has the directory to
+; create them in and a1 points to the name to create for the Btree file.
+;
+	lea.l		bigPB(a6), a0					; a0 = ptr(param block)
+	moveq.l		#0, d0							; clear high bytes
+	move.b		(a1), d0						; get length of btree file name
+	move.b		#'F', (a1, d0.w)				; change name to datafile name
+	move.l		a1, ioFileName(a0)				; use datafile name
+	move.w		d1, ioVRefNum(a0)				; use volume from FindDTFiles
+	move.l		d2, ioDirID(a0)					; use directory from FindDTFiles
+	go_HCreate									; create the data file
+	bne			@OpenDTExit						; punt on errors
+
+	move.l		#DTDataFileType, d3				; set the data file type
+	bsr			SetFileAttribs					; and the appropriate attrib bits
+	bne			@DeleteDataExit
+
+	moveq.l		#0, d0							; clear high bytes
+	move.b		(a1), d0						; get length of data file name
+	move.b		#'B', (a1, d0.w)				; change name to btree name
+	go_HCreate									; create the file that will become the btree file
+	bne			@DeleteDataExit					; errors? Delete data file and leave
+
+	move.w		#DTMaxKeySize, ioBTMaxKLen(a0)	; set maximum key size
+	clr.l		ioBTClumpSize(a0)				; use volume clump size
+	pea.l		DTKeyDescriptor					; push pointer to our key descriptor
+	move.l		(sp)+, ioBTKDPtr(a0)			; and tell the btree about it
+	go_BTInit									; initialize btree file
+	bne			@DeleteBothExit
+
+	move.l		#DTBTFileType, d3				; set the btree file type
+	bsr			SetFileAttribs					; and the appropriate attrib bits
+	bne			@DeleteBothExit
+
+;
+; Try to open the files: allocate space in the system heap for a DTDBQElt and do the opens
+;
+@OpenFiles:
+	move.l		#DTDBQElt.Size,d0				; Size of DT variable block
+	_NewPtr 	sys, clear						; Try to allocate the space in the system heap
+	bne			@OpenDTExit						; give up if there's no memory
+	movea.l		a0, a3							; a3 = ptr(DTDBQElt)
+
+@OpenBTFile:
+	lea.l		bigPB(a6), a0					; a0 = ptr(param block)
+	move.l		a1, ioFileName(a0)				; use btree name from FindDTFiles
+	move.w		d1, ioVRefNum(a0)				; use vRef from FindDTFiles
+	move.b		#fsRdWrPerm, ioPermssn(a0)		; grab write permission
+	move.l		d2, ioDirID(a0)					; use DirID from FindDTFiles
+	pea.l		DTKeyCmp						; use our own key comparison procedure
+	move.l		(sp)+,ioBTKCProc(a0)
+	go_BTOpen
+	bne			@DeallocateExit					; if not, that's trouble						<20>
+	move.w		ioRefNum(a0), DTDBQElt.DBRefNum(a3)		; save away the btree file refnum
+
+	moveq.l		#0, d0							; clear high bytes
+	move.b		(a1), d0						; get length of database name
+	move.b		#'F', (a1, d0.w)				; change last character to an F
+	move.b		#fsRdWrPerm, ioPermssn(a0)		; grab write permission
+	clr.l		ioOwnBuf(a0)					; use volume buffer
+	go_HOpen
+	bne			@CloseBTExit					; punt on errors
+	move.w		ioRefNum(a0), DTDBQElt.DFRefNum(a3)		; save away the data file refnum
+;
+; So far, so good.  Both files are open, and we've got a QElt ready.
+; Fill in the rest of the info, enqueue it, get unmount notification, and we're done
+;
+	move.w	DTDBQElt.DBRefNum(a3), DTDBQElt.DTRefNum(a3)	; DTRefNum = ioRefNum of the btree file
+	move.w	DTDBQElt.DBRefNum(a3), ioDTRefNum(a4)			; return DTRefNum to caller
+	clr.b	DTDBQElt.Flags(a3)						; clear out our flags
+	clr.b	DTDBQElt.Reserved(a3)					; clear out the reserved byte
+	move.w	userVRef(a6), DTDBQElt.XVRefNum(a3)		; save user's target volume
+	move.w	d1, DTDBQElt.VRefNum(a3)				; save the real volume where files are
+	move.l	d2, DTDBQElt.ParID(a3)					; and the real directory
+	move.l	#DTDataClump, DTDBQElt.DFClumpSize(a3)	; and an arbitrary clump
+	clr.l	DTDBQElt.lastHint(a3)					; no btree hint yet
+
+	move.l	FSVarsPtr, a1						; a1 = ptr(file system global area)
+	move.l	FSVars.DTDBMgr(a1), a1				; a1 = ptr(DTDB manager's global area)
+	lea.l	DTGlobals.qFlags(a1), a1			; a1 = ptr(DTQueue header)
+	movea.l	a3, a0								; move DTDBQElt ptr into a0
+	_Enqueue
+	tst.w	d0									; enqueue is a toolbox trap
+	beq.s	@SkyStillUp
+	jmp		deepShitError						; if the sky falls, duck
+@SkyStillUp:
+;
+; <21> If the files just got created, try to allocate a contiguous clump just for performance.
+;
+	tst.b		existsFlag(a6)					; are we brand new?
+	bne.s		@alreadyExisted					; no, don’t allocate a clump
+	lea.l		bigPB(a6), a0					; a0 = ptr(param block)						<22>
+	move.l		DTDBQElt.DFClumpSize(a3), ioReqCount(a0)	; d1 = the data file's clump size
+	go_Allocate 								; request the additional space
+@alreadyExisted:
+;
+; <1.7> Install MultiFinder unmount notification
+;
+	move.l	FSVarsPtr, a1						; a1 = ptr(file system global area)
+	move.l	FSVars.DTDBMgr(a1), a1				; a1 = ptr(DTDB manager's global area)
+	bset.b	#notifyBit, DTGlobals.infoFlags(a1)	; do we already have notification installed?
+	bne.s	@skipNotify							; yes? ->
+
+	lea.l	-2(sp), sp							; leave space for OSErr output
+	pea.l	DesktopNotifyProc					; the routine called at notification time
+	move.l	#'KWAK', -(sp)						; we don't have a refCon
+	bsr		myBeginSystemMode					; be the system
+	_RequestVolumeNotification					; sign up for notify
+	bsr		myEndSystemMode						; be the app
+	move.w	(sp)+, d0							; did we succeed?
+	beq.s	@ItWorked
+	jmp		deepShitError						; if not, the sky is falling
+@ItWorked:
+
+@skipNotify:
+
+@SuccessExit:									; all successful exits are through here		<20>
+	moveq.l		#noErr, d0						; we succeeded
+	tst.b		existsFlag(a6)					; return a result
+	beq.s		@OpenDTExit
+	moveq		#1,d1							; files existed, so we return a 1
+	bra.s		@OpenDTExitResultInD1
+
+; We failed while initializing the btree file, so delete both files before cruising
+@DeleteBothExit:
+	move.w		d0, ioResult(a4)				; save the error that got us here
+	go_HDelete									; delete the btree file
+	move.w		ioResult(a4), d0				; replace err w/real err that got us here
+
+; We failed while creating the btree file, so delete the datafile before cruising
+@DeleteDataExit:
+	move.w		d0, ioResult(a4)				; save the error that got us here
+	moveq.l		#0, d0							; clear high bytes
+	move.b		(a1), d0						; get length of btree file name
+	move.b		#'F', (a1, d0.w)				; change name to data file name
+	move.l		a1, ioFileName(a0)				; use data file name
+	go_HDelete									; delete the data file
+	move.w		ioResult(a4), d0				; replace err w/real err that got us here
+	bra.s		@OpenDTExit
+
+; We failed on opening the datafile, so close the btree file before punting
+@CloseBTExit:
+	move.w		d0, ioResult(a4)				; save the error that got us here
+	lea.l		bigPB(a6), a0					; a0 = ptr(param block)
+	move.w		DTDBQElt.DBRefNum(a3), ioRefNum(a0)
+	go_BTClose
+	move.w		ioResult(a4), d0				; and make sure that it gets back to the user
+
+; We allocated a DTDBQElt before failing, so deallocate it before punting
+@DeallocateExit:
+	movea.l		a3, a0							; get DTDBQElt ptr
+	move.w		d0, -(sp)						; save failure-provoking result code
+	_DisposPtr									; and free up DTDBQElt
+	move.w		(sp)+, d0						; restore failure-provoking result code
+	bra.s		@OpenDTExit						; and leave
+
+@NoSupportExit:
+	move.w		#wrgVolTypErr, d0				; indicate the boo-boo
+
+@OpenDTExit:
+	moveq.l		#0, d1							; clear high bytes
+@OpenDTExitResultInD1:							; 											<20>
+	adda.w		#LSize, a6						; deallocate locals
+	movem.l		(a6)+, @OpenDTRegs
+	move.l		(a6)+, -(sp)
+	rts
+
+	endwith
+	_DTDebugTail		'OpenDT',0
+
+	endproc
+
+; ==========
+; Routine:		SetFileAttribs (requires locals frame of RealOpenDT)
+;
+; Inputs:		a0 - pointer to PB w/vRef, ioNamePtr, and ioDirID set
+;				a4 - pointer to OpenDT parameter block
+;				a6 - pointer to RealOpenDT locals (uses userVRef) (does compensation for saved addr) 
+;				d2 - dirID of file
+;				d3 - file type (DTFL or BTFL)
+;
+; Outputs:		registers preserved
+;				d0 - noErr or result code from call which failed
+;
+; Set the finder info (type in d3, creator DMGR)
+; Set the attribute bits:
+;	regular desktops: invisible
+;	shadow desktops:  visible
+; ==========
+
+SetFileAttribs:	proc
+	with		RealOpenDTLocals
+	
+	move.l		(sp)+,-(a6)						; we do I/O									<30>
+	clr.w		ioFDirIndex(a0)					; no indexing; look by dirID and CName only
+	go_HGetFileInfo								; fill the param block with cat info <21>
+	bne			@errorExit
+	move.l		d3, ioFlUsrWds+fdType(a0)		; set the file type
+	move.l		#DTFileCreator, ioFlUsrWds+fdCreator(a0)		; set the file creator
+
+	cmp.w		userVRef+4(a6), d1				; compare target volume to actual volume	<30>
+	bne.s		@shadow							; if they're different, we're shadowing
+	move.w		#fInvisible, d0					; bit pattern for invisible flag
+	bra.s		@setAttributes
+
+@shadow:
+	moveq.l		#0,d0							; no special attributes
+
+@setAttributes
+	or.w		d0, ioFlUsrWds+fdFlags(a0)		; logical or into current attributes
+	move.l		d2, ioDirID(a0)					; set correct directory (GetCatInfo blasts it)
+	clr.w		ioFDirIndex(a0)					; no indexing; look by dirID and CName only
+	go_HSetFileInfo								; set our new info <21>
+
+@errorExit:
+	move.l		(a6)+,-(sp)						; we did I/O								<30>
+	tst.w		d0								; restore those cute cc's					<30>
+	rts
+	endproc
+;________________________________________________________________________________
+;
+; Routine:		DTOpenInform
+;
+; Inputs:		a0 - pointer to caller's DT param block
+;							uses only ioVRefNum
+;
+; Outputs:		d0 - result code
+;
+; Function: 	Same as DTGetPath, except returns a flag in ioTagInfo indicating
+;				whether or not the files already existed.
+;				True = already existed
+;				False = were just created
+;________________________________________________________________________________
+DTOpenInform:		proc export
+				jsrROM		FSQUEUESYNC   		; just to check for external file systems
+				bsr			DTVolExtFSCheck		; find the right volume and hope it's ours
+				bsr			DeskMgrQueue
+				bsr			RealOpenDT			; d1 true/false for dtExisted
+				and.l		#1, d1				; return low bit only			<20>
+				move.l		d1, ioTagInfo(a0)
+				bra			DTDone
+				_DTDebugRTS	'DTOpenInform', 0
+				endproc
+
+;________________________________________________________________________________
+;
+; Routine:		DTGetPath
+;
+; Inputs:		a0 - pointer to caller's DT param block
+;							uses only ioVRefNum
+;
+; Outputs:		d0 - result code
+;
+; Function: 	Open an access path to the Desktop database.  If the database is already
+;				open for the specified volume, return its refNum.
+;________________________________________________________________________________
+DTGetPath:		proc export
+				jsrROM		FSQUEUESYNC   		; just to check for external file systems
+				bsr			DTVolExtFSCheck		; find the right volume and hope it's ours
+				bsr			DeskMgrQueue
+				bsr			RealOpenDT
+				bra			DTDone
+				_DTDebugRTS	'DTGetPath', 0
+				endproc
+
+;________________________________________________________________________________
+;
+; Routine:		DequeueDTDBQElt
+;
+; Inputs:		a0 - pointer to DTDBQElt to remove
+; Outputs		none
+;
+; Function: 	Dequeue and deallocate a DTDBQElt.  No check of a0 is
+;				done.  The block it points to must be both allocated
+;				and in the queue.
+; Called by:	CloseDT and VerifyOpenFiles
+;________________________________________________________________________________
+DequeueDTDBQElt:	proc
+	move.l		a1, -(sp)
+	move.l		FSVarsPtr, a1					; a1 = ptr(file system global area)
+	move.l		FSVars.DTDBMgr(a1), a1			; a1 = ptr(DTDB manager's global area)
+	lea.l		DTGlobals.qFlags(a1), a1		; a1 = ptr(DTQueue header)						<dnf 1.3>
+	_Dequeue
+	tst.w		d0								; 'cause _Dequeue doesn't test					<dnf 1.3>
+	beq.s		@Ok
+	jmp			deepShitError					; we're really up the creek if this fails
+@Ok:
+	_DisposPtr									; free it up the element
+	movea.l		(sp)+, a1
+	rts
+	_DTDebugTail	'DequeueDTDBQElt', 0
+	endproc
+
+;________________________________________________________________________________
+;
+; Routine:		DTCloseDown
+;
+; Inputs:		a0 - pointer to caller's DT param block
+;							uses only ioDTRefNum
+;
+; Outputs:		d0 - result code
+;
+; Function: 	Close the desktop database for a volume
+;________________________________________________________________________________
+DTCloseDown:		proc export
+
+DTCloseDownLocals	record	0, increment
+bigPB			ds.b		DTBigPBSize			; big enough to make any HFS or Btree call
+LSize			equ			*-bigPB
+				endr
+
+@DTCloseDownRegs	reg			a0-a4/d1-d2
+	jsrROM		FSQUEUESYNC   					; just to check for external file systems
+	bsr			DTRfnExtFSCheck					; find the right volume and hope it's ours
+	bsr			DeskMgrQueue
+
+	with		DTCloseDownLocals
+	movem.l		@DTCloseDownRegs, -(a6)
+	suba.w		#LSize, a6
+	movea.l		a0, a4							; move user's DTParam to a safe register
+
+	bsr 		DTSetup 						; Do common setup. a3 = ptr(DTDBQElt)
+	bne.s		@DTCloseDownExit
+
+	lea.l		bigPB(a6), a0					; a0 = ptr(param block)
+	move.w		DTDBQElt.DBRefNum(a3), ioRefNum(a0)
+	go_BTClose
+
+	move.w		DTDBQElt.DFRefNum(a3), ioRefNum(a0)
+	go_Close									; same goes for here
+
+	movea.l		a3, a0							; move DTDBQElt to a0
+	bsr			DequeueDTDBQElt					; dequeue and dispose of it
+
+@DTCloseDownExit:
+	adda.w		#LSize, a6						; deallocate locals
+	movem.l		(a6)+, @DTCloseDownRegs
+	bra			DTDone
+
+	endwith
+	_DTDebugRts		'DTCloseDown',0
+	endproc
+
+;________________________________________________________________________________
+;
+; Routine:		DTAddIcon
+;
+; Input:		a0 - user's DT param block
+; Output:		d0 - result code
+;
+; Function: 	Add an icon bitmap to the Desktop database under its FileType/Creator
+;________________________________________________________________________________
+;
+DTAddIcon:		proc export
+
+	StandardLocals	AddIconLocals, IconDRec		; normal locals w/icon sized data rec
+
+@AddIconRegs		reg		a0-a4/d1-d2	; set of regs to save around AddIcon
+	jsrROM	FSQUEUE   					; just to check for external file systems
+	bsr		DTRfnExtFSCheck				; find the right volume and hope it's ours
+	bsr 	DeskMgrQueue 				; Wait our turn.
+
+	with	AddIconLocals				; Key and Data refer to locals
+	movem.l	@AddIconRegs, -(a6)
+	suba.w	#LSize, a6					; allocate locals on the a6 stack
+	movea.l	a0, a4						; move user's DTParam to a safe register
+
+	bsr 	DTSetup 					; Do common setup. a3 = ptr(DTDBQElt)
+	bne		@AddIconExit				; and punt on errors
+
+	move.l	ioReqCount(a0), d0			; d0 = user's icon data size
+	cmp.l	#DTMaxIconSize, d0			; icon too big?
+	ble.s	@SizeOK						; then keep going
+	moveq	#paramErr, d0				; otherwise, complain
+	bra		@AddIconExit				; and cruise
+
+;
+; First, search the btree to see if there's an icon with the same key already in the database
+;
+@SizeOK:
+	bsr		SetUpBTPB					; standard BT param in a0 w/btree refNum
+	move.l	#IconDRec.IRLen, ioReqCount(a0)	; indicate size of icon data record
+	move.b	#IconKey.IKLen-1, (a2)+		; Set length of key (minus length byte)
+	move.b	#IconKeyType,(a2)+			; ... and key type
+	move.l	ioFlCreator(a4),(a2)+		; Set up CreatorType
+	move.l	ioFlType(a4),(a2)+			; ... and FileType
+	move.b	ioIconType(a4),(a2)+		; Pass in the requested icon Type
+	clr.b	(a2)+						; clear the filler byte							<1.7>
+	go_BTSearch
+	bsr		DoneBTPB					; finished with BTPB <21>
+
+	beq.s	@ChkSize 					; If no errors, check icon size
+	cmp.w	#btRecNotFnd, d0			; Entry not found?
+	beq.s	@AddNew 					; No problem - go create a brand new one
+	bra 	@AddIconExit				; Other errors are more serious
+;
+; An entry for an icon of the same FlCreator/FlType/IconType already exists,
+; make sure its the same size as the requested new one.
+;
+@ChkSize:
+	lea.l 	Data(a6), a2				; a2 = ptr(B*-Tree Icon data record)
+	move.w	IconDRec.IconSize(a2), d0	; Pick up current icon size
+	cmp.w	ioReqCount+2(a4), d0 		; Same size as replacement?
+	beq.s	@CanWrite					; Yes - go overwrite it
+	move.w	#afpIconTypeError,d0
+	bra		@AddIconExit				; otherwise, fail miserably
+
+@CanWrite:
+	move.l	IconDRec.IconPos(a2), d0	; Pick up old position
+	bra.s	@AIWriteIcon				; And go overwrite the old icon bits
+
+;
+; We'll have to allocate space in the DF file for a new entry.  Just add to the end.
+;
+@AddNew:
+	bsr		SetUpDFPB					; Get an ioParam on a0 w/data file refnum
+	go_GetEOF 							; Find LEOF of the datafile
+	bne.s	@AddIconExit				; Problems? See your registered pharmacist.
+	move.l	ioLEOF(a0), d0 				; Pick up position to write icon at
+
+;
+; Arrive here from CanWrite or AddNew with d0 = position to write icon bits in Desktop DF:
+; Write the icon into the data file, and if that succeeds, add the icon record to the Btree.
+;
+@AIWriteIcon:
+	lea.l 	Data(a6), a2				; a2 = ptr(B*-Tree Icon data record)
+	move.l	ioTagInfo(a4),IconDRec.TagInfo(a2)	; Copy tag information into data record
+	move.l	d0,IconDRec.IconPos(a2)				; save file position in icon btree rec
+	move.w	ioReqCount+2(a4),IconDRec.IconSize(a2) ; Copy size of icon
+
+; a quick check to see if we need to extend the data file
+	move.w	DTDBQElt.DFRefNum(a3), d1	; use the datafile's refNum
+	move.l	FCBSPtr,a1					; a1 = ptr(FCB array)
+	lea.l 	0(a1,d1.w),a1 				; a1 = ptr(datafile's FCB)
+	move.l	d0,d2						; move icon's file position to d2 for some calculating
+	add.l	ioReqCount(a4),d2			; d2 = file position + bitmap size
+	cmp.l	fcbPLen(a1),d2				; Check against the current PEOF
+	bls.s	@AIGoWrite					; If icon end < PEOF, start writing
+
+; To minimize fragmentation, we extend the icon datafile by a bunch each time
+	bsr		SetUpDFPB					; Get an ioParam on a0 w/data file refnum
+	move.l	DTDBQElt.DFClumpSize(a3), ioReqCount(a0)	; d1 = the data file's clump size
+	go_Allocate 						; Request the additional space
+
+; The file's big enough, so write the icon data to the datafile
+@AIGoWrite:
+	bsr		SetUpDFPB					; Get an ioParam on a0 w/data file refnum
+	move.l	ioBuffer(a4), ioBuffer(a0)			; data comes from user's pointer
+	clr.l	ioReqCount(a0)						; size is just a word
+	move.w	ioReqCount+2(a4), ioReqCount+2(a0)	; get size from user pb
+	move.w	#fsFromStart, ioPosMode(a0)			; position is relative to byte 0
+	move.l	IconDRec.IconPos(a2), ioPosOffset(a0)	; use the icon pos we've computed
+	go_Write									; Fire off the write
+	bne.s	@AddIconExit						; punt on errors
+
+	; set the icon record in the Btree file
+	bsr		SetUpBTPB							; standard BT param in a0 w/btree refNum
+	move.l	#IconDRec.IRLen, ioReqCount(a0)		; tell the btree about the length
+	go_BTSetRec									; the key is still cool from the search
+	bsr		DoneBTPB							; finish up with the BTPB <21>
+
+@AddIconExit:
+	adda.w	#LSize, a6							; get rid of our locals
+	movem.l	(a6)+, @AddIconRegs					; and restore our registers
+	bra 	DTDone								; We're all set.
+
+	endwith
+	_DTDebugRts		'DTAddIcon',0
+	endproc
+
+;________________________________________________________________________________
+;
+; Routine:		DTGetIcon
+;
+; Input:		a0 - user's DT param block
+; Output:		d0 - result code
+;
+; Function: 	Retrieve an icon from the Desktop database by Creator/Type
+;________________________________________________________________________________
+;
+DTGetIcon:	proc export
+
+	StandardLocals	GetIconLocals, IconDRec
+
+@GetIconRegs		reg		a0-a4/d1-d2				; set of regs to save around AddIcon
+	jsrROM	FSQUEUE   								; just to check for external file systems
+	bsr		DTRfnExtFSCheck							; find the right volume and hope it's ours
+	bsr 	DeskMgrQueue 							; Wait our turn.
+
+	with	GetIconLocals							; Key and Data refer to locals
+	movem.l	@GetIconRegs, -(a6)
+	suba.l	#LSize, a6								; allocate locals
+	movea.l	a0, a4									; move user's DTParam to a safe register
+
+	bsr 	DTSetup 								; Do common setup. a3 = ptr(DTDBQElt)
+	bne.s	@GetIconExit							; punt on errors
+
+; go look for the requested icon's entry in the btree
+	bsr		SetUpBTPB								; a0 = ptr(BTioParam)
+	move.l	#IconDRec.IRLen, ioReqCount(a0)			; indicate size of icon data record
+	move.b	#IconKey.IKLen-1, (a2)+					; Stuff key length (minus length byte)
+	move.b	#IconKeyType, (a2)+						; and the type
+	move.l	ioFlCreator(a4), (a2)+					; creator from user's DTPB
+	move.l	ioFlType(a4), (a2)+						; type from user's DTPB
+	move.b	ioIconType(a4), (a2)+					; icon type from user's DTPB
+	clr.b	(a2)+									; clear the filler byte 			<1.7>
+	go_BTSearch
+	bsr		DoneBTPB								; finish up with the BTPB <21>
+
+	bne.s	@GetIconExit							; punt on errors
+
+	move.l	IconDRec.TagInfo+Data(a6), ioTagInfo(a4)	; return tag information
+
+;
+; Read the icon from the data file
+;
+	bsr		SetUpDFPB								; Get an ioParam on a0 w/data file refnum
+	move.l	ioBuffer(a4), ioBuffer(a0)				; data goes to the user's buffer
+	moveq.l	#0, d0									; clear high word
+	move.w	IconDRec.IconSize+Data(a6), d0			; d0 = size of icon data
+	cmp.w	ioReqCount+2(a4), d0					; is the user's size big enough?
+	bls.s	@sizeOk									; yes, read the whole icon
+	move.w	ioReqCount+2(a4), d0					; otherwise clip to provided space
+@sizeOk:
+	move.l	d0, ioReqCount(a0)						; the correct length
+	move.w	#fsFromStart, ioPosMode(a0)				; position from start of file
+	move.l	IconDRec.IconPos+Data(a6), ioPosOffset(a0)	; get position from icon's btree rec
+	go_Read 											; go get the icon data
+	bne.s	@GetIconExit							; punt on errors
+
+	move.l	ioActCount(a0),ioActCount(a4) 			; Return actual byte count
+
+@GetIconExit
+	adda.w	#LSize, a6								; deallocate locals
+	movem.l	(a6)+, @GetIconRegs
+	bra 	DTDone									; We're all set.
+
+	endwith
+	_DTDebugRts		'DTGetIcon',0
+	endproc
+
+;________________________________________________________________________________
+;
+; Routine:		DTGetIconInfo
+;
+; Input:		a0 - user's DT param block
+; Output:		d0 - result code
+;
+; Function: 	Retrieve an icon from the Desktop database by Creator/Index
+;________________________________________________________________________________
+;
+DTGetIconInfo:	proc export
+
+	StandardLocals	GetIconInfoLocals, IconDRec
+
+@GetIconInfoRegs		reg		a0-a4/d1-d2					; set of regs to save around this call
+	jsrROM	FSQUEUE   					; just to check for external file systems
+	bsr		DTRfnExtFSCheck				; find the right volume and hope it's ours
+	bsr 	DeskMgrQueue 				; Wait our turn
+
+	with	GetIconInfoLocals			; Key and Data refer to locals
+	movem.l	@GetIconInfoRegs, -(a6)
+	suba.w	#LSize, a6
+	movea.l	a0, a4						; move user's DTParam to a safe register
+
+	bsr 	DTSetup 					; Do common setup. a3 = ptr(DTDBQElt)
+	bne		@GetIconInfoExit2			; Punt on any error
+
+; Do a search. We know we won't find anything, but the hint will put us just
+; to the "left" of all of the icons with this icon creator
+	bsr		SetUpBTPB					; a0 = ptr(BTioParam), a2 = ptr(key)
+	move.l	#IconDRec.IRLen, ioReqCount(a0)	; we know how big the record is
+	move.b	#05, (a2)+					; special short key  (•• magic constant)
+	move.b	#IconKeyType, (a2)+			; standard icon type
+	move.l	ioFlCreator(a4), (a2)+		; user's requested creator
+	go_BTSearch
+	cmp.w	#btRecNotFnd, d0 			; was the error a search miss?
+	bne.s	@GetIconInfoExit			; otherwise, something's wrong
+
+; With the ioBTHint set up, go get the indexed record
+	move.w	ioIndex(a4), d0				; get the caller's index
+	bne.s	@IndexOK					; did the user use a silly index, like zero?
+	move.w	#btRecNotFnd, d0			; well, that one doesn't exist
+	bra.s	@GetIconInfoExit			; so leave
+
+@IndexOK:
+	subq.w	#1, d0						; indicies start at 1, so adjust offset
+	move.w	d0, ioBTPosMode(a0)			; record offset from current position
+	move.w	#IconKey.IKLen, ioKReqCount(a0)	; we know how big the key is (including length byte here)
+	go_BTGetRec
+	bne.s	@GetIconInfoExit			; Bad day at the office? then leave.
+
+	move.b	IconKey.Type+Key(a6), d0	; get the key id
+	cmp.b	#IconKeyType, d0			; is it still an icon key?
+	beq.s	@CheckCreator				; if so, go see if the creator is still the same
+	move.w	#afpItemNotFound, d0		; otherwise, the index was too high
+	bra.s	@GetIconInfoExit			; so return an error
+
+@CheckCreator:
+	move.l	IconKey.CrType+Key(a6), d0	; pick up the icon's creator type
+	cmp.l	ioFlCreator(a4), d0			; check against user's requested type
+	beq.s	@FoundGoodOne				; same = good
+	move.w	#afpItemNotFound, d0		; otherwise, index was too high
+	bra.s	@GetIconInfoExit			; so return an error
+
+@FoundGoodOne:
+	move.l	IconDRec.TagInfo+Data(a6), ioTagInfo(a4)	; return this icon's tag
+	clr.l	ioActCount(a4)								; clear whole long
+	move.w	IconDRec.IconSize+Data(a6), ioActCount+2(a4); and return word-sized icon size
+	move.b	IconKey.IconType+Key(a6), ioIconType(a4)	; return this icon's iconType
+	move.l	IconKey.FlType+Key(a6), ioFlType(a4)		; return this icon's fileType
+	moveq.l	#0, d0						; All is well.
+
+@GetIconInfoExit:
+	bsr		DoneBTPB					; finish up with the BTPB <21>
+
+@GetIconInfoExit2:
+	adda.w	#LSize, a6									; deallocate locals
+	movem.l	(a6)+, @GetIconInfoRegs
+	bra 	DTDone										; We're all set.
+
+	endwith
+	_DTDebugRts		'DTGetIconInfo',0
+	endproc
+
+;________________________________________________________________________________
+; The Application List
+;
+; Applications are stored in the app list by their creator and a synthetic 16-bit
+; sequence number.  The seqnums exist to provide unique keys and ordering to each
+; application with a given creator.
+;
+; The two app list routines which need to manipulate the list (add and delete)
+; use a common iterator function that calls them once for each application in
+; the list.  The iterator runs from higher seqnums to lower seqnums. (right to
+; left).
+;
+; Apps are kept in the list so that the leftmost entry is always the youngest
+; (as recorded by the creation date of the application file).
+;________________________________________________________________________________
+
+;________________________________________________________________________________
+; Routine:		SetUpAPPLIterator
+;
+; Input:		a2 - standard locals (param block, key, data)
+;				a3 - dtdbqelt pointer
+;				d1 - creator type
+;
+; Output:		a0 - BT param block with valid hint, key and data sizes
+;				d0 - result code from BTSearch (btRecNotFound error is suppressed)
+;
+; Function: 	Initialize a btree param block to point one to the right of
+;				the "first" (i.e. rightmost) APPL entry of the given creator.
+;				A btRecNotFound error is expected since we're using a short key,
+;				so return noErr if we see it.  All other errors are passed through.
+;
+;________________________________________________________________________________
+;
+SetUpAPPLIterator:	proc
+
+	move.l	(sp)+, -(a6)						; <18>
+
+	with	APPLLocals							; Key and Data are application-sized
+	move.l	a1, -(a6)
+
+	lea.l	bigPB(a2), a0						; a0 = ptr(btree param block)
+	bsr		GetHintFromDTDBQElt					; fetch the hints
+	move.w	DTDBQElt.DBRefNum(a3), ioRefNum(a0)	; use the btree file's refnum
+	lea.l	Data(a2), a1						; a1 = ptr(APPL record data block)
+	move.l	a1, ioBuffer(a0)
+	lea.l	Key(a2), a1							; a1 = ptr(APPL key block)
+	move.l	a1, ioBTKeyPtr(a0)
+	move.b	#5, (a1)+							; use short key so we'll be at the far left
+	move.b	#APPLKeyType, (a1)+					; this is an APPL key
+	move.l	d1, (a1)							; with the requested creator
+	add.l	#1, (a1)+							; tweak the key up to the next higher creator
+	move.l	#APPLRec.ARLen, ioReqCount(a0)		; set for later indexed BTGetRec calls
+	move.w	#APPLKey.AKLen, ioKReqCount(a0)		; set for later indexed BTGetRec calls
+	go_BTSearch									; go miss the target
+	move.l	d1, APPLKey.SeqNum+Key(a2)			; restore correct creator type
+	cmp.w	#btRecNotFnd, d0					; did we miss (as expected?)
+	beq.s	@NoErrExit							; yes? Leave with a smile
+	bra.s	@Exit								; otherwise pass the error through
+
+@NoErrExit:
+	moveq.l	#0, d0
+@Exit:
+	tst.w	d0
+	move.l	(a6)+, a1
+	move.l	(a6)+, -(sp)						; <18>
+	rts
+	endwith
+	_DTDebugTail	'SetUpAPPLIterator',0
+	endproc
+
+;________________________________________________________________________________
+; Routine:		APPLIterator
+;
+; Input:		a0 - BT param block with valid hint, key, and data pointers
+;				a1 - callback procedure
+;				a2 - standard locals (param block, key, data)
+;				d1 - creator type
+;
+; Output:		a0 - BT param block with valid hint, key, and data pointers
+;				a1 - callback procedure
+;				a2 - standard locals (param block, key, data)
+;				d0 - noErr if normal termination; terminating error code otherwise
+;				d1 - creator type
+;
+; Function:		This iterator is used by the APPL calls (Add, Remove, and Get).
+;				It iterates through all APPL records with a creator type that
+;				matches the one in the user's param block.  For each record,
+;				a callback procedure is called.  Iteration continues until either
+;				no more APPL records with the right creator are available or
+;				the callback procedure returns a zero in d0.
+;
+;				Registers a3-a5 and d2-d7 are passed directly to the callback
+;				procedure; it is responsible for restoring all registers except d0.
+;
+;				Index through the records backwards (ffff through 0) to maintain
+;				compatibility with AppleShare's desktop manager.
+;________________________________________________________________________________
+;
+APPLIterator:		proc
+	move.l	(sp)+, -(a6)						; <18>
+
+	with	APPLLocals
+
+	move.w	#-1, ioBTPosMode(a0)				; get records in descending key order
+
+@Iterate:
+	go_BTGetRec									; get the next record
+	beq.s	@Examine							; if noErr, check for reasonableness
+	cmp.w	#btBofErr, d0						; are we out of records?
+	bra.s	@Exit								; else, a real error has ocurred
+
+@Examine:
+	move.b	APPLKey.Type+Key(a2), d0			; get this record's key type
+	cmp.b	#APPLKeyType, d0					; is this an APPL key?
+	bne.s	@NoErrExit							; if not, we're out of reasonable records
+
+	move.l	APPLKey.CrType+Key(a2), d0			; get this record's creator
+	cmp.l	d0, d1								; is this the right creator?
+	bne.s	@NoErrExit							; if not, we're out of reasonable records
+
+	jsr		(a1)								; give the caller a shot at it
+	tst.w	d0									; are they all through?
+	beq.s	@NoErrExit
+
+	bra.s	@Iterate
+
+@NoErrExit:
+	moveq.l	#0, d0
+@Exit:
+	move.l	(a6)+, -(sp)						; <18>
+	rts
+	endwith
+	_DTDebugTail	'APPLIterator',0
+	endproc
+
+
+;________________________________________________________________________________
+; Routine:		APPLCompareNames
+;
+; Input:		a2 - standard APPL locals
+;
+; Output:		d0 - trashed
+;				ccr state from _CmpString of names
+;
+; Function:
+;	This routine compares the name from the current APPL rec (sitting in the
+; APPL locals) to the name in the AppSpec (sitting in the APPL locals).
+;
+; You must have set up the AppSpec in APPLLocals before using this routine.
+;________________________________________________________________________________
+APPLCompareNames:	proc
+	with	APPLLocals
+
+@stash	reg		a0/a1
+
+	movem.l	@stash, -(sp)						; save away for a sec
+	moveq.l	#0, d0								; clear high bytes
+	lea.l	AppSpec+FSSpec.name(a2), a0			; a0 = ptr(leaf name of app)
+	move.b	(a0)+, d0							; d0 = length, a0 = ptr(1st char)
+	swap	d0									; length of 1st string into high word
+	lea.l	APPLRec.CName+Data(a2), a1			; a1 = ptr(CName of current entry)
+	move.b	(a1)+, d0							; d0 = length, a1 = ptr(1st char)
+	_FSCmpString								; are the names the same?
+	movem.l	(sp)+, @stash
+	rts
+
+	endwith
+	_DTDebugTail	'APPLCompareNames', 0
+	endproc
+
+;________________________________________________________________________________
+; Routine:		AddAPPLCallback
+;
+; Input:		a0 - BT param block with valid hint, key, and data pointers
+;				a1 - callback procedure
+;				a2 - standard APPL locals
+;				a3 - DTDBQElt pointer
+;				a4 - user DT param block
+;				d1 - creator type
+;
+; Output:		a0 - BT param block
+;				a1 - callback procedure
+;				a2 - standard locals (param block, key, data)
+;				a3 - DTDBQElt pointer
+;				a4 - user DT param block
+;				d0 - zero to signal end of iteration; nonzero otherwise
+;				d1 - creator type
+;
+; Function:
+;	This routine will get called once per APPL entry with a creator matching the
+;	one of the application being added to the list.
+;	It does these things:
+;		Look for a sequence number at which to add the new application.
+;		Keep track of the creation date and sequence number of the last record it saw
+;		Look for a duplicate entry, which means we don't need to insert anything.
+;
+;		If no free sequence number is found when scanning the list, index(a2) will
+;		be one to the left of the last existing record - by definition a free
+;		seqnum.
+;________________________________________________________________________________
+;
+AddAPPLCallback:	proc
+
+	with	APPLLocals
+
+	bset.b	#applSawARecord, flags(a2)				; we've seen at least one record
+	move.l	APPLRec.TagInfo+Data(a2), theDate(a2)	; record leftmost record's create date
+	move.w	APPLKey.SeqNum+Key(a2), theSeqNum(a2)	; record leftmost record's sequence number
+
+	move.l	APPLRec.parID+Data(a2), d0				; pick up the ParID
+	cmp.l	AppSpec.parID(a2), d0					; entry in the same folder? <19>
+	bne.s	@NotADuplicate
+
+	bsr		APPLCompareNames						; are the names the same?
+	bne.s	@NotADuplicate							; no ->
+
+; The current application record has the same creator, parID and name as the app
+; being added.
+
+	move.l	APPLRec.TagInfo+Data(a2), d0			; get this application's creation date
+	cmp.l	crDate(a2), d0							; check it against our prospective entry
+	bne.s	@DifferentCreateDate					; handle same app/different date case
+
+	bset.b	#applFoundADup, flags(a2)				; indicate our find
+	moveq.l	#0, d0									; signal the end of this search
+	bra.s	@Exit
+
+; We've got most of a duplicate entry - everything except the create date matches.
+; This really shouldn't happen, but if it does, simply return the seqnum of the
+; current record as the place we should insert the new application.
+@DifferentCreateDate:
+	move.w	APPLKey.SeqNum+Key(a2), index(a2)		; use this seqnum
+	bra.s	@FoundASeqNum
+
+@NotADuplicate:
+	btst.b	#applFoundASeqNum, APPLLocals.flags(a2)	; do we need to find a seqnum?
+	bne.s	@KeepIterating
+	move.w	APPLKey.SeqNum+Key(a2), d0				; get the current record's seqnum
+	cmp.w	index(a2), d0							; collision?
+	bne.s	@FoundASeqNum							; if not, we've found a good seqnum
+
+	sub.w	#1, index(a2)							; subtract to get next prospective seqnum
+	bra.s	@KeepIterating
+
+@FoundASeqNum:
+	bset.b	#applFoundASeqNum, flags(a2)			; indicate our find
+
+@KeepIterating:
+	moveq.l	#1, d0									; indicate that we should keep iterating
+@Exit:
+	rts
+
+	endwith
+	_DTDebugTail	'AddAPPLCallback',0
+	endproc
+
+;________________________________________________________________________________
+; Routine:		DTAddAPPL
+;
+; Input:		a0 - user's DT param block
+; Output:		d0 - result code
+;
+; Register Use:	a0 - bt param block
+;				a1 -
+;				a2 - locals
+;				a3 - DTDBQElt
+;				a4 - user's param block
+;
+; Function: 	Add an entry for an application into the application list
+;
+; Add the given application to the app list.  If this application is younger than
+; all existing applications, make sure its sequence number is lowest.  If it's not
+; the youngest, add the application at the highest available seqnum.
+; If the application has the same name, directory and tag as an entry in the list,
+; no action is necessary.  If the application has the same name and directory but a
+; different tag, delete the existing entry and insert the application as if there
+; had been no duplicate.
+;________________________________________________________________________________
+DTAddAPPL:		proc export
+
+@AddAPPLRegs		reg		a0-a4/d1-d2			; set of regs to save around this call
+	jsrROM	FSQUEUE   							; just to check for external file systems
+	bsr		DTRfnExtFSCheck						; find the right volume and hope it's ours
+	bsr		DeskMgrQueue 						; Wait our turn
+
+	with	APPLLocals							; Key and Data are APPL-sized
+	movem.l	@AddAPPLRegs, -(a6)
+	suba.w	#LSize, a6							; allocate locals
+	movea.l	a6, a2								; setup a2 as locals ptr
+	movea.l	a0, a4								; move user's DTParam to a safe register
+
+	bsr 	DTSetup 							; Do common setup. a3 = ptr(DTDBQElt)
+	bne		@Exit2								; Punt on any errors
+
+	lea.l	bigPB(a2), a0						; a0 = ptr(param block)
+	move.l	ioFileName(a4), ioFileName(a0)		; use user's application name
+	move.w	DTDBQElt.XVRefNum(a3), ioVRefNum(a0); use correct volume ref
+	clr.w	ioFDirIndex(a0)						; no indexing
+	move.l	ioDirID(a4), ioDirID(a0)			; use user's DirID
+	go_HGetFileInfo 							; Go get this app's creation date <21>
+	bne		@Exit2								; run away on errors
+	move.l	ioFlCrDat(a0), APPLLocals.crDate(a2)	; save the creation date
+
+	move.l	ioDirID(a4), ioDirID(a0)			; reset dirID field (modified by GetCatInfo)
+	lea.l	AppSpec(a2), a1						; address of our FSSpec record
+	move.l	a1, ioFSSpecPtr(a0)					; tell the param block about it
+	go_MakeFSSpec
+	bne		@Exit2								; run away on errors
+
+	move.w	#$ffff, index(a2)					; initial seqnum is ffff to maintain compatibility
+	clr.b	flags(a2)							; clear all iterator signal flags
+
+	move.l	ioFlCreator(a4), d1					; d1 = creator type for new APPL list entry
+	bsr		SetUpAPPLIterator					; get ready to iterate through existing entries
+	lea.l	AddAPPLCallback, a1					; a1 = ptr(AddAPPL's iterator callback)
+	bsr		APPLIterator						; go look at each existing record
+
+	move.w	index(a2), d1						; set up free seqnum
+
+	btst.b	#applSawARecord, flags(a2)			; did we see at least one good record?
+	beq.s	@Insert								; if not, insert the new sole record
+
+@SawAnExistingRecord:
+	btst.b	#applFoundADup, APPLLocals.flags(a2)	; did we find a duplicate?
+	bne.s	@NoErrExit								; if so, take the easy way out
+
+; We have a valid seqnum.  There's at least one other record with this creator,
+; so make sure that the leftmost record has the newest creation date.
+; There are four possibilities here, based on two facts:
+;	The free seqnum is left or right of the leftmost existing record
+;	The leftmost existing record is newer or older (by creation date) than the app being added
+;
+;                        free seqnum right of existing leftmost   free seqnum left of existing leftmost
+; caller's app newer:            swap                                      insert at free seqnum
+; caller's app older:            insert at free seqnum                     swap
+;
+; A swap puts the existing leftmost record into the free seqnum and the caller's
+; app into the newly available seqnum where the leftmost app used to be. Note that
+; this operation either ensures that the leftmost record stays that way (by moving it
+; to a new, even lower seqnum) or that the new record becomes the leftmost (when the
+; free seqnum was off to the right).
+;
+; This ensures that the leftmost record is always the one with the youngest app.
+
+@HaveASeqNum:
+	move.l	theDate(a2), d0						; d0 = creation date of leftmost existing record
+	cmp.l	crDate(a2), d0						; compare that to the app's creation date
+	bhi.s	@ExistingRecIsNewer
+
+	move.w	theSeqNum(a2), d0					; d0 = seqnum of the leftmost existing record
+	cmp.w	index(a2), d0						; compare that to this app's assigned seqnum
+	blo.s	@DoASwap							; left seq < free seq, left rec older than caller's
+	bra.s	@Insert								; left seq > free seq, left rec older than caller's
+
+@ExistingRecIsNewer:
+	move.w	theSeqNum(a2), d0					; d0 = seqnum of leftmost existing record
+	cmp.w	index(a2), d0						; compare that to this app's assigned seqnum
+	blo.s	@Insert								; left seq < free seq, left rec newer than caller's
+
+; Move the existing leftmost record to the newly selected seqnum and the
+; caller's app at the (freed up) seqnum of the existing leftmost
+; record.  We know that the iterator left us one to the left of the leftmost
+; record.
+
+@DoASwap:
+	move.l	ioFlCreator(a4), APPLKey.CrType+Key(a2)	; iterator always bumps into previous creator type
+	move.w	theSeqNum(a2), APPLKey.SeqNum+Key(a2)	; we want the leftmost record
+	go_BTSearch									; get the leftmost record
+	move.w	index(a2), APPLKey.SeqNum+Key(a2)	; use the selected free seqnum
+	go_BTSetRec									; move the leftmost record into the list at the free spot
+	move.w	theSeqNum(a2), d1					; and add the new record at the leftmost position
+
+; Add the caller's application at the sequence number in d1
+@Insert:
+	lea.l	APPLKey.Len+Key(a2), a1				; a1 = ptr(APPL key)
+	move.b	#APPLKey.AKLen-1, (a1)+				; make a full length APPL key (-1 for length byte)
+	move.b	#APPLKeyType, (a1)+					; make it an APPL key
+	move.l	ioFlCreator(a4), (a1)+				; use the caller's creator
+	move.w	d1, (a1)+							; use the seqnum in d1
+
+	lea.l	APPLRec.TagInfo+Data(a2), a1		; a1 = ptr(APPL record)
+	move.l	crDate(a2), (a1)+					; use this app's creation date
+	move.l	AppSpec+FSSpec.parId(a2), (a1)+		; and parent ID
+	lea.l	AppSpec+FSSpec.name(a2), a0			; a0 = ptr(CName of app)
+	moveq.l	#0, d0								; clear high bytes
+	move.b	(a0), d0							; name length into d0 (+1 for itself, -1 for dbra)
+@loop:
+	move.b	(a0)+, (a1)+
+	dbra	d0, @loop
+
+	lea.l	bigPB(a2), a0						; get our param block pointer back
+	go_BTSetRec									; all fields are still valid
+	bra.s	@Exit								; return the error straight back
+
+@NoErrExit:
+	moveq.l	#0, d0
+@Exit:
+	bsr		SaveHintInDTDBQElt					; save off the hint
+@Exit2:
+	add.w	#LSize, a6							; deallocate locals
+	movem.l	(a6)+, @AddAPPLRegs
+	bra 	DTDone								; We're all set.
+
+	endwith
+	_DTDebugRts		'DTAddAPPL',0
+	endproc
+
+;________________________________________________________________________________
+; Routine:		RemoveAPPLCallback
+;
+; Input:		a0 - BT param block with valid hint, key, and data pointers
+;				a1 - callback procedure
+;				a2 - standard APPL locals
+;				a3 - DTDBQElt pointer
+;				d1 - creator type
+;
+; Output:		a0 - BT param block
+;				a1 - callback procedure
+;				a2 - standard locals (param block, key, data)
+;				a3 - DTDBQElt pointer
+;				d0 - zero to signal end of iteration; nonzero otherwise
+;				d1 - creator type
+;
+; Function:
+;	This routine will get called once per APPL entry with a creator matching the
+;	one of the application being removed to the list.
+;	It does these things:
+;		Look for an entry whose name and dirID match the caller's pb
+;		If there's a match, find out if it is the leftmost entry
+;		Keep track of the youngest non-matching app seen, in case
+;		the matching app was leftmost and the youngest one needs to
+;		be found and made leftmost.
+;
+;________________________________________________________________________________
+;
+RemoveAPPLCallback:	proc
+
+	with	APPLLocals
+
+	add.w	#1, count(a2)							; tally this record
+	btst.b	#applFoundAMatch, flags(a2)				; have we already seen a match?
+	beq.s	@NoMatchYet								; if not, keep on looking
+
+	bset.b	#applNotLeftmost, flags(a2)				; we've seen a match, and now another
+													; record, which means that the match
+													; wasn't the leftmost (youngest) entry,
+													; so no rebalancing will be necessary.
+	moveq.l	#0, d0									; Tell the iterator to chill out
+	bra.s	@Exit									; And we're done iterating
+
+@NoMatchYet:
+	move.l	APPLRec.parID+Data(a2), d0				; pick up the ParID
+	cmp.l	AppSpec.parID(a2), d0					; entry in the same folder? <19>
+	bne.s	@NotAMatch
+
+	bsr		APPLCompareNames						; are the names the same?
+	bne.s	@NotAMatch								; no ->
+
+; The current application record has the same creator, parID and name as the app
+; being added.
+
+	bset.b	#applFoundAMatch, flags(a2)				; remember that we've found it
+	move.w	APPLKey.SeqNum+Key(a2), index(a2)		; remember its SeqNum
+	bra.s	@KeepIterating							; and go look for a more-leftmost entry
+
+; The current entry is a miss.  Check to see if it is the "newest" to date in the
+; scan
+@NotAMatch:
+	move.l	theDate(a2), d0							; date of the current "youngest"
+	cmp.l	APPLRec.TagInfo+Data(a2), d0			; is this record younger?
+	bhi.s	@KeepIterating							; if not, just keep going
+
+	move.w	APPLKey.SeqNum+Key(a2), theSeqNum(a2)	; remember this SeqNum
+	move.l	APPLRec.TagInfo+Data(a2), theDate(a2)	; remember this date
+
+@KeepIterating:
+	moveq.l	#1, d0									; tell the iterator to keep at it
+@Exit:
+	rts
+
+	endwith
+	_DTDebugTail	'RemoveAPPLCallback',0
+	endproc
+
+;________________________________________________________________________________
+; Routine:		DTRemoveAPPL
+;
+; Input:		a0 - user's DT param block
+; Output:		d0 - result code
+;
+; Register Use:	a0 - bt param block
+;				a1 -
+;				a2 - locals
+;				a3 - DTDBQElt
+;				a4 - user's param block
+;
+; Function: 	Delete an entry for an application in the application list
+;
+; Remove the given application to the app list.  If this application is younger than
+; all existing applications, make sure that after it is deleted the next-youngest
+; app is promoted to the front of the list.
+;________________________________________________________________________________
+DTRemoveAPPL:		proc export
+@RemoveAPPLRegs		reg			a0-a4/d1-d2
+
+	jsrROM	FSQUEUE   							; just to check for external file systems
+	bsr		DTRfnExtFSCheck						; find the right volume and hope it's ours
+	bsr		DeskMgrQueue						; wait our turn
+
+	with	APPLLocals
+	movem.l	@RemoveAPPLRegs, -(a6)
+	suba.w	#LSize, a6						; allocate locals
+	movea.l	a6, a2							; set up a2 as locals ptr
+	movea.l	a0, a4							; move user's DTParam to a safe register
+
+	bsr 	DTSetup 						; Do common setup. a3 = ptr(DTDBQElt)
+	bne		@Exit2 							; Punt on any errors
+
+	lea.l	bigPB(a2), a0						; a0 = ptr(param block)
+	move.l	ioFileName(a4), ioFileName(a0)		; use user's application name
+	move.w	DTDBQElt.XVRefNum(a3), ioVRefNum(a0); use correct volume ref
+	move.l	ioDirID(a4), ioDirID(a0)			; use user's DirID
+	lea.l	AppSpec(a2), a1						; address of our FSSpec record
+	move.l	a1, ioFSSpecPtr(a0)					; tell the param block about it
+	go_MakeFSSpec
+	beq.s	@1									; no err? How pleasant.
+	cmp.w	#fnfErr, d0							; app doesn't have to be here
+	bne.s	@Exit2								; other errors spell trouble
+
+@1:
+	clr.b	flags(a2)						; clear all iterator signal flags
+	clr.l	theDate(a2)						; oldest possible create date
+	clr.w	theSeqNum(a2)					; indicate no younger APPL in the list
+	clr.w	count(a2)						; we've seen no records
+
+	move.l	ioFlCreator(a4), d1				; d1 = creator type for APPL entry to delete
+	bsr		SetUpAPPLIterator				; get ready to look through existing entries
+	lea.l	RemoveAPPLCallback, a1			; a1 = ptr(RemoveAPPL's iterator callback)
+	bsr		APPLIterator					; go look at existing records
+
+	btst.b	#applFoundAMatch, flags(a2)		; did we see a hit?
+	beq.s	@NoMatchFound
+
+	move.l	ioFlCreator(a4), APPLKey.CrType+Key(a2)	; put our creator back into key
+
+; We saw a hit.  There are several things to consider, in this order
+;	1) If there are only one or two records, we never need to re-balance
+;	2) If the hit wasn't leftmost, we don't need to re-balance
+;	3) If the hit was the leftmost record, we need to re-balance.
+
+	cmp.w	#2, count(a2)					; did we see more than 2 records?
+	bls.s	@DeleteMatch					; if not, just go delete the hit
+	btst.b	#applNotLeftmost, flags(a2)		; was the hit leftmost?
+	bne.s	@DeleteMatch					; if not, just go delete it
+
+; We need to rebalance.  Since we know the seqnums of the youngest record
+; and the seqnum of the leftmost record, we'll just get the youngest and
+; set it into the leftmost position.
+	move.w	theSeqNum(a2), APPLKey.SeqNum+Key(a2)	;
+	go_BTSearch								; get the youngest
+	bne.s	@Exit							; errors are trouble
+	move.w	index(a2), APPLKey.SeqNum+Key(a2)	; leftmost SeqNum
+	go_BTReplRec							; replace match with youngest
+	bne.s	@Exit							; errors are trouble
+	move.w	theSeqNum(a2), index(a2)		; aim our upcoming delete at
+											; the old position of the youngest
+
+@DeleteMatch:
+	move.w	index(a2), APPLKey.SeqNum+Key(a2)
+	go_BTDelRec								; delete the match (or the old
+											; position of the youngest)
+	bra.s	@Exit							; pass errors straight back
+
+@NoMatchFound:
+	move.l	#btRecNotFnd, d0				; tell'em about it and give up
+
+@Exit:
+	bsr		SaveHintInDTDBQElt				; save off the hint <21>
+@Exit2:
+	adda.w	#LSize, a6						; deallocate locals
+	movem.l	(a6)+, @RemoveAPPLRegs			; restore registers
+ 	bra 	DTDone							; We're all set.
+
+	endwith
+	_DTDebugRts		'DTRemoveAPPL',0
+	endp
+
+;________________________________________________________________________________
+;
+; Routine:		DTGetAPPL
+;
+; Input: a0 points to user's DTParam
+; Output: d0 contains result code
+;
+; Function: 	Retrieve an APPL entry from the Desktop database by Creator/index
+;________________________________________________________________________________
+DTGetAPPL:		proc export
+
+	StandardLocals	GetAPPLLocals, APPLRec
+
+@GetAPPLRegs		reg		a0-a4/d1-d2		; set of regs to save around GetAPPL
+	jsrROM	FSQUEUE   						; just to check for external file systems
+	bsr		DTRfnExtFSCheck					; find the right volume and hope it's ours
+	bsr 	DeskMgrQueue 					; Wait our turn
+
+	with	GetAPPLLocals					; Key and Data refer to locals
+	movem.l	@GetAPPLRegs, -(a6)
+	suba.w	#LSize, a6						; allocate locals on a6
+	movea.l	a0, a4							; move user's DTParam to a safe register
+
+	bsr 	DTSetup 						; Do common setup. a3 = ptr(DTDBQElt)
+	bne		@GetAPPLExit2 					; and run if we see trouble
+
+	bsr		SetUpBTPB						; a0 = ptr(BTioParam), a2 = ptr(key)
+	move.l	#APPLRec.ARLen, ioReqCount(a0)	; indicate size of an APPL data record
+	move.b	#APPLKey.AKLen-1, (a2)+			; set APPL key length (minus length byte)
+	move.b	#APPLKeyType, (a2)+				; and APPL type
+	move.l	ioFlCreator(a4), (a2)+			; look for user's creator
+	clr.l	(a2)+							; and a value "left" of all seqnums
+	go_BTSearch
+	cmp.w	#btRecNotFnd, d0				; was the error a simple not found?
+	bne.s	@GetAPPLExit					; no, must be something more serious
+
+	move.w	ioIndex(a4), d0					; get the user's requested index
+	tst.w	d0								; is index 0?
+	bne.s	@notSpecial						; if not, don't adjust
+	moveq.l	#1, d0							; caller wants "best" app, which happens to be 1st one
+
+@notSpecial:
+	subq.w	#1, d0							; the user's index starts at 1
+	move.w	d0, ioBTPosMode(a0)				; tell the btree the record offset
+	move.w	#APPLKey.AKLen, ioKReqCount(a0)	; tell the btree how much space for key return
+	go_BTGetRec
+	bne.s	@GetAPPLExit 					; Punt on errors
+
+	move.b	APPLKey.Type+Key(a6), d0		; pick up the key ID
+	cmp.b	#APPLKeyType, d0				; is this record an APPL entry?
+	beq.s	@FoundAPPL						; yes - check the creators					; <dnf 1.4>
+	move.w	#btRecNotFnd, d0				; no - search failed
+	bra.s	@GetAPPLExit 					; So punt
+
+@FoundAPPL:									;											; <dnf 1.4>
+	move.l	APPLKey.CrType+Key(a6), d0		; pick up this APPL entries' creator		; <dnf 1.4>
+	cmp.l	ioFlCreator(a4), d0				; is it still the same as the caller's?		; <dnf 1.4>
+	beq.s	@FoundOne						; yes - return information					; <dnf 1.4>
+	move.w	#btRecNotFnd, d0				; no - search failed						; <dnf 1.4>
+	bra.s	@GetAPPLExit					; So punt									; <dnf 1.4>
+
+@FoundOne:
+	move.l	APPLRec.TagInfo+Data(a6), ioTagInfo(a4)		; return tag information
+	move.l	APPLRec.parID+Data(a6), ioFlParID(a4)		; return ParID
+	tst.l	ioFileName(a4)					; did the user want the file name?
+	beq.s	@NoCopy							; no - don't copy it over
+
+	lea.l	APPLRec.CName+Data(a6), a0		; a0 = ptr(the Cname string)
+	movea.l	ioFileName(a4), a1				; a1 = ptr(user's Cname string)
+	moveq.l	#0, d0							; clear high bytes
+	move.b	(a0), d0						; get length
+	addq.b	#1, d0							; add one for the length byte
+	_BlockMove								; copy the string over
+
+@NoCopy:
+	moveq.l	#0,d0							; All is well.
+
+@GetAPPLExit:
+	bsr		DoneBTPB						; finish up with the BTPB <21>
+
+@GetAPPLExit2:
+	adda.w	#LSize, a6						; deallocate locals
+	movem.l	(a6)+, @GetAPPLRegs
+	bra 	DTDone							; We're all set.
+
+	endwith
+	_DTDebugRts		'DTGetAPPL',0
+	endp
+
+;________________________________________________________________________________
+;
+; Routine:		DTSetComment
+;
+; Input: a0 points to user's DTParam
+; Output: d0 contains result code
+;
+; Function: 	Add a comment for a file or folder to the Desktop database
+;________________________________________________________________________________
+DTSetComment:		proc export
+
+	StandardLocals	SetCommentLocals, CommentRec
+
+@SetCommentRegs		reg		a0-a4/d1-d2		; set of regs to save around SetComment
+	jsrROM	FSQUEUE   						; just to check for external file systems
+	bsr		DTRfnExtFSCheck					; find the right volume and hope it's ours
+	bsr	 	DeskMgrQueue 					; Wait our turn
+
+	with	SetCommentLocals				; Key and Data refer to locals
+	movem.l	@SetCommentRegs, -(a6)
+	suba.w	#LSize, a6						; allocate locals on a6
+	movea.l	a0, a4							; move user's DTParam to a safe register
+
+	bsr 	DTSetup 						; Do common setup. a3 = ptr(DTDBQElt)
+	bne.s	@AddCmtExit						; exit, stage left, if, like, errors are happenin
+
+	bsr		CheckCSpec						; Make sure the file or directory exists
+	bne.s	@AddCmtExit						; Punt on errors
+
+;
+; Build a Comment data record.  Notice that since we build the data record at Data(a6),
+; SetUpBTPB will automatically point the BTParam at it.
+;
+	moveq.l	#0, d0							; clear high bytes (for _BlockMove)
+	move.l	ioReqCount(a4), d0				; get comment text length
+	cmp.l	#MaxCommentLen, d0				; is the comment too large?
+	bls.s	@NoClip							; if not, no need to clip it
+	move.l	#MaxCommentLen, d0				; clip length to max
+@NoClip:
+	move.b	d0, CommentRec.CmtSize+Data(a6)	; set the comment length
+	move.l	ioBuffer(a4), a0				; get ready to copy the user's data
+	lea.l	CommentRec.CmtData+Data(a6), a1	; into the Comment record
+	_BlockMove								; copy that comment...
+
+	bsr		SetUpBTPB						; a0 = ptr(BTioParam), a2 = ptr(key)
+	moveq.l	#0, d0							; clear high bytes
+	move.b	CommentRec.CmtSize+Data(a6), d0	; d0 = size of comment data
+	addq.b	#1, d0							; add one for length byte
+	move.l	d0, ioReqCount(a0)				; tell BTParam how big this comment record is
+	move.b	#CommentKey.CKLen-1, (a2)+		; set key length (minus length byte)
+	move.b	#CommentKeyType, (a2)+			; set key type
+	move.l	d1, (a2)+						; d1 still has CNodeID from CheckCSpec
+	go_BTSetRec
+	bsr		DoneBTPB						; finish up with the BTPB <21>
+
+@AddCmtExit:
+	adda.w	#LSize, a6						; dispose of locals
+	movem.l	(a6)+, @SetCommentRegs				; restore regs
+	bra 	DTDone							; We're all set.
+
+	endwith
+	_DTDebugRts		'DTSetComment',0
+	endproc
+
+;________________________________________________________________________________
+;
+; Routine:		DTGetComment
+;
+; Input: a0 points to user's DTParam
+; Output: d0 contains result code
+;
+; Function: 	Retrieve a comment for a file or folder from the Desktop database
+;________________________________________________________________________________
+DTGetComment:		proc export
+
+	StandardLocals	GetCommentLocals, CommentRec
+
+@GetCommentRegs		reg		a0-a4/d1-d2			; set of regs to save around GetComment
+	jsrROM	FSQUEUE   						; just to check for external file systems
+	bsr		DTRfnExtFSCheck					; find the right volume and hope it's ours
+	bsr 	DeskMgrQueue 					; Wait our turn
+
+	with	GetCommentLocals					; Key and Data refer to locals
+	movem.l	@GetCommentRegs, -(a6)
+	suba.w	#LSize, a6						; allocate locals on a6
+	movea.l	a0, a4							; move user's DTParam to a safe register
+
+	bsr 	DTSetup 						; Do common setup. a3 = ptr(DTDBQElt)
+	bne.s	@GetCommentExit					; Errors? Run and hide.
+
+	clr.l	ioActCount(a4)					; in case we don't make it
+
+	bsr 	CheckCSpec						; Look up the CNode's CNID
+	bne.s	@GetCommentExit					; punt on errors
+
+@GCGotCNID:
+	bsr		SetUpBTPB						; a0 = ptr(BTioParam), a2 = ptr(key)
+	move.l	#CommentRec.CRLen, ioReqCount(a0)	; indicate size of a comment record
+	move.b	#CommentKey.CKLen-1, (a2)+		; set the key length (minus length byte)
+	move.b	#CommentKeyType, (a2)+			; and the type
+	move.l	d1, (a2)+						; d1 = CNodeID of requested file (from CheckCSpec)
+	go_BTSearch								; go get that comment
+	bsr		DoneBTPB						; finish up with the BTPB <21>
+	bne.s	@GetCommentExit					; Yipes! an error!
+
+	moveq.l	#0, d0							; clear high bytes
+	move.b	CommentRec.CmtSize+Data(a6), d0	; d0 = length of comment data
+	cmp.b	#MaxCommentLen, d0				; for some strange reason, is comment too big?
+	bls.s	@sizeOK
+	move.b	#MaxCommentLen, d0				; clip it.
+@sizeOK:
+	move.l	d0, ioActCount(a4)				; tell the user how much data there was
+	lea.l	CommentRec.CmtData+Data(a6), a0	; copy starts from the Data
+	move.l	ioBuffer(a4), a1				; a1 = address of user's buffer
+	_BlockMove								; put the Comment Data in the user's buffer
+	moveq.l	#0,d0							; All went well
+
+@GetCommentExit:
+	adda.w	#LSize, a6						; deallocate locals
+	movem.l	(a6)+, @GetCommentRegs
+	bra		DTDone							; We're all set.
+
+	endwith
+	_DTDebugRts		'DTGetComment',0
+	endproc
+
+;________________________________________________________________________________
+;
+; Routine:		DTRemoveComment
+;
+; Input: a0 points to user's DTParam
+; Output: d0 contains result code
+;
+; Function: 	Remove a comment for a file or folder from the Desktop database
+;________________________________________________________________________________
+;
+DTRemoveComment:		proc export
+
+	StandardLocals	RemoveCommentLocals, 0		; we only need a pb and a key here. Zero Data
+
+@RemoveCommentRegs		reg		a0-a4/d1-d2			; set of regs to save around RmvCmt
+	jsrROM	FSQUEUE   						; just to check for external file systems
+	bsr		DTRfnExtFSCheck					; find the right volume and hope it's ours
+	bsr 	DeskMgrQueue 					; Wait our turn
+
+	with	RemoveCommentLocals				; Key and Data refer to locals
+	movem.l	@RemoveCommentRegs, -(a6)		; save regs
+	suba.l	#LSize, a6						; allocate and clear locals on a6
+	movea.l	a0, a4							; move user's DTParam to a safe register
+
+	bsr 	DTSetup 						; Do common setup. a3 = ptr(DTDBQElt)
+	bne.s	@RmvCmtExit						; Zorro defects
+
+	bsr		CheckCSpec						; does the file exist? (d1 = CNodeID)
+	bne.s	@RmvCmtExit						; punt on errors
+
+	bsr		SetUpBTPB						; a0 = ptr(BTparam), a2 = ptr(key)
+	move.b	#CommentKey.CKLen-1, (a2)+		; set key length (minus length byte)
+	move.b	#CommentKeyType, (a2)+			; it's a comment key
+	move.l	d1, (a2)+						; d1 = CNodeID of file to delete comment for
+	go_BTDelRec
+	bsr		DoneBTPB						; finish up with the BTPB <21>
+
+@RmvCmtExit:
+	adda.w	#LSize, a6						; deallocate locals
+	movem.l	(a6)+, @RemoveCommentRegs
+	bra		DTDone							; We're all set.
+
+	endwith
+	_DTDebugRts		'RmvComment',0
+	endp
+
+;________________________________________________________________________________
+;
+; Routine:		DTFlush
+;
+; Input: a0 points to user's DTParam
+; Output: d0 contains result code
+;
+; Function: 	Flush buffers associated with a database
+;________________________________________________________________________________
+DTFlush:		proc export
+
+DTFlushLocals		record		0, increment
+bigPB		ds.b		DTBigPBSize		; big enough for all HFS calls
+LSize		equ			*-bigPB
+			endr
+
+@DTFlushRegs	reg		a0/a3-a4
+	jsrROM		FSQUEUE   					; just to check for external file systems
+	bsr			DTRfnExtFSCheck				; find the right volume and hope it's ours
+	bsr			DeskMgrQueue				; wait our turn
+
+	with		DTFlushLocals
+	movem.l		@DTFlushRegs, -(a6)			; save regs
+	suba.w		#LSize, a6					; allocate locals on file system stack
+	movea.l		a0, a4						; move user's DTParam to a safe register
+
+	bsr			DTSetup						; Do common setup. a3 = ptr(DTDBQElt)
+	bne.s		@DTFlushExit				; punt on errors
+
+	lea.l		bigPB(a6), a0				; a0 = ptr(param block)
+	move.w		DTDBQElt.DBRefNum(a3), ioRefNum(a0)	; use the btree file refnum
+	go_BTFlush
+	bne.s		@DTFlushExit				; punt on errors
+
+	lea.l		bigPB(a6), a0				; a0 = ptr(param block)
+	move.w		DTDBQElt.VRefNum(a3), ioVRefNum(a0)	; use the data file refnum
+	clr.l		ioVNPtr(a0)					; no name needed <21>
+	go_FlushVol								; flush a volume at a time <21>
+
+@DTFlushExit:
+	adda.w		#LSize, a6
+	movem.l		(a6)+, @DTFlushRegs
+	bra			DTDone
+
+	endwith
+	_DTDebugRts		'DTFlush',0
+	endproc
+
+;________________________________________________________________________________
+;
+; Routine:		DTReset
+;
+; Input: a0 points to user's DTParam
+; Output: d0 contains result code
+;
+; Function: 	Reinitialize the btree files  (leaving them both open)
+;	SetEOF on both to zero
+;	Call BTInit on the BTree file
+;________________________________________________________________________________
+DTReset:		proc export
+
+DTResetLocals		record		0, increment
+bigPB		ds.b		DTBigPBSize		; big enough for all HFS calls
+DBName		ds.b		32				; holds btree file name
+DBParID		ds.l		1				; ParID of btree file
+LSize		equ			*-bigPB
+			endr
+
+@DTResetRegs	reg		a0-a4/d1-d2
+	jsrROM		FSQUEUE   					; just to check for external file systems
+	bsr			DTRfnExtFSCheck				; find the right volume and hope it's ours
+	bsr			DeskMgrQueue				; wait our turn
+
+	with		DTResetLocals
+	movem.l		@DTResetRegs, -(a6)			; save regs
+	suba.w		#LSize, a6					; allocate locals on file system stack
+	movea.l		a0, a4						; move user's DTParam to a safe register
+
+	bsr			DTSetup						; Do common setup.  a3 = ptr(DTDBQElt)
+	bne			@DTResetExit				; and punt on errors
+
+;
+; Get the name and parent ID of the btree file
+;
+	lea.l		bigPB(a6), a0				; a0 = ptr(param block)
+	lea.l		DBName(a6), a1				; a1 = ptr(space for btree file name)
+	move.l		a1, ioFileName(a0)			; tell the param block about it
+	clr.w		ioVRefNum(a0)				; look at all FCB's
+	move.w		DTDBQElt.DBRefNum(a3), ioRefNum(a0)	; look for the btree file
+	clr.l		ioFCBIndx(a0)				; and look only by ioRefNum
+	go_GetFCBInfo
+	bne			@DTResetExit
+	move.l		ioFCBParID(a0), DBParID(a6)	; stash btree's parID
+
+;
+; Free up all of the space in both files
+;
+	lea.l		bigPB(a6), a0						; a0 = ptr(param block)
+	move.w		DTDBQElt.DBRefNum(a3), ioRefNum(a0)	; zap the btree file
+	clr.l		ioLEOF(a0)							; deallocate all space
+	go_SetEOF
+	bne			@DTResetExit						; errors are serious trouble here
+
+	lea.l		bigPB(a6), a0						; a0 = ptr(param block)
+	move.w		DTDBQElt.DFRefNum(a3), ioRefNum(a0)	; zap the data file
+	clr.l		ioLEOF(a0)							; deallocate all space
+	go_SetEOF
+	bne			@DTResetExit						; errors are serious trouble here
+
+;
+; <21> To minimize fragmentation, we extend the icon datafile by a bunch each time
+;
+	move.l	DTDBQElt.DFClumpSize(a3), ioReqCount(a0)	; d1 = the data file's clump size
+	go_Allocate 									; Request the additional space
+
+;
+; Close the btree file so we can BTInit it
+;
+	lea.l		bigPB(a6), a0						; a0 = ptr(param block)
+	move.w		DTDBQElt.DBRefNum(a3), ioRefNum(a0)
+	go_BTClose
+	bne.s		@DTResetExit
+
+;
+; Now call BTInit on the btree file
+;
+	lea.l		bigPB(a6), a0						; a0 = ptr(param block)
+	lea.l		DBName(a6), a1						; a1 = ptr(DB file name)
+	move.l		a1, ioFileName(a0)					; use btree file name
+	move.w		DTDBQElt.VRefNum(a3), ioVRefNum(a0)	; use the volume the file was on
+	move.w		#DTMaxKeySize, ioBTMaxKLen(a0)		; set maximum key size
+	clr.l		ioBTClumpSize(a0)					; use volume clump size
+	move.l		DBParID(a6), ioDirID(a0)			; use DirID from when it was open
+	pea.l		DTKeyDescriptor						; push pointer to our key descriptor
+	move.l		(sp)+, ioBTKDPtr(a0)				; and tell the btree about it
+	go_BTInit										; initialize btree file
+	bne.s		@DTResetExit
+
+;
+; And then open it back up
+;
+	lea.l		bigPB(a6), a0						; a0 = ptr(param block)
+	lea.l		DBName(a6), a1						; a1 = ptr(DB file name)
+	move.l		a1, ioFileName(a0)					; use the name it had when it was open
+	move.w		DTDBQElt.VRefNum(a3), ioVRefNum(a0)	; use vRef from when it was open
+	move.b		#fsRdWrPerm, ioPermssn(a0)			; use exclusive read/write perm
+	move.l		DBParID(a6), ioDirID(a0)			; use DirID from when it was open
+	pea.l		DTKeyCmp							; use our own key comparison procedure
+	move.l		(sp)+,ioBTKCProc(a0)
+	go_BTOpen
+	bne			@DTResetExit						; punt if there's trouble
+	move.w		ioRefNum(a0), DTDBQElt.DBRefNum(a3)		; save away the btree file refnum
+
+	moveq.l		#noErr, d0							; we made it.
+
+@DTResetExit:
+	adda.w		#LSize, a6
+	movem.l		(a6)+, @DTResetRegs
+	bra			DTDone
+
+	endwith
+	_DTDebugRts		'DTReset',0
+	endproc
+
+;________________________________________________________________________________
+; Routine:		DTDelete
+;
+; Input: a0 points to param block with ioVRefNum
+; Output: d0 contains result code
+;
+; Function: 	Delete all files that make up the desktop database
+;				Note that DTReset only works if the desktop database can be
+;				opened, while DTDelete takes a volume refnum
+;________________________________________________________________________________
+DTDelete:		proc export
+
+DTDeleteLocals		record		0, increment
+bigPB		ds.b		DTBigPBSize		; big enough for all HFS calls
+DBName		ds.b		32				; holds btree file name
+DBParID		ds.l		1				; ParID of btree file
+LSize		equ			*-bigPB
+			endr
+
+@DTDeleteRegs	reg		a0-a4/d1-d2
+
+	jsrROM		FSQUEUE   					; just to check for external file systems
+	bsr			DTVolExtFSCheck				; find the right volume and hope it's ours
+	bsr			DeskMgrQueue				; wait our turn
+
+	with		DTDeleteLocals
+	movem.l		@DTDeleteRegs, -(a6)		; save regs
+	suba.w		#LSize, a6					; allocate locals on file system stack
+	movea.l		a0, a4						; move user's DTParam to a safe register
+
+	move.l		FSVarsPtr, a3				; a3 = ptr(file system global area)
+	move.l		FSVars.DTDBMgr(a3), a3		; a3 = ptr(DTDB manager's global area)
+	move.w		DTGlobals.targetVRef(a3), d0	; get caller's target volume
+	move.w		d0, d2						; save a copy
+
+	bsr			FindDTVol					; is this volume's database already open?
+	beq.s		@DatabaseOpenExit			; if so, we can't delete the files
+
+	lea.l		DBName(a6), a1				; a1 = ptr(space for database file name)
+	move.w		d2, d0						; d0 = vRef
+	bsr			FindDTFiles					; go look for the database files
+											; note that we don't bother to look for errors here
+
+; delete the btree file
+
+	lea.l		bigPB(a6), a0
+	move.l		a1, ioNamePtr(a0)			; aim at the btree file
+	move.w		d1, ioVRefNum(a0)			; on the right volume
+	move.l		d2, ioDirID(a0)				; in the right directory
+	go_HDelete								; ignore errors
+
+	moveq.l		#0, d0						; clear high bytes
+	move.b		(a1), d0					; get length of btree file name
+	move.b		#'F', (a1, d0.w)			; change name to datafile name
+	go_HDelete								; ignore errors
+
+	moveq.l		#noErr, d0					; we always "succeed"
+	bra.s		@DTDeleteExit
+
+@DatabaseOpenExit:
+	moveq.l		#fBsyErr, d0				; can't delete if the database is open
+
+@DTDeleteExit:
+	adda.w		#LSize, a6
+	movem.l		(a6)+, @DTDeleteRegs
+	bra			DTDone
+
+	endwith
+	_DTDebugRts		'DTDelete',0
+	endproc
+
+;________________________________________________________________________________
+; Routine:		DTGetInfo
+;
+; Input: a0 points to user's DTParam
+; Output: d0 contains result code
+;
+; Function: 	Returns informative and entertaining facts about today's desktop
+;
+; ioFlLgLen gets the sum of the logical lengths of the desktop files
+; ioFlPyLen gets the sum of the physical lengths of the desktop files
+; ioDTFlCnt gets the number of desktop files
+; ioDirID gets the parent directory of the desktop files
+;
+; Even though neither file normally has a resource fork, we compute them
+; in in case someone has added one.
+;________________________________________________________________________________
+DTGetInfo:		proc export
+
+GetDTILocals		record		0, increment
+bigPB		ds.b		DTBigPBSize		; big enough for all HFS calls
+CName		ds.b		32				; space for a name
+LSize		equ			*-bigPB
+			endr
+
+@DTGetInfoRegs	reg		a0-a4/d1-d2
+	jsrROM		FSQUEUE   					; just to check for external file systems
+	bsr			DTRfnExtFSCheck				; find the right volume and hope it's ours
+	bsr			DeskMgrQueue				; wait our turn
+
+	with		GetDTILocals
+	movem.l		@DTGetInfoRegs, -(a6)		; save regs
+	suba.w		#LSize, a6					; allocate locals on file system stack
+	movea.l		a0, a4						; move user's DTParam to a safe register
+
+	bsr			DTSetup						; Do common setup.  a3 = ptr(DTDBQElt)
+	bne.s		@DTGetInfoExit				; and punt on errors
+
+	lea.l		bigPB(a6), a0				; a0 = ptr(param block)
+	lea.l		CName(a6), a1				; space for a name
+	move.l		a1, ioNamePtr(a0)			; tell 'em where to put the name
+	clr.l		ioDTLgLen(a4)				; clear out so we can add						<29>
+	clr.l		ioDTPyLen(a4)				; 												<29>
+
+	move.w		DTDBQElt.DBRefNum(a3), ioRefNum(a0)	; use the btree file
+	bsr.s		@AddFileSizes
+	bne.s		@DTGetInfoExit
+	move.w		DTDBQElt.DFRefNum(a3), ioRefNum(a0) ; use the data file
+	bsr.s		@AddFileSizes
+	bne.s		@DTGetInfoExit
+
+	move.w		#2, ioDTFlCnt(a4)					; indicate # of desktop files
+	move.w		DTDBQElt.VRefNum(a3), ioVRefNum(a4)	; indicate volume with files
+	moveq.l		#0, d0						; we succeeded									<29>
+@DTGetInfoExit:
+	adda.w		#LSize, a6
+	movem.l		(a6)+, @DTGetInfoRegs
+	bra			DTDone
+
+; assumes
+;    a0 - param block with refnum and name pointer set up
+;    a4 - user dt param block
+;
+@AddFileSizes:
+	move.l		(sp)+, -(a6)				; <18>
+	clr.l		ioFCBIndx(a0)				; return info by refnum only
+	go_GetFCBInfo
+	bne.s		@scram
+
+	move.l		ioFCBParID(a0), ioDirID(a0)	; move for GetCatInfo call
+	clr.w		ioFDirIndex(a0)				; by name & vref
+	go_HGetFileInfo							; <21>
+	bne.s		@scram
+
+	move.l		ioDTLgLen(a4), d0			; get the current value							<29>
+	add.l		ioFlLgLen(a0), d0			; add in data fork logical length
+	add.l		ioFlRLgLen(a0), d0			; add in the resource fork logical length
+	move.l		d0, ioDTLgLen(a4)			; stash it away									<29>
+
+	move.l		ioDTPyLen(a4), d0			; get the current value							<29>
+	add.l		ioFlPyLen(a0), d0			; add in data fork physical length
+	add.l		ioFlRPyLen(a0), d0			; add in the resource fork physical length
+	move.l		d0, ioDTPyLen(a4)			; stash it away									<29>
+	moveq.l		#0,d0						; we succeeded									<29>
+@scram:
+	move.l		(a6)+, -(sp)				; <18>
+	tst.w		d0							;												<29>
+	rts										; rah
+
+	endwith
+	_DTDebugTail		'DTGetInfo',0
+	endproc
+
+
+;________________________________________________________________________________
+;
+; Routine:      DTKeyCmp
+;
+; Function:     Compare two Desktop B*-Tree keys.
+;
+; Input:        A0.L  -  search key pointer
+;               A1.L  -  trial key pointer
+;
+; Output:       D0.W  -  result code
+;                            +n  search key > trial key
+;                             0  search key = trial key
+;                            -n  search key < trial key
+;
+; NOTE: The keys in the Desktop B*-Tree are all either numeric or case-sensitive
+;       strings, differentiated in the first position by the key type.  The key
+;       type will ensure that keys are sorted by type first; beyond that, a
+;       straight byte comparison may be used to properly differentiate the keys.
+;________________________________________________________________________________
+;
+DTKeyCmp:   proc
+			MOVEM.L A0-A1/D1,-(SP)      ; Save away scratch registers
+;
+; Figure the trial key length from the search key type; since all index
+; keys are padded out to their full length, the trial key length is
+; unreliable.  The search key length cannot be used because Getxxx routines
+; pass shorter keys (Type & Creator only) meant to compare less than any
+; key by that creator, but greater than preceding Creators.
+;
+			MOVE.B	(A0)+,D0					; Pick up length of search key
+			MOVEQ	#IconKey.IKLen-1,D1			; Figure length of icon key
+			CMP.B	#IconKeyType,(A0)			; Looking for an icon key?
+			BEQ.S	@5							; Yes - we're in business
+			MOVEQ	#APPLKey.AKLen-1,D1			; No - try an APPL key
+			CMP.B	#APPLKeyType,(A0)			; Looking for an APPL key?
+			BEQ.S	@5							; Yes - go with it
+			MOVEQ	#CommentKey.CKLen-1,D1		; Finally, try a comment key
+			CMP.B	#CommentKeyType,(A0)		; Looking at a comment?
+			BEQ.S	@5							; Yes - finally right.
+			MOVE.B	D0,D1						; No - just use the search key length
+;
+@5			TST.B   (A1)+						; Ignore length of trial key
+@10			CMPM.B  (A1)+,(A0)+					; Compare byte in key
+			BHI.S   DTKCIsGT					; search key > trial key
+			BLO.S   DTKCIsLT					; search key < trial key
+			SUBQ.B  #1,D1						; Count off one trial key character
+			SUBQ.B  #1,D0						; Count off one search key character
+			BEQ.S   @20							; If zero, stop comparison
+			TST.B   D1							; Reached end of trial key?
+			BNE.S   @10							; No - keep checking
+			BRA.S   DTKCIsGT					; Yes - search key > trial key
+@20			TST.B   D1							; Also reached end of trial key?
+			BNE.S   DTKCIsLT					; No - search key < trial key
+DTKCIsEQ	MOVEQ   #0,D0						; The two keys are equal
+			BRA.S   DTKCExit					; So we're done
+DTKCIsLT	MOVEQ   #-1,D0						; Search key < trial key
+			BRA.S   DTKCExit
+DTKCIsGT	MOVEQ   #1,D0						; Search key > trial key
+DTKCExit	MOVEM.L (SP)+,A0-A1/D1				; Restore scratch registers [leaves CC alone]
+			RTS									; And call it a day, leaving CC set from D0
+
+
+;________________________________________________________________________________
+;
+; Routine:		deepShitError
+;
+; Input:
+; Output:
+;
+; Function: 	Called when an error that shouldn't happen has, and the system
+;				is in an inconsistent state.
+;
+;				Called when our request for unmount notification fails.
+;				Called in an _enqueue fails in OpenDT
+;				Called if a _dequeue fails in CloseDT
+;________________________________________________________________________________
+
+deepShitError	proc
+	move.w		#HFSDSErr, d0
+	_SysError								; bye-bye
+	endproc
+
+	end

@@ -1,0 +1,1116 @@
+;
+;	File:		FXM.a
+;
+;	Contains:	These routines provide functions used to access and maintain
+;				file extents.
+;
+;	Written by:	Bill Bruffey
+;
+;	Copyright:	© 1985-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM1>	 4/1/92		kc		Export XFFlush.
+;									¥ Pre-SuperMario comments follow ¥
+;		 <2>	 9/10/91	JSM		Add a header.
+;	   <1.2>	  3/2/89	DNF		removed references to forROM; HFS now builds identically for ram
+;									or rom
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	  <¥1.1>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				 3/24/87	BB		Fixed bug in MapFBlock which was incorrectly calculating the
+;									starting logical block number (a word value was being added
+;									rather than a long word value). This fix rolls in patches S118
+;									in ROMAllFix and PM119 in ROM75Fix.
+;				10/27/86	BB		Vectored MapFBlock and XFSearch routines.
+;				 9/25/86	BB		Updated to use new MPW equate files.
+;				  1/9/86	BB		Added use of an option flags byte to TruncateFile. An option
+;									flag was defined to indicate 'truncate to end of extent'
+;									replacing the current use of the FlushOnly flag for that
+;									purpose.
+;				  1/8/86	BB		Added use of an option flags byte to ExtendFile. Two flags were
+;									defined indicating 'all or nothing' and 'contiguous' allocation
+;									requests. The ROM75 SetEOF patch supporting the 'all or nothing'
+;									allocation was integrated into the code.
+;				10/28/85	BB		TruncateFile now truncates based on the current state of the
+;									"FlushOnly" flag. If FlushOnly is set, the file is truncated at
+;									the end of the extent containing the new PEOF. If FlushOnly is
+;									not set, the file is truncated to the new PEOF rounded to the
+;									next allocation block. Truncate File now sets the PEOF in the
+;									FCB once new PEOF has been successfully mapped.
+;				10/25/85	BB		Added common FX set up routine. Added vectors for ROM versions.
+;				10/22/85	PWD		Fixed TruncateFile bug when starting deallocation in FCB ext.
+;									rec.
+;				10/17/85	BB		Replaced extent record BlockMoves with MOVE.L loops. XRUpdate
+;									now returns updated hints. ExtendFile no longer requires a
+;									re-map of the PEOF in order to add more than one extent.
+;				10/16/85	BB		Cleaned up some.
+;				 10/2/85	LAK		Code-saving pass.
+;				 10/1/85	LAK		MapFBlock now returns D0 as result code rather than end block+1.
+;				 9/26/85	PWD		Fixed bug in MapFBlock w. >512 byte allocation blocks
+;				 9/23/85	BB		Modified MapFBlock to save low level error code before calling
+;									SysError.
+;				 9/19/85	BB		Fixed another bug in TruncateFile, D3 was not being set up
+;									following a truncation of the last extent in the FCB.
+;				 9/17/85	BB		Fixed bug in TruncateFile, was not saving BTree hints.
+;				 8/27/85	BB		Added support for contiguous allocation.
+;				 7/10/85	BB		Added XFFlush subroutine and the necessary calls to it.
+;				 6/27/85	BB		Reworked MapFBlock. Added check in DeAllocFile to verify the
+;									CNode type.
+;				 6/22/85	PWD		Fixed MapFBlock bug in computation of available bytes
+;				 5/30/85	BB		Modified TruncateFile to handle a new PEOF = 0.
+;				 5/20/85	BB		Fixed bug in XFSearch, it wasn't checking for 'not found' result
+;									code from BTGetRecord.
+;				 5/15/85	BB		Fixed bug in ExtendFile, return code was getting trashed.
+;				 5/13/85	BB		Fixed PEOF stuff.
+;				 4/29/85	BB		Rewrote from Gary's initial version and added support for FCB
+;									resident extents.
+;
+
+;_________________________________________________________________________________
+;
+; External
+;  Routines:	 DeAllocFile  -  Deallocates all disk space for a given file.
+;				 ExtendFile   -  Extends the disk space allocated to a file.
+;				 FXMKeyCmp	  -  Compares two extent file keys.
+;				 MapFBlock	  -  Maps a file position into a physical disk
+;								 address.
+;				 TruncateFile -  Truncates the disk space allocated to a file.
+;
+; Internal
+;  Subroutines:  XFFlush	 -	 Flushes the extent BTree file.
+;				 XFSearch	 -	 Searches extent file (including the FCB resident
+;								 extent record) for a given file position.
+;				 XRSearch	 -	 Searches an extent record for a given file
+;								 allocation block number (FABN).
+;				 XRUpdate	 -	 Updates an extent record.
+;
+;_________________________________________________________________________________
+
+
+			BLANKS		ON
+			STRING		ASIS
+
+			PRINT		OFF
+			LOAD		'StandardEqu.d'
+			PRINT		ON
+			PRINT		NOGEN
+
+FXM 		PROC	EXPORT
+
+			EXPORT	DeAllocFile,Extendfile,FXMKeyCmp,MapFBlock,TruncateFile,XFFlush
+
+			EXPORT	vDeallocFile,vExtendFile,vMapFBlock,vTruncateFile,vXFSearch		;<27Oct86>
+
+			IMPORT	BTGetRecord,BTDelete,BTFlush,BTInsert,BtSearch,BTUpdate
+			IMPORT	BlkAlloc,BlkDealloc
+			IMPORT	CMGetCN
+			IMPORT	MarkVCB,FlushMDB
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		DeallocFile (Deallocate File)
+;
+; Function: 	De-allocates all disk space allocated to a specified file.
+;				The space occupied by both forks is deallocated.
+;
+; Input:		A2.L  -  VCB pointer
+;				D0.W  -  ParID
+;				A0.L  -  CName pointer
+;
+; Output:		D0.W  -  result code
+;							0 = ok
+;							other = error
+;
+; Called by:	DeleteFile
+;
+; Note: 		The extent records resident in catalog are not updated by DeallocFile.
+;				DeleteFile deletes the catalog record for the file after calling
+;				DeallocFile.
+;_________________________________________________________________________________
+
+DeallocFile
+			MOVE.L	jDeallocFile,-(SP)	; jump table entry for vDeallocFile 	<25Oct85>
+			RTS 						; go there								<25Oct85>
+vDeallocFile							; 'vectored' DeallocFile routine		<25Oct85>
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1-D7/A0-A1/A3-A4,-(A6) ; save registers
+
+			BSR 	FXSetUp 			; set up common stuff					<25Oct85>
+
+			MOVEA.L A0,A3				; A3 = ptr to Cname
+			MOVE.L	D0,D7				; D7 = ParID
+			CLR.B	D6					; D6 = initial fork type (0 = data fork)
+
+; Locate catalog record for file
+
+DFFkLoop
+			CLR.W	D4					; initial FABN
+
+			MOVEA.L A3,A0				; ptr to Cname
+			MOVE.L	D7,D0				; ParID
+			CLR.L	D2					; no hint
+			JSR 	CMGetCN 			; locate catalog record
+			BNE 	DFExit1 			; didn't get it ->
+
+			CMPI.B	#CMFilCN,cdrType(A1) ; file CNode?
+			BEQ.S	@1					; yes ->
+			MOVEQ	#CMnotfound,D0		; result = 'not found'						  <02Oct85>
+			BNE 	DFExit1 			; exit ->
+
+@1			MOVE.L	filFlNum(A1),D5 	; D5 = file number
+			LEA 	FXVxkrOff(A4),A0	; ptr to FXM key buffer
+			CLR.W	xkrFABN(A0) 		; indicate catalog resident extent record
+			TST.B	D6					; deleting the data fork?
+			BNE.S	@2					; no ->
+			LEA 	filExtRec(A1),A1	; position to data fork extent record
+			BRA.S	DFCopyRec			; copy extent record ->
+@2			LEA 	filRExtRec(A1),A1	; position to resource fork extent record
+			BRA.S	DFCopyRec			; copy extent record ->
+;
+; set up key for next extent file record
+;
+DFRecLoop
+			LEA 	FXVxkrOff(A4),A0	; A0 points to FXM key buffer
+			MOVE.B	#lenxkr-1,xkrKeyLen(A0) ; key length
+			MOVE.B	D6,xkrFkType(A0)	; fork type
+			MOVE.L	D5,xkrFNum(A0)		; file number
+			MOVE.W	D4,xkrFABN(A0)		; file alloc block number
+;
+; get the next extent record
+;
+			MOVE.W	VCBXTRef(A2),D0 	; extents file refnum
+			CLR.L	D2					; no hint
+
+			JSR 	BTSearch			; find the record
+			BEQ.S	DFCopyRec			; found it ->
+			CMPI.W	#BTnotfound,D0		; record not found?
+			BEQ.S	DFNxtFork			; yes, done with this fork ->
+			BRA.S	DFExit1 			; error ->
+;
+; copy extent data to FXM buffer
+;
+DFCopyRec
+			LEA 	FXVxdrOff(A4),A0	; dest = xdr buffer in fxm vars 		   <17Oct85>
+			MOVEQ	#(lenxdr/4)-1,D0	; loop index in long words				   <17Oct85>
+@1			MOVE.L	(A1)+,(A0)+ 		; Copy the record						   <17Oct85>
+			DBRA	D0,@1				;										   <17Oct85>
+;
+; release extents for this record
+;
+			LEA 	FXVxdrOff(A4),A1	; A1 = ptr to extent record 			   <17Oct85>
+			CLR.W	D1					; offset to 1st extent
+DFRelExt
+			MOVE.W	xdrStABN(A1,D1.W),D2 ; starting alloc blk number
+			MOVE.W	xdrNumABlks(A1,D1.W),D3 ; number of alloc blks
+			BEQ.S	DFDelRec			; extent not used, delete the record ->
+
+			JSR 	BlkDealloc			; deallocate the space
+			BNE.S	DFExit1 			; error ->
+
+			ADD.W	D3,D4				; bump FABN to beg of next extent
+
+			ADDQ.W	#lenExt,D1			; bump to next extent
+			CMPI.W	#maxExtOff,D1		; past last extent?
+			BLE.S	DFRelExt			; no, release next one ->
+;
+; delete extent record
+;
+DFDelRec
+			LEA 	FXVxkrOff(A4),A0	; A0 points to search key
+			TST.W	xkrFABN(A0) 		; catalog resident record?
+			BEQ.S	@1					; yes, nothing to delete ->
+
+			MOVE.W	VCBXTRef(A2),D0 	; extents file refnum
+			JSR 	BTDelete			; delete the record
+			BNE.S	DFExit1 			; error ->
+
+@1			TST.W	D3					; end with null extent entry?
+			BNE.S	DFRecLoop			; no, get next record for same fork ->
+;
+; finished with current fork, check for another one
+;
+DFNxtFork
+			NOT.B	D6					; just finished resource fork ($FF -> $00)? 	<02Oct85>
+			BNE		DFFkLoop			; $00 -> $FF: release space for resource fork	<02Oct85>
+;
+; clean up and exit
+;
+DFExit
+			CLR.W	D0					; result = ok
+			BSR 	XFFlush 			; flush the extent file
+DFExit1
+			ADD 	#lenFXVars,A6		; de-allocate memory for FXM vars				<02Oct85>
+			MOVEM.L (A6)+,D1-D7/A0-A1/A3-A4 ; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set up condition codes
+			RTS 						; exit DeallocFile
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		Extendfile
+;
+; Function: 	Extends the disk space allocated to a file.
+;
+; Input:		A2.L  -  VCB pointer
+;				A1.L  -  pointer to FCB array
+;				D1.W  -  file refnum
+;				D3.B  -  option flags
+;						   EFContig - force contiguous allocation
+;						   EFAll - allocate all requested bytes or none
+;				D4.L  -  number of additional bytes to allocate
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 -n = IO error
+;				D6.L  -  number of bytes allocated
+;
+; Called by:	FileAloc,FileWrite,SetEof
+;
+; Note: 		ExtendFile updates the PEOF in the FCB.
+;_________________________________________________________________________________
+
+ExtendFile
+			MOVE.L	jExtendFile,-(SP)  ; jump table entry for vExtendFile			 <25Oct85>
+			RTS 						; go there									 <25Oct85>
+vExtendFile 						   ; 'vectored' ExtendFile routine				 <25Oct85>
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1-D5/D7/A0-A4,-(A6) ; save regs
+
+			BSR 	FXSetUp 			; set up common stuff						 <25Oct85>
+
+			LEA 	0(A1,D1.W),A3		; A3 = FCB pointer
+			MOVE.L	FCBPLen(A3),-(A6)	; save previous PEOF
+;
+; Set up for type of allocation requested.
+;
+			BTST	#EFAll,D3			; all or nothing requested? 				 <08Jan86>
+			BEQ.S	@1					; no -> 									 <08Jan86>
+
+			MOVE.W	VCBFreeBks(A2),D0	; Compute free space in bytes				 <08Jan86>
+			MULU	VCBAlBlkSiz+2(A2),D0 ;											 <08Jan86>
+			CMP.L	D4,D0				; Compare against requested space			 <08Jan86>
+			BHS.S	@1					; If enough space free, go on ->			 <08Jan86>
+
+			MOVEQ	#DskFulErr,D0		; result = 'disk full'						 <08Jan86>
+			BRA 	EFExit1 			; exit	ExtendFile ->						 <08Jan86>
+
+@1			BSET	#FXVTContig,FXVFlags(A4) ;	1st try contig allocation			 <27Aug85>
+			BTST	#EFContig,D3		; forced contiguous requested?				 <08Jan86>
+			BEQ.S	@2					; no -> 									 <02Sep85>
+			BSET	#FXVFContig,FXVFlags(A4) ; yes, set flag						 <27Aug85>
+
+@2			MOVE.L	VCBAlBlkSiz(A2),D0	; round  the # of bytes requested
+			ADD.L	D0,D4				;
+			SUBQ.L	#1,D4				;
+			DIVU	D0,D4				;
+			MULU	D0,D4				; ...up to next alloc blk
+;
+; locate the extent mapping the new PEOF - 1 (last byte in file)
+;
+EFLocExt
+			MOVE.L	FCBPLen(A3),D0		; current PEOF
+			ADD.L	D4,D0				;	 + # of bytes requested = new PEOF
+			SUBQ.L	#1,D0				; new PEOF - 1 = last byte in file
+			BSR 	XFSearch			; locate the extent
+			BNE.S	@1					; didn't find it ->
+
+			ADD.L	D4,FCBPLen(A3)		; update PEOF
+			BSET	#FCBModBit,FCBMdRByt(A3) ; mark FCB dirty
+			BRA 	EFExit				; all done ->
+
+@1			CMPI.W	#FXRangeErr,D0		; out of range?
+			BNE 	EFExit1 			; no, some error ->
+
+			MOVE.L	D2,D7				; D7 = BTree hint
+			MOVE.W	D3,D6				; D6 = ending FABN +1
+;
+; adjust PEOF to end of extent
+;
+			MOVE.W	D6,D0				; (ending FABN + 1)
+			MULU	VCBAlBlkSiz+2(A2),D0 ;	  in bytes = max PEOF for extent
+			SUB.L	FCBPlen(A3),D0		; PEOF already at end of extent?
+			BEQ.S	EFAddSpace			; yes ->
+			ADD.L	D0,FCBPlen(A3)		; no, adjust PEOF to end of extent
+			BSET	#FCBModBit,FCBMdRByt(A3) ; mark FCB dirty
+			SUB.L	D0,D4				; adjust remaining count
+;
+; allocate additional disk space
+;
+EFAddSpace
+			MOVE.W	xdrStABN(A1,D1.W),D5 ; starting alloc blk number
+			ADD.W	xdrNumABlks(A1,D1.W),D5 ;	 + # of blks = last blk +1
+
+@1			MOVE.W	D5,D2				; preferred starting blk = last blk + 1
+			BTST	#FXVTContig,FXVFlags(A4) ; are we trying for contig 			 <27Aug85>
+			SNE 	D3					; yes, set flag for BlkAlloc				 <27Aug85>
+			JSR 	BlkAlloc			; allocate the disk space					 <27Aug85>
+			BEQ.S	EFExtExt			; got it -> 								 <27Aug85>
+
+			CMPI.W	#DskFulErr,D0		; disk full error?							 <27Aug85>
+			BNE 	EFExit1 			; no, some other error ->					 <27Aug85>
+			BCLR	#FXVTContig,FXVFlags(A4) ; did we just try for contig?			 <27Aug85>
+			BEQ 	EFExit1 			; no, must be out of space ->				 <27Aug85>
+			BTST	#FXVFContig,FXVFlags(A4) ; forced contig requested? 			 <27Aug85>
+			BNE 	EFExit1 			; yes, could't get it ->                     <27Aug85>
+			BRA.S	@1					; try non-contig -> 						 <27Aug85>
+;
+; got some space, see if current extent can be extended
+;
+EFExtExt
+			CMP.W	D2,D5				; get preferred space?
+			BNE.S	EFAddExt			; no, must add an extent ->
+			ADD.W	D3,xdrNumABlks(A1,D1.W) ; add new blks to current extent
+			BRA.S	EFUpdExt			; use common code ->						  <17Oct85>
+;
+; add a new extent entry
+;
+EFAddExt
+			TST.W	xdrNumABlks(A1,D1.W) ; current extent null?
+			BEQ.S	@1					; yes, use it ->
+			ADDQ.W	#lenExt,D1			; bump to next extent
+			CMPI.W	#maxExtOff,D1		; past last extent?
+			BGT.S	EFNewRec			; yes, must add new record? ->
+
+@1			MOVE.W	D2,xdrStABN(A1,D1.W) ; set starting alloc blk #
+			MOVE.W	D3,xdrNumABlks(A1,D1.W) ; ...and # of blks
+;
+; update the extent record
+;
+EFUpdExt
+			MOVE.L	D7,D2				; BTree hint
+			BSR 	XRUpdate			; update the extent record
+			BNE 	EFExit1 			; error ->
+			MOVE.L	D2,D7				; D7 = new hint 							   <17Oct85>
+			BRA.S	EFUpdFCB			; go update FCB ->
+;
+; add a new extent record
+;
+EFNewRec
+			MOVE.L	FCBFlNm(A3),D5		; D5 = file number
+			CMPI.L	#FSXtCNID,D5		; mapping the extents file?
+			BNE.S	@1					; no ->
+			MOVEQ	#FXOvFlErr,D0		; result = 'extent file overflow'			   <16Oct85>
+			BRA.S	EFExit1 			; exit ->
+
+@1			LEA 	FXVxkrOff(A4),A0	; point to FXM buffer
+			LEA 	FXVxdrOff(A4),A1	;
+			MOVE.B	#lenxkr-1,xkrKeyLen(A0) ; key length
+			CLR.B	xkrFkType(A0)		;assume data fork
+			BTST	#FCBRscBit,FCBMdRByt(A3) ; mapping resource fork?
+			SNE 	xkrFkType(A0)		; yes, set resource fork flag
+			MOVE.L	D5,xkrFNum(A0)		; file number
+			MOVE.W	D6,xkrFABN(A0)		; starting file allocation blk #
+
+			MOVE.W	#(lenxdr/2)-1,D0	; clear new extent record
+@2			CLR.W	(A1)+				;
+			DBRA	D0,@2				;
+
+			LEA 	FXVxdrOff(A4),A1	; restore ptr to xdr
+			CLR.W	D1					; offset to 1st extent in record
+			MOVE.W	D2,xdrStABN(A1,D1.W) ; set starting alloc blk #
+			MOVE.W	D3,xdrNumABlks(A1,D1.W) ; ...and # of blks
+
+			MOVE.L	D1,-(A6)			; save D1									   <17Oct85>
+			MOVE.W	#lenxdr,D1			; record length
+			MOVE.W	VCBXTRef(A2),D0 	; extents file refnum
+			JSR 	BTInsert			; insert the new record
+			MOVE.L	(A6)+,D1			; restore D1								   <17Oct85>
+			TST.W	D0					; restore BTInsert result					   <17Oct85>
+			BNE.S	EFExit1 			; error ->
+			MOVE.L	D2,D7				; D7 = new hint 							   <17Oct85>
+;
+; finished with this extension, update FCB and see if more space is needed
+;
+EFUpdFCB
+			ADD.W	D3,D6				; update ending FABN + 1					   <17Oct85>
+
+			MULU	VCBAlBlkSiz+2(A2),D3 ; convert # of blks allocated to bytes
+			ADD.L	D3,FCBPlen(A3)		; adjust PEOF to include new space
+			BSET	#FCBModBit,FCBMdRByt(A3) ; mark FCB dirty
+
+			SUB.L	D3,D4				; allocated enough space?
+			BGT		EFAddSpace			; no, do it again ->						   <17Oct85>
+
+			ADD.L	D4,FCBPLen(A3)		; adjust PEOF to alloc blk boundry
+;
+; clean up and exit
+;
+EFExit
+			CLR.W	D0					; result = ok
+			BSR 	XFFlush 			; flush the extent file
+EFExit1
+			MOVE.L	FCBPLen(A3),D6		; new PEOF
+			MOVE.L	(A6)+,D1			;	 - previous PEOF
+			SUB.L	D1,D6				;	 = #  of bytes allocated
+
+			ADD 	#lenFXVars,A6		; de-allocate memory for FXM vars			   <02Oct85>
+			MOVEM.L (A6)+,D1-D5/D7/A0-A4 ; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set condition codes
+			RTS 						; exit ExtendFile
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		FXMKeyCmp (FXM Key Compare)
+;
+; Function: 	Compares two extent file keys (a search key and a trial key).
+;
+; Input:		A0.L  -  search key pointer
+;				A1.L  -  trial key pointer
+;
+; Output:		D0.W  -  result code
+;							 +n  search key > trial key
+;							  0  search key = trial key
+;							 -n  search key < trial key
+;_________________________________________________________________________________
+
+FXMKeyCmp
+			MOVEM.L A0-A1,-(SP) 		; save registers
+
+			MOVE.L	 2(A0),D0			; compare file ID's
+			CMP.L	 2(A1),D0			;
+			BHI.S	 KCIsGT 			; search fileNum > trial fileNum ->
+			BCS.S	 KCIsLT 			; search fileNum < trial fileNum -> 			  <02Oct85>
+;
+; file ID's are equal, compare fork types
+;
+			MOVE.B	 1(A0),D0			; Get search key fork type
+			CMP.B	 1(A1),D0			; Compare against trial fork type
+			BHI.S	 KCIsGT 			; search key fork type > trial key fork type
+			BCS.S	 KCIsLT 			; search key fork type < trial key fork type	   <02Oct85>
+;
+; fork types are equal; compare the starting block numbers
+;
+			MOVE.W	 6(A0),D0			; compare block numbers
+			CMP.W	 6(A1),D0			;
+			BHI.S	 KCIsGT 			; search block # > trial block # ->
+			BCS.S	 KCIsLT 			; search block # < trial block # -> 				<02Oct85>
+KCIsEQ
+			CLR.W	 D0 				; result = "equal"
+			BRA.S	 KCExit
+KCIsLT
+			MOVE.W	 #-1,D0 			; result = "less than"
+			BRA.S	 KCExit
+KCIsGT
+			MOVE.W	 #+1,D0 			; result = "greater than"
+KCExit
+			MOVEM.L (sp)+,A0-A1 		; restore registers
+			TST.W	 D0 				; set up condition codes
+			RTS 						; exit FXMKeyCmp
+
+
+;_________________________________________________________________________________
+;
+; Routine:		MapFBlock
+;
+; Function: 	Maps a file position into a physical disk address.
+;
+; Input:		A2.L  -  VCB pointer
+;				(A1,D1.W)  -  FCB pointer
+;				D4.L  -  number of bytes desired
+;				D5.L  -  file position (byte address)
+;
+; Output:		D3.L  -  physical start block
+;				D6.L  -  number of contiguous bytes available (up to D4 bytes)
+;				D0.L  -  result code												<01Oct85>
+;						   0 = ok
+;						   FXRangeErr = file position beyond mapped range			<17Oct85>
+;						   FXOvFlErr = extents file overflow						<17Oct85>
+;						   other = error											<17Oct85>
+;
+; Called By:	Log2Phys (read/write in place), Cache (map a file block).
+;_________________________________________________________________________________
+
+MapFBlock
+			MOVE.L	jMapFBlock,-(SP)	; jump table entry for vMapFBlock 	<27Oct86>
+			RTS 						; go there							<27Oct86>
+vMapFBlock								; 'vectored' MapFBlock routine		<27Oct86>
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1-D2/D4-D5/D7/A0-A1/A3-A4,-(A6) ; save registers
+
+			BSR 	FXSetUp 			; set up common stuff						<25Oct85>
+
+			LEA 	0(A1,D1.W),A3		; A3 = FCB pointer
+;
+; locate the extent mapping the desired file position
+;
+			MOVE.L	D5,D0				; file position
+			BSR 	XFSearch			; locate the extent
+			BNE.S	MFExit				; exit on errors
+
+			LEA 	0(A1,D1.W),A1		; A1 = ptr to extent entry
+			MOVE.W	D3,D1				; D1 = beg FABN for extent
+			SUB.W	xdrNumABlks(A1),D1	;
+			MOVE.W	D3,D2				; D2 = end FABN in extent + 1
+;
+; determine end of available space (PEOF or end of extent)
+;
+			MULU	VCBAlBlkSiz+2(A2),D2 ; convert end FABN + 1 to file pos
+			MOVE.L	FCBPLen(A3),D0		; get PEOF
+			CMP.L	D0,D2				; end of extent > PEOF?
+			BLE.S	@1					; no, use end of extent ->
+			MOVE.L	D0,D2				; yes, use PEOF
+
+@1			DIVU	VCBAlBlkSiz+2(A2),D2 ; D2 = end of avail space ( end FABN + 1)
+;
+; set up some constants
+;
+			MOVE.L	VCBAlBlkSiz(A2),D6	; D6 =	# blks per alloc blk
+			DIVU	#512,D6 			;
+
+			MOVEQ	#0,D7				; D7 = start blk # for alloc blks
+			MOVE.W	VCBAlBlSt(A2),D7	;
+;
+; calculate physical start block
+;
+			MOVE.L	D5,D3				; file position / alloc blk size
+			DIVU	VCBAlBlkSiz+2(A2),D3 ;	= FABN mapping file position
+			SWAP	D3					; Get remainder in low word 				 <PWD 26Sep85>
+			MOVEQ	#0,D0				; Clear top word to get remainder as long	 <PWD 26Sep85>
+			MOVE.W	D3,D0				; Compute block offset within alloc block	 <PWD 26Sep85>
+			LSR.L	#8,D0				; 'divide' by 256							 <PWD 26Sep85>
+			LSR.L	#1,D0				; and again by 2 to get size in phys. blocks <PWD 26Sep85>
+			SWAP	D3					; Restore D3 for use						 <PWD 26Sep85>
+			SUB.W	D1,D3				;	- beg FABN = alloc blk delta
+			ADD.W	xdrStABN(A1),D3 	;	+ starting ABN = ABN mapping file pos
+			MULU	D6,D3				; convert to physical block #
+			ADD.L	D0,D3				; Offset in physical blocks within alloc. blk	<24Mar87>
+			ADD.L	D7,D3				;
+;
+; calculate number of available bytes
+;
+			MOVE.W	D2,D6				; end FABN + 1 * alloc blk size
+			MULU	VCBAlBlkSiz+2(A2),D6 ;	 = ending file pos + 1
+			SUB.L	D5,D6				;	 - file position = size avail
+
+			CMP.L	D4,D6				; compare with desired number
+			BCS.S	mFBlockOK			; < D4 bytes, leave it alone					<02Oct85>
+			MOVE.L	D4,D6				; > D4 bytes, set to D4 bytes
+
+mFBlockOK	MOVEQ	#0,D0				; we're ok                                      <01Oct85>
+;
+; clean up and exit
+;
+MFExit
+			ADD 	#lenFXVars,A6		; de-allocate memory for FXM vars				<02Oct85>
+			MOVEM.L (A6)+,D1-D2/D4-D5/D7/A0-A1/A3-A4 ; restore registers
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set CCR for result							<01Oct85>
+			RTS 						; exit MapFBlock
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Routine:		TruncateFile
+;
+; Function: 	Truncates the disk space allocated to a file.  The file space is
+;				truncated a specified new PEOF rounded up to the next allocation block
+;				boundry.  If the 'TFTrunExt' option is specified, the file is truncated
+;				to the end of the extent containing the new PEOF.
+;
+; Input:		A2.L  -  VCB pointer
+;				A1.L  -  pointer to FCB array
+;				D1.W  -  file refnum
+;				D2.B  -  option flags
+;						   TFTrunExt - truncate to the extent containing new PEOF
+;				D3.L  -  new PEOF
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 -n = IO error
+;
+; Note: 		TruncateFile updates the PEOF in the FCB.
+;_________________________________________________________________________________
+
+TruncateFile
+			MOVE.L	jTruncateFile,-(SP) ; jump table entry for vTruncateFile	   <25Oct85>
+			RTS 						; go there								   <25Oct85>
+vTruncateFile							; 'vectored' TruncateFile routine		   <25Oct85>
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1-D7/A0-A4,-(A6)	; save registers
+
+			BSR 	FXSetUp 			; set up common stuff					   <25Oct85>
+
+			LEA 	0(A1,D1.W),A3		; A3 = FCB pointer
+			MOVE.B	D2,D6				; D6 = option flags 					   <09Jan86>
+;
+; locate the extent mapping the last byte of the truncated file
+;
+TFLocExt
+			MOVE.L	D3,D5				; D5 = new PEOF
+			MOVE.L	VCBAlBlkSiz(A2),D0	; round  the new PEOF
+			ADD.L	D0,D5				;
+			SUBQ.L	#1,D5				;
+			DIVU	D0,D5				;
+			MULU	D0,D5				; ...up to next alloc blk
+
+			MOVE.L	D5,D0				; new PEOF - 1 = last byte in file
+			SUBQ.L	#1,D0				;
+			BGE.S	@1					; new PEOF > 0 ->
+
+			MOVE.L	D5,FCBPlen(A3)		; update PEOF in FCB						 <28Oct85>
+			BSET	#FCBModBit,FCBMdRByt(A3) ; mark FCB dirty						 <28Oct85>
+
+			SUBA.L	A0,A0				; indicate FCB resident record
+			MOVEQ	#0,D7				; no hint
+			LEA 	FCBExtRec(A3),A1	; point to FCB extent record
+			CLR.W	D4					; last FABN in extent + 1
+			BRA 	TFRelExt			; release all extents ->					 <28Oct85>
+
+@1			BSR 	XFSearch			; locate the extent
+			BNE 	TFExit1 			; error ->
+
+			MOVE.L	D2,D7				; D7 = BTree hint
+			MOVE.W	D3,D4				; D4 = last FABN in extent + 1
+
+			MOVE.L	D5,FCBPlen(A3)		; update PEOF in FCB						 <28Oct85>
+			BSET	#FCBModBit,FCBMdRByt(A3) ; mark FCB dirty						 <28Oct85>
+
+			BTST	#TFTrunExt,D6		; truncate to end of extent?				 <09Jan86>
+			BEQ.S	TFTrunPEOF			; no, truncate to new PEOF ->				 <09Jan86>
+
+			MOVE.W	xdrNumABlks(A1,D1.W),D3 ; D3 = # of blks in extent				 <28Oct85>
+			BRA 	TFRelRExt			; release remaining extents in record ->	 <28Oct85>
+;
+; truncate extent containing new PEOF
+;
+TFTrunPEOF
+			MOVE.L	D5,D0				; new PEOF - 1 (last byte in file)
+			SUBQ.L	#1,D0				;
+			DIVU	VCBAlBlkSiz+2(A2),D0 ;	  / alloc blk size = last FABN in file
+			SUB.W	D0,D3				; (last extent FABN +1) - (last file FABN)
+			SUBQ.W	#1,D3				;	 - 1 = # to deallocate
+			BEQ.S	@1					; nothing to deallocate ->
+			MOVE.W	xdrStABN(A1,D1.W),D2 ; starting ABN
+			ADD.W	xdrNumABlks(A1,D1.W),D2 ;	 + # alloc blks in extent
+			SUB.W	D3,D2				;		 - # to dealloc = starting ABN
+			JSR 	BlkDealloc			; deallocate the space
+			BNE 	TFExit1 			; error ->
+
+@1			MOVE.W	D3,D0				; D0 = # of blks deallocated				  <19Sep85>
+			MOVE.W	xdrNumABlks(A1,D1.W),D3 ; D3 = orig # of blks					  <19Sep85>
+			SUB.W	D0,xdrNumABlks(A1,D1.W) ; update # of blks in extent			  <19Sep85>
+			BNE.S	TFRelRExt			; extent not empty ->
+			CLR.W	xdrStABN(A1,D1.W)	; set extent null
+			BRA.S	TFRelRExt			; release remaining extents in record ->
+;
+; get the next extent record in BTree
+;
+TFLoop
+			LEA 	FXVxkrOff(A4),A0	; A0 points to search key buffer
+			MOVE.B	#lenxkr-1,xkrKeyLen(A0) ; key length
+			BTST	#FCBRscBit,FCBMdRByt(A3) ; mapping resource fork?				  <09Jan86>
+			SNE 	xkrFkType(A0)		; yes, indicate resource fork				  <09Jan86>
+			MOVE.L	FCBFlNm(A3),xkrFNum(A0) ; file number
+			MOVE.W	D4,xkrFABN(A0)		; file alloc block number
+
+			MOVE.W	VCBXTRef(A2),D0 	; extents file refnum
+			CLR.L	D2					; no hint
+			JSR 	BTSearch			; find the record
+			BEQ.S	@1					; found it ->
+			CMPI.W	#BTnotfound,D0		; record not found?
+			BEQ.S	TFExit				; yes, all done ->								<28Oct85>
+			BRA.S	TFExit1 			; error ->
+
+@1			MOVE.L	D2,D7				; save hint in D7								<17Sep85>
+
+			LEA 	FXVxdrOff(A4),A0	; dest = xdr buffer in fxm vars 				<17Oct85>
+			MOVEQ	#(lenxdr/4)-1,D0	; loop index in long words						<17Oct85>
+@2			MOVE.L	(A1)+,(A0)+ 		; Copy the record into FXM buffer				<17Oct85>
+			DBRA	D0,@2				;												<17Oct85>
+
+			LEA 	FXVxkrOff(A4),A0	; A0 = ptr to search key						<28Oct85>
+			LEA 	FXVxdrOff(A4),A1	; A1 = ptr to extent record 					<28Oct85>
+;
+; release extents for this record
+;
+TFRelExt
+			CLR.W	D1					; offset to 1st extent							<22Oct85>
+TFRelNxt
+			MOVE.W	xdrStABN(A1,D1.W),D2 ; starting alloc blk number
+			MOVE.W	xdrNumABlks(A1,D1.W),D3 ; number of alloc blks
+			BEQ.S	TFUpdRec			; extent not used, update the record ->
+
+			JSR 	BlkDealloc			; deallocate the space
+			BNE.S	TFExit1 			; error ->
+
+			CLR.L	xdrStABN(A1,D1.W)	; set the extent null
+			ADD.W	D3,D4				; bump FABN to beg of next extent
+TFRelRExt
+			ADDQ.W	#lenExt,D1			; bump to next extent
+			CMPI.W	#maxExtOff,D1		; past last extent?
+			BLE.S	TFRelNxt			; no, release next one ->
+;
+; update extent record
+;
+TFUpdRec
+			TST.W	xdrNumABlks(A1) 	; 1st extent null?
+			BEQ.S	@1					; yes, delete record ->
+
+			MOVE.L	D7,D2				; BTree hint
+			BSR 	XRUpdate			; update the record
+			BRA.S	@2					;
+
+@1			MOVE.L	A0,D0				; FCB resident record?
+			BEQ.S	@2					; yes, nothing to delete ->
+			MOVE.W	VCBXTRef(A2),D0 	; extents file refnum
+			JSR 	BTDelete			; delete the record
+			BNE.S	TFExit1 			; error ->
+
+@2			TST.W	D3					; end with null extent entry?
+			BNE		TFLoop				; no, continue with next record ->
+;
+; clean up and exit
+;
+TFExit
+			CLR.W	D0					; result = ok
+			BSR.S	XFFlush 			; flush the extent file 					<02Oct85>
+TFExit1
+			ADD 	#lenFXVars,A6		; de-allocate memory for FXM vars			<02Oct85>
+			MOVEM.L (A6)+,D1-D7/A0-A4	; restore registers
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set condition codes
+			RTS 						; exit TruncateFile
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Internal Subroutines
+;_________________________________________________________________________________
+
+
+
+;__________________________________________________________________________________
+;
+; Subroutine:	FXSetUp (FXM Set Up)
+;
+; Function: 	Sets up for all FXM calls.	Space for the FXM variable storage area
+;				(FXVars) is allocated on the A6 stack.	The status flags in FXVars
+;				are also cleared.
+;
+; Input:		none
+;
+; Output:		A4.L  -  pointer to FXVars
+;__________________________________________________________________________________
+
+FXSetUp
+			SUB 	#lenFXVars,A6		; allocate memory for FXM vars				 <25Oct85>
+			MOVEA.L A6,A4				; A4 = pointer to FXM vars					 <25Oct85>
+
+			CLR.B	FXVFlags(A4)		; clear all flags							 <25Oct85>
+
+			RTS 						; exit FXSetUp								 <25Oct85>
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Subroutine:	XFFlush (Extent File Flush)
+;
+; Function: 	Flushes the extent file for a specified volume.
+;
+;
+; Input:		A2.L  -  VCB pointer
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 other = error
+;_________________________________________________________________________________
+
+XFFlush
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1/A1,-(A6) 		; save registers
+
+			MOVE.W	VCBXTRef(A2),D1 	; D1 = refnum of extent file
+
+			MOVE.W	D1,D0				; flush the extent BTree
+			JSR 	BTFlush 			;
+			BNE.S	FFExit1 			; error ->
+
+			MOVEA.L FCBSPtr,A1			; FCB dirty?
+			BTST	#FCBModBit,FCBMdRByt(A1,D1.W) ;
+			BEQ.S	FFExit				; no, all done ->
+
+			JSR 	MarkVCB 			; Mark the VCB dirty
+
+			JSR 	FlushMDB			; flush the MDB
+			BNE.S	FFExit1 			; error ->
+FFExit
+			CLR.W	D0					; result ='ok'
+FFExit1
+			MOVEM.L (A6)+,D1/A1 		; restore registers
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit XFFlush
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Subroutine:	XFSearch (Extent File Search)
+;
+; Function: 	Searches extent file (including the FCB resident extent record)
+;				for the extent mapping a given file position.
+;
+; Input:		A2.L  -  VCB pointer
+;				A3.L  -  FCB pointer
+;				A4.L  -  pointer to FXM vars
+;				D0.L  -  file position (byte address)
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 FXRangeErr = file position beyond mapped range
+;							 other = error
+;				A0.L  -  pointer to extent key record (xkr)
+;							0 = FCB resident extent record
+;				A1.L  -  pointer to extent data record(xdr)
+;				D1.L  -  offset to extent entry in xdr
+;							result =  0, offset to extent mapping desired FABN
+;							result = FXRangeErr, offset to last extent in record
+;				D2.L  -  BTree hint for extent record
+;				D3.W  -  ending FABN +1
+;_________________________________________________________________________________
+
+XFSearch
+			MOVE.L	jXFSearch,-(SP)		; jump table entry for vXFSearch 	<27Oct86>
+			RTS 						; go there							<27Oct86>
+vXFSearch								; 'vectored' XFSearch routine		<27Oct86>
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D4-D6,-(A6) 		; save regs
+
+			MOVE.L	D0,D4				; D4 = file position to be mapped
+			DIVU	VCBAlBlkSiz+2(A2),D4 ; convert to FABN
+
+			MOVE.L	FCBFlNm(A3),D5		; D5 = file number
+;
+; search FCB extent record first
+;
+FSSchFCB
+			SUBA.L	A0,A0				; indicate FCB resident record
+			MOVEQ	#0,D2				; no hint
+			LEA 	FCBExtRec(A3),A1	; point to extent record
+			MOVE.W	D4,D0				; desired FABN
+			CLR.W	D3					; starting FABN
+			BSR 	XRSearch			; search record for extent entry
+			BEQ 	FSExit				; found it ->
+
+			CMP.W	#maxExtOff,D1		; end before last extent entry?
+			BLT 	FSExit1 			; yes, no more extents ->
+			TST.W	xdrNumABlks(A1,D1.W) ; end with a null extent?
+			BEQ 	FSExit1 			; yes, no more extents ->
+
+			CMPI.L	#FSXtCNID,D5		; mapping the extents file?
+			BEQ 	FSExit1 			; yes, no more extents ->
+;
+; locate desired record in extents file
+;
+FSSchFile
+			LEA 	FXVxkrOff(A4),A0	; A0 = ptr to key buffer
+			MOVE.B	#lenxkr-1,xkrKeyLen(A0) ; key length
+			BTST	#FCBRscBit,FCBMdRByt(A3) ; mapping resource fork?
+			SNE 	D6					; yes, set resource fork flag			<02Oct85>
+			MOVE.B	D6,xkrFkType(A0)	; D6 = fork flag						<02Oct85>
+			MOVE.L	D5,xkrFNum(A0)		; file number
+			MOVE.W	D4,xkrFABN(A0)		; desired file allocation blk #
+
+			MOVE.W	VCBXTRef(A2),D0 	; extents file refnum
+			CLR.L	D2					; no hint
+			JSR 	BTSearch			; search BTree for extent record
+			BEQ.S	FSCopyRec			; a direct hit ->
+			CMPI.W	#BTnotfound,D0		; result = 'not found'?
+			BNE.S	FSExit1 			; no, error ->
+
+			MOVE.W	VCBXTRef(A2),D0 	; extents file refnum
+			MOVEQ	#-1,D1				; indicate previous record
+			JSR 	BTGetrecord 		; get previous extent record
+			BEQ.S	@1					; got it ->
+			CMPI.W	#BTnotfound,D0		; result = 'not found'?
+			BEQ.S	FSMissed			; yes, no extent record ->
+			BRA.S	FSExit1 			; error ->
+
+@1			CMP.L	xkrFNum(A0),D5		; same file?
+			BNE.S	FSMissed			; no ->
+			CMP.B	xkrFkType(A0),D6	; same fork?
+			BEQ.S	FSCopyRec			; yes, we got it ->
+;
+; didn't find extent record in BTree, return pointing to last extent in FCB
+;
+FSMissed
+			SUBA.L	A0,A0				; indicate FCB resident record
+			MOVEQ	#0,D2				; no hint
+			LEA 	FCBExtRec(A3),A1	; point to FCB extent record
+			MOVE.W	#maxExtOff,D1		; the last extent
+			MOVEQ	#FXRangeErr,D0		; result = 'range error'				<02Oct85>
+			BRA.S	FSExit1 			; exit ->
+;
+;found extent record, copy the key and data records into FXM vars
+;
+FSCopyRec
+			MOVE.L	A1,-(SP)			; save ptr(xdr) in cache buffer
+			LEA 	FXVxkrOff(A4),A1	; dest = key buffer in FXM vars 	   <17Oct85>
+			MOVEQ	#(lenxkr/4)-1,D0	; loop index in long words			   <17Oct85>
+@1			MOVE.L	(A0)+,(A1)+ 		; Copy the key record				   <17Oct85>
+			DBRA	D0,@1				;									   <17Oct85>
+
+			MOVEA.L (SP)+,A0			; source = xdr in cache buffer
+			LEA 	FXVxdrOff(A4),A1	; dest = xdr in FXM vars
+			MOVEQ	#(lenxdr/4)-1,D0	; loop index in long words			   <17Oct85>
+@2			MOVE.L	(A0)+,(A1)+ 		; Copy the data record				   <17Oct85>
+			DBRA	D0,@2				;									   <17Oct85>
+
+			LEA 	FXVxkrOff(A4),A0	; A0 = ptr to xkr in FXM vars		   <17Oct85>
+			LEA 	FXVxdrOff(A4),A1	; A1 = ptr to xdr in FXM vars		   <17Oct85>
+			MOVE.W	xkrFABN(A0),D3		; D3 = beg FABN for extent record
+
+;  search record for desired extent entry
+
+FSSchRec
+			MOVE.W	D4,D0				; desired FABN
+
+			BSR.S 	XRSearch			; search record for desired FABN	   <17Oct85>
+			BNE.S	FSExit1 			; didn't find it ->
+
+; clean up and exit
+
+FSExit
+			CLR.W	D0					; result = ok
+FSExit1
+			MOVEM.L (A6)+,D4-D6 		; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set condition codes
+			RTS 						; exit XFSearch
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Subroutine:	XRSearch (Extent Record Search)
+;
+; Function: 	Searches extent record for the extent mapping a given file
+;				allocation block number (FABN).
+;
+; Input:		D0.W  -  desired FABN
+;				A1.L  -  pointer to extent data record (xdr)
+;				D3.W  -  beginning FABN for extent record
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 FXRangeErr = desired FABN > last mapped FABN in record
+;				D1.L  -  offset to extent entry within xdr
+;							result = 0, offset to extent mapping desired FABN
+;							result = FXRangeErr, offset to last extent in record
+;				D3.W  -  ending FABN +1
+;_________________________________________________________________________________
+
+XRSearch
+			MOVE.L	D2,-(SP)			; save regs
+			MOVE.W	D0,D2				; D2 = desired FABN
+			CLR.W	D1					; D1 = initial offset
+
+@1			MOVE.W	xdrNumABlks(A1,D1.W),D0 ; number of alloc blks in extent
+			BEQ.S	@2					; null extent ->
+
+			ADD.W	D0,D3				; ending FABN + 1
+			CMP.W	D2,D3				; desired FAB within this extent?
+			BHI.S	RSExit				; yes, all done ->
+			ADDQ.W	#lenExt,D1			; bump to next extent
+			CMPI.W	#maxExtOff,D1		; past last extent?
+			BLE.S	@1					; no, continue search ->
+
+@2			SUBQ.W	#lenExt,D1			; back up to previous extent
+			BGE.S	@3					; still within the record ->
+			CLR.W	D1					; reset to 1st extent
+@3			MOVEQ	#FXRangeErr,D0		; result = 'range error'				<02Oct85>
+			BRA.S	RSExit1 			; exit ->
+RSExit
+			CLR.W	D0					; result = ok
+RSExit1
+			MOVE.L	(SP)+,D2			; restore regs
+			TST.W	D0					; set condition codes
+			RTS 						; exit XRSearch
+
+
+
+
+
+;_________________________________________________________________________________
+;
+; Subroutine:	XRUpdate (Extent Record Update)
+;
+; Function: 	Updates the current extent record.	For the FCB resident record,
+;				the FCB is marked 'dirty'.	For an extents file record, the
+;				corresponding BTree record is re-located and updated.
+;
+; Input:		A2.L  -  VCB pointer
+;				A3.L  -  FCB pointer
+;				A4.L  -  pointer to FXM vars
+;				A0.L  -  pointer to extent key record (xkr)
+;							0 = FCB resident extent record
+;				A1.L  -  pointer to extent data record(xdr)
+;				D2.L  -  BTree hint for extent record
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 other = error
+;				D2.L  -  updated BTree hint for extent record						<17Oct85>
+;_________________________________________________________________________________
+
+XRUpdate
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1/A0-A1,-(A6)		; save registers							 <17Oct85>
+
+			MOVE.L	A0,D0				; FCB resident record?
+			BNE.S	RUUpdFile			; no, must update extents file ->
+			BSET	#FCBModBit,FCBMdRByt(A3) ; mark FCB dirty
+			BRA.S	RUExit				; all done, exit ->
+
+RUUpdFile
+			MOVE.W	VCBXTRef(A2),D0 	; extents file refnum
+			JSR 	BTSearch			; re-locate the extent file record
+			BNE.S	RUExit1 			; error ->
+
+			LEA 	FXVxdrOff(A4),A0	; source = xdr in FXM vars
+			MOVEQ	#(lenxdr/4)-1,D0	; loop index in long words					 <17Oct85>
+@2			MOVE.L	(A0)+,(A1)+ 		; update the xdr in cache buffer			 <17Oct85>
+			DBRA	D0,@2				;											 <17Oct85>
+
+			MOVE.W	VCBXTRef(A2),D0 	; extents file refnum
+			JSR 	BTUpdate			; update BTree record
+			BNE.S	RUExit1 			; error ->
+RUExit
+			CLR.W	D0					; result = 'ok'
+RUExit1
+			MOVEM.L (A6)+,D1/A0-A1		; restore registers 						  <17Oct85>
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set condition codes
+			RTS 						; exit XRUpdate
+
+
+			END 
+

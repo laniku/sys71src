@@ -1,0 +1,610 @@
+;
+;	File:		TFSRFN1.a
+;
+;	Contains:	This file contains routines using refnums.
+;
+;	Copyright:	© 1982-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM5>	 8/27/93	BH		Removed <SM4>. The flushing stuff is now in CmdDone.
+;	   <SM4>	  8/3/93	BH		Flushing critical volume info when changed for a volume in a
+;									manual-eject drive.
+;	   <SM3>	 10/26/92	CSS		We now flush on chip caches after we do a read and before we
+;									do a write. Also, make a short branch into a word branch.
+;	   <SM2>	 5/21/92	kc		Append "Trap" to the names of GetFPosTrap and SetFPosTrap to
+;									avoid name conflict with the glue.
+;	   <SM1>	 4/1/92		kc		Checked in from Reality.
+;									¥ Pre-SuperMario comments follow ¥
+;		 <2>	 9/12/91	JSM		Add a header.
+;	   <1.4>	 4/13/89	DNF		Vectored FileRead and FileWrite.
+;	   <1.3>	  3/2/89	DNF		removed references to forROM; HFS now builds identically for ram
+;									or rom
+;	   <1.2>	11/21/88	CCH		Replaced references to forRAM with ÒNOT forROM.Ó
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				 1/22/86	LAK		Set CacheFlag before FlushCache call for read-verify flush.
+;				 1/14/86	LAK		TFSBitTst doesn't trash D0 as before (needed for FileAlloc
+;									change).
+;				 10/8/85	LAK		Fixed bug in DoPart for ROM (vectoring to BlockMove kills D1).
+;				 10/1/85	LAK		Added label for TFSVCBTst. Rewrote to call cache for all I/O.
+;									Write no longer prefetches when extending the file. Read-verify
+;									calls cause the file fork to be flushed and blocks to be read
+;									read from disk rather than the cache.
+;				 9/21/85	LAK		Changed for new TrashBlocks interface.
+;				 9/18/85	LAK		Call TrashBlocks with D2=last block number, not last block+1.
+;				  9/8/85	LAK		Slight modification to read code so it doesn't use FSTemp4.
+;				  9/6/85	LAK		Tag data bug for Write-in-place fixed. MyRWSub uses longword D3
+;									for start disk block for TFS volumes (for > 32MB volumes).
+;				  9/2/85	LAK		Release cache buffer immediately after read (read-verify error
+;									path wasn't releasing the buffer). Use MarkBlock to dirty buffer
+;									for TFS write . . .
+;				 8/31/85	LAK		Removed TFS support of OwnBuf buffers . . . removed Pat's debug
+;									code.
+;				 8/19/85	PWD		Tempered enthusiam displayed above to save only between calls to
+;									MyRWSub0 and GetRegs, NEVER AFTER GetRegs.
+;				 8/15/85	PWD		Added code to save A6 before ,ASYNC calls
+;				 2/25/85	GJC		new today
+;				 6/27/84	GSS		Put in line the WrPart patch from MSFileFix
+;				 8/30/83	LAK		Removed redundant set of FCB dirty bit in FileWrite (gets set by
+;									AdjEOF).
+;				 8/15/83	LAK		Flushes file buffer now if block is dirty and falls within
+;									read-in-place . . . saved some bytes, too.
+;				 8/11/83	LAK		Added support for a read-verify mode.
+;				  8/2/83	LAK		Fixed read bug (read count 0 with position past EOF). Changed
+;									file positioning mode 2 (relative to end of file) by defining
+;									IOPosOffset to be either positive or negative . . .
+;				  6/2/83	LAK		Changes for FCBBfAdr=0 meaning use volume buffer.
+;				 2/10/83	LAK		Fixed bugs in Read with EOL character.
+;				  2/9/83	LAK		Fixed MyWriteIP bug (now invalidates file's buffer if it happens
+;									to write that block . . .)
+;				 1/17/83	LAK		Latest changes for final structures. Brought SetFPos and GetFPos
+;									here from FSRFN2. Made GetFPos and SetFPos call FileRead with
+;									zero bytes requested.
+;				12/14/82	LAK		Rewrote for new file system data structures.
+;
+
+;_______________________________________________________________________
+;
+; External Routines:	FileRead,FileWrite,SetFPos,GetFPos
+;
+; Internal Routines:	MyWrite,Seek,CVFlgs,MyReadBk,MyReadDB,MyReadIP
+;
+;_______________________________________________________________________
+
+;_______________________________________________________________________
+;
+; Routines		TFSBitTst, TFSVolTst, TFSVCBTst
+; Arguments 	  A0.L (input)	-- pointer to I/O parameter block
+;				  D0 (output)  --  status
+; Calls 		GetVCBRfn
+; Called by 	Create
+; Function		determines whether or not the volume is TFS format
+;				(TFSVolTst) and whether or not TFS params are defined
+;				for this call (TFSBitTst).
+;
+; Modification History:
+;
+;	25-Feb-85  GJC	new today
+;_______________________________________________________________________
+
+
+			BLANKS		ON
+			STRING		ASIS
+
+TFSBitTst	BTST	#HFSBit,IOtrap(A0) ; test TFS bit							<14Jan86>
+			RTS 					 ; on return, status .ne. means TFS
+TFSVolTst	MOVEA.L FCBVPtr(A1,D1.w),A2
+TFSVCBTst	CMPI.W	#Tsigword,VCBSigWord(A2) ; is sigword that of TFS?			<01Oct85>
+			RTS 					 ; on return, status .eq. TFS vol
+;
+;_______________________________________________________________________
+;
+; Routine:		  Seek
+; Arguments:		A0.L (input)  -- I/O parameter block pointer, uses: IOPosMode,
+;							 IOPosOffset
+;					(A1,D1) (input) -- FCB ptr for the file in question
+;					D0.W (output) -- error code
+;					D2.W (output) -- distance past EOF (0 or - if not past EOF)
+;					D5.L (output) -- current file position
+;					D7.L (output) -- set to IOReqCount
+;					IOActCount cleared
+;					trashes D4
+; Called By:	  FileRead,FileWrite
+; Function: 	  Seek is a utility routine that interprets the positioning
+;				  parameters in an read or write call, updating the current
+;				  file position in the FCB.
+;
+;				  There are 4 positioning modes:
+;
+;					mode 0 -> no positioning
+;					mode 1 -> relative to beginning (absolute)
+;					mode 2 -> relative to end of file
+;					mode 3 -> relative to current
+;
+;				  If the file positioning would cause the current position to
+;				  become negative, it is not changed and an error
+;				  (PosErr) is returned; otherwise, result code 0
+;				  returned.  Read and Write must check for positioning past
+;				  current EOF since they handle that case differently (read
+;				  reports an error, write extends the file). This routine will
+;				  clip the position to the end-of-file but returns a remainder
+;				  in D2.
+;
+;				  The IOReqCount field must be positive; IOPosOffset may be
+;				  positive or negative . . .
+;
+; Modification History:
+;  14 Dec 82  LAK  Rewrote to reflect new file system data structures. Changed
+;					to handle positioning past end-of-file differently, reports
+;					error when positioning to before file start.
+;  15 Aug 83  LAK  Now trashes D4 and passes back file position in D5.
+;
+; USoft memo Aug 10: A read with position past end of file should return an
+;  error; a write should allocate space on the disk up to the specified
+;  position.  Read and write should return the current file position in the
+;  in the parameter block after reads and writes regardless of positioning mode.
+;
+;_______________________________________________________________________
+
+Seek
+			CLR.L	IOActCount(A0)		; haven't actually done any bytes yet.
+			MOVEQ	#ParamErr,D0		; assume bad count
+			MOVE.L	IOReqCount(A0),D7	; # bytes to read/write
+			BMI.S	SkExitRTS			; exit with error if negative
+
+			MOVE.L	IOPosOffset(A0),D2	; position value the user supplied
+			MOVE.L	FCBCrPs(A1,D1),D5	; current file position
+			MOVE.L	FCBEOF(A1,D1),D4	; get the current EOF
+
+			MOVE.B	IOPosMode+1(A0),D0	; the position mode is in bits 0,1
+			ROXR.B	#2,D0				; get position bits in carry, sign
+			BCC.S	PM01				; br if 0 or 1
+			BMI.S	PM3 				; br if 3
+
+; relative to the end of the file (mode 2)
+
+			MOVE.L	D4,D5				; current EOF
+
+; relative to current position (mode 3)
+
+PM3 		ADD.L	D2,D5
+			BRA.S	SkExit
+
+PM01		BPL.S	SkExit				; br if no position operation (mode 0)
+
+; relative to start (mode 1)
+
+			MOVE.L	D2,D5				; relative to start is absolute
+
+SkExit		BPL.S	@1					; did D5 go negative? br if not
+			MOVEQ	#PosErr,D0			; report positioning error
+			BRA.S	SkExitRTS			; and don't change current position
+
+@1			MOVE.L	D5,D2				; new position
+			SUB.L	D4,D2				; distance past end of file (pos-EOF)
+			BLE.S	@2					; br if not past the end
+			MOVE.L	D4,D5				; pin to EOF
+
+@2			MOVE.L	D5,FCBCrPs(A1,D1)	; set the new current position
+			MOVEQ	#0,D0				; no error
+
+SkExitRTS	RTS
+
+;_______________________________________________________________________
+;
+; Routine:		GetFPos
+;
+; (c) 1983 Apple Computer, Inc.
+;
+; Arguments:	  A0.L (input)	-- pointer to I/O parameter block; uses:
+;								   IORefNum,IOPosOffset
+;				  D0.W (output) -- 0 if file was found, error code otherwise.
+; Calls:
+; Function: 	Get current file position for specified opened file
+;
+; Modification History:
+;  10 Dec 82  LAK  Modified for new file system data structures.
+;  17 Jan 83  LAK  Modified to call FileRead via SetFPos to do the work.
+;
+;_______________________________________________________________________
+
+GetFPosTrap:
+			CLR.B	IOPosMode+1(A0) 	; no file positioning
+										; Fall thru to SetFPos
+;_______________________________________________________________________
+;
+; Routine:		SetFPos
+;
+; (c) 1983 Apple Computer, Inc.
+;
+; Arguments:	  A0.L (input)	-- pointer to I/O parameter block; uses:
+;								   IORefNum,IOPosOffset
+;				  D0.W (output) -- 0 if file was found, error code otherwise.
+; Calls:
+; Function: 	Set current file position for specified opened file. Will
+;				not set the position past end of file. Uses positioning modes
+;				like FileRead.
+;
+; Modification History:
+;  10 Dec 82  LAK  New Today.
+;  17 Jan 83  LAK  Modified to call fileread.
+;
+;_______________________________________________________________________
+
+SetFPosTrap:
+			CLR.L	IOReqCount(A0)		; no bytes
+										; fall thru to FileRead
+;_______________________________________________________________________
+;
+; Routine:		  FileRead
+; Arguments:		A0.L (input)  -- I/O parameter block pointer, uses: IORefnum,
+;							 IOBuffer,IOReqCount,IOActCount,IOPosMode,IOPosOffset
+;					D0.W (output) -- error code
+; Calls:		  FSQueue,RFnCall,Seek,Lg2Phys,MyRead,CmdDone
+; Function: 	  General purpose file read call.
+;
+; Modification History:
+;  15 Dec 82  LAK  Rewrote to reflect new file system data structures;
+;				   Separated reading with EOL mode from regular reading (now
+;					checks for EOL character whenever specified).
+;
+;  11 Mar 85  GJC  Added modifications so FileRead can handle the caching scheme
+;				   Used by TFS
+
+;  16 May 85  PWD  Set up options on FlushCache call.
+;
+;	  IOPosMode(A0).W = Newline char in bits 8-15, newline flag (1=enabled) in
+;					bit 7, bits 0-1 are position information
+;
+;
+; - if positions to EOF and 0 bytes are requested, EOF is not reported.
+;	(reading exactly to EOF will not raise EOF condition unless byte count
+;	 is not satisfied because EOF hit)
+;_______________________________________________________________________
+
+			IMPORT	CacheFlush			; <SM3> CSS
+	
+FileRead:
+			MOVE.L	jFileRead,-(SP) 	; jumptable entry for vFileRead 		<dnf v1.4>
+			RTS 						; go there								
+vFileRead:								; 'vectored' FileRead routine
+			BSR 	FSQueue 			; wait our turn
+
+			BSR 	RFnCall 			; map the reference number
+			BNE 	FRdExit1			; exit on errors (don't set IOPosOffset)
+										; (also exit for offline, ext fs calls)
+			BSR.S	Seek				; do any positioning - D5 gets cur pos,
+										;  IOActCount cleared, D7 set to
+										;  IOReqCount
+			BNE.S	FRdExit0			; exit if positioned to before file start
+
+; figure min(requested count,distance to EOF)
+
+			NEG.L	D2					; EOF-current pos (from seek)
+			BMI.S	FRdEOFXit			; if negative, report end of file
+			CMP.L	D2,D7				; number of bytes desired within EOF?
+			BLE.S	@1					; br if so
+			MOVE.L	D2,D7				; just read distance to EOF
+
+@1			TST.L	D7					; byte count 0?
+			BEQ.S	FRdOK				; all done if none to read!
+
+			MOVE.W	IOPosMode(A0),D2	; get newline stuff
+			LSR.W	#8,D2				; newline char in low byte, enb in carry
+			BCS		FRNewLine			; if newline enabled, do it differently		<SM3> CSS
+
+			BTST	#6,IOPosMode+1(A0)	; read verify?								<01Oct85>
+			BEQ.S	@2					; br if not 								<01Oct85>
+
+			MOVEM.L A1/D1,-(A6) 		; save A1/D1 across FlushCache call 		<01Oct85>
+			MOVE.W	D1,D0				; set up to make a flushcache for the file	<01Oct85>
+			MOVEQ	#0,D1				; just normal call . . .					<01Oct85>
+			MOVEA.L VCBBufAdr(A2),A1	; point to volume buffer					<01Oct85>
+			ST		CacheFlag			; make sure we flush						<22Jan86>
+			JSR 	FlushCache			; write all file blocks before read-verify	<01Oct85>
+			MOVEM.L (A6)+,A1/D1 		;  and trash so we actually read them		<01Oct85>
+
+@2			MOVE.W	D5,D2				; current file position (low word)			<01Oct85>
+			AND.W	#$01FF,D2			; check lower 9 bits for blk bndry read
+			BEQ.S	RDMain				; br if so (see if we can read into place)
+
+; must read a funny amount of data (not a full block's worth)
+
+RdPart		BSR 	RdFileBlk			; read the data (asynchronously)			<01Oct85>
+			BNE.S	FRdExit 			; exit on errors
+
+; the data block is at (A5).  Move it into user buffer byte by byte.
+
+			BTST	#6,IOPosMode+1(A0)	; read verify only?
+			SNE 	D0					; $00 if not, $FF if so
+			BSR 	DoPart				; share code with similar write code
+			BNE.S	FRdExit 			; exit on verify errors
+
+; read multiple blocks into place in user's buffer
+
+RdMain		MOVE.L	D7,D4				; number of bytes we want.
+			BEQ.S	FRdOK				; all done if no more bytes.
+			AND.W	#$FE00,D4			; only read whole blocks (pass D4=max bytes to read)
+			TST.L	D4					; any whole blocks to read?
+			BEQ.S	RdPart				; br if not . . .
+
+			JSR 	CacheRdIP			; pass: 	A2=VCB ptr,(A1,D1.W)=FCB pointer
+										;			D5.L=cur file pos, D4.L=max bytes to read
+										;			A0=IO Param Blk ptr
+										; returns:	D6=bytes read, D0=result code
+			BNE.S	FRdExit 			; disk errors deserve an exit
+
+			BSR 	UpdteCntPos 		; using D6, update D7, D5, and IOActCount(A0)
+			BRA.s	RdMain				; loop.
+
+FRdOK		MOVEQ	#0,D0				; no errors (except maybe EOF)
+FRdExit 	TST.W	D0					; other error?
+			BNE.S	FRdExit0			; br if so
+
+			MOVE.L	IOActCount(A0),D2	; if actual count is not equal to
+			CMP.L	IOReqCount(A0),D2	;  requested count, and no other errors,
+			BEQ.S	FRdExit0			;  (br if not true)
+FRdEOFXit	MOVEQ	#EOFErr,D0			; then we must have hit end of file . . .
+
+FRdExit0	MOVE.L	D5,FCBCrPs(A1,D1)	; update current position in FCB
+			MOVE.L	D5,IOPosOffset(A0)	; always return current pos
+FRdExit1	BSR.L	CacheFlush			; <SM3> CSS
+			BRA 	CmdDone 			; bye now . . .
+
+; reading while looking for end of line characters . . . do it a block at a time
+
+FRNewLine	BSR.S	RdFileBlk			; read the data (asynchronously)			<01Oct85>
+			BNE.S	FRdExit 			; exit on errors
+
+; the data block is at (A5).  Move it into user buffer byte by byte.
+
+@5			MOVE.L	D5,D2				; current file position
+			AND.W	#$01FF,D2			; get the index
+			MOVE.L	IOBuffer(A0),A3 	; user buffer
+			MOVE.L	IOActCount(A0),D4	; where to start continuing read
+
+@10 		MOVE.B	0(A5,D2.W),D0		; get byte from the buffer
+			MOVE.B	D0,0(A3,D4.L)		; put it into user's area
+			ADDQ.L	#1,IOActCount(A0)	; actually read another byte!
+			ADDQ.L	#1,D4				; incr destination byte offset
+			ADDQ.W	#1,D2				; incr source byte offset
+
+			ADDQ.L	#1,D5				; incr current position
+			CMP.B	IOPosMode(A0),D0	; is it the EOL character?
+			BNE.S	@20
+			MOVEQ	#0,D0				; no error, we found EOL!
+			BRA.S	FRdExit0
+
+@20 		SUBQ.L	#1,D7				; decr byte count
+			BEQ.S	FRdOK				; exit, checking for EOF condition
+
+			CMP.W	D6,D2				; reached end of buffer?
+			BCS.S	@10 				; loop if not
+			BRA.S	FRNewLine			; get another block
+
+
+;_______________________________________________________________________
+;
+; Routine:		RdFileBlk, PreRdFileBlk
+; Arguments:	  A0.L (in ) -- I/O Param Blk Ptr (RdFileBlk)
+;				  A2.L (in ) -- VCB ptr
+;				  D5.L (in ) -- file position to read block from
+;				  D0.W (out) -- error code
+;				  D6.L (out) -- const 512 (byte count)
+;				  A5.L (out) -- buffer pointer
+;				  A6.L		 -- TFS stack pointer
+;				  Clobbers:
+;				  All other registers are preserved
+;				  This routine returns to one level above caller during the
+;				   read(caller must not have anything on the stack when
+;				   issuing the call!)
+; Called By:	FileRead,FileWrite
+; Function: 	Calls cache routines GetBlock and RelBlock to get a block
+;				of the file.
+;
+;
+; Modification History:
+; <01Oct85>  LAK  New today. Built from old MyReadBk.
+;_______________________________________________________________________
+
+
+PreRdFileBlk
+			BSR.S	ReadBlock
+			CMP.L	D3,D5				; read position >= old LEOF rounded?	<01Oct85>
+			BCS.S	RdFileB1			; br if not 							<01Oct85>
+			MOVEQ	#kGBNoRead,D1		; don't bother to read it then          <01Oct85>
+			BRA.S	RdFileB1			;										<01Oct85>
+
+RdFileBlk
+			BSR.S	ReadBlock			;
+			BTST	#6,IOPosMode+1(A0)	; read verify?							<01Oct85>
+			BEQ.S	RdFileB1			; br if not 							<01Oct85>
+			MOVEQ	#kGBRead,D1 		; always read it if so					<01Oct85>
+
+RdFileB1
+			MOVEA.L VCBBufAdr(A2),A1	; Use a TFS volume cache buffer 		<01Oct85>
+			MOVE.L	D5,D2				; Byte position 						<01Oct85>
+			LSR.L	#8,D2				; 'Divide' by 256						<01Oct85>
+			LSR.L	#1,D2				; by 512 to get long file block #		<01Oct85>
+			RTS 						; return to ReadBlock					<01Oct85>
+
+; Called by:	MFSDirRead, MFSMapRead, RdFileBlk
+
+ReadBlock
+			MOVEM.L A0-A1/D1-D2,-(A6)	; save status							<01Oct85>
+			MOVE.L	(SP)+,A1			; 'set up routine' address				<01Oct85>
+			MOVE.L	(SP)+,-(A6) 		; Save return address					<01Oct85>
+			MOVE.W	D1,D0				; file refnum
+			MOVEQ	#0,D1				; flag									<01Oct85>
+			MOVEQ	#2,D6				; always return D6=512 for historical	<01Oct85>
+			LSL.L	#8,D6				;  reasons . . .						<01Oct85>
+			JSR 	(A1)				; fill in A1=Cache Ptr, D2.L=block num, <01Oct85>
+										;  D0.W=refnum (file or volume).		<01Oct85>
+			ADDQ.B	#kGBrelease,D1		; immediate release 					<01Oct85>
+			JSR 	GetBlock			; get the cache buffer					<01Oct85>
+
+			MOVEA.L A0,A5				; return A5->released buffer
+			MOVE.L	(A6)+,-(SP) 		; pop ret address off TFS stack
+			MOVEM.L (A6)+,A0-A1/D1-D2	; restore status
+			TST.W	D0					; any errors?
+			RTS 						; return to caller with error code
+
+;_______________________________________________________________________
+;
+; Routine:		  FileWrite
+; Arguments:		A0.L (input)  -- I/O parameter block pointer, uses: IORefnum,
+;							 IOBuffer,IOReqCount,IOActCount,IOPosMode,IOPosOffset
+;					D0.W (output) -- error code
+; Calls:		  FSQueue,TstMod,RFnCall,Seek,Lg2Phys,MyWriteIP,MyWriteDB,CmdDone
+; Function: 	  Write user data to a file, extending the file as necessary.
+;
+; Modification History:
+;  17 Dec 82  LAK  Rewrote to reflect new file system data structures;
+;				   When file is initially positioned past end-of-file, the
+;				   file is automatically extended enough for the write.
+;
+;_______________________________________________________________________
+
+			IMPORT		CacheFlush		; <SM3> CSS
+
+FileWrite:
+			MOVE.L	jFileWrite,-(SP) 	; jumptable entry for vFileWrite 		<dnf v1.4>
+			RTS 						; go there								
+vFileWrite:								; 'vectored' FileWrite routine
+
+			BSR.L	CacheFlush			; flush the chip caches so data is in memory. <SM3> CSS
+			BSR 	FSQueue 			; don't do the call until time.
+			BSR 	TstMod				; test if we may modify this file.
+			BNE.S	FWrExit1			; br if not.
+			BSR 	Seek				; share this routine with read - D5 gets
+										;  cur file position, IOActCount cleared,
+										;  D7 set to IOReqCount
+			BNE.S	@2					; br if tried to position before start
+										;  (to FWrExit0)
+			TST.L	D2					; positioned past EOF?
+			BMI.S	@1					; br if not
+			ADD.L	D2,D5				; extend added to cur pos
+
+; set up D3 so PreRdFileBlk can tell when a block actually has to be read
+
+@1			MOVE.L	#511,D3 			;										<01Oct85>
+			ADD.L	D4,D3				; add current LEOF from Seek			<01Oct85>
+			AND.W	#$FE00,D3			; LEOF rounded to next block boundary	<01Oct85>
+
+; see if file has to be made physically longer
+
+			MOVE.L	D5,D4				; current position after positioning
+			ADD.L	D7,D4				; end byte for write + 1
+			CMP.L	FCBEOF(A1,D1),D4	; will it fit within the old EOF?
+			BLS.S	SameLen 			; if so, leave file at same phys length
+			SUB.L	FCBPLen(A1,D1),D4	; is it past the phys end?
+			BLS.S	@3					; no, just reset the eof
+
+; ran off the physical end of the file--need to allocate more blocks
+; Call alloc with D4=number of extra bytes we need, A2=addr of VCB,
+; (A1,D1) ptr to FCB . . .
+
+			BSR 	Alloc				; do it to it (sets FCB PEOF, start blk)
+@2			BNE.S	FWrExit0			; exit if didn't get it (return with
+										;  cur file pos = EOF)
+
+; now just update the logical len.
+
+@3			MOVE.L	D5,D4				; current position after positioning
+			ADD.L	D7,D4				; plus # bytes to write
+			MOVE.L	D4,FCBEOF(A1,D1)	; is new logical end-of-file
+
+; the data will fit into the file.	At this point:
+;  A0=ptr to params,
+;  (A1,D1) = ptr to file's FCB
+;  A2 = ptr to VCB
+;  D7 = # bytes to write total
+;  D5 = current file position.
+
+SameLen 	MOVE.W	D5,D0				; check if writing to a block boundary
+			AND.W	#$01FF,D0			; if so, low 9 bits will be 0
+			BEQ.S	WrMain				; if so, try writing full blocks out
+
+; must write some funny amount of data
+
+WrPart		BSR 	PreRdFileBlk		; get the appropriate block 			<01Oct85>
+			BNE.S	FWrExit 			; just skip if bad read
+
+; the destination data block is at (A5).  Move it out of user buffer byte by byte.
+
+			MOVEQ	#1,D0				; D0=1 for write
+			BSR.S	DoPart				; share code with fileread
+			JSR 	MarkA5Block 		; mark the block dirty					<01Oct85>
+
+; This section tries to write out entire blocks and/or groups of blocks
+
+WrMain		MOVE.L	D7,D4				; number bytes we want.
+			BEQ.S	FWrOK				; all done if no more bytes.
+			AND.W	#$FE00,D4			; only write whole blocks
+			TST.L	D4					; must want at least 512 bytes
+			BEQ.S	WrPart				; br if not . . .
+
+			JSR 	CacheWrIP			; pass: 	A2=VCB ptr,(A1,D1.W)=FCB pointer
+										;			D5.L=cur file pos, D4.L=max bytes to read
+										;			A0=IO param blk ptr
+										; returns:	D6=bytes read, D0=result code
+			BNE.S	FWrExit 			; disk errors deserve an exit
+
+			BSR.S	UpdteCntPos
+			BRA.S	WrMain				; loop.
+
+FWrOK		MOVEQ	#0,D0				; no errors
+
+FWrExit 	BSR 	AdjEOF				; adjust other FCBs for this file
+			MOVE.L	D5,FCBCrPs(A1,D1)	; update current position in FCB
+
+FWrExit0	MOVE.L	FCBCrPs(A1,D1),IOPosOffset(A0)	; always return current pos
+FWrExit1	BRA 	CmdDone 			; command is done.
+
+UpdteCntPos
+			SUB.L	D6,D7				; adjust for number of bytes read
+			ADD.L	D6,IOActCount(A0)	; actually read this many more
+			ADD.L	D6,D5				; update current position
+			RTS
+
+; code sharing routine . . . D6 = 512 on entry
+
+DoPart
+			MOVE.L	D5,D2				; current file position
+			AND.W	#$01FF,D2			; get the index
+			SUB.W	D2,D6				; bytes in blk from cur pos
+			CMP.L	D6,D7				; more than we want?
+			BCC.S	@1
+			MOVE.L	D7,D6				; if so, only r/w num requested
+
+@1			MOVE.L	IOBuffer(A0),A3 	; user buffer
+			ADD.L	IOActCount(A0),A3	; where to start continuing read/write
+			BSR.S	UpdteCntPos
+
+			MOVEM.L D1/A0-A2,-(SP)		; preserve blockmove registers			<08Oct85>
+			MOVE.L	A3,A0				; src for writes
+			MOVE.L	A5,A1
+			ADD 	D2,A1				; dest for writes
+			TST.B	D0					; read or write?
+			BGT.S	@2					; br for write
+			BMI.S	@5					; br for read verify
+			EXG 	A0,A1				; switch src, dest for reads
+
+@2			MOVE.L	D6,D0				; byte count
+			MOVE.L	JBlockMove, A2		;										<01Oct85>
+			JSR 	(A2)				;										<01Oct85>
+
+@3			MOVEQ	#0,D0				; no errors
+@4			MOVEM.L (SP)+,D1/A0-A2		; restore regs							<08Oct85>
+			RTS
+
+@5			MOVEQ	#IOErr,D0			; assume error
+			SUBQ.W	#1, D6				; for DBNE loop 						<01Oct85>
+@6			CMPM.B	(A0)+,(A1)+ 		; compare next byte
+			DBNE	D6,@6				; exit on errors or done				<01Oct85>
+			BNE.S	@4					; br if err 							<01Oct85>
+			BRA.S	@3					; and take the good route if done
+
+

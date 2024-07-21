@@ -1,0 +1,1254 @@
+;
+;	File:		IOPKernel.aii
+;
+;	Contains:	I/O Processor Kernel for SWIM IOP.
+;
+;	Written by:	Gary G. Davidian
+;
+;	Copyright:	© 1987-1990 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <2>	  1/2/90	GGD		NEEDED FOR ZONE-5: Adding call to IdleLoop to run any IdleTasks
+;									that drivers may have.
+;	   <1.5>	11/19/89	GGD		Needed for Zone-5 Expanded the code that is just below the
+;									interrupt vectors to make saving and restoring state even easier
+;									(for fremont diags).
+;	   <1.4>	 9/21/89	GGD		Increased the number of BCPBs from 4 to 6. Return zero (equal)
+;									in BCPBcompRel if operation is not bcCompare. Moved the
+;									PatchWait loop to a fixed address below the interrupt vectors to
+;									make it easier for the diagnostics to save and restore the IOP
+;									state.
+;	   <1.3>	  7/8/89	CCH		Added EASE comments to file.
+;	  <¥1.2>	 6/15/89	GGD		Updated to use equates for the latest rev of the IOP chip,
+;									re-formated tab stops in source.
+;	   <1.1>	  2/9/89	GGD		Fixed bug in timer code that could cause a timer to go off much
+;									later than requested.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;
+;	To Do:
+;
+				eject
+				title	'IOP Kernel - I/O Processor Kernel for SWIM IOP'
+
+				machine m65C02
+				codechk off
+				datachk off
+				longa	off
+				longi	off
+				print	nomdir
+				include 'IOPDefs.aii'
+
+				import	InitDrivers
+				import	RunIdleTasks
+				import	HandleSCCInt
+				import	HandleDMA1Int
+				import	HandleDMA2Int
+				import	HandleXMTMsg2
+				import	HandleXMTMsg3
+				import	HandleXMTMsg4
+				import	HandleXMTMsg5
+				import	HandleXMTMsg6
+				import	HandleXMTMsg7
+				import	HandleRCVMsg1
+				import	HandleRCVMsg2
+				import	HandleRCVMsg3
+				import	HandleRCVMsg4
+				import	HandleRCVMsg5
+				import	HandleRCVMsg6
+				import	HandleRCVMsg7
+
+				entry	NonMaskable
+				entry	Reset
+				entry	UnknownInt
+				entry	PatchWait
+				entry	PatchDone
+				entry	HandleHSTInt
+				entry	HandleTMRInt
+				entry	Interrupt
+				entry	InitBlockCopyDriver
+				entry	InitDelayTimerDriver
+				entry	IntDecode
+				entry	XMTMsgDecode
+				entry	RCVMsgDecode
+				entry	MsgNumTimes2
+				entry	HandleXMTMsg1
+				entry	StartTimer
+				entry	StopTimer
+				title	'IOP Kernel - Initialization'
+
+				seg 	'vectors'
+Vectors 		proc
+				entry	PatchWait
+
+;	This code is at a fixed address ($7FE5) below the vectors to allow
+;	context saving and restoring of a running IOP (used by diagnostics).
+
+RestoreState	ldx 	#$FF				; stack base is $01FF
+				txs 						; initialize stack
+				lda 	#'A'				; initialize a-register
+				ldy 	#'Y'				; initialize y-register
+PatchWait		sei 						; sync up with host, with interrupts disabled
+				ldx 	#MessageCompleted	; let host know we can now be patched
+				stx 	PatchReq			; update the patch request message state
+@WaitLoop		ldx 	PatchReq			; wait for patching to be completed
+				assert	Idle=$00
+				bne 	@WaitLoop			; loop until patching complete (until Idle)
+				jmp 	PatchDone			; patching done, enable interrupts
+
+;	Interrupt Vectors follow at $7FFA
+
+				dc.w	NonMaskable 		; Non-Maskable Interrupt
+				dc.w	Reset				; processor reset
+				dc.w	Interrupt			; Interrupt Request
+
+				endproc
+
+; Reset and initialization code
+
+				seg 	'code'
+Reset			proc						; Reset Handler
+				ldx 	#$FF				; stack base is $01FF
+				txs 						; initialize stack
+				stz 	DMA1Control 		; initialize DMA1
+				stz 	DMA2Control 		; initialize DMA2
+				stz 	TimerDPLLctl		; initialize TimerHostDPLL
+				stz 	HostControl 		; initialize Host Control reg
+				stz 	TimerCounterL		; initialize TimerCounterL
+				stz 	TimerCounterH		; initialize TimerCounterH
+				stx 	InterruptMask		; allow all interrupts
+				stx 	InterruptReg		; clear all interrupts
+
+				jsr 	InitBlockCopyDriver
+				jsr 	InitDelayTimerDriver
+				jsr 	InitDrivers 		; initialize the drivers
+
+				lda 	#'A'				; initialize a-register
+				ldy 	#'Y'				; initialize y-register
+				entry	PatchDone
+PatchDone		cli 						; enable interrupts
+IdleLoop		ldx 	#'X'				; initialize x-register
+				cpa 	#'A'				; see if a-reg got destroyed
+				bne 	IdleRegError		; Crash if a-reg changed
+				cpy 	#'Y'				; see if y-reg got destroyed
+				bne 	IdleRegError		; Crash if y-reg changed
+				cpx 	#'X'				; see if x-reg got destroyed
+				bne 	IdleRegError		; Crash if x-reg changed
+				tsx 						; get stack pointer
+				cpx 	#$FF				; should be at stack base
+				bne 	IdleStackError		; Crash if stack incorrect
+				stx 	Alive				; Let mom know we're still alive
+				jsr		RunIdleTasks		; Run any idle loop tasks that drivers have
+				ldx 	PatchReq			; see if host wants to patch iop memory
+				assert	Idle=$00
+				beq 	IdleLoop			; not a patch request (still Idle)
+				jmp		PatchWait			; go to wait loop at fixed address
+
+IdleRegError	brk 						; register destroyed while idle
+
+IdleStackError	brk 						; stack became skewed while idle
+
+				endproc
+				title	'IOP Kernel - Interrupt Handlers'
+
+;_______________________________________________________________________
+;
+;  Routine: 	Interrupt
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	none
+;  Cycles:		50 + Interrupt Handler
+;  Calls:		Interrupt Handler
+;  Called by:	65C02 Hardware
+;
+;  Function:	Decodes and prioritizes the pending interrupt, and calls
+;				the handler for the highest priority interrupt.
+;				This routine saves all register state, so that the
+;				interrupt handlers may use all registers. Interrupt
+;				handlers should return to this routine using an RTS
+;				instruction (don't use RTI).
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+Interrupt		proc						; Interrupt Handler
+
+; it takes 7 clocks for the processor get here after the last instruction
+; finished executing. (pushing state for RTI to pop).
+
+				pha 						; save reg A
+				phx 						; save reg X
+				phy 						; save reg Y
+
+				jsr 	CallIntHandler		; handle the interrupt
+
+				ply 						; restore reg Y
+				plx 						; restore reg X
+				pla 						; restore reg A
+				rti 						; restore PSW and PC
+
+
+CallIntHandler	ldx 	InterruptReg		; get the interrupts
+				jmp 	(IntDecode,x)		; run the interrupt handler
+
+
+; Non-Maskable Interrupt Handler
+				entry	NonMaskable
+NonMaskable 	brk 						; shouldn't be any non-maskable ints
+
+
+; Unknown Interrupt Handler
+
+				entry	UnknownInt
+UnknownInt		tsx 						; get stack pointer
+				lda 	StackPage+6,x		; get the psw from the stack
+				bit 	#pswB				; test the b bit
+				bne 	BRKinterrupt		; if it was a BRK interrupt
+				rts 						; no interrupt found, just ignore it
+
+
+; If we received a BRK interrupt, we will just loop forever, scanning the stack
+; so that we can read the stack on a logic analyzer.
+
+BRKinterrupt	tsx 						; get the stack pointer
+ScanStack		inx 						; point to next stack entry
+				beq 	BRKinterrupt		; scan the stack forever
+				lda 	StackPage,x 		; get the stack data
+				bra 	ScanStack			; process next entry
+
+				endproc
+
+;		Interrupt decode and priority table.
+;		Interrupt priority order is as follows (highest to lowest)
+;		SCC, DMA1, DMA2, TMR, HST
+;											;		D D
+;											; T H S M M
+;											; M S C A A
+;											; R T C 2 1
+;											; I I I I I
+;											; n n n n n
+				seg 	'WordConsts'		; t t t t t
+IntDecode		proc						; ---------
+				dc.w	UnknownInt			; 0 0 0 0 0
+				dc.w	HandleDMA1Int		; 0 0 0 0 1
+				dc.w	HandleDMA2Int		; 0 0 0 1 0
+				dc.w	HandleDMA1Int		; 0 0 0 1 1
+				dc.w	HandleSCCInt		; 0 0 1 0 0
+				dc.w	HandleSCCInt		; 0 0 1 0 1
+				dc.w	HandleSCCInt		; 0 0 1 1 0
+				dc.w	HandleSCCInt		; 0 0 1 1 1
+				dc.w	HandleHSTInt		; 0 1 0 0 0
+				dc.w	HandleDMA1Int		; 0 1 0 0 1
+				dc.w	HandleDMA2Int		; 0 1 0 1 0
+				dc.w	HandleDMA1Int		; 0 1 0 1 1
+				dc.w	HandleSCCInt		; 0 1 1 0 0
+				dc.w	HandleSCCInt		; 0 1 1 0 1
+				dc.w	HandleSCCInt		; 0 1 1 1 0
+				dc.w	HandleSCCInt		; 0 1 1 1 1
+				dc.w	HandleTMRInt		; 1 0 0 0 0
+				dc.w	HandleDMA1Int		; 1 0 0 0 1
+				dc.w	HandleDMA2Int		; 1 0 0 1 0
+				dc.w	HandleDMA1Int		; 1 0 0 1 1
+				dc.w	HandleSCCInt		; 1 0 1 0 0
+				dc.w	HandleSCCInt		; 1 0 1 0 1
+				dc.w	HandleSCCInt		; 1 0 1 1 0
+				dc.w	HandleSCCInt		; 1 0 1 1 1
+				dc.w	HandleTMRInt		; 1 1 0 0 0
+				dc.w	HandleDMA1Int		; 1 1 0 0 1
+				dc.w	HandleDMA2Int		; 1 1 0 1 0
+				dc.w	HandleDMA1Int		; 1 1 0 1 1
+				dc.w	HandleSCCInt		; 1 1 1 0 0
+				dc.w	HandleSCCInt		; 1 1 1 0 1
+				dc.w	HandleSCCInt		; 1 1 1 1 0
+				dc.w	HandleSCCInt		; 1 1 1 1 1
+
+				endproc
+				title	'IOP Kernel - Host Interrupt Handler'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	HandleHSTInt
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, v, z, c
+;  Cycles:		40 + 12*(XMTMsgMax+RCVMsgMax) + 28 per service routine called
+;  Calls:		Message service routines
+;  Called by:	Interrupt
+;
+;  Function:	Scans the transmit and receive message state lists looking
+;				for a message that needs service and calls the service
+;				routine for each message that needs service.
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+HandleHSTInt	proc
+				lda 	#HSTINT 			; get the host interrupt bit
+				sta 	InterruptReg		; clear the host interrupt
+				trb 	InterruptMask		; disable host interrupts
+				cli 						; allow higher priority interrupts
+
+;				service Transmit Message Completed first
+
+				ldy 	XMTMsgMax			; get highest XMT message number
+				lda 	#MessageCompleted	; get the desired message state
+XMTMsgLoop		cpa 	XMTMsg1State-1,y	; see if the message completed
+				bne 	XMTMsgNext			; if no service needed
+				phy 						; preserve loop counter
+				ldx 	MsgNumTimes2,y		; convert message number to table index
+				sei 						; disable interrupts before calling handler
+				jsr 	CallXMTHandler		; call the handler
+				cli 						; re-enable interrupts after handler returns
+				ply 						; restore the message number
+				lda 	#MessageCompleted	; restore desired message state
+XMTMsgNext		dey 						; point to previous message
+				bne 	XMTMsgLoop			; loop through all messages
+
+;				service Receive New Message Sent last
+
+				ldy 	RCVMsgMax			; get highest RCV message number
+				lda 	#NewMessageSent		; get the desired message state
+RCVMsgLoop		cpa 	RCVMsg1State-1,y	; see if message just arrived
+				bne 	RCVMsgNext			; if no service needed
+				phy 						; preserve loop counter
+				ldx 	MsgNumTimes2,y		; convert message number to table index
+				sei 						; disable interrupts before calling handler
+				jsr 	CallRCVHandler		; call the handler
+				cli 						; re-enable interrupts after handler returns
+				ply 						; restore the message number
+				lda 	#NewMessageSent 	; restore desired message state
+RCVMsgNext		dey 						; point to previous message
+				bne 	RCVMsgLoop			; loop through all messages
+
+				sei 						; disable interrupts
+				lda 	#HSTINT 			; get the host interrupt bit
+				tsb 	InterruptMask		; re-enable host interrupts
+				rts 						; all done
+
+
+CallXMTHandler	jmp 	(XMTMsgDecode-2,x)	; go to the proper handler
+
+CallRCVHandler	jmp 	(RCVMsgDecode-2,x)	; go to the proper handler
+
+				endproc
+
+;		Transmit message Request Completed Handlers
+
+				seg 	'WordConsts'
+XMTMsgDecode	proc
+				dc.w	HandleXMTMsg1
+				dc.w	HandleXMTMsg2
+				dc.w	HandleXMTMsg3
+				dc.w	HandleXMTMsg4
+				dc.w	HandleXMTMsg5
+				dc.w	HandleXMTMsg6
+				dc.w	HandleXMTMsg7
+
+
+;		Receive message Start New Request Handlers
+
+				entry	RCVMsgDecode
+RCVMsgDecode	dc.w	HandleRCVMsg1
+				dc.w	HandleRCVMsg2
+				dc.w	HandleRCVMsg3
+				dc.w	HandleRCVMsg4
+				dc.w	HandleRCVMsg5
+				dc.w	HandleRCVMsg6
+				dc.w	HandleRCVMsg7
+
+				endproc
+
+
+;		Table for computing Message Number * 2
+
+				seg 	'constants'
+MsgNumTimes2	proc
+				dc.b	0,2,4,6,8,10,12,14
+
+				endproc
+				title	'IOP Kernel - Cross Processor Block Copy'
+
+				seg 	'data'
+BCPBdef 		record
+; Block Copy Parameter Block (BCPB)
+
+MaxBCPBs		equ 	6					; (range 1..8)								<1.4>
+
+BCPBnext		ds.b	1					; next BCPB on list
+BCPBstate		ds.b	1					; request state
+
+; BCPB cmd, byteCount, hostAddr, and iopAddr must be filled in before calling MakeBCPBreq
+				export	BCPBcmd
+				export	BCPBbyteCountH
+				export	BCPBbyteCountL
+				export	BCPBhostAddrB0
+				export	BCPBhostAddrB1
+				export	BCPBhostAddrB2
+				export	BCPBhostAddrB3
+				export	BCPBiopAddrH
+				export	BCPBiopAddrL
+; BCPB CompRel is returned from host
+				export	BCPBcompRel 		; output
+BCPBcmd 		ds.b	1					; copy command
+BCPBbyteCountH	ds.b	1					; byte count (high)
+BCPBbyteCountL	ds.b	1					; byte count (low)
+BCPBhostAddrB0	ds.b	1					; HOST RAM Address (byte 0)
+BCPBhostAddrB1	ds.b	1					; HOST RAM Address (byte 1)
+BCPBhostAddrB2	ds.b	1					; HOST RAM Address (byte 2)
+BCPBhostAddrB3	ds.b	1					; HOST RAM Address (byte 3)
+BCPBiopAddrH	ds.b	1					; IOP RAM Address (high)
+BCPBiopAddrL	ds.b	1					; IOP RAM Address (low)
+BCPBcompRel 	ds.b	1					; compare result (relationship)
+
+BCPBpcH 		ds.b	1					; completion routine PC high
+BCPBpcL 		ds.b	1					; completion routine PC low
+BCPBsaveA		ds.b	1					; reg A save
+BCPBsaveX		ds.b	1					; reg X save
+
+BCPBsize		equ 	*-BCPBnext			; bytes per BCPB
+				ds.b	BCPBsize*(MaxBCPBs-1)	; allocate remaining BCPBs
+
+nilBCPB 		equ 	$FF 				; nil index value
+availBCPBhead	ds.b	1					; head of BCPB free list
+bcReqQhead		ds.b	1					; head of BCPB request queue
+bcReqQtail		ds.b	1					; tail of BCPB request queue
+activeBCPB		ds.b	1					; BCPB currently active
+				endr
+				title	'IOP Kernel - Init Block Copy Driver'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	InitBlockCopyDriver
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	A, X, n, v, z, c
+;  Cycles:		31 + 14 per BCPB
+;  Calls:		none
+;  Called by:	Reset
+;
+;  Function:	Initializes the Block Copy data structures.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED.
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+InitBlockCopyDriver 	proc
+				with	BCPBdef
+last			equ 	BCPBsize*(MaxBCPBs-1)
+
+				lda 	#0					; index of first BCPB
+				sta 	availBCPBhead		; all BCPBs are now available
+				clc 						; clear carry for additions
+loop			tax 						; setup index register
+				adc 	#BCPBsize			; point to next BCPB
+				sta 	BCPBnext,x			; have previous point to next
+				cpa 	#last				; check for last BCPB
+				blt 	loop				; process next BCPB
+				lda 	#nilBCPB			; mark empty lists
+				sta 	last+BCPBnext		; mark end of free list
+				sta 	bcReqQhead			; request queue head is empty
+				sta 	bcReqQtail			; request queue tail is empty
+				sta 	activeBCPB			; no BCPB currently active
+				rts
+				endwith
+				endproc
+				title	'IOP Kernel - Get BCPB'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	GetBCPB
+;  Inputs:		none
+;  Outputs: 	Y - BCPB index
+;				n - 1 if no free BCPBs available
+;  Destroys:	A, Y, n, z
+;  Cycles:		32 if BCPB was available
+;				13 if BCPB was not available
+;  Calls:		none
+;  Called by:	Drivers
+;
+;  Function:	Returns the index of a free Block Copy Parameter Block
+;				(BCPB), and removes it from the list of free BCPBs.
+;				A flag is returned to indicate if a free BCPB existed.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED.
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+GetBCPB 		proc	export				; Get a free BCPB
+				with	BCPBdef
+				ldy 	availBCPBhead		; get the available list head
+				bmi 	exit				; if list empty
+				lda 	BCPBnext,y			; get successor
+				sta 	availBCPBhead		; update list head
+				lda 	#MessageCompleted	; initialize to completed state
+				sta 	BCPBstate,y 		; initialize the state
+				lda 	#$00				; indicate no completion address
+				sta 	BCPBpcH,y			; initialize the PC page
+exit			rts 						; all done
+				endwith
+				endproc
+				title	'IOP Kernel - Free BCPB'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	FreeBCPB
+;  Inputs:		Y - BCPB index
+;  Outputs: 	none
+;  Destroys:	A, n, z, c
+;  Cycles:		27
+;  Calls:		none
+;  Called by:	Drivers
+;
+;  Function:	Adds the BCPB that was passed in, to the list of available
+;				BCPBs.	If the BCPB is currently active, the system crashes
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+FreeBCPB		proc	export
+				with	BCPBdef
+				lda 	availBCPBhead		; get the available list head
+				sta 	BCPBnext,y			; link it to end of new entry
+				sty 	availBCPBhead		; new entry is new list head
+				lda 	BCPBstate,y 		; check the state
+				cpa 	#newMessageSent		; see if copy was in progress
+				beq 	IsActive			; crash if was active
+				rts 						; all done
+IsActive		brk 						; FreeBCPB on avtive BCPB
+				endwith
+				endproc
+				title	'IOP Kernel - Wait BCPB done'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	WaitBCPBdone
+;  Inputs:		Y - BCPB index
+;  Outputs: 	none
+;  Destroys:	n, z, c
+;  Cycles:		54 - if has to wait
+;				24 - if no wait needed
+;  Calls:		none
+;  Called by:	Drivers
+;
+;  Function:	If the BCPB is complete, this routine simply returns to
+;				its caller.  If it is not complete, then it returns to
+;				its callers caller, and will return to its caller when
+;				the BCPB request has completed.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+WaitBCPBdone	proc	export
+				with	BCPBdef
+				sta 	BCPBsaveA,y 		; save reg a
+				lda 	BCPBstate,y 		; get the state
+				cpa 	#MessageCompleted
+				beq 	exit				; if already done
+				txa 						; prepare to save reg x
+				sta 	BCPBsaveX,y 		; save reg x
+				lda 	BCPBpcH,y			; see if already waiting
+				bne 	MultipleWaits		; crash if already waiting
+				pla 						; get pcL
+				sta 	BCPBpcL,y			; save pcL
+				pla 						; get pcH
+				sta 	BCPBpcH,y			; save pcH
+exit			lda 	BCPBsaveA,y 		; restore reg a
+				rts 						; all done
+MultipleWaits	brk 						; multiple waits on BCPB
+				endwith
+				endproc
+				title	'IOP Kernel - Check BCPB done'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	CheckBCPBdone
+;  Inputs:		Y - BCPB index
+;  Outputs: 	z - 1 if BCPB request has completed
+;				z - 0 if BCPB request in progress, or not started
+;  Destroys:	A, n, c
+;  Cycles:		12
+;  Calls:		none
+;  Called by:	Drivers
+;
+;  Function:	Returns an indication as to whether the BCPB request has
+;				completed.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+CheckBCPBdone	proc	export
+				with	BCPBdef
+				lda 	BCPBstate,y 		; get the state
+				cpa 	#MessageCompleted	; see if it is done
+				rts 						; all done
+				endwith
+				endproc
+				title	'IOP Kernel - Make BCPB request'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	MakeBCPBreq
+;  Inputs:		Y - BCPB index
+;  Outputs: 	none
+;  Destroys:	A, n, v, z, c
+;  Cycles:		41 - if queue is not empty
+;				41 - if queue is empty, but message slot busy
+;				122 - if queue is empty, and message slot available
+;  Calls:		none
+;  Called by:	Drivers
+;
+;  Function:	Sends the block copy request to the host precessor, or queues
+;				the request if the host processor is still processing
+;				a prior request. The cmd, byteCount, hostAddr, and iopAddr fields
+;				of the BCPB must be filled in prior to this call.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+MakeBCPBreq 	proc	export
+				with	BCPBdef
+				lda 	#nilBCPB			; mark entry as end of list
+				sta 	BCPBnext,y			; BCPBnext := nil
+				lda 	#NewMessageSent		; get the new message state
+				sta 	BCPBstate,y 		; mark the BCPB as active
+				lda 	bcReqQhead			; get request queue head
+				bmi 	QueueEmpty			; if nobody queued
+				tya 						; save BCPB index
+				ldy 	bcReqQtail			; get old tail
+				sta 	BCPBnext,y			; link to end of queue
+				sta 	bcReqQtail			; establish new tail
+				rts 						; return with BCPB queued
+
+QueueEmpty		lda 	BCxmtState			; check the message state
+				assert	Idle=$00
+				beq 	SendReq 			; if idle, send it now
+				sty 	bcReqQhead			; otherwise it is Qhead
+				sty 	bcReqQtail			; and Qtail
+				rts 						; return with BCPB queued
+
+SendReq 		lda 	BCPBcmd,y			; get the command
+				sta 	bcReqCmd			; move it to the request packet
+				lda 	BCPBbyteCountH,y	; copy the byte count
+				sta 	bcReqByteCount+0
+				lda 	BCPBbyteCountL,y
+				sta 	bcReqByteCount+1
+				lda 	BCPBhostAddrB0,y	; copy the host address
+				sta 	bcReqHostAddr+0
+				lda 	BCPBhostAddrB1,y
+				sta 	bcReqHostAddr+1
+				lda 	BCPBhostAddrB2,y
+				sta 	bcReqHostAddr+2
+				lda 	BCPBhostAddrB3,y
+				sta 	bcReqHostAddr+3
+				lda 	BCPBiopAddrH,y		; copy the IOP address
+				sta 	bcReqIopAddr+0
+				lda 	BCPBiopAddrL,y
+				sta 	bcReqIopAddr+1
+				lda 	#NewMessageSent 	; get the new message state
+				sta 	BCxmtState			; set the new message state
+				sty 	activeBCPB			; remember who it was for
+				lda 	#NewMsgSentINT		; prepare to interrupt the host
+				sta 	HostControl 		; interrupt the host
+				rts
+				title	'IOP Kernel - Handle XMT Message 1'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	HandleXMTMsg1
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, v, z, c
+;  Cycles:		49 - nothing queued, no completion routine
+;				73 - nothing queued, has completion routine
+;				165 - entry was queued, no completion routine
+;				189 - entry was queued, has completion routine
+;				+ 3 clocks if bcCompare
+;  Calls:		SendReq, BCPB completion handler
+;  Called by:	HandleHSTInt
+;
+;  Function:	Dequeues and sends the next block copy request, if any
+;				to the host precessor and then calls the completion
+;				routine, if any, for the request that had just completed.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				entry	HandleXMTMsg1		; a block copy has completed
+HandleXMTMsg1
+				assert	Idle=$00
+				stz 	BCxmtState			; Acknowledge the message
+				ldy 	activeBCPB			; find who completed
+				lda 	BCPBcmd,y			; get the command that completed
+				assert	(bcIOPtoHOST>>1)=0
+				assert	(bcHOSTtoIOP>>1)=0
+				assert	(bcCompare>>1)<>0
+				lsr		a					; test for bcCompare
+				beq		@compRelDone		; if not compare, return zero result (equal)
+				lda 	bcReqCompRel		; get the compare result
+@compRelDone	sta 	BCPBcompRel,y		; return it in the BCPB
+				lda 	#MessageCompleted	; mark the BCPB as completed
+				sta 	BCPBstate,y 		; mark the BCPB as done
+				lda 	bcReqQhead			; see if anything to be sent
+				bmi 	CheckCompletion		; if nothing queued
+				phy 						; save completed BCPB
+				tay 						; point to queued BCPB
+				lda 	BCPBnext,y			; get next in queue
+				sta 	bcReqQhead			; and make it the new head
+				jsr 	SendReq 			; send old queue head request
+				ply 						; restore completed BCPB
+CheckCompletion lda 	BCPBpcH,y			; get high byte of comp. addr
+				beq 	NoComp				; if no completion routine
+				pha 						; restore return pcH
+				lda 	BCPBpcL,y			; get low byte of comp. addr
+				pha 						; restore return pcL
+				lda 	#$00				; indicate no completion address
+				sta 	BCPBpcH,y			; to indicate that the wait completed
+				lda 	BCPBsaveA,y 		; restore reg-a
+				ldx 	BCPBsaveX,y 		; restore reg-y
+NoComp			rts 						; all done
+				endwith
+				endproc
+				title	'IOP Kernel - Delay Timer Management'
+
+				seg 	'data'
+TMPBdef 		record
+; TiMer Parameter Block (TMPB)
+
+MaxTMPBs		equ 	4					; (range 1..15)
+
+TMPBnext		ds.b	1					; next TMPB on list
+TMPBstate		ds.b	1					; request state
+
+; TMPBtimeH/L are to be filled in by user before calling StartTMPBtimer
+				export	TMPBtimeH
+				export	TMPBtimeL
+TMPBtimeH		ds.b	1					; High byte of 2 byte timer
+TMPBtimeL		ds.b	1					; Low byte of 2 byte timer
+
+TMPBpcH 		ds.b	1					; completion routine PC high
+TMPBpcL 		ds.b	1					; completion routine PC low
+TMPBsaveA		ds.b	1					; reg A save
+TMPBsaveX		ds.b	1					; reg X save
+
+TMPBsize		equ 	*-TMPBnext			; bytes per TMPB
+				ds.b	TMPBsize*(MaxTMPBs-1)	; allocate remaining TMPBs
+
+nilTMPB 		equ 	$FF 				; nil index value
+availTMPBhead	ds.b	1					; head of TMPB free list
+tmReqQhead		ds.b	1					; head of TMPB request queue
+tmIndexTemp 	ds.b	1					; temp used for indexing
+				endr
+				title	'IOP Kernel - Init Delay Timer Driver'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	InitDelayTimerDriver
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	A, X, n, v, z, c
+;  Cycles:		45 + 14 per TMPB
+;  Calls:		none
+;  Called by:	Reset
+;
+;  Function:	Initializes the Delay Timer data structures.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED.
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+InitDelayTimerDriver	proc
+				with	TMPBdef
+last			equ 	TMPBsize*(MaxTMPBs-1)
+
+				lda 	#0					; index of first TMPB
+				sta 	availTMPBhead		; all TMPBs are now available
+				clc 						; clear carry for additions
+loop			tax 						; setup index register
+				adc 	#TMPBsize			; point to next TMPB
+				sta 	TMPBnext,x			; have previous point to next
+				cpa 	#last				; check for last TMPB
+				blt 	loop				; process next TMPB
+				lda 	#nilTMPB			; mark empty lists
+				sta 	last+TMPBnext		; mark end of free list
+				sta 	tmReqQhead			; request queue head is empty
+				lda 	#TMRENI 			; disable timer interrupts
+				trb 	InterruptMask		; update the interrupt mask
+				lda 	#CONT				; prepare to force one shot mode
+				trb 	TimerDPLLctl		; reset the bit
+				lda 	#$80				; low byte latch is a constant
+				sta 	TimerLatchL 		; initialize the low timer latch
+				rts
+				endwith
+				endproc
+				title	'IOP Kernel - Get TMPB'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	GetTMPB
+;  Inputs:		none
+;  Outputs: 	Y - TMPB index
+;				n - 1 if no free TMPBs available
+;  Destroys:	A, Y, n, z
+;  Cycles:		34 if BCPB was available
+;				13 if BCPB was not available
+;  Calls:		none
+;  Called by:	Drivers
+;
+;  Function:	Returns the index of a free TiMer Parameter Block
+;				(TMPB), and removes it from the list of free TMPBs.
+;				A flag is returned to indicate if a free TMPB existed.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED.
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+GetTMPB 		proc	export				; Get a free TMPB
+				with	TMPBdef
+				ldy 	availTMPBhead		; get the available list head
+				bmi 	exit				; if list empty
+				lda 	TMPBnext,y			; get successor
+				sta 	availTMPBhead		; update list head
+				lda 	#MessageCompleted	; initialize to completed state
+				sta 	TMPBstate,y 		; initialize the state
+				lda 	#$00				; indicate no completion address
+				sta 	TMPBpcH,y			; initialize the PC page
+exit			rts 						; all done
+				endwith
+				endproc
+				title	'IOP Kernel - Free TMPB'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	FreeTMPB
+;  Inputs:		Y - TMPB index
+;  Outputs: 	none
+;  Destroys:	A, n, z, c
+;  Cycles:		27
+;  Calls:		none
+;  Called by:	Drivers
+;
+;  Function:	Adds the TMPB that was passed in, to the list of available
+;				TMPBs.	If the TMPB is currently active, the system crashes
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+FreeTMPB		proc	export
+				with	TMPBdef
+				lda 	availTMPBhead		; get the available list head
+				sta 	TMPBnext,y			; link it to end of new entry
+				sty 	availTMPBhead		; new entry is new list head
+				lda 	TMPBstate,y 		; check the state
+				cpa 	#newMessageSent		; see if copy was in progress
+				beq 	IsActive			; crash if was active
+				rts							; all done
+IsActive		brk 						; FreeTMPB on avtive TMPB
+				endwith
+				endproc
+				title	'IOP Kernel - Wait TMPB done'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	WaitTMPBdone
+;  Inputs:		Y - TMPB index
+;  Outputs: 	none
+;  Destroys:	n, z, c
+;  Cycles:		54 - if has to wait
+;				24 - if no wait needed
+;  Calls:		none
+;  Called by:	Drivers
+;
+;  Function:	If the TMPB is complete, this routine simply returns to
+;				its caller.  If it is not complete, then it returns to
+;				its callers caller, and will return to its caller when
+;				the TMPB request has completed.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+WaitTMPBdone	proc	export
+				with	TMPBdef
+				sta 	TMPBsaveA,y 		; save reg a
+				lda 	TMPBstate,y 		; get the state
+				cpa 	#MessageCompleted
+				beq 	exit				; if already done
+				txa 						; prepare to save reg x
+				sta 	TMPBsaveX,y 		; save reg x
+				lda 	TMPBpcH,y			; see if already waiting
+				bne 	MultipleWaits		; crash if already waiting
+				pla 						; get pcL
+				sta 	TMPBpcL,y			; save pcL
+				pla 						; get pcH
+				sta 	TMPBpcH,y			; save pcH
+exit			lda 	TMPBsaveA,y 		; restore reg a
+				rts 						; all done
+MultipleWaits	brk 						; multiple waits on TMPB
+				endwith
+				endproc
+				title	'IOP Kernel - Check TMPB done'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	CheckTMPBdone
+;  Inputs:		Y - TMPB index
+;  Outputs: 	z - 1 if TMPB request has completed
+;				z - 0 if TMPB request in progress, or not started
+;  Destroys:	A, n, c
+;  Cycles:		12
+;  Calls:		none
+;  Called by:	Drivers
+;
+;  Function:	Returns an indication as to whether the TMPB request has
+;				completed.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+CheckTMPBdone	proc	export
+				with	TMPBdef
+				lda 	TMPBstate,y 		; get the state
+				cpa 	#MessageCompleted	; see if it is done
+				rts 						; all done
+				endwith
+				endproc
+				title	'IOP Kernel - Start TMPB timer'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	StartTMPBtimer
+;  Inputs:		Y - TMPB index
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, v, z, c
+;  Cycles:		39 + StartTimer - if timer queue was empty
+;				142 + StopTimer + StartTimer +..., otherwise
+;  Calls:		StopTimer, StartTimer
+;  Called by:	Drivers
+;
+;  Function:	Starts running the timer in the TMPB.
+;				The timeH and timeL fields of the TMPB must be filled in prior
+;				to this call.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+StartTMPBtimer	proc	export
+				with	TMPBdef
+				lda 	#NewMessageSent 	; get the new message state
+				sta 	TMPBstate,y 		; mark the TMPB as active
+				ldx 	tmReqQhead			; get index of head of list
+				bpl 	QueueNotEmpty		; if queue already has entries
+				sty 	tmReqQhead			; new entry is queue head
+				lda 	#nilTMPB			; mark this entry as end of list
+				sta 	TMPBnext,y			; indicate no successor
+				lda 	#TMRENI 			; enable timer interrupts
+				tsb 	InterruptMask		; update the interrupt mask
+				tya 						; get TMPB index
+				tax 						; setup TMPB index for StartTimer
+				bra 	StartTimer			; start the timer and return
+
+QueueNotEmpty	jsr 	StopTimer			; stop the currently running timer
+				bmi 	loop				; if head is negative, begin after it
+				ldx 	#tmReqQhead-TMPBnext; fake index to tmReqQhead
+loop			stx 	tmIndexTemp 		; remember index of previous TMPB
+				lda 	TMPBnext,x			; get index to next TMPB
+				tax 						; load index register
+				bmi 	exit				; exit if end of list (nil)
+				sec 						; set carry for subtract
+				lda 	TMPBtimeL,y 		; TMPBtime,y := TMPBtime,y - TMPBtime,x
+				sbc 	TMPBtimeL,x
+				sta 	TMPBtimeL,y
+				lda 	TMPBtimeH,y
+				sbc 	TMPBtimeH,x
+				sta 	TMPBtimeH,y
+				bpl 	loop				; loop until TMPBtime,y is < 0
+				clc 						; clear carry for addition
+				lda 	TMPBtimeL,y 		; TMPBtime,y := TMPBtime,y + TMPBtime,x
+				adc 	TMPBtimeL,x
+				sta 	TMPBtimeL,y
+				lda 	TMPBtimeH,y
+				adc 	TMPBtimeH,x
+				sta 	TMPBtimeH,y
+				sec 						; set carry for subtract
+				lda 	TMPBtimeL,x 		; TMPBtime,x := TMPBtime,x - TMPBtime,y
+				sbc 	TMPBtimeL,y
+				sta 	TMPBtimeL,x
+				lda 	TMPBtimeH,x
+				sbc 	TMPBtimeH,y
+				sta 	TMPBtimeH,x
+exit			txa 						; prepare to store x
+				sta 	TMPBnext,y			; add rest of list after new entry
+				ldx 	tmIndexTemp 		; get index of entry before new one
+				tya 						; prepare to store y
+				sta 	TMPBnext,x			; add new entry after beginning of list
+				ldx 	tmReqQhead			; get index of head of list
+* Falls into StartTimer, which follows below
+*				bra 	StartTimer			; start the timer for the list head
+				endwith
+				endproc
+				title	'IOP Kernel - Start Timer'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	StartTimer
+;  Inputs:		X - tmReqQhead TMPB index
+;  Outputs: 	none
+;  Destroys:	A, n, v, z, c
+;  Cycles:		26 - when timer in range $8000..$FFFF
+;				33 - when timer in range $0000..$007F
+;				40 - when timer in range $0080..$00FF
+;				43/49 - when timer in range $0100..$7FFF
+;  Calls:		none
+;  Called by:	StartTMPBtimer, HandleTMR2Int, CancelTMPBtimer
+;
+;  Function:	Loads the hardware timer with the amount of time remaining
+;				for the timer at the head of the timer queue, or $0080 if
+;				the amount is less than 1, or $7F80 if the value is greater
+;				than $007F.  Adjusts the value in the TMPB to reflect the
+;				value loaded into the hardware time.  The timer is then
+;				started and will interrupt when it reaches zero.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+StartTimer		proc
+				with	TMPBdef
+				lda 	TMPBtimeH,x 		; get high bits
+				bne 	OutOfRangeH 		; if way too big
+				lda 	TMPBtimeL,x 		; get low bits
+				bmi 	OutOfRangeL 		; not in range $0000..$007F
+				stz 	TMPBtimeL,x 		; clear low bits
+				sta 	TimerCounterH		; start the counter
+				lda 	#$FF				; Set latch to $FF to re-load timer
+				sta 	TimerLatchH 		; with $FF when timer runs out
+				rts
+
+OutOfRangeH 	bmi 	OutOfRangeNeg		; if negative
+				lda 	#$7F				; load timer with $7F80
+				sta 	TimerCounterH		; start the counter
+				lda 	#$FF				; Set latch to $FF to re-load timer
+				sta 	TimerLatchH 		; with $FF when timer runs out
+				sec 						; set carry for subtract
+				lda 	TMPBtimeL,x 		; get low bits
+				sbc 	#$7F				; TMPBtime,x := TMPBtime,x - $007F
+				sta 	TMPBtimeL,x
+				bcs 	exit				; if no borrow
+				dec 	TMPBtimeH,x 		; adjust for borrow
+exit			rts
+
+
+OutOfRangeNeg	stz 	TimerCounterH		; use $0080 if negative
+				lda 	#$FF				; Set latch to $FF to re-load timer
+				sta 	TimerLatchH 		; with $FF when timer runs out
+				rts
+
+OutOfRangeL 	sec 						; set carry for subtract
+				sbc 	#$7F				; TMPBtime,x := TMPBtime,x - $007F
+				sta 	TMPBtimeL,x
+				lda 	#$7F				; load timer with $7F80
+				sta 	TimerCounterH		; start the counter
+				lda 	#$FF				; Set latch to $FF to re-load timer
+				sta 	TimerLatchH 		; with $FF when timer runs out
+				rts
+				endwith
+				endproc
+				title	'IOP Kernel - Stop Timer'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	StopTimer
+;  Inputs:		X - tmReqQhead TMPB index
+;  Outputs: 	n - indicates sign of TMPBtimer,x
+;  Destroys:	A, v, z, c
+;  Cycles:		38..40	+ 9 if close to rollover
+;  Calls:		none
+;  Called by:	StartTMPBtimer, HandleTMR2Int, CancelTMPBtimer
+;
+;  Function:	Reads the hardware timer, and updates the head of the
+;				timer queue to reflect the actual amount of time remaining.
+;				It also returns an indication of the sign of the timer
+;				remaining for the queue head.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+StopTimer		proc
+				with	TMPBdef
+				lda 	TimerCounterL		; read low byte of counter
+				cpa 	#$10				; see if close to rollover
+				blt 	StopTimer			; wait if close to rollover
+				lda 	TimerCounterH		; read high byte of counter
+				clc 						; clear carry for addition
+				bpl 	ZeroExtended		; if high byte was positive
+				adc 	TMPBtimeL,x 		; add to timer remaining for the
+				sta 	TMPBtimeL,x 		; timer at head of the timer list
+				bcs 	TestResultSign		; if no borrow from high byte
+				dec 	TMPBtimeH,x 		; adjust high byte
+				rts 						; all done
+
+TestResultSign	lda 	TMPBtimeH,x 		; return the timer sign
+				rts 						; all done
+
+ZeroExtended	adc 	TMPBtimeL,x 		; add to timer remaining for the
+				sta 	TMPBtimeL,x 		; timer at head of the timer list
+				bcc 	TestResultSign		; if no carry into high byte
+				inc 	TMPBtimeH,x 		; adjust high byte
+				rts 						; all done
+				endwith
+				endproc
+				title	'IOP Kernel - Handle TMR Interrupt'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	HandleTMRInt
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, v, z, c
+;  Cycles:		15 + StopTimer + StartTimer, if timer not fully expired
+;				60 + StopTimer, if expired, no more queued,
+;												no completion handler
+;				84 + StopTimer, if expired, no more queued,
+;												has completion handler
+;				62 + StopTimer + StartTimer, if expired, and more queued
+;												no completion handler
+;				86 + StopTimer + StartTimer, if expired, and more queued
+;												has completion handler
+;  Calls:		StopTimer, StartTimer, TMPB completion handler
+;  Called by:	Interrupt
+;
+;  Function:	Handles timer interrupts, determines if the timer at the
+;				head of the timer queue has fully expired, and calls the
+;				completion handler for that timer if one exists. Start
+;				any remaining timers on the timer queue.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+HandleTMRInt	proc						; timer interrupt handler
+				with	TMPBdef
+				ldx 	tmReqQhead			; get index of head of list
+				bmi 	unknownTMRint		; if timer queue is empty
+				jsr 	StopTimer			; stop timer and update queue head
+				bpl 	StartTimer			; if not expired, restart timer and exit
+				phx 						; save pointer to dequeued entry
+				lda 	TMPBnext,x			; get next queue entry
+				sta 	tmReqQhead			; dequeue head
+				bmi 	DisableTimer		; if no successor
+				tax 						; get pointer to new queue head
+				jsr 	StartTimer			; start next timer
+				bra 	RunCompletion		; go run the completion routine
+DisableTimer	lda 	#TMRENI 			; disable timer interrupts
+				trb 	InterruptMask		; update the interrupt mask
+RunCompletion	ply 						; restore pointer to dequeued entry
+				lda 	#MessageCompleted	; mark the TMPB as completed
+				sta 	TMPBstate,y 		; mark the TMPB as done
+				lda 	TMPBpcH,y			; get high byte of comp. addr
+				beq 	NoComp				; if no completion routine
+				pha 						; restore return pcH
+				lda 	TMPBpcL,y			; get low byte of comp. addr
+				pha 						; restore return pcL
+				lda 	#$00				; indicate no completion address
+				sta 	TMPBpcH,y			; to indicate that the wait completed
+				lda 	TMPBsaveA,y 		; restore reg-a
+				ldx 	TMPBsaveX,y 		; restore reg-y
+NoComp			rts 						; all done
+unknownTMRint	brk 						; TMR interrupt with empty Q
+				endwith
+				endproc
+				title	'IOP Kernel - Cancel TMPB timer'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	CancelTMPBtimer
+;  Inputs:		Y - TMPB index
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, v, z, c
+;  Cycles:		15 - if it is already completed
+;				50 - if it is the only running timer
+;				98 + StopTimer + StartTimer - if head, with successors
+;				65..94+ - if not head
+;  Calls:		StopTimer, StartTimer
+;  Called by:	Drivers
+;
+;  Function:	Cancels the timer in the indicated TMPB, and removes it
+;				from the timer queue.
+;
+;  NOTE:		This routine must be called with interrupts DISABLED
+;
+;_______________________________________________________________________
+
+				seg 	'code'
+CancelTMPBtimer proc	export
+				with	TMPBdef
+				lda 	#MessageCompleted	; prepare to check for done
+				cpa 	TMPBstate,y 		; see if already completed
+				beq 	exit				; exit if already completed
+				sta 	TMPBstate,y 		; indicate completed
+				lda 	#$00				; indicate no completion address
+				sta 	TMPBpcH,y			; to indicate that the wait completed
+				cpy 	tmReqQhead			; see if it is running
+				bne 	SearchQueue 		; if not head of queue
+				lda 	TMPBnext,y			; check for successor
+				bpl 	HasSuccessor		; if not the only entry
+				sta 	tmReqQhead			; set head to nil
+				lda 	#TMRENI 			; disable timer interrupts
+				trb 	InterruptMask		; update the interrupt mask
+				rts 						; all done
+
+HasSuccessor	ldx 	tmReqQhead			; get queue head
+				jsr 	StopTimer			; stop the head timer
+				ldy 	tmReqQhead			; get index of entry to dequeue
+				ldx 	TMPBnext,y			; get index of successor
+				stx 	tmReqQhead			; successor is new head
+				jsr 	AdjustTime			; adjust the delay time
+				jmp 	StartTimer			; start new head timer
+
+SearchQueue 	lda 	#tmReqQhead-TMPBnext; fake index to tmReqQhead
+				sty 	tmIndexTemp 		; save index of canceled timer
+loop			tax 						; load index register
+				bmi 	exit				; exit if end of list (nil)
+				lda 	TMPBnext,x			; get index to next TMPB
+				cpa 	tmIndexTemp 		; check for a match
+				bne 	loop				; loop if not a match
+				lda 	TMPBnext,y			; prepare to un-link entry
+				sta 	TMPBnext,x			; finish unlinking it
+				bmi 	exit				; if entry has no successor
+				tax
+AdjustTime		clc 						; clear carry for addition
+				lda 	TMPBtimeL,x 		; TMPBtime,x := TMPBtime,x + TMPBtime,y
+				adc 	TMPBtimeL,y
+				sta 	TMPBtimeL,x
+				lda 	TMPBtimeH,x
+				adc 	TMPBtimeH,y
+				sta 	TMPBtimeH,x
+exit			rts 						; all done
+				endwith
+				endproc
+
+				end

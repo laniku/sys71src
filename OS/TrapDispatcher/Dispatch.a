@@ -1,0 +1,770 @@
+;
+;	File:		Dispatch.a
+;
+;	Written by:	Andy Hertzfeld   July 15, 1982
+;
+;	Copyright:	© 1982-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM15>	10/25/93	SAM		Roll in <MC4> from mc900ftjesus.
+;	   <MC4>	10/25/93	SAM		Changed equate name mmCacheUnk1 to mmFigEnable.
+;	  <SM14>	10/15/93	rab		Roll ProtectGetTrap and ProtectSetTrap from PatchProtector.a
+;									into G/SetTrapAddress.
+;	  <SM13>	10/12/93	SAM		Roll in <MC2> from mc900ftjesus.
+;	   <MC2>	10/12/93	SAM		Redid the figment check to look at universal flags to determine
+;									if we should switch in the figment aware dispatch table.  Side
+;									effect of this check is the update of MMFlags from PRAM.
+;	  <SM12>	 5/26/93	BT		Switch polarity of figment switch.
+;	  <SM11>	 5/20/93	BT		Urgh, forgot something
+;	  <SM10>	 5/20/93	BT		Update build to only include Figment under conditional compile
+;									flag "hasNewHeapMgr".
+;	   <SM9>	 5/19/93	BT		Change PRAM address to end of Spectre's Server Name address.
+;									Using slot 6 didn't work because it was reset after every second
+;									boot.
+;	   <SM8>	 5/18/93	BT		Add some code to check PRAM to see if Figment is supposed to be
+;									loaded and change which trap table is used, accordingly. The
+;									alternate trap table is right after the original OS trap table
+;									in DispTable.a
+;	   <SM7>	  5/6/93	SAM		On machines with a 68k emulator running, the cacheFlush vector
+;									is pointed at an RTS (cuz there's no need to be flushin!)
+;	   <SM6>	11/30/92	GD		Added support for A-Trap tracing and logging in forRomulator
+;									builds (with the correct nub).
+;	   <SM5>	 11/2/92	kc		Remove DispatchTable DeCompression.
+;	   <SM4>	  7/1/92	RB		Added the TrapAddressBits procedure to Get and Set TrapAddress.
+;									This function takes a full word trap address and it clears/sets
+;									the relevant OS/Toolbox bits. The Installer needs this in order
+;									for it to work on SuperMario.
+;	   <SM3>	 5/21/92	RB		Changing the name of SetTrapAddress and GetTrapAddress to
+;									SetTrapAddressTrap and GetTrapAddressTrap because someone forgot
+;									to finish the damn job.
+;	   <SM2>	 5/11/92	PN		Remove 68000 conditionals for SuperMario ROM
+;		 <8>	 2/12/92	JSM		Moving to TrapDispatcher directory, keeping all revisions.
+;		 <7>	 8/29/91	JSM		Cleanup header.
+;		 <6>	 6/12/91	LN		Changed #include 'HardwareEqu.a' to 'HardwarePrivateEqu.a'
+;		 <5>	10/10/90	HJR		Save and restore d1 register in the Cache flush routine since it
+;									needs to be preserved routines that call this code directly.
+;		 <4>	 6/25/90	BG		Corrected a comment.  No code changes.
+;		 <3>	 1/15/90	BG		Added vCacheFlush68040 to provide 040 cache flushing.  Modified
+;									InitDispatcher to install the 040 cache flushing routine into
+;									jCacheFlush when appropriate.
+;		 <2>	 1/11/90	CCH		Added include of HardwarePrivateEqu.a.
+;	   <1.5>	 7/17/89	GGD		Changed aligns to use alignment equate instead of hard coded 16.
+;	   <1.4>	 6/15/89	GGD		Incorporated code review optimization to cache flushing routine.
+;	   <1.3>	  4/1/89	GGD		Removed reference to DispOff, and referenced as an offset from
+;									ROMBase instead, to eliminate link errors on some machines.
+;	   <1.2>	11/17/88	GGD		Completely re-written and optimized. Old change history left
+;									around for historical purposes.
+;	  <•1.1>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.0>	 2/10/88	BBM		Adding file for the first time into EASE…
+;	  <C914>	10/29/87	rwh		Port to Modern Victorian (onMvMac)
+;	  <C668>	 1/22/87	bbm		added a vector to flush the cache in SetTrapAddress. Added anew
+;									the same to GetTrapAddress and the routine to do it (called
+;									vCacheFlush). Even though the routine is in this module, you
+;									should go through the vector so that UNIX (which runs in user
+;									mode) can still patch this call.
+;	  <C476>	 12/2/86	JTC		Unroll various cases in order to optimize for speed, not space.
+;									Some random notes: 1) We were careful to use CMPI.W rather than
+;									BTST to decode the A-line words, because the immediate
+;									operations were faster on the 68000; nowadays (on the 020 that
+;									is), the Bxxx instructions are a single cycle faster in the
+;									worst case, but in the interest of simplicity we leave well
+;									enough alone. 2) Although we were careful to use the constant
+;									numTrapMask to strip the leading bits $A800, we later use BCLRs
+;									to get rid of the $0600 bits in the OS trap words--just a little
+;									nit. Change SetTrapAddress to flush the cache, based on David
+;									Goldsmith’s suggestion that many apps (and formerly MacApp)
+;									would indiscreetly blast some code into the system heap
+;									(possibly an absolute jump elsewhere) and _SetTrapAddress. To
+;									accommodate non-020 systems we leave the cache-clearing code in
+;									even though we move the entry point down past it in the case of
+;									68000s; if a system is to run with the 020, a simple patch will
+;									be needed to fix the entry points to the cache-buster routines.
+;	  <C456>	11/22/86	bbm		moved the code to flush the cache into blockmove, loadseg,
+;									unloadseg, and read. this might improve performance.
+;	   <C99>	  8/5/86	BBM		added support for expanded toolbox table on NuMac. (this file
+;									now includes hwEqu.a)
+;	   <C54>	 6/25/86	WRL		& BBM Flush cache in trap dispatch for 68020 to fix self
+;									modifying code.
+;				 2/19/86	BBM		Made some modifications to work under MPW
+;				  5/5/85	JTC		_L... made modifier-bits variants of the original _Set... and
+;									_Get...
+;				  3/6/85	JTC		Long-word dispatch table entries. Separate OSTable and
+;									ToolTable. New _LGetTrapAddress and _LSetTrapAddress.
+;				 1/31/85	LAK		Added ATrap68010 for new machine support.
+;				 1/23/85	LAK		Adapted for new equate files.
+;				  8/8/83	LAK		Saved space in SetTrapAddr as per 17-July code review.
+;				 5/12/83	JTC		Tweaked for speedup.
+;				 2/22/83	LAK		Changed OS dispatch to save fewer regs since OS routines now
+;									observe Pascal regsave conventions; (async bit is bit 10).
+;				10/24/82	AJH		Added bit 10 auto-pop for toolBox dispatches Added
+;									GetTrapAddress, SetTrapAddress
+;
+;_______________________________________________________________________
+;
+;			  Written by Andy Hertzfeld   July 15, 1982
+;			Re-Written and optimized by Gary G. Davidian  November 7, 1988
+;
+; Copyright Apple Computer, Inc. 1982-1988
+; All Rights Reserved
+;
+;	Ancient Modification History: (for historical purposes only, does not correspond to this code)
+;
+; 24-Oct-82  AJH  Added bit 10 auto-pop for toolBox dispatches
+;				   Added GetTrapAddress, SetTrapAddress
+; 22-Feb-83  LAK  Changed OS dispatch to save fewer regs since OS routines
+;				   now observe Pascal regsave conventions;
+;				   (async bit is bit 10).
+; 12-May-83  JTC  Tweaked for speedup.
+; 08-Aug-83  LAK  Saved space in SetTrapAddr as per 17-July code review.
+;_______________________________________________________________________
+;
+; 23 Jan 85  LAK  Adapted for new equate files.
+; 31 Jan 85  LAK  Added ATrap68010 for new machine support.
+; 06 Mar 85  JTC  Long-word dispatch table entries.  Separate OSTable and ToolTable.
+;					New _LGetTrapAddress and _LSetTrapAddress.
+; 05 May 85  JTC  _L... made modifier-bits variants of the original _Set... and _Get...
+;_______________________________________________________________________
+
+			eject
+			Title	'Dispatch - Line A trap dispatcher'
+
+;_______________________________________________________________________
+;
+;	  EMT1010 -- MacIntosh Operating System Dispatcher
+;
+;	  The following code receives all Line 1010 emulator traps and transfers control
+;  to the appropriate system code to interpret the trap.  Two 32-bit/entry RAM-based
+;  dispatch tables are used to derive the addresses to dispatch to.  Since this table
+;  is patchable, a system or application program can patch in and intercept any system
+;  call to fix bugs, etc.
+;
+;  An A-line trap has the form:  1010 tabc nnnn nnnn
+;
+;  t=1 ==> Toolbox;  t=0 ==> OS.  They differ mainly in register saving conventions.
+;
+;  ToolBox:
+;		These calls follow Pascal parameter-passing conventions, receiving and returning
+;		values on the stack, and saving all but D0-D2/A0-A1.
+;		All registers are preserved up to the time the target routine is reached; the
+;		stack is as though a JSR had been executed.
+;		a=1 ==> an extra return address was on the stack when the trap was executed
+;			(e.g. a dumb compiler required a JSR to the A-line trap).  This superfluous
+;			address will be removed by the dispatcher.
+;		bcnnnnnnnn = trap number
+;
+;  OS:
+;		All parameters are passed in registers.  Routine must follow Pascal
+;		conventions about D3-D7/A2-A7.	D0/A0-A1 are passed through to the
+;		routine unchanged.	D1.W is the actual A-line instruction.
+;		c=1 ==> D1-D2/A1 are preserved by the dispatcher (so values can be returned
+;			in D0/A0).
+;		c=0 ==> D1-D2/A0-A1 are preserved by the dispatcher (so D0 can be returned).
+;		a,b = don't care, but are used by the traps to indicate, say, SYS/APPL,
+;			SYNC/ASYNC, DIACRITICALS/NOT, . . .
+;		nnnnnnnn = trap number
+;
+; Dispatch addresses are maintained in two tables of long words, ToolTable with 512 entries,
+; and OSTable with 256 entries.  (They used to be rolled into one table of 512 word entries.)
+; For backward compatibility, the GetTrapAddress and SetTrapAddress routines use the original
+; trap numbering scheme, that is traps $00-$4F, $54, and $57 are OS traps, and the rest are
+; Tool traps.
+;
+; The expanded routines GetTrapAddress and SetTrapAddress routines use
+; bits #10 to specify Tool=1/OS=0 and #9 to specify New=1/Old=0 numbering.	Bit #10 is ignored
+; when bit #9 is 0.
+;
+;	A few things to remember.  Although toolbox routines use pascal register
+;	saving conventions, the trap dispatcher must preserve all registers when
+;	dispatching a toolbox trap, since there are some routines which are
+;	documented as saving all registers (_Debugger, _LoadSeg, _FP68K, …).
+;
+;	Even though the OS trap dispatcher saves A0-A2/D1-D2 for the user, it
+;	may not modify A0 or A1 before calling the OS routine, since routines
+;	like _BlockMove expect paramaters in A0/A1/D0.  Additionally, register
+;	D1 must contain a copy of the A-Trap word, since that is how routines
+;	read the additional trap bits (eg. _NewPtr ,SYS,CLEAR).
+;
+;	Although the register save order, and format of the stack frame for an
+;	OS trap is undocumented, Microsoft does a SetTrapAddress on _GetHandleSize
+;	and and their new routine calls the ROM GetHandleSize, and then restores
+;	the registers that the trap dispatcher saved, and does a TST.L on D0.
+;	Because of this, register save order must be maintained for compatibility,
+;	since we may never get back to restore them.
+;
+;	For machines with CPUs earlier than the 68020, we include 3 versions of the
+;	trap dispatcher in ROM, 68000, 68010, and 68020/030.  At startup time we determine
+;	which CPU we are running on, and install the correct dispatcher.  We also modify
+;	the dispatch addresses for GetTrapAddress, SetTrapAddress, and BlockMove to use
+;	cache flushing versions when the CPU is a 68020 or later.
+;	On systems with 68020/030 cpus, we only provode the 020/030 versions.
+;_______________________________________________________________________
+
+			print	off
+			LOAD	'StandardEqu.d'
+			include	'HardwarePrivateEqu.a'
+			include	'UniversalEqu.a'
+			print	on
+			print	nomdir
+			machine	mc68020		; assembles 68020 instructions, even for a 68000
+
+;	Conditionals used only within this code and unlikely to change.
+
+FasterTool	equ		1			; favor toolbox traps at the expense of OS (68000 only)
+Opt68010	equ		0			; share code with 68000, and don't use separate optimized 68010 code
+LotusKludge	equ		1			; add extra code to be compatible with a Lotus kludge
+
+Dispatcher 	proc	export
+
+			export	EMT1010				; default line A-Trap dispatcher
+			export	GetTrapAddressTrap	; <SM3> rb
+			export	SetTrapAddressTrap	; <SM3> rb
+			export	CacheFlush
+			export	vCacheFlush
+			export	InitDispatcher
+			export	BadTrap
+			import	SysErr1
+			import	BlockMove68020
+	If hasNewHeapMgr Then
+			import	PramIO				; <SM8 BT>
+	endif
+
+			Title	'Dispatch - ATrap68020'
+
+;_______________________________________________________________________
+;
+; Routine:		ATrap68020
+;
+; Function: 	Dispatch A-line emulator traps to Mac system.
+;
+; Input:		(SP)	-	status register
+;				2(SP)	-	address of trapped instruction
+;				6(SP)	-	stack frame format word
+;
+; Output:		none
+;
+; Called by:	Jump through vector at $28 when trap occurs.
+;
+;	68020 / 68030 / 68040 A-line trap dispatcher								<4>
+;
+;	Approx Mem information	ROM Reads	RAM Reads	RAM Writes
+;
+;	ToolBox, autopop		13			8			7			
+;	ToolBox, normal			12			8			8			
+;
+;	OpSys, A0 not saved		20			10			10			
+;	OpSys, normal			20			11			11			
+;_______________________________________________________________________
+
+
+			align	alignment			; align on cache line boundary			<1.5>
+ATrap68020								; 2 1 4	overhead for A-Trap exception
+			move.l	a2,-(sp)			; 1 0 1	save a2, stack has a2/x/pc/x
+			move.l	d2,-(sp)			; 0 0 1	save d2, stack has d2/a2/x/pc/x
+			movea.l	4+4+2(sp),a2		; 1 2 0	get return address
+			move.w	(a2)+,d2			; 1 1 0	get trap word, inc pc
+			cmpi.w	#$A800,d2			; 1 0 0	see if os or tool trap
+			blo.s	@OsTrap				; 0 0 0	os-traps are lower
+
+@ToolTrap
+			subi.w	#($A800+autoPop)\	; 1 0 0	subtract tool trap start
+					,d2					;		and see if auto-pop set
+			bhs.s	@AutoPop			; 1 0 0	handle auto pop separatly
+
+			move.l	(ToolTable\			; 2 1 1	get trap table entry
+					+(autoPop*4)\		;		biased by autopop bit
+					,d2.w*4),4+4(sp)	;		setup routine address
+			move.l	a2,4+4+4(sp)		; 1 0 1	save updated return pc
+			move.l	(sp)+,d2			; 0 1 0	restore d2
+			movea.l	(sp)+,a2			; 1 1 0	restore a2
+			rts							; 1 1 0	jump to the routine
+
+			align	alignment			; align on cache line boundary			<1.5>
+@AutoPop								; 1 0 0	overhead needed to branch here
+			move.l	(ToolTable,d2.w*4)\	; 2 1 1	get trap table entry
+					,4+4(sp)			;		setup routine address
+			move.l	(sp)+,d2			; 1 1 0	restore d2
+			movea.l	(sp)+,a2			; 0 1 0	restore a2
+			rtd		#4					; 1 1 0	jump to the routine
+			eject
+			align	alignment			; align on cache line boundary			<1.5>
+@OsTrap									; 1 0 0	overhead needed to branch here
+			move.l	d1,-(sp)			; 1 0 1	save d1, stack has d1/d2/a2/xx/pc
+			move.l	a1,-(sp)			; 0 0 1	save a1, stack has a1/d1/d2/a2/xx/pc
+			move.w	d2,d1				; 1 0 0	pass trap word to OStraps in D1
+			move.l	a2,5*4(sp)			; 1 0 1	save updated return pc
+			andi.w	#$0100,d2			; 1 0 0	test the don't save A0 bit
+			bne.s	@A0NotSaved			; 0 0 0	handle it separatly
+
+			move.b	d1,d2				; 1 0 0	zero extend the trap table index
+			move.l	a0,-(sp)			; 0 0 1	save a0, stack has a0/a1/d1/d2/a2/xx/pc
+			jsr		([OSTable,d2.w*4])	; 3 1 1	call the routine
+			movea.l	(sp)+,a0			; 1 1 0	restore a0
+			movea.l	(sp)+,a1			; 0 1 0	restore a1
+			move.l	(sp)+,d1			; 1 1 0	restore d1
+			move.l	(sp)+,d2			; 0 1 0	restore d2
+			movea.l	(sp)+,a2			; 1 1 0	restore a2
+			tst.w	d0					; 0 0 0	set conditions based on d0.w
+			addq.w	#4,sp				; 1 0 0	pop hole from stack
+			rts							; 1 1 0	return
+
+
+			align	alignment			; align on cache line boundary			<1.5>
+@A0NotSaved								; 1 0 0	overhead needed to branch here
+			move.b	d1,d2				; 1 0 0	get the trap table index
+			jsr		([OSTable-($100*4),d2.w*4])	; 2 1 1	call the routine
+			movea.l	(sp)+,a1			; 1 1 0	restore a1
+			move.l	(sp)+,d1			; 0 1 0	restore d1
+			move.l	(sp)+,d2			; 1 1 0	restore d2
+			movea.l	(sp)+,a2			; 0 1 0 restore a2
+			tst.w	d0					; 1 0 0	set conditions based on d0.w
+			addq.w	#4,sp				; 0 0 0	pop hole from stack
+Rts020Disp	rts							; 2 1 0	return
+
+
+EMT1010		equ		ATrap68020
+
+			Title	'Dispatch - Find Table Entry'
+
+;_______________________________________________________________________
+;
+; Routine:		FindTableEntry
+;
+; Function: 	Return address of trap entry in the dispatch table. (flushes Inst cache on 020).
+;
+; Input:		D0		-	trap number in low bits
+;				D1		-	Get/Set TrapAddress trap word (for NewTool/NewOs bit testing)
+;
+; Output:		A1		-	address of trap table entry for specified trap number
+;
+;_______________________________________________________________________
+
+FindTableEntry
+			_AssumeEq	OldDisp,ToolDisp-1	; OldDisp is next to, and lower than ToolDisp
+			lsl.w	#16-ToolDisp,d1		; ccr.c <- ToolDisp, ccr.n <- OldDisp
+			bpl.s	@oldTrap			; if OldDisp = 0, it's an old style trap
+			bcc.s	@osTrap				; if ToolDisp = 0, it's a new style OS trap
+										; otherwise, it's a new style ToolBox trap
+
+@toolTrap	andi.w	#numTrapMask,d0		; clear all but trap bits
+			lea		(ToolTable,d0.w*4),a1	; index into the Toolbox table
+			bra		CacheFlush			; flush inst cache and return (destroys only reg D1)	<SM14>
+
+@oldTrap	andi.w	#$01FF,d0			; clear irrelevant bits
+			moveq.l	#-$0057,d1			; setup to check for ToolBox range
+			add.w	d0,d1				; d1 := TrapNum - $0057
+			bgt.s	@toolTrap			; $0058 … $01FF are tool box traps
+			beq.s	@osTrap				; $0057 is an OS trap
+			addq.w	#$0057-$004F,d1		; d1 := TrapNum - $004F
+			ble.s	@osTrap				; $0000 … $004F are OS traps
+			subq.w	#$0054-$004F,d1		; d1 := TrapNum - $0054
+			bne.s	@toolTrap			; $0054 is an OS trap, $50…$53,$55,$56 are tool box
+@osTrap		andi.w	#$00FF,d0			; only 8 bits for OS trap numbers
+			lea		(OSTable,d0.w*4),a1	; index into the OS table
+			bra.s	CacheFlush			; flush inst cache and return (destroys only reg D1)
+
+			Title	'Dispatch - Get / Set Trap Address'
+
+			IMPORT	TrapAddressBits		; <SM4> rb
+;_______________________________________________________________________
+;
+; Routine:		GetTrapAddress
+;
+; Function: 	Return trap address from dispatch table.
+;
+; Input:		D0		-	trap number in low 9 bits
+;
+; Output:		A0		-	trap address
+;
+;_______________________________________________________________________
+kBranchOverJMPLOpcode	equ		$6006											;	<SM14>
+kJMPLOpcode				equ		$4EF9											;	<SM14>
+kComeFromHeader			equ		(kBranchOverJMPLOpcode << 16) + kJMPLOpcode		;	<SM14>
+
+GetTrapAddressTrap						; <SM3> rb
+
+			bsr		TrapAddressBits			; makes sure trap word is correct		<SM14>begin
+			move	ccr,-(sp)				; save condition register
+			bsr.s	OldGetTrapAddress		; call the old GetTrapAddress
+			move	(sp)+,ccr				; get condition codes back
+			bcs.s	@done					; come-from patches bypass our trickery
+@next
+			cmp.l	#kComeFromHeader,(a0)	; does this have the come-from header?
+			bne.s	@done					; no we are done
+			move.l	4(a0),a0				; go on to the next
+			bra.s	@next
+@done
+			moveq	#0,d0					; must zero the result code again
+			rts
+
+OldGetTrapAddress							;									;	<SM14>end
+
+			bsr.s	FindTableEntry		; locate the dispatch table entry
+			movea.l	(a1),a0				; get the routine address from the table
+			moveq.l	#noErr,d0			; return with success
+			rts							; all done
+
+
+;_______________________________________________________________________
+;
+; Routine:		SetTrapAddress
+;
+; Function: 	Load new trap vector into dispatch table.
+;				On 020 machines, flush the cache as well.
+;
+; Input:		D0		-	trap number in low 9 bits
+;				A0		-	trap address
+;
+; Output:		none
+;
+;_______________________________________________________________________
+
+SetTrapAddressTrap						; <SM3> rb
+
+			move.l	(a0),d2					; get header of trap, and check for bus errors		<5><SM14>begin
+
+			bsr		TrapAddressBits			; makes sure trap word is correct			<SM4> rb
+			bcs.s	OldSetTrapAddress		; come-from patches bypass our trickery
+
+			cmp.l	#kComeFromHeader,d2		; headers can only be used on come-from patches		<5>
+			beq.s	@illegalHeader			; saw a header, so I must system error				<5>
+
+			movem.l	d0-d1/a0,-(sp)			; save trap address, number, and bits
+			bsr		OldGetTrapAddress		; call the old GetTrapAddress
+			move.l	#0,a1					; no come-froms found yet
+@next
+			cmp.l	#kComeFromHeader,(a0)+	; does this have the come-from header?
+			bne.s	@done					; no we are done
+			move.l	a0,a1					; remember this address
+			move.l	(a0),a0					; go on to the next
+			bra.s	@next
+@done
+			movem.l	(sp)+,d0-d1/a0			; restore trap address, number, and bits
+
+			cmp.l	#0,a1					; any come-froms found?
+			beq.s	OldSetTrapAddress		; no, go do the real SetTrapAddress
+			move.l	a0,(a1)					; set the trap address
+			move.l	jCacheFlush,-(sp)		; get the cache flush vector						<9>
+			rts								; call it, and then return to the trap dispatcher	<9>
+
+@illegalHeader
+			move.w	#dsBadPatchHeader,d0	; get error code									<5>
+			_SysError						; report it to the unsuspecting user				<5>
+
+OldSetTrapAddress
+	
+			bsr.s	FindTableEntry			; locate the dispatch table entry
+			move.l	a0,(a1)					; install the new routine address into the table
+			moveq.l	#noErr,d0				; return with success
+
+			move.l	jCacheFlush,-(sp)		; get the cache flush vector						<9>
+			rts								; call it, and then return to the trap dispatcher	<9><SM14>end
+
+;_______________________________________________________________________
+;
+; Macros:		CacheFlush, vCacheFlush
+;
+; Function: 	Flush the 68020 Cache.  For programs that do self modifying code, etc.
+;
+; Arguments:	none
+;
+; Invoked by:	BlockMove, GetTrapAddress, LoadSeg, Read, SetTrapAddress, UnloadSeg
+;
+;	Note that this routine only trashes one register, namely D1.  D1 was chosen to speed up
+; blockmove.  In blockmove we can trash D1, since D1 is not used in blockmove, and since D1
+; is preserved by the trap dispatcher.  In the 040 case, NO registers are destroyed.		<3>
+;
+;_______________________________________________________________________
+
+CacheFlush
+			move.l	jCacheFlush,-(sp)	; push the vector
+			rts							; jump through the vector
+
+vCacheFlush
+			move.l	d1,-(SP)			; save this f*&%$ng register						<5>
+			movec.l	cacr,d1				; get current cache state of 68020
+			addq.w	#1<<3,d1			; flush the instruction cache				<1.4>
+			movec.l	d1,cacr				; write back to the control register
+			move.l	(SP)+,d1			; restore register									<5>
+			rts							; all done
+
+vCacheFlush68040						; 68040 cache flushing for self-modifying programs	<3>
+
+;	NOTE - since the 040 I-Cache never gets "dirty", it only needs to be invalidated.		<3>
+;	BUT - if someone writes self-modifying code, it will end up in the D-Cache (!),			<3>
+;	the D-Cache must be flushed since the I-Cache does not snoop the D-Cache				<3>
+;	(and verse visea).[MC68040 User's Manual, 1st Ed., pg 7-7]								<3>
+;
+
+			MACHINE	MC68040				; perform 040 cache flushing						<3>
+
+			cpusha	bc					; invalidate the i-cache, flush d-cache				<3>
+			rts							; return to caller - no registers destroyed			<3>
+
+			MACHINE	MC68020				; reset to previous MACHINE directive				<3>
+			Title	'Dispatch - InitDispatcher'
+
+;_______________________________________________________________________
+; InitDispatcher: Load Tool and OS trap tables, separate blocks of 512 and 256
+;	32-bit addresses.
+;
+; Encoded table contains 512 Tooltraps, then as many OS traps as used.	Format of entries is:
+;	$80 		==> skip entry
+;	$FF 		==> next 4 bytes are absolute ROM address
+;	1xxx xxxx	==> xxxx xxx0 is a positive offset from last trap address
+;	0yyy ... y	==> yyyy yyyy yyyy yyy0 is a SIGNED offset from last trap address
+;	0000 ... 0	==> end of table
+; Table begins at offset DispTableOff from base of ROM.
+;
+; Destroys	D0-D3/A0-A4
+; Called by	StartInit
+;_______________________________________________________________________
+	if LotusKludge then
+
+; The following code is to accommodate Lotus, which, on Mac+ and later machines,
+; looks INTO THE ROM INSTRUCTION STREAM to derive the address of the a-trap handler,
+; presumably to bypass any debugger that may be installed.  This code is NOT executed
+; by this ROM, it is only here for compatibility.  I assume they search for the final
+; "move.l a0,line1010" instruction, and look for the LEA's relative to it, so this code
+; must come before the real dispatcher installation code so that we don't confuse them.
+; See the MacPlus ROMs locs $4005AE…$4005BB.
+
+			lea		EMT1010,A0			; default dispatcher (cpuflag=0)
+			beq.s	@kludge				; br if 680000
+			lea		ATrap68020,a0		; otherwise use the 68020 dispatcher
+@kludge		move.l	a0,Line1010			; install the Line-A exception handler
+	endif
+
+InitDispatcher							; initialize / install the trap dispatcher
+
+	If &Type('NewBuildSystem') = 'Undefined' Then
+NewBuildSystem		Equ	0
+	Endif
+	If NewBuildSystem Then				; This is a temporary hack <SM5>.start
+
+;	initialize the trap dispatch tables
+
+			with	ROMHeader
+			
+			lea		BadTrap,a4			; a4 := trap handler for undefined A-Traps			
+			move.l	ROMBase,a3			; a3 := address of ROM base
+
+			movea.l	a3,a2				; a2 := address of ROM base
+			add.l	DispTableOff(a3),a2	; a2 += dispatch table offset
+
+;	initialize ToolBox table
+
+			lea		ToolTable,a1		; a1 := ToolBox dispatch table ptr
+			move.w	#numTbTrap-1,d0		; d0 := loop counter for toolbox trap table
+
+ToolLoop	move.l	(a2)+,d1			; get the next entry from the ROM dispatch table
+			beq.s	@BadTrap			; if zero then unused trap
+			
+@GoodTrap	add.l	a3,d1				; add ROM base to offset
+			bra.s	@Install			; install trap handler
+
+@BadTrap	move.l	a4,d1				; install bad trap handler
+
+@Install	move.l	d1,(a1)+			; install it into the ToolBox dispatch table
+
+@NextEntry	dbra	d0,ToolLoop			; loop till end of table
+
+;	initialize OS table
+
+	if hasNewHeapMgr Then								; <MC2> SAM
+
+			With	ProductInfo
+			
+			BTST	#hasNewMemMgr,UnivROMFlags			; Does this ROM support Figment?
+			BEQ.S	@noFigment							; -> No. Don't bother w/PRAM
+
+			MOVEM.L	A0-A3/D1/D3,-(SP)		; save regs
+
+			MOVEA.L	UnivInfoPtr,a1						; Get product info pointer
+			MOVEA.L	A1,A0								; Make a copy into A1
+			ADDA.L	ProductInfo.DecoderInfoPtr(A1),A0	; Get ptr to hardware bases
+			MOVE.L	ProductInfo.ExtValid(A1),D1			; Get external features (0-31)
+			MOVE.L	#MMPRAMloc,D3						; Read MMFlags from PRAM
+			LEA		MMFlags,A3							; A3 points to MMFlags lomem
+			BSR.L	PramIO								; Get the current MMFlags
+			
+			MOVEM.L	(SP)+,A0-A3/D1/D3		; restore regs
+			
+			BTST	#mmFigEnable,MMFlags				; Is Figment enabled for this boot?
+			BEQ.S	@noFigment							; -> Nope.  Use old MemMgr
+
+			ADD.L	#numOSTrap*4,A2						; Yes, skip to second table
+	
+			EndWith
+	endif
+		
+@noFigment	lea		OSTable,a1			; a1 := OS dispatch table ptr
+			move.w	#numOsTrap-1,d0		; d0 := loop counter for toolbox trap table
+
+OSLoop		move.l	(a2)+,d1			; get the next entry from the ROM dispatch table
+			beq.s	@BadTrap			; if zero then unused trap
+			
+@GoodTrap	add.l	a3,d1				; add ROM base to offset
+			bra.s	@Install			; install trap handler
+
+@BadTrap	move.l	a4,d1				; install bad trap handler
+
+@Install	move.l	d1,(a1)+			; install it into the OS dispatch table
+
+@NextEntry	dbra	d0,OSLoop			; loop till end of table
+
+	Else	;Not NewBuildSystem			; This is a temporary hack <SM5>.end
+	
+;	setup registers
+
+			lea		BadTrap,a4			; a4 := trap handler for undefined A-Traps
+			movea.l	ROMBase,a3			; a3 := absolute address of base of ROM
+			movea.l	a3,a2				; a2 := trap handler address (start at ROMBase)
+			lea		ToolTable,a1		; a1 := RAM based dispatch table ptr (ToolBox first)
+			movea.l	a3,a0				; a0 := ROM based encoded dispatch table ptr
+			adda.l	ROMHeader.DispTableOff(a0),a0	; add offset stored in ROM by PostLinker	<1.3>
+			moveq.l	#$7F,d2				; d2 := constant $7F for masking
+			move.w	#numTbTrap-1,d0		; d0 := loop counter for toolbox trap table
+
+;	initialize the RAM based dispatch tables
+
+@TablesLoop	move.b	(a0)+,d1			; get next byte from encoded ROM table
+			bmi.s	@notSignedWord		; signed word offsets have high bit cleared
+			lsl.w	#8,d1				; position high byte, make room for low byte
+			move.b	(a0)+,d1			; insert the low byte
+@DoubleOffset
+			add.w	d1,d1				; double it to form 16 bit even signed offset
+			beq.s	@TablesDone			; an offset of zero terminates the loop
+			adda.w	d1,a2				; add offset to previous trap handler address
+@WriteEntry	move.l	a2,(a1)+			; install it into the RAM based dispatch table
+@nextEntry	dbra	d0,@TablesLoop		; loop through the Toolbox table, and then OsTable
+
+;	end of ToolBox table, switch to OsTable, and continue until end of ROM table found
+
+			lea		OSTable,a1			; a1 := RAM based dispatch table ptr (OSTalbe last)
+			bra.s	@TablesLoop			; loop through OSTable (loop count = $FFFF from DBRA)
+
+@notSignedWord
+			and.w	d2,d1				; clear high bits, check for $80
+			beq.s	@unused				; $80 indicated unused trap number
+			cmp.w	d2,d1				; check for $FF (which is now $7F)
+			bne.s	@DoubleOffset		; if $81…$FE, low 7 bits are positive offset
+
+;	$FF indicates that a 4 byte absolute (from ROMBase) offset follows
+
+			movea.l	(a0)+,a2			; get the offset
+			adda.l	a3,a2				; add in ROMBase
+			bra.s	@WriteEntry			; write out the table entry
+
+;	$80 indicates that the trap number for this entry is undefined
+
+@unused		move.l	a4,(a1)+			; install bad trap handler (dont change prev handler addr)
+			bra.s	@nextEntry			; go on the next table entry
+
+@TablesDone
+
+	EndIf	;	Not NewBuildSystem
+;	now install the trap dispatcher
+
+			lea		EMT1010,a0			; point to the dispatcher
+
+			TestFor has68kEmulator		; Are we emulating a 68020?										<SM7> SAM
+			beq.s	@noEmu				; -> Nope.														<SM7>
+			lea		Rts020Disp,A1		; Point A1 to an rts (hopefully near some cache resident code)	<SM7>
+			bra.s	@StuffFlush			; -> Install it													<SM7>
+			
+@noEmu		cmpi.b	#cpu68040,CpuFlag	; check if we need to install 040 Cache Flush routine	<3>
+			bne.s	@notAn040			; NO  ... perform 020/030 cache-flush					<3>
+			lea		vCacheFlush68040,a1	; YES ... get addr. of 040 cache flush routine			<3>
+@StuffFlush	move.l	a1,jCacheFlush		; ... and install it									<3>
+@notAn040								;														<3>
+			move.l	a0,Line1010			; install the Line-A exception handler
+			
+		IF forRomulator THEN			; register the Line-A handler with the nub 				<SM6>
+			movec	vbr,a0				;														  |
+			movea.l	ResetPC(a0),a0		;														  v
+			cmpi.l	#'nver',2(a0)		; does nub have a version number?
+			bne.s	@skipLog			;  no, then don't do this…
+			cmpi.w	#$0120,6(a0)		;  else check the version number
+			blo.s	@skipLog			;   if version too low, then bail…
+			adda.l	$0A(a0),a0			; get nub logging routine address from vect table
+			tst.l	(a0)				; be paranoid
+			beq.s	@skipLog			; bail if vector is null
+			jsr		(a0)				; call nub supplied routine (finally)					  ^
+@skipLog								;														  |
+		ENDIF ; forRomulator																	<SM6>
+			rts							; A-Trap dispatcher is now initialized
+			
+
+;_______________________________________________________________________
+; BadTrap: receiver for unimplemented core routines.
+; Destroys	D0
+; Called by	default routine for unimplemented routines.
+;_______________________________________________________________________
+
+BadTrap
+			movem.l d0-d7/a0-a7,SEVars	; save regs in debugger space
+			moveq.l	#dsCoreErr,d0		; get DS alert ID for bad traps
+			jmp 	SysErr1		 		; invoke the DS manager
+
+
+; <SM4> rb, start 		from PatchProtector.a
+
+
+TrapAddressBits	proc	export
+
+; TrapAddressBits
+;
+;	In:
+;		d0.w	trap number
+;		d1.w	[GS]etTrapAddress trap word
+;
+;	Out:
+;		d1.w	(modified) [GS]etTrapAddress trap word
+;		ccr		CC if it is not a come-from, CS if it is a come-from
+
+; bits in trap numbers and Set/GetTrapAddress opcodes
+
+TrapNumber				record	0
+toolboxBit				equ		11
+						endr
+
+TrapAddressOpcode		record	0
+newBit					equ		9
+toolboxBit				equ		10
+						endr
+
+		btst	#TrapAddressOpcode.newBit,d1		; is this N[GS]etTrapAddress?
+		bnz.s	@notFullWord						; yes, don’t handle it
+		btst	#TrapAddressOpcode.toolboxBit,d1	; is this normal [GS]etTrapAddress?
+		bz.s	@notFullWord						; yes, don’t handle it
+
+@fullWord
+		; adjust the trap bits
+
+		bset	#TrapAddressOpcode.newBit,d1		; is this NGetTrapAddress?
+		btst	#TrapNumber.toolboxBit,d0			; is the trap a Toolbox trap?
+		bnz.s	@toolbox							; yes, leave the bit set
+		bclr	#TrapAddressOpcode.toolboxBit,d1	; clear bit for OS
+@toolbox
+
+		cmp.w	#$C000,d0					; is this a come-from trap word?
+		blo.s	@notComeFrom				; no, it is not
+		cmp.w	#$D000,d0					; is it a come-from trap word?
+		bhs.s	@notComeFrom				; no, it is not
+@comeFrom
+		; oooh... carry is set for us, we can return
+		rts
+
+@notFullWord
+@notComeFrom
+		and		#$FE,ccr					; clear the carry bit
+		rts
+
+				endproc
+
+; <SM4> rb, end
+
+
+			end
+

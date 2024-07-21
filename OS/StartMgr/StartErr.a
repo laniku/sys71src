@@ -1,0 +1,521 @@
+;__________________________________________________________________________________________________
+;
+;	File:		StartErr.a
+;
+;	Contains:	System Error Handler & Debugger Interface
+; 				This file contains the error handling interface code for Macintosh.
+;
+;				This code can be divided into three pieces:
+;
+;					1) _Debugger trap handler
+;					2) _SysError trap handler
+;					3) Exception/interrupt handler
+;
+; 				The key to the new interface is the MacJmp low-memory vector.  If nil, it
+; 				implies that the current 'debugger' is the DeepShit error handler, otherwise
+; 				it points to the entry point for alternate debugger, be it Macsbug, MPS remote
+; 				or Joe Blow's turboProbe.
+;
+; 				The _Debugger trap interface is in the form of
+;						Debugger (Arg1, Arg2, ... ArgN, SizeOfParams, CmdWord)
+;
+; 				SizeOfParams (INTEGER) is the number of bytes occupied by Arg1...ArgN
+; 				CmdWord (INTEGER) is the dispatch word (0...N) for the debugger
+;
+; 				The _SysError trap interface is the same, i.e. error value in D0.W
+;
+; 				The Exception/interrupt handler & _SysError both save registers in syserror space
+; 				($7FC80), then they and the _Debugger trap handler attempt to dispatch either
+; 				to an installed debugger (MacJmp <> 0) or (if not _Debugger) to the DeepShit
+; 				handler.
+;
+; 				The MacJmp (or MacJmpFlag for 32 bit clean machine) vector has three high-byte flags
+;
+;						| Debugger Running | Debugger Initialized | Debugger Installed | 5 unused bits |
+;
+; 				Debugger Running (bit set) => the debugger is currently executing
+; 				Debugger Initialized => Able to handle system errors
+; 				Debugger Installed => MacJmp vector pts to usable debugger
+;
+;	Written by:	Ken Krugler
+;
+;	Copyright:	© 1985-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM8>	 11/9/93	KW		added some eieioSTP macros.  Only expands for CygnusX1 ROM
+;	   <SM7>	  6/3/93	SAM		Added some Supports24Bit around the DSHandler.
+;	   <SM6>	 12/1/92	RB		Under SuperMario ROMs, change the system error for No patch to
+;									the system error that saiz this is an older system. When someone
+;									boots a SM ROM with a system less than 7.1 they should get that
+;									error and not a 'can't find patch' system error.
+;	   <SM5>	 11/24/92	HY		Change Parity NMI check.  Wrong branch sense (changed bne to beq)
+;	   <SM4>	 11/3/92	rab		Roll in Horror changes. <H5> 5/4/92 JC Change Parity NMI patch
+;									to check specifically for PGC bit in Hardware External features
+;									flags on RBV type machines instead of checking for V8 flag.
+;	   <SM3>	 8/19/92	CSS		Update from Reality:
+;									<13> 8/18/92	DTY		Change the name of BootGlobs to StartGlobals to avoid confusion
+;															with BootGlobals, which is used by the boot code in Boot[1-3].a.
+;	   <SM2>	 5/16/92	kc		Roll in Horror. Comments follow:
+;		<H7>	 5/29/91	CCH		Backed out revision 6.
+;		<H6>	 5/29/91	WM		Changed MOVE to SR into OR to SR
+;		<H5>	 5/10/91	HJR		Backed out of last revisions changes since a much cleaner
+;									implementation was done in PowerMgr.a.
+;		<H4>	 4/29/91	HJR		Added NMIExcpPatch to NMIExcp in order allow NMI on portables
+;									with power-cycling.
+;		<H3>	12/11/90	JJ		Mac LC:  Change reference to VISAChipBit to be V8ChipBit.
+;		<H3>	12/11/90	JJ		Mac LC: Changes references to VISAChipBit to V8ChipBit.
+;		<H2>	10/25/90	CCH		Added support for ReAnimator when forRomulator equate is set.
+;		<12>	 1/15/92	KC		Fix "If last BRA.S to import is to next instruction, BAD CODE
+;									will be generated" assembler error.
+;		<11>	 10/1/91	JSM		Don’t use eclipseDebug.
+;		<10>	 9/30/91	JSM		Don’t use is32BitClean conditional, all future ROMs will be.
+;		 <9>	 9/16/91	JSM		Cleanup header.
+;		 <8>	 6/12/91	LN		removed #include 'HardwareEqu.a'
+;		 <7>	10/22/90	JJ		Rex V8: Change VISAChipBit to V8ChipBit.
+;		 <6>	  7/2/90	CCH		Removed a fatally redundant MOVEC  xxx,VBR.
+;		 <5>	 6/27/90	CCH		Added code to be nice to the ReAnimator nub so that it's
+;									exception vectors don't get initialized over. Also moved the
+;									initialization of VBR (Cpu ≥ 020) to AFTER we actually have
+;									useful vectors in the exception vector table.
+;		 <4>	 4/14/90	JJ		Add runtime check to avoid seeing parity error NMI on Elsie.
+;		 <3>	 1/11/90	CCH		Added include of “HardwarePrivateEqu.a”.
+;		 <2>	12/26/89	GMR		RPU parity is now disabled after the error, just as the IIci was
+;									handled.
+;	   <2.1>	 12/7/89	GMR		COMMENT:NEEDED FOR ZONE5: Updated NMI handler for Zone-5 parity
+;									interrupts.
+;	   <2.0>	 8/22/89	SES		Removed references to nFiles.
+;	   <1.9>	 7/17/89	GMR		fixed bug when blasting warm start on MMU machines: call
+;									_SwapMMUMode before looking at bootglobs and after.
+;	   <1.8>	 5/26/89	rwh		fixed changed names of BootGlobals fields
+;	   <1.7>	 5/19/89	GMR		Use equate for parity error code (dsParityErr)
+;	   <1.5>	 5/16/89	GMR		Added parity code in NMI handler, to set error code to 101 if
+;									parity caused NMI on RBV based machines.
+;	   <1.6>	 5/16/89	rwh		(for gmr) cleared warmstart flag after parity error, so ram gets
+;									re-initialized.
+;	   <1.4>	 5/11/89	SWC		Changed conditionals from machine- to feature-based for
+;									universal ROM.
+;	   <1.3>	 2/24/89	SES		Added setup of VBR for '020 machines and greater.
+;	   <1.2>	 2/17/89	CSL		Added MacJmpFlag to make MacJmp a clean 32 bit vector.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	  <•1.1>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.0>	 2/10/88	BBM		Adding file for the first time into EASE…
+;	  <C914>	10/29/87	rwh		Port to Modern Victorian (onMvMac)
+;	  <C882>	  9/3/87	RDC		Fix code for new MacsBug - make NMI handler set error code(reg
+;									D0) = 13 on entry to SysError - have Syserror check only for
+;									D0=13 for NMI exceptions - provide alternate entry point into
+;									SysError for BadTrap routine
+;	  <C875>	  9/2/87	MSH		Port to HcMac (Laguna)
+;	  <C447>	11/20/86	DAH		Clear NMIFlag in SysErrInit.
+;	  <A375>	 11/8/86	CSL		fixed launching into Microbug.
+;	  <C206>	 10/9/86	bbm		Modified to mpw aincludes.
+;	  <C152>	 9/18/86	WRL		Turned this into a separately compiled PROC.
+;	   <C84>	 7/29/86	WRL		Removed nub debugger installation.
+;	   <C28>	  6/3/86	CSL		Added changes for Aladddin (onMacPP).
+;		<C1>	 4/14/86	RDC		Added changes for 68020 Reno project (NuMac)
+;									- Changed variable for NMI debounce
+;									- Removed init of Nubdebugger for now
+;				 11/4/85	JTC		Save 8 bytes of address/bus error info in SExxx space for new
+;									debuggers.
+;				 11/2/85	JTC		Fix handling of exception frame. Pass whole business to
+;									debugger, saving up for a grand RTE finale. Must dummy a
+;									format-0 frame for 010 and 020.
+;				 7/23/85	RDC		added changes for MidMac
+;									- code to setup and handle true NMI exception
+;									- debounce of NMI int
+;				 7/13/85	JTC		Modified SysErr interface for 010/020 stack handling.
+;				  5/2/85	KWK		new MacJmp flags, NMI signals init call
+;				  5/1/85	KWK		Significant re-structure for flexible debugger call
+;				 4/30/85	KWK		new today
+;__________________________________________________________________________________________________
+
+			BLANKS	ON
+			STRING	ASIS
+
+			IF CPU >= 20 THEN				;												<1.3>
+			MACHINE	MC68020					;												<1.3>
+			ENDIF							;												<1.3>
+
+
+			PRINT	OFF						;												<C152>
+			LOAD	'StandardEqu.d'
+			INCLUDE	'HardwarePrivateEqu.a'
+			INCLUDE	'UniversalEqu.a'		;												<1.5>
+			INCLUDE	'MMUEqu.a'				;												<C152>
+			INCLUDE	'BootEqu.a'				;												<C152>
+			PRINT	ON						;												<C152>
+
+;----------------------------------------------------------------------
+; Routine		SysErrInit
+; Arguments 	A3.L	(input) 		Ram overlay offset value
+;				A6.L	(input) 		Return address
+; Function		Set up exception vectors, nub memory, etc.
+; Uses			A2
+;----------------------------------------------------------------------
+
+SysErrInit	PROC	EXPORT					;												<C152>
+
+			IMPORT	GenExcps				;												<C152>
+			IMPORT	IRQException			;												<C152>
+			IMPORT	NMIExcp					;												<C152>
+
+			SUB.L	A0,A0					; point A0 at start of RAM
+
+		IF NOT forRomulator THEN			;										<T2>
+			MOVE.L	A0,D0					; setup the VBR for '020s and greater			<1.3>
+			MOVEC	D0,VBR					;												<1.3>
+		ENDIF
+
+			ADDQ.W	#BusErrVct,A0			; start stuffing at the bus error vector		<1.4>
+			LEA 	GenExcps,A1
+
+			MOVEQ	#10-1,D0 				; setup exception handlers for					<1.4>
+@0			MOVE.L	A1,(A0)+				;  bus error thru line 1111 emulator vectors
+			ADDQ.W	#2,A1					; 												<1.4>
+			DBRA	D0,@0
+
+			MOVEQ	#13-1,D0				; point unassigned (vector 12) thru spurious	<1.4>
+@1			MOVE.L	A1,(A0)+				;  interrupt vectors to the "undefined" handler
+			DBRA	D0,@1					;  (System Error #11)
+
+			LEA 	IRQException,A2 		; point to the IRQ exception handler
+			MOVEQ	#6-1,D0					; stuff the IRQ pointer into first 6 autovectors<1.4>
+@2			MOVE.L	A2,(A0)+
+			DBRA	D0,@2
+			LEA		NMIExcp,A2				; level 7 (NMI) has a special routine to de-bounce the
+			MOVE.L	A2,(A0)+				; programmer's switch on some machines (else don't care)
+
+			MOVEQ	#32-1,D0				; point TRAP #0 vector thru unassigned (63)		<1.4>
+@3			MOVE.L	A1,(A0)+				;  to the "undefined" handler (System Error #11)
+			DBRA	D0,@3					;  since they aren't user-definable
+
+		IF forRomulator THEN				;										<T2>
+			SUB.L	A0,A0					; point A0 at start of RAM
+
+			TestInRam	a1					; only allow vector-nuking if running in RAM	<bg>
+			beq.s	@dontNukeMe				; skip vector restoration if running from ROM	<bg>
+			movec	vbr,a1					; get OUR VBR
+		; ... and put them in the standard vector tbl
+			move.l	BusErrVct(a1),BusErrVct(a0)	; then copy in our vectors
+			move.l	AddrVector(a1),AddrVector(a0)
+			move.l	IlglVector(a1),IlglVector(a0)
+			move.l	ZeroVector(a1),ZeroVector(a0)
+			move.l	CheckVector(a1),CheckVector(a0)
+			move.l	TrapVVector(a1),TrapVVector(a0)
+			move.l	PrivlgVector(a1),PrivlgVector(a0)
+			move.l	TraceVector(a1),TraceVector(a0)
+			move.l	DebugVector(a1),DebugVector(a0)
+			move.l	FmtErrVect(a1),FmtErrVect(a0)
+			move.l	BadIntVector(a1),BadIntVector(a0)
+			move.l	BkptVector(a1),BkptVector(a0)
+@dontNukeMe									; <bg>
+
+			MOVE.L	A0,D0					; setup the VBR for '020s and greater			
+			MOVEC	D0,VBR					;											
+		ENDIF								;											
+
+; now clear out the SysErr data space.	Starts at $7FC80 and continues for 128 bytes.  Used to save off
+; registers and maintain other nub state information (nub data ptr, etc).
+
+			CLR.B	NMIFlag					; clear debouncing flag							<C447>
+
+			LEA 	SEVars,A0				; pt to start of nub memory
+			MOVEQ	#(SEVSize/4)-1,D0		; data size
+@4			CLR.L	(A0)+					; clear it
+			DBRA	D0,@4					; loop
+
+; set up the default debugger (serial interface to MPS debugger)
+
+			CLR.L	MacJmp					; init debugger flag for no debugger			<C1/14Apr86>
+			CLR.B	MacJmpFlag				; init debugger flag for 32 bit clean machine 	<v1.2>
+
+			RTS6
+
+			ENDP							;												<C152>
+
+
+;----------------------------------------------------------------------
+; Routine		Debugger (Arg1, Arg2...ArgN, ParamSize, CmdWord)
+; Arguments 	Highly variable
+; Function		Dispatch debugger call to current installed debugger,
+;				else ignore. (_Debugger trap)
+;----------------------------------------------------------------------
+
+Debugger	PROC	EXPORT					;												<C152>
+			EXPORT	DebugProlog				;												<C152>
+
+			MOVEM.L A0-A7/D0-D7,SEVars		; save all regs
+
+			BSET	#7,MacJmpFlag			; in the debugger 								<v1.2>
+
+			LINK	A6,#0					; no locals
+			LEA 	8(A6),A0				; pt A0 at args
+			MOVE.W	(A0)+,D0				; get command word
+			MOVE.W	(A0)+,SECmdSize 		; stash size of param list
+			BSR.S	DebugProlog 			; set up call for debuggers, set CC=existence
+			BLE.S	DebugErr				; V true, so either Z or (NOT N) means no inited debugger
+
+; Now we know there's a debugger, so call it.
+; A0 = ptr to last command parameter, A1 = ptr to debugger entry pt.
+
+			BSET	#15,D0					; set high bit of word to flag trap call
+			JSR 	(A1)					; call debugger!!!!
+
+DebugAdios	UNLK	A6						; restore A6
+			MOVEM.L SEVars,A0-A7/D0-D7		; restore all regs
+			MOVE.L	(SP)+,A0				; get return address
+			ADD.W	SECmdSize,SP			; pop params
+			ADDQ.L	#4,SP					; pop command word & size word
+			BCLR	#7,MacJmpFlag			; out of the debugger 							<v1.2>
+			JMP 	(A0)					; and return
+
+
+DebugErr	MOVEQ	#SENoDB,D0				; return "no debugger" error
+			BRA.S	DebugAdios
+
+; Utility for setting CC's for existance of debugger, pointing A1 to debugger code entry.
+; Must preserve D0.
+
+DebugProlog
+			MOVE.L	MacJmp,A1				; get ptr in A1									<v1.2>
+			MOVE.B	MacJmpFlag,D3			; get flags										<v1.2>
+			ADD.B	D3,D3					; init flag now high bit, set CC's
+			RTS 							; and return
+
+			ENDP							;												<C152>
+
+
+;----------------------------------------------------------------------
+; Routine		ToDeepShit
+; Arguments 	(SP)	(input) 		Return address to exception receiver
+;				xxxx(SP)				CPU and exception type stack frame					<13Jul85>
+; Function		Receives all the hardware exceptions.  It derives the
+;				deepShit ID from the return address on the stack and then
+;				invokes the deepShit manager.
+;				Modified to call yoghurt manager with stack cleansed of all frame			<13Jul85>
+;				information.  Idea is to save Reg/Stack info then RTE to DS manager,		<13Jul85>
+;				using the RTE to clear whatever frame info is there.						<13Jul85>
+;				Nowadays, pass entire frame (sans PC and SR) to debugger, for later RTE 	<02Nov85>  JTC
+;----------------------------------------------------------------------
+
+ToDeepShit	PROC	EXPORT					;												<C152>
+
+			IMPORT	GenExcps				;												<C152>
+			IMPORT	SysErr2					;												<C152>
+
+			MOVE.W	#$2700,SR				; turn off interrupts
+			TST.B	MacJmpFlag				; are the debuggers in control here?
+			BMI.S	@0						; yes, don't bother saving regs
+
+			MOVEM.L A0-A7/D0-D7,SEVars		; save all regs for debug
+
+; Compute small integer exception index 1,2,... into D0, based on address atop the stack.	<13Jul85>
+
+@0			LEA 	GenExcps,A0 			; get address of receiver table
+			MOVE.L	(SP)+,D0				; get return address
+			SUB.L	A0,D0					; compute delta
+			LSR 	#1,D0					; divide by 2
+
+; Now clear stack of exception info, saving SR and PC unless re-entered.  A special case	<13Jul85>
+; is class 0 exception on the 68000, which has 4 words of info on top of the usual SR/PC.	<13Jul85>
+
+			TST.B	CPUFlag 				; 0-000, 1-010, 2-020, etc. 					<13Jul85>
+			BNE.S	@1						;												<13Jul85>
+
+			CMPI.W	#2,D0					; 1 or 2 means nasty bus error frame			<13Jul85>
+			BGT.S	@1						;												<13Jul85>
+			MOVE.L	(SP)+,SE000BE			; save fcn code, access address, and instruction word	<04Nov85> JTC
+			MOVE.L	(SP)+,SE000BE+4 		; ...the other 4 bytes of the eight 					<04Nov85> JTC
+@1
+			TST.B	MacJmpFlag				; minus means we're re-entering					<13Jul85>
+			BMI.S	@3						;												<13Jul85>
+
+			MOVE	(SP)+,SESR				; SR on top for all CPUs						<13Jul85>
+			MOVE.L	(SP)+,SEPC				; next is the saved PC							<13Jul85>
+			BRA.S	SysErr2					; bypass nonsaving pop							<13Jul85><1.4>
+
+@3			ADDQ.W	#6,SP					; kill SR and PC								<13Jul85><1.4>
+			BRA.S	SysErr2
+			NOP								; appease the assembler gods <12> kc
+			ENDP							;							 <C152>
+
+
+
+; This is the receiver table for all exceptions (except 1010).	Look at ToDeepShit
+; code to understand BSR.S stuff
+
+GenExcps	PROC	EXPORT					;												<C152>
+			IMPORT	ToDeepShit				;												<C152>
+			EXPORT	IRQException			;												<C152>
+			EXPORT	NMIExcp					;												<C152>
+
+			BSR.S	ToDeepShit				; (1) bus error
+			BSR.S	ToDeepShit				; (2) address error
+			BSR.S	ToDeepShit				; (3) illegal instruction
+			BSR.S	ToDeepShit				; (4) zero divide
+			BSR.S	ToDeepShit				; (5) check instruction
+			BSR.S	ToDeepShit				; (6) trapv instruction
+			BSR.S	ToDeepShit				; (7) privilege violation
+			BSR.S	ToDeepShit				; (8) trace
+			BSR.S	ToDeepShit				; (9) line 1010 (temporarily)
+			BSR.S	ToDeepShit				; (10) line 1111
+			BSR.S	ToDeepShit				; (11) other exceptions (TRAP calls, spurious int, etc)
+			BSR.S	ToDeepShit				; (12) Place holder for no trap number exception
+IRQException
+			BSR.S	ToDeepShit				; (13) interrupt exceptions
+
+NMIExcp		BSET	#7,NMIFlag				; use high bit of NMI flag as indicator 		<C1/14Apr86>
+			BEQ.S	IRQException			; process first interrupt						<23Jul85><1.4>
+			RTE 							; else just ignore								<23Jul85>
+
+			ENDP							;												<C152>
+
+
+;----------------------------------------------------------------------
+; Routine		SystemError
+; Arguments 	D0.W	(input) 		System error number
+; Function		Handle system errors.  Allows consistant interface to
+;				debuggers.
+;				Stack is cleansed of all trap parameters, so that return with RTE			<13Jul85>
+;				depends on information restored from SEPC and SESR. 						<13Jul85>
+;				Nowadays, debugger is called with exception parameters on stack.			<02Nov85>  JTC
+;				So must dummy up a format-0 frame when SystemError is called.				<02Nov85>  JTC
+;----------------------------------------------------------------------
+
+SystemError	PROC	EXPORT					;												<C152>
+
+			EXPORT	SysErr1					;												<C882>
+			EXPORT	SysErr2					;												<C152>
+			IMPORT	DebugProlog				;												<C152>
+			IMPORT	DSErrorHandler			;												<C152>
+
+			MOVEM.L D0-D7/A0-A7,SEVars		; save regs up high in nub space
+
+; entry point from BadTrap routine															<C882>
+
+SysErr1		MOVE.W	SR,SESR 				; save SR										<13Jul85>
+			MOVE.L	(SP)+,SEPC				; clean PC for fall-through to SysErr2			<13Jul85>
+			TST.B	CPUFlag 				; zero for 68000								<02Nov85>  JTC
+			BEQ.S	SysErr2 				; no need for dummy frame on old cpu			<02Nov85>  JTC
+			CLR.W	-(SP)					;												<02Nov85>  JTC
+
+; entry point for standard system exceptions (address error, etc)
+
+SysErr2
+			TST.B	MacJmpFlag				; re-entrancy? (presumed PLus for SystemError)	<v1.2>
+			BMI.S	@0						; yes, skip reg saving
+			MOVE.L	SP,SEA7 				; save true PC
+@0											; deleted obsolete stack-cleansing instructions <13Jul85>
+			BSET	#7,MacJmpFlag			; prevent re-entrancy, vote Republican			<v1.2>
+
+			cmpi.w	#13,d0					; was it an NMI?								<1.5>
+			bne.w	@continue				; no, proceed									<1.5>
+
+		    TestFor RBVExists				;												<1.5>
+			beq.s	@noRBV					;												<1.5>
+
+			btst.b	#ProductInfo.PGCInstalled,UnivRomFlags+3	; see if we have a PGC chip		<9><4><H5><SM4>
+			beq.s	@continue									; no, handle normal NMI-- there is no parity 	<4><SM5>
+
+			move.l	VIA,A0					; get VIA1 base									<1.5>
+		eieioSTP
+			btst	#vPGCEnb,VBufB(a0)		; is parity enabled?							<1.5>
+		eieioSTP
+			bne.s	@continue				; no, proceed									<1.5>
+		eieioSTP
+			bclr	#vPGCErr,vDirB(a0)		; make parity error bit an input				<1.5>
+		eieioSTP
+			move.b	VBufB(a0),d1			; read parity error flag						<2.1>
+		eieioSTP
+			bset	#vPGCErr,vDirB(a0)		; back to an output								<1.5>
+		eieioSTP
+			btst	#vPGCErr,d1				; was NMI caused by parity error?				<1.5>
+			bne.s	@continue				; no, restore ddr and proceed					<1.5>
+		eieioSTP
+			bset	#vPGCEnb,VBufB(a0)		; yes, disable parity (so we won't get int again<1.5>
+		eieioSTP
+			bra.s	@parityErr				; and blast the warm start flag
+@noRBV
+
+			WITH 	DecoderInfo
+		    TestFor RPUExists				; do we have RPU parity?
+			beq.s	@continue				; no, skip...
+
+			movea.l	OSS,a0					; get OSS address
+		eieioSTP
+			move.w	OSSIntStat(a0),d1
+		eieioSTP
+			btst	#OSSIntRPU,d1			; did the RPU cause the interrupt?
+			beq.s	@continue				; no, handle normal NMI
+		eieioSTP
+			clr.b	OSSMskRPU(a0)			; disable RPU parity interrupts					<2>
+		eieioSTP
+			movea.l	UnivInfoPtr,a0
+			adda.l	ProductInfo.DecoderInfoPtr(a0),a0
+			movea.l	RPUAddr(a0),a0			; get RPU base
+			st.b	rpuReset(a0)			; reset serial ptr
+			move.l	(a0),d1
+			bset.l	#16,d1					; clear the parity error
+			move.l	d1,(a0)
+@parityErr
+		IF Supports24Bit THEN				;												<SM7>
+			moveq	#true32B,d0				; 32 bit mode to look at BootGlobs 				<1.9>
+			_SwapMMUMode					; switch to 32 bit mode							<1.9>
+			move.l	BootGlobPtr,a1			; get ptr to boot globals (near top of RAM) 	<1.6><1.8>
+			clr.l	StartGlobals.sgWarmStart(a1) ; <SM3> CSS clear boot-globs warm start flag
+			_SwapMMUMode					; switch back to previous mode (in d0)			<1.9>
+		ELSE
+			move.l	BootGlobPtr,a1			; get ptr to boot globals (near top of RAM) 	<1.6><1.8>
+			clr.l	StartGlobals.sgWarmStart(a1) ; <SM3> CSS clear boot-globs warm start flag
+		ENDIF
+			clr.l	WarmStart				; clear low memory global warm start flag		<1.6>
+			moveq	#dsParityErr,d0			; yes, set parity error code					<1.5><1.7>
+@continue									;												<1.5>
+			cmpi.w	#dsNoPatch,d0			; is this Error can't find patch ?				<SM6> rb
+			beq.s	@PreCubeE				; change the error message then					<SM6> rb
+			cmpi.w	#dsBadPatch,d0			; is this a can't load patch message ?			<SM6> rb
+			bne.s	@SaveErr				; if not, don't touch it						<SM6> rb
+@PreCubeE									; SM ROMs don't have patches, user booted 7.0	<SM6> rb
+			moveq	#dsOldSystem,d0			; set error (system on disk is too old)			<SM6> rb
+@SaveErr									;												<SM6> rb
+
+			MOVE.W	D0,DSErrCode			; Save the possibly modified ErrCode			<SM7>
+
+; now we've set up all regs, etc.  Time to decide whether to call the debuggers
+; or just call the Deepshit code
+
+			BSR 	DebugProlog 			; any debuggers?
+			BPL.S	Call2DS 				; yes, but not initialized (init bit not set)
+			BNE.S	CallDB					; yes, initialized, call 'em
+
+; We got a system error w/un-initialized debuggers, if NMI then assume that user wants to try
+; to get the debugger up and running.
+
+Call2DS		CMP.W	#13,D0					; Exception?
+			BNE.S	CallDS					; no, call the deepshit handler
+
+			MOVEQ	#0,D0					; set special system error (0) for initialization
+			BRA.S	CallDB					; and call the debugger
+
+CallDS		LEA 	DSErrorHandler,A1		; point at system alert handler
+CallDB		Move.L	A1,D1					; check if A1 is nil							<A375>
+			BEQ.S	CallDS					; if nil, go to DSErrorHandler					<A375>
+			JSR 	(A1)					; call the debugger/system error handler
+			TST.W	D0						; any error?
+			BNE.S	CallDS					; yes, call deepshit
+
+SysErrExit
+			BCLR	#7,MacJmpFlag			; NOT in debugger any longer					<v1.2>
+			MOVEM.L SEVars,D0-D7/A0-A7		; restore regs
+
+; In order to return with RTE, must set up vanilla 000 or 4-word 010/020 frame. 			<13Jul85>
+
+			MOVE.L	SEPC,-(SP)				; push user's PC
+			MOVE.W	SESR,-(SP)				; restore status reg
+			RTE 							; and return to caller
+
+			ENDP							;												<C152>
+
+			END
+

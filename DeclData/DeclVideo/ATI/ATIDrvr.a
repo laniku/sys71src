@@ -1,0 +1,464 @@
+;
+;	File:		ATIDrvr.a
+;
+;	Contains:	xxx put contents here xxx
+;
+;	Written by:	xxx put writers here xxx
+;
+;	Copyright:	© 1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <1>	 11/5/93	fau		first checked in
+;		 <1>	10/27/93	fau		first checked in
+;		 <1>	10/19/93	fau		first checked in
+;
+;
+
+;--------------------------------------------------------------------------
+;start
+;
+;Name:		ATIDrvr.a
+;Creator:	George D. Wilson Jr.
+;Date:		4/24/92
+;
+;Purpose:	Driver header for the ATI graphics driver.
+;
+;Category:	Driver Header
+;File:		ATIDrvr.a
+;
+;Exports:	Open		-	Driver open routine.
+;			Control		-	Driver control routine.
+;			Status		-	Driver status routine.
+;			Close		-	Driver close routine.
+;			intHandler	-	ATI VBL interrupt handler.
+;
+;Locals:	done		-	Common driver exit routine.
+;
+;Detailed:	This file is the assembly front end to the high level
+;			ATI driver routines.  Most routines within this module
+;			simply setup a call to a high level routine of the same type.
+;			The only exception to this "Open".  Open performs almost
+;			all the driver and variable initalization.
+;
+;Note:
+;
+;History:
+;
+;	  Date		Programmer					Modification
+;	--------	----------		-----------------------------------------
+;
+;stop
+;------------------------------------------------------------------------*/
+
+;--------------------------------------------------------------------------
+;
+;								Includes
+;
+;------------------------------------------------------------------------*/
+
+	include		'QuickDraw.a'
+	include		'Traps.a'
+	include		'SysEqu.a'
+	include		'ToolUtils.a'
+	include		'SysErr.a'
+	
+	include		'ATIHdr.a'
+	
+;--------------------------------------------------------------------------
+;
+;							Imported Variables
+;
+;------------------------------------------------------------------------*/
+				
+globals			RECORD	0,INCREMENT
+				ALIGN	2
+globalsSize		EQU		*-globals
+				ENDR
+
+Enable			EQU		1				; Turn ATI interrupts on
+true			EQU		1				; Boolean true
+false			EQU		0				; Boolean false
+
+;--------------------------------------------------------------------------
+;
+;							Imported Procedures
+;
+;------------------------------------------------------------------------*/
+
+		IMPORT			OpenDRVR			; High level 'C' open routine
+		IMPORT			ControlDRVR			; High level 'C' control routine
+		IMPORT			StatusDRVR			; High level 'C' status routine
+		IMPORT			CloseDRVR			; High level 'C' close routine
+		IMPORT			DrvrSlotIntHandlerNuBus	; High level 'C' interrupt handler
+
+;--------------------------------------------------------------------------
+;
+;							Local Equates
+;
+;------------------------------------------------------------------------*/
+
+rSave	reg			d1-d7/a0-a6				; Saved registers
+
+;--------------------------------------------------------------------------
+;
+;							Exported Procedures
+;
+;------------------------------------------------------------------------*/
+
+;--------------------------------------------------------------------------
+;
+;							Driver Headers
+;
+;		*** WARNING: No code must be placed before these headers. ***
+;
+;------------------------------------------------------------------------*/
+
+ATI		MAIN	EXPORT
+
+		IMPORT			Open
+		IMPORT			Close
+		IMPORT			Control
+		IMPORT			Status
+
+ATIDrvr
+			dc.w 	$4C00					; Flags: locked,bye,stat,ctl
+			dc.w 	0						; Periodic call interval
+			dc.w 	0						; Not an ornament
+			dc.w 	0						; No menu
+
+			dc.w 	Open-ATIDrvr			; Open routine offset
+			dc.w	0						; Prime routine offset
+			dc.w 	Control-ATIDrvr			; Control routine offset
+			dc.w 	Status-ATIDrvr			; Status routine offset
+			dc.w 	Close-ATIDrvr			; Close routine offset
+
+			STRING	PASCAL
+			_DCB_DriverNameATI				; Name of driver
+			ALIGN	2
+			_DCW_Version					; Version number of driver
+
+			ENDP
+
+;--------------------------------------------------------------------------
+;
+;					Beginning of Procedure Definitions
+;
+;------------------------------------------------------------------------*/
+
+
+;--------------------------------------------------------------------------
+;start
+;				
+;Name:		done
+;Creator:	George D. Wilson Jr.
+;Date:		4/24/92
+;
+;Purpose:	Common exit routine.
+;
+;Category:	Driver Done Handler
+;File:		ATIDrvr.a
+;
+;Calls:		none
+;
+;Called By: Open, Close, Status, Control
+;
+;Entry:		A0	- Parameter block pointer.
+;			A1	- Driver DCE pointer.
+;
+;Alters:	ioResult	-	In parameter block will be altered.
+;
+;Exit:		D0	- Result code (also copied into parameter block)
+;
+;Algorithm:	If the "noQueueBit" bit is set in the ioTrap field of the
+;			parameter block, the I/O call is immediate, and exit via
+;			an RTS instruction.  Immediate calls don't go through IODone,
+;			since the parameter block isn't queued.
+;
+;			If ioResult is less than or equal to zero, return via a
+;			jump to the Device Manager's IODone routine.
+;
+;			If ioResult is greater than zero, indicating that the I/O
+;			call is not yet done, return is via an RTS instruction.
+;
+;History:
+;
+;	  Date		Programmer					Modification
+;	--------	----------		---------------------------------------
+;
+;stop
+;------------------------------------------------------------------------*/
+
+done	PROC
+
+		bclr		#drvrActive,dCtlFlags+1(a1) ; always clear busy bit
+		move.w		ioResult(a0),d0			 	; get ioResult
+		tst.w		d0						 	; is the call done?
+		bgt.s		@byRts					 	; no - exit via RTS instr.
+		btst		#noQueueBit-8,ioTrap(a0) 	; is the call immediate?
+		bne.s		@byRts					 	; br if so - exit via RTS instr.
+		move.l		JIODone,-(sp)			 	; call is done; return to IODone
+
+@byRts
+;		_Debugger								; MacsBug
+		rts									 	;
+		ENDP
+
+		
+;--------------------------------------------------------------------------
+;start
+;
+;Name:		IntHandlerNuBus
+;Creator:	George D. Wilson Jr.
+;Date:		4/24/92
+;
+;Purpose:	ATI interrupt handler.
+;
+;Category:	Slot Interrupt Handler
+;File:		ATIDrvr.a
+;
+;Called By:	Mac exception handler
+;
+;Alters:
+;
+;Detailed:	This is the low level entry point for the interrupt generated
+;			by the cursor VBL.
+;
+;			Currently this routine is called by the 'intMeister' interrupt
+;			system.  It determines which ATI interrupt generated the
+;			exception and calls the appropriate routine registered.
+;
+;Note:		Keep a eye on this routine if the hardware or the 'intMeister'
+;			change.
+;
+;History:
+;
+;	  Date		Programmer					Modification
+;	--------	----------		----------------------------------------
+;
+;stop
+;------------------------------------------------------------------------*/
+IntHandlerNuBus	PROC	EXPORT
+
+
+;			_Debugger
+			moveq		#kOurSlotNum,d0
+			move.l		JVBLTask,a0						; Make the cursor move
+			jsr			(a0)
+			moveq		#1,d0
+@noVBL		rts
+
+				ENDP
+
+
+;--------------------------------------------------------------------------
+;start
+;
+;Name:		Open
+;Creator:	George D. Wilson Jr.
+;Date:		4/24/92
+;
+;Purpose:	Performs low level driver open functions.
+;
+;Category:	Driver Entry Point.
+;File:		ATIDrvr.c
+;
+;Calls:		OpenDRVR, done
+;
+;Entry:		a1		-	Our driver DCE.
+;
+;Alters:	dCtlStorage		-	Will be set to the global data storage
+;								for our driver if everything is OK.
+;
+;			ioResult(a0)	-	The ioResult field of the parameter
+;								block will contain a driver error code
+;								or 'noErr' if everything went OK.
+;
+;Exit:		d0		-	Contains a driver error code or 'noErr'
+;						if everything went OK.
+;
+;Detailed:	This routine leaves all the hard work to the high level routine.
+;			It expects the high level to indicate the success or failure by
+;			leaving a result code in D0.
+;
+;History:
+;
+;	  Date		Programmer					Modification
+;	--------	----------		-----------------------------------------
+;
+;stop
+;------------------------------------------------------------------------*/
+Open		PROC
+		
+		WITH		globals
+		
+		movem.l		rSave,-(sp)			; Save regs
+		move.l		a1,-(sp)			; push DCE pointer
+		move.l		a0,-(sp)			; push parm block pointrt
+		jsr			OpenDRVR			; call C code
+		add			#8,sp				; drop arguments
+		movem.l		(sp)+,rSave			; Restore registers
+		move.w		d0,ioResult(a0)		; Store the result code
+		bra			done
+			ENDP
+
+;--------------------------------------------------------------------------
+;start
+;
+;Name:		Close
+;Creator:	George D. Wilson Jr.
+;Date:		4/24/92
+;
+;Purpose:	Performs driver close function.
+;
+;Category:	Driver Entry Point.
+;File:		ATIDrvr.c
+;
+;Calls:		close, done
+;
+;Entry:		a0		-		Pointer to callers parameter block.
+;
+;			a1		-		Pointer to our driver DCE.
+;
+;Alters:	ioResult(a0)	-	The result field of the parameter block
+;								is set to the value returned from the
+;								high level call.  The high level routine
+;								leaves its result in D0.
+;
+;Exit:		d0		-	Has a driver error code left by the high level routine.
+;
+;Detailed:	When a driver close call is made this routine passes the
+;			callers parameter block in A0 and the driver DCE in A1 and 
+;			calls the high level routine.  The high routine handles everything.
+;
+;			The high level routine should return a driver error code in D0.
+;
+;History:
+;
+;	  Date		Programmer					Modification
+;	--------	----------		-----------------------------------------
+;
+;stop
+;------------------------------------------------------------------------*/
+Close		PROC
+;	_Debugger							; MacsBug
+		movem.l		rSave,-(sp)			; Save regs
+		move.l		a1,-(sp)			; push DCE pointer
+		move.l		a0,-(sp)			; push parm block pointer
+		jsr			CloseDRVR			; call C code
+		add			#8,sp				; drop arguments
+		movem.l		(sp)+,rSave			; Restore registers
+		move.w		d0,ioResult(a0)		; Store the result code
+		bra			done
+
+			ENDP
+;--------------------------------------------------------------------------
+;start
+;
+;Name:		Status
+;Creator:	George D. Wilson Jr.
+;Date:		4/24/92
+;
+;Purpose:	Performs driver status functions.
+;
+;Category:	Driver Entry Point.
+;File:		ATIDrvr.c
+;
+;Calls:		status, done
+;
+;Entry:		a0		-		Pointer to callers parameter block.
+;
+;			a1		-		Pointer to our driver DCE.
+;
+;Alters:	ioResult(a0)	-	The result field of the parameter block
+;								is set to the value returned from the
+;								high level call.  The high level routine
+;								leaves its result in D0.
+;
+;Exit:		d0		-	Has a driver error code or 'noErr'.
+;
+;Detailed:		This routine is simply an assembly language interface
+;				to the higher level status routine.  It pushs a
+;				pointer to the callers parameter and then pushs
+;				a pointer to the driver DCE onto the stack.
+;
+;				The high level routine should return a driver error
+;				code in D0.
+;
+;History:
+;
+;	  Date		Programmer					Modification
+;	--------	----------		-----------------------------------------
+;
+;stop
+;------------------------------------------------------------------------*/
+Status		PROC
+		movem.l		rSave,-(sp)			; Save regs
+		move.l		a1,-(sp)			; push DCE pointer
+		move.l		a0,-(sp)			; push parm block pointer
+		jsr			StatusDRVR			; call C code
+		add			#8,sp				; drop arguments
+		movem.l		(sp)+,rSave			; Restore registers
+		move.w		d0,ioResult(a0)		; Store the result code
+		bra			done
+
+			ENDP
+;--------------------------------------------------------------------------
+;start
+;
+;Name:		Control
+;Creator:	George D. Wilson Jr.
+;Date:		4/24/92
+;
+;Purpose:	Performs driver control functions.
+;
+;Category:	Driver Entry Point.
+;File:		ATIDrvr.c
+;
+;Calls:		control, done
+;
+;Entry:		a0		-		Pointer to callers parameter block.
+;
+;			a1		-		Pointer to our driver DCE.
+;
+;Alters:	ioResult(a0)	-	The result field of the parameter block
+;								is set to the value returned from the
+;								high level call.  The high level routine
+;								leaves its result in D0.
+;
+;Exit:		d0		-	Has a driver error code or 'noErr'.
+;
+;Detailed:		This routine is simply an assembly language interface
+;				to the higher level control routine.  It pushs a
+;				pointer to the callers parameter and then pushs
+;				a pointer to the driver DCE onto the stack.
+;
+;				The high level routine should return a driver error
+;				code in D0.
+;
+;History:
+;
+;	  Date		Programmer					Modification
+;	--------	----------		-----------------------------------------
+;
+;stop
+;------------------------------------------------------------------------*/
+Control		PROC
+
+		movem.l		rSave,-(sp)			; Save regs
+		move.l		a1,-(sp)			; push DCE pointer
+		move.l		a0,-(sp)			; push parm block pointrt
+		jsr			ControlDRVR			; call C code
+		add			#8,sp				; drop arguments
+		movem.l		(sp)+,rSave			; Restore registers
+		move.w		d0,ioResult(a0)		; Store the result code
+		bra			done
+	
+	ENDP
+
+	END
+;--------------------------------------------------------------------------
+;
+;							End of Module
+;
+;------------------------------------------------------------------------*/

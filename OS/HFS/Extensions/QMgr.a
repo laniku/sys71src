@@ -1,0 +1,415 @@
+;
+;	File:		QMgr.a
+;
+;	Contains:	An FSQueue-CmdDone like queue mechanism that is more general
+;				and handles only asynchronous-type queueing.
+;
+;	Written by:	Dave Feldman
+;
+;	Copyright:	© 1989-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		<10>	 9/13/91	JSM		Cleanup header.
+;		 <9>	 3/17/91	dnf		dba, dty, #84977: introduce the CallWithRegistersPreserved
+;									routine which keeps stack depth down; use
+;									CallWithRegistersPreserved in dispatching; save D0 across calls
+;									to completion routines
+;		 <8>	 3/11/91	dnf		dba, #dnf10: change QMgr so that it always does things
+;									asynchronously; this works because there is always someone else to
+;									SyncWait for the synchronous calls (kill QMQueueSync)
+;		 <7>	 12/5/90	dnf		Change <6> was with dba
+;		 <6>	 12/5/90	dnf		Don't attempt to fall through an endproc
+;		 <5>	11/12/90	dnf		include FileMgrPrivateEqu.a
+;		 <4>	 9/22/90	dnf		Adapt for multiple queues
+;		 <3>	  7/2/90	dnf		Change to include HardwarePrivateEqu.a
+;		 <2>	  2/4/90	DNF		Remove includes
+;	   <1.2>	 12/8/89	dnf		Fix up includes
+;	   <1.1>	10/17/89	dnf		Set async bit at dispatch
+;	   <1.0>	 9/18/89	dnf		Adding to ease for the first time
+;
+
+		load		'StandardEqu.d'
+		include		'HardwarePrivateEqu.a'
+		include		'QMgrEqu.a'
+		include		'FileMgrPrivate.a'
+
+; routines we'd like to see:
+;
+; QMNewQueue
+;	in	a0 - ptr to alternate stack
+;		d0 - length of stack
+;	out	d2 - queue refnum (or zero if no memory)
+;
+; QMRemoveQueue
+;   in	d2 - queue refnum
+;	out : queue removed
+
+;________________________________________________________________________________
+;
+; Routine:		GetOffFSQueue
+;
+; Function:		This routine extricates the parameter block currently on the head of
+;				the File System queue (which is the Desktop Manager parameter block
+;				currently being worked on) from the File System queue and onto the
+;				Desktop Manager queue.  The only tricky bit is keeping the File System
+;				going full steam ahead at all times. For this we rely on the QMgr Enqueue
+;				routine to restart the file system for us later.
+;
+; Inputs:		FSQHead -> Current Desktop Manager parameter block
+; Outputs:		A0 -> parameter block that was on the front of the file system queue
+;
+; This routine clobbers a0-a1/d0-d2 when it vectors into the File System's CmdDone code.
+;
+;________________________________________________________________________________
+
+GetOffFSQueue:	proc	export
+		move	sr,-(sp)			; save interrupt state
+		ori.w 	#HiIntMask,sr		; only debug interrupts allowed
+		clr.w	FSBusy				; clear file system busy boolean
+									; (It's OK - Interrupts are disabled!)
+
+; delete the current request from the queue
+
+		move.l	FSQHead,a0			; a0 -> current request
+		move.l	QLink(a0),FSQHead	; get next request, if any
+		bne.s	@MoreLater			; if another FS request, don't clear the tail ptr
+		clr.l	FSQTail 			; if no more requests, clear tail ptr
+
+@MoreLater:
+		move		(sp)+, sr		; restore interrupt state
+		rts
+		endproc
+
+;_______________________________________________________________________
+;
+; Routine:		GetQMRecPtr
+;
+; Arguments:	in:		d2 = queue type/refnum
+;				out:
+;						a1 = QMRec pointer (or -1 if bad type/refnum)
+;						Z = 0 implies dispatch trap (store d0.b in ioTrap+1)
+;						Z = 1 implies straight trap (leave ioTrap alone)
+;
+; Called by:	all the QM routines that take queue refnums
+;
+; Function: 	goes and finds the QMRec for a given refnum.
+;				refnums are currently allocated staticly in this code.
+;_______________________________________________________________________
+
+GetQMRecPtr:	proc		export
+		move.l		FSVarsPtr, a1					; a1 = ptr(FSVars)
+		move.l		FSVars.QMgr(a1), a1				; a1 = ptr(QMgr globals)
+		cmp.b		#desktopQType, d2				; desktop manager queue?
+		bne.s		@CheckCLQueue
+
+		move.l		QMGlobals.DTQueuePtr(a1), a1	; a1 = ptr(DTDB mgr QM rec)
+		bra.s		@Exit
+
+@CheckCLQueue:
+		cmp.b		#fsCompatQType, d2				; compatibility layer queue?
+		bne.s		@BadRefNum
+		move.l		QMGlobals.CLQueuePtr(a1), a1	; a1 = ptr(comp. layer QM rec)
+
+@Exit:	tst.w		d2								; clear Z
+		rts
+
+@BadRefnum:
+		move.l		#-1, a1							; no queue found
+		bra.s		@Exit
+		endp
+
+;_______________________________________________________________________
+;
+; Routine:		QMEnqueue
+; Arguments:	d0 = (possibly) dispatch number
+;				d1 = trap word
+;				d2 = queue refnum
+;				a0 = parameter block pointer
+;
+; Calls:		QMQueue enqueues the calling routine on the selected queue,
+;				and dispatches it if that queue is not busy.
+;				Like the file system queue mechanism, Pascal registers are
+;				saved on the a7 stack.
+;
+; Called by:	Any client who wants queueing and dispatching services.
+;
+; Function: 	This entry point determines whether a call is synchronous
+;				or asynchronous; it queues up the call, then, if async and
+;				there is a command already executing, returns immediately.
+;				Otherwise, it enters the sync wait routine, then goes to
+;				command dispatch.
+;
+;				The dispatched command is BSR'ed to; it should put
+;				the return address on the a6 stack and rts off that
+;				stack to complete the call.
+;
+;				No registers are preserved across calls to the two queue hooks,
+;				allowing hook patches to grab the return address off the stack
+;				and not return to this code.
+;
+;				Note: What the hell is @KickStartFS?
+;				If you're pulling a pb off of the front of the file system queue
+;				you normally dispatch the next pb, if there is one, so that all
+;				of the calls get processed.  If you didn't, you'd hang the file
+;				system.
+;
+;				However, several clients of the QMgr (such as the desktop
+;				manager and the file system compatibility layer) need to move
+;				calls from the file system queue to a QMgr queue.  If they had
+;				to the "traditional" thing (i.e. restart the file system)
+;				they'd have no place to remember the address of the pb when
+;				they can back to place it on a qmgr queue.
+;
+;				Since the QMgr always restarts the file system, clients can remove param
+;				blocks from the front of the file system queue and branch here
+;				secure in the knowledge that we'll restarts the file system for them.
+;				Restarting the file system when it is already busy has no effect.
+;
+;  Modification History:
+;
+;	7-28-89 dnf	Taken from FSQueue, which taken from the original MFS queue
+;_______________________________________________________________________
+
+QMEnqueue:	proc	export
+		import	QMDispatchRequest
+
+		move.w	d2, ioType(a0)			; save qType/refnum
+		bsr		GetQMRecPtr				; pointer to QMRec in a1
+		beq.s	@NotDispatch			; Z=1 implies straight trap
+
+		and.w	#$0f00, d1				; preserve modifier bits
+		move.b	d0, d1					; move dispatch byte into trap word
+
+@NotDispatch:
+		move.w	d1, ioTrap(a0)			; save the trap number
+		move.w	#1, ioResult(a0)		; set ioResult to "in process"
+
+		with	QMRec
+		move.l	enQHook(a1), d2			; enqueue hook?
+		beq.s	@NoEnqueueHook			; cruise if not
+		move.l	d2, a1					; get the hook where we can call it
+		jsr		(a1)					; call the enqueue hook (can't trash any regs)
+
+@NoEnqueueHook:
+		move.w	ioType(a0), d2			; get qType/refnum
+		bsr		GetQMRecPtr				; pointer to QMRec in a1
+		move.l	(sp)+, ioCmdAddr(a0)	; save enqueuing routine's address
+		bset.l	#AsyncTrpBit, d1		; set async bit in trap word					<8>
+		bne.s	@DoAsyncCall			; if already an asynchronous call, go on		<8>
+
+		clr.l	ioCompletion(a0)		; no completion routines for sync calls
+		; here we fall through because we handle all calls asynchronously				<8>
+
+@DoAsyncCall:
+		move	sr, -(sp)				; save interrupt state
+		ori		#HiIntMask, sr			; only allow macsbug interrupts
+		_Enqueue						; put the request at the end of the queue
+
+@ToDispatch:
+		bset.b	#qIsBusy, qMFlags(a1)	; mark this queue busy
+		beq.s	@Dispatch				; if it wasn't already busy, go do this request
+
+; The queue is busy so we're done for now.  This request will get executed after
+; the completion of the one in front of it.
+
+		moveq.l	#noErr,d0				; no errors (yet)
+		move	(sp)+, sr				; re-enable interrupts and return
+		bra.s	@KickStartFS			; restarting the file system on the way out
+
+@Dispatch:
+		move	(sp)+,sr				; re-enable interrupts
+		movem.l	pascalRegs, -(sp)		; save the Pascal registers
+		jsr		QMDispatchRequest		; go do the rest of the dispatching						<9>
+		movem.l	(sp)+, pascalRegs		; restore the Pascal registers
+
+@KickStartFS:							; (see massive note above)
+		movea.l	ExpandMem, a1			; aim at expanded lomem blob
+		move.l	ExpandMemRec.jDispatchNext(a1), -(sp)	; push file system restart address
+		rts								; hop back down async thread, restarting fs on the way
+		endproc
+		
+;______________________________________________________________________
+; QMDispatchRequest - the specific call dispatcher
+;
+; We assume that the appropriate registers have been saved and 
+; dispatch the call.
+;
+; Input:
+;		a1	-	QMRec pointer
+;______________________________________________________________________
+
+QMDispatchRequest:	proc
+		import	QMCmdDone
+		
+		with	QMRec
+		bset.b	#asyncCall, qmFlags(a1)	; ask for all I/O to be done asynchronously
+		move.l	qHead(a1), a0			; get pointer to first parameter block
+		move.w	ioTrap(a0), d1			; d1 = trap word for this call
+		move.l	stackBase(a1), a6		; set up a6 for alternate stack use
+		move.w	ioType(a0), -(a6)		; save for later safety check
+		move.l	ioCmdAddr(a0), a1		; get address of enqueued routine
+
+		pea.l	QMCmdDone				; push ptr(completion code)
+		move.l	(sp)+, -(a6)			; move completion address onto a6
+
+		jmp		(a1)					; go do the call										<9>
+
+		endproc
+		
+;______________________________________________________________________
+; QMCmdDone
+;
+; Complete the current request, post completion routines and 
+; possibly dispatch another request.
+;
+; QMCmdDone modifies a0/a1, d0-d2
+;______________________________________________________________________
+
+QMCmdDone:		proc
+		import	CallWithRegistersPreserved
+
+		move.w	(a6)+, d2				; get queue refnum
+		bsr		GetQMRecPtr				; get QMRecPtr in a1
+		with	QMRec
+
+		ext.l	d0						; Make a long of it 					<14Jun85>
+		ble.s	@notDSErr				; If zero or negative, we're OK
+		move.w	d0, dsErr(a1) 			; save internal error for debug
+		moveq	#FSDSIntErr, d0			; replace with generic "deep shit" error
+
+@notDSErr:
+		move.l	qHead(a1), a0			; a0 -> current param block (that just finished)
+		cmp.w 	ioType(a0), d2 			; it better be the right type
+		bne.s 	toDSFSErr				; or else die
+
+		move.l	deQHook(a1), d2			; just-before-dequeue hook?
+		ble.s	@doTheDequeue			; branch if not . . .
+		move.l	d2, a1					; a1 = ptr(just-before-dequeue hook)
+		jsr		(a1)					; go do the whatever the hook wants
+
+@doTheDequeue:
+		move.w	ioType(a0), d2			; get qType/refnum
+		bsr		GetQMRecPtr				; pointer to QMRec in a1
+		move	sr, -(sp)				; save interrupt state
+		ori 	#HiIntMask, sr			; only debug interrupts allowed
+		bclr.b	#qIsBusy, qMFlags(a1)	; mark this queue not busy
+
+; delete the current request from the queue and post any completion routines
+
+		move.l	qHead(a1), a0			; a0 -> current request
+		move.l	qLink(a0), qHead(a1)	; get next request, if any
+		bne.s	@moreRequests			; just go call completion if there are more requests
+		clr.l	qTail(a1)				; if no more, clear the tail, too
+
+@moreRequests:
+		move	(sp)+, sr				; restore interrupt state
+		move.w	d0, ioResult(a0)		; post error code
+
+		move.l	ioCompletion(a0), d1	; is there a completion routine?
+		beq.s	@dispatchNext			; if not, just do dispatch the next call
+
+		move.l	a1, -(sp)				; save QMRecPtr around completion routine
+		move.l	d1, a1					; a1 = ptr(completion routine)
+		jsr		(a1)					; go call the completion routine
+		move.l	(sp)+, a1				; get QMRecPtr back
+
+; go dispatch the next call if there is one
+
+@dispatchNext:
+		move	sr, -(sp)				; save interrupt state
+		ori		#HiIntMask, sr			; allow only MacsBug interrupts
+		tst.l	qHead(a1)				; is there another call on the queue?
+		beq.s	@Done					; if not, cruise										<9>
+
+		bset.b	#qIsBusy, qMFlags(a1)	; mark this queue busy									<9>
+		bne.s	@Done					; if it was already busy, we can return asynchronously	<9>
+		move.w	(sp)+,sr				; restore interrupt state								<9>
+
+		lea.l	QMDispatchRequest,a0		; our dispatcher’s entry point						<9>
+		jmp		CallWithRegistersPreserved	; call it 											<9>
+
+@Done:
+		move	(sp)+, sr				; restore interrupt state
+		rts								; and leave
+
+toDSFSErr	MOVEQ	#DSFSErr,D0
+			_SysError
+		endp
+
+;_______________________________________________________________________
+;
+; Routine:		QMInitQueue
+; Arguments:	d2 - queue refnum
+;
+; Function: 	Clear the queue of all pending commands except for the one
+;				running (if there is one . . .).
+;
+;  Modification History:
+;
+;  05 Aug 84  New today. Taken directly from LAK's FS code
+;  01 Aug 89  New again today.  (Rewrite every 5 years, whether it needs it or not...)
+;_______________________________________________________________________
+
+QMInitQueue:		proc	export
+		; •• get QManRec in a4
+		move	sr, -(sp)				; save interrupt state
+		ori		#HiIntMask, sr			; allow only debug interrupts
+
+		move	qHead(a4), d0			; any commands?
+		beq.s	@weAreDone				; then we're done
+		move.l	d0, a0					; a0 = ptr(currently running command)
+		clr.l	ioLink(a0)				; blow away any other entries in the queue
+		move.l	a0, qTail(a4)			; except this one
+
+@weAreDone:
+		move.w	#noErr, d0				; this routine has no errors
+		move.w	(sp)+, sr				; restore interrupt state
+		rts
+		endp
+
+;________________________________________________________________________________
+; <9>
+; CallWithRegistersPreserved
+;	
+; This routine provides an easy way for the kind of recursive code found in the 
+; File Manager, BTree Manager and Desktop Manager to eliminate tail recursion.
+;
+; CallWithRegistersPreserved will call any routine while making sure that the
+; volatile interrupt registers (d4-d7/a4-a6) are preserved.  We have an optimization
+; to prevent stack buildup when registers are actually already preserved. The trick
+; is to notice the instruction pointed to by (sp) and see if it is a
+; movem.l (sp)+ instruction with enough registers to make us happy.
+;
+; The rule:
+;	You must call this routine at a point where you could otherwise execute an RTS.
+;
+;	Inputs:
+;		a0.l	address of routine to execute with preserved registers
+;		
+;	Outputs:
+;		d0		trash
+;		a0		trash
+;		all other registers passed through to the call to a0
+;________________________________________________________________________________
+CallWithRegistersPreserved:		proc	export
+			move.l	a0,-(sp)							; put the target onto the stack
+			movea.l	4(sp),a0							; point to the code we'd return to
+			cmpi.w	#MOVEMSPPostIncOpCode,(a0)+			; is it going to restore some registers?
+			bne.s	Protected							; if not, be safe
+			move.w	(a0),d0								; get the Movem register mask
+			not.w	d0									; get 0 bits for registers that ARE saved
+			andi.w	#VolatileInterruptRegisterMask, d0	; see if all registers we care about are saved
+			beq.s	Direct								; if so, get right to it
+Protected:
+			movea.l	(sp)+,a0							; get our target back
+			movem.l	InterruptRegs,-(sp)
+			jsr		(a0)								; registers are protected, so call in
+			movem.l	(sp)+,InterruptRegs
+Direct:
+			rts
+			endproc
+
+;________________________________________________________________________________
+
+		end

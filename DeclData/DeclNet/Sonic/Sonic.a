@@ -1,0 +1,1378 @@
+;
+;	File:		Sonic.a
+;
+;	Contains:	Sonic-specific support routines
+;
+;	Written by:	Sean Findley
+;
+;	Copyright:	© 1990, 1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <1>	 10/6/92	GDW		New location for ROMLink tool.
+;		 <1>	 6/12/92	RLM		first checked in
+;		<P2>	02/07/92	jmp		(jmp,H2/BG/SJF,Z3) Modifications for passing in SonicPtr instead
+;									of storing it.
+;		 <1>	  2/4/92	mal		first checked in
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;	  Pre-Horror ROM comments begin here.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;		 <2>	 4/21/91	CCH		Rolled in Sean Findley's changes.
+;		 <1>	12/14/90	JK		Added to builds
+;
+;	To Do:
+;
+
+;¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥ SONIC.a
+;	written by Sean J. Findley Jan. 1990
+
+				PRINT		NOMDIR,NOMCALL
+
+				MACRO
+				Set10
+				SMOVE		#(TalliesPerSec*10) MOD 65536,Timer0(A2)
+														; set lower 16 bits of counter
+				SMOVE		#(TalliesPerSec*10) DIV 65536,Timer1(A2)
+														; set upper 16 bits of counter
+				MOVE.L		#(1<<TimerElapsed),D0
+				SMOVE		D0,Int_Status(A2)			; make sure no pending timer interrupt
+				ENDM				
+				
+				INCLUDE		'SonicEqu.a'
+
+				IF			Txpkt.frag_esize = 6 THEN
+				MACRO
+&L				FragMul		&DReg
+&L				ADD.W		&DReg, &DReg
+				MOVE.W		&DReg, -(A7)
+				ADD.W		&DReg, &DReg
+				ADD.W		(A7)+, &DReg
+				ENDM
+				ELSEIF		Txpkt.frag_esize = 12 THEN
+				MACRO
+&L				FragMul		&DReg
+&L				ADD.W		&DReg, &DReg
+				MOVE.W		&DReg, -(A7)
+				ADD.W		&DReg, &DReg
+				ADD.W		(A7)+, &DReg
+				ADD.W		&DReg, &DReg
+				ENDM
+				ELSE
+				AError		'Unexpected value for Txpkt.frag_esize'
+				ENDIF
+
+SONICdata		PROC
+;	For machines with MMUs present, pointers may have additional values associated with them.
+;	One is the lowest possible logical address the pointer may have. This value is used to
+;	calculate an offset that can be added to the second value which is the lowest possible
+;	physical address to quickly translate logical to physical addresses, and vice-versa.
+
+				ENTRY		TxTDAptr,NextTxTDA,FreeTxTDA,RRAptr,RBAptr,RDAptr
+				ENTRY		RECVParms,RECVProc,TRANParms,TRANProc,TxRetries,RxDescs
+				ENTRY		NextRxDesc,LastDesc,HoldDescHdr,IntDRtn,IntERtn,NetStatp,FreeQ
+				
+TxTDAptr		DC.L		0,0,0						; pointer to current Tx descriptor area
+NextTxTDA		DC.L		0							; pointer to next TDA to transmit
+FreeTxTDA		DC.L		0							; pointer to available TDA
+
+RRAptr			DC.L		0,0,0						; pointer to read resource area
+RBAptr			DC.L		0,0,0						; pointer to read buffer area
+RDAptr			DC.L		0,0,0						; pointer to read descriptor area
+
+RECVParms		DC.L		0							; parm ptr to pass to user receive routine
+RECVProc		DC.L		0							; addr of user receive routine
+TRANParms		DC.L		0							; parm ptr to pass to xmit complete routine
+TRANProc		DC.L		0							; address of xmit complete routine
+
+TxRetries		DC.L		0							; retry counter for failed xmits
+RxDescs			DC.L		0							; number of recv descriptors allocated
+
+NextRxDesc		DC.L		0							; ptr to next recv descriptor to poll
+LastDesc		DC.L		0							; ptr to last descriptor
+HoldDescHdr		DC.L		0							; hdr to held descriptor list
+
+IntDRtn			DC.L		0							; ptr to proc to disable interrupts
+IntERtn			DC.L		0							; ptr to proc to enable interrupts
+
+NetStatp		DC.L		0							; ptr to network stats. array
+
+;	We keep a queue to manage the freeing of receive descriptors. Since descriptors may be
+;	freed out of the received sequence order, we cannot permit the SONIC to use a given descriptor
+;	unless it is being freed in the same sequence as it was received. Thus as packets are
+;	received, their descriptors are placed onto a queue (we have a head & tail for fast queue
+;	insertions/deletions), and a "freed" flag is set to false. When the descriptor is freed,
+;	the flag is set to true, and if the descriptor is at the front of the queue it, and any others
+;	directly behind it that have been freed are given back to the SONIC. This will prevent a
+;	"buffer wrap-around".
+
+FreeQ			DC.L		0,0							; head/tail pointer for queuing
+				ENDPROC
+
+llg				EQU			4							; offset to lowest logical addr
+lph				EQU			8							; offset to lowest physical addr
+
+;	Routines for initializing SONIC chip and reading/writing packets on Ethernet.
+
+;¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+;	Setup SONIC clock to go off in 10 seconds. Assumes A2-> SONIC registers.
+Set10Seconds	PROC		ENTRY
+				WITH		SONICRegs
+				Set10									; set timer for 10 seconds
+				RTS
+				ENDPROC
+;¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+;	Restart SONIC. Assumes A2-> SONIC registers.
+RestartSONIC	PROC		EXPORT						; take SONIC out of reset			<T2>
+				WITH		SONICRegs
+				MOVEQ		#0,D0
+				SMOVE		D0,Command(A2)				; take out of reset
+@wait
+				SMOVE		Command(A2),D0
+				BTST		#SoftReset,D0
+				BNE.S		@wait						; wait for it
+
+				Set10									; set timer for 10 seconds
+				
+				MOVEQ		#(1<<RxEnable)+(1<<StartTimer),D0
+				SMOVE		D0,Command(A2)				; start receiving packets again
+@waitmore
+				SMOVE		Command(A2),D0
+				BTST		#RxDisable,D0
+				BNE.S		@waitmore					; wait for receiver to enable
+				RTS
+				ENDPROC
+;¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+;	Reset SONIC. Assumes A2-> SONIC registers
+				
+ResetSONIC		PROC		EXPORT						;									<T2>
+				WITH		SONICRegs
+				MOVEQ		#(1<<RxDisable),D0
+				SMOVE		D0,Command(A2)				; disable packet reception
+@wait
+				SMOVE		Command(A2),D0
+				BTST		#RxEnable,D0
+				BNE.S		@wait						; wait until it disables
+@wait1
+				SMOVE		Command(A2),D0
+				EORI.W		#(1<<StartTimer)+(1<<RxDisable),D0
+				BNE.S		@wait1						; make sure no other commands active
+				
+				BSET		#SoftReset,D0
+				SMOVE		D0,Command(A2)				; so we can look at CAM cells
+				
+				RTS
+				ENDPROC
+;¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+;	Set a bit in command register and wait for it to clear. 
+;	D0=bit # to set/poll.
+;	A2->SONIC chip
+;	Uses D1
+
+SONICSync		PROC		ENTRY
+				WITH		SONICRegs
+				SUB.L		D1,D1						; clear 32 bits
+				BSET		D0,D1
+				SMOVE		D1,Command(A2)
+@waitloop
+				SMOVE		Command(A2),D1
+				BTST		D0,D1
+				BNE.S		@waitloop					; wait for command to complete
+				RTS
+				ENDWITH
+				ENDPROC
+				
+;¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥
+;	Link to the end of recv descriptor list.
+;	A1->new entry, uses A0
+LinkToRxList	PROC		ENTRY
+				
+				MOVE.L		A2,-(SP)
+				
+				SUB.L		D0,D0
+				SMOVE		D0,Rxpkt.status(A1)			; setup to receive
+				MOVEQ		#(1<<EOL_Bit), D0			; mark us at the end
+				SMOVE		D0,Rxpkt.link(A1)			; new last one
+
+				MOVEQ		#-1,D0
+				SMOVE		D0,Rxpkt.in_use(A1)			; mark entry as in use by SONIC
+
+				LEA			LastDesc,A0					; A0->last descriptor ptr
+				MOVEA.L		(A0),A2						; A2->last descriptor
+				
+				MOVE.L		A1,(A0)						; update last pointer
+				MOVE.L		A1,D0
+				
+				IF			MMU THEN
+				SUB.L		RDAptr+llg,D0
+				ADD.L		RDAptr+lph,D0				; D0=physical address
+				ENDIF
+				
+				SMOVE		D0,Rxpkt.link(A2)			; link us to the end of the list
+				
+				LEA			NextRxDesc,A0
+				TST.L		(A0)						; were we out of buffers?
+				BNE.S		@done						; no
+				
+				MOVE.L		A1,(A0)						; set next recv desc to poll
+@done
+				MOVEA.L		(SP)+,A2
+				RTS
+				ENDPROC
+
+;¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥ SONIC Free Buffer
+;	void SONICFREEBUFF(desc)
+SONICFREEBUFF	PROC		EXPORT
+
+parms			RECORD		4
+RxDescriptor	DS.L		1							; ->to RDA descriptor to free
+				ENDR
+				
+				WITH		parms
+				
+				MOVEA.L		IntDRtn,A0					; A0->proc to disable interrupts
+				JSR			(A0)						; call it
+				
+				MOVEA.L		RxDescriptor(SP),A1			; A1->descriptor to be freed
+
+				MOVE.L		A2,-(SP)					; save reg
+				MOVE.L		D0,-(SP)					; save SR returned by proc
+				
+				ST			Rxpkt.isFree(A1)			; mark this desc to be freed
+				
+				LEA			FreeQ,A2					; A2->to be freed queue
+				CMPA.L		(A2),A1						; is this entry at the front?
+				BNE.S		@xit						; that's all we can do now
+; free as many descriptors as possible starting at the front of the queue
+@FreeDesc
+				TST.B		Rxpkt.isFree(A1)			; can we free this desc?
+				BEQ.S		@done						; no, all done
+				
+				MOVE.L		Rxpkt.nextRD(A1),(A2)		; set queue head to next desc if any
+				
+				BSR.S		doFreeDesc					; give descriptor back to SONIC
+				
+				MOVE.L		(A2),D0						; any more to free?
+				BEQ.S		@done						; all done
+				
+				MOVEA.L		D0,A1						; A1->next descriptor to free
+				BRA.S		@FreeDesc					; try the next one
+@done
+				TST.L		(A2)+						; see if queue has been emptied
+				BNE.S		@xit						; is not
+				CLR.L		(A2)						; clear tail pointer too
+@xit
+				MOVEA.L		IntERtn,A0					; A0->proc to enable interrupts
+				JSR			(A0)						; do it
+				ADDQ.W		#4,SP						; strip SR parm
+				
+				MOVEA.L		(SP)+,A2					; get back reg
+				RTS
+doFreeDesc
+				SMOVE		Rxpkt.in_use(A1),D0			; see if SONIC still using desc
+				TST.W		D0
+				BEQ			LinkToRxList				; put desc on receive list
+; put desc on hold list
+;	If the descriptor might still be in use by the SONIC. This can happen if no other descriptors
+;	have been freed prior to this one OR we have not received any packets since freeing other
+;	descriptors prior to this one.
+				LEA			HoldDescHdr,A0				; A0->hold list header
+				MOVE.L		(A0),Rxpkt.nextRD(A1)		; link prev to our next
+				MOVE.L		A1,(A0)						; put desc on head of list
+				RTS
+				
+				ENDWITH
+				ENDPROC
+				
+
+;¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥ SONIC Interrupt Handler
+SONICInterrupt	PROC		ENTRY
+				
+OurStack		RECORD		{A6Link}					;									<Z3>
+Sz				EQU			*							;									<Z3>
+A6Link			DS.L		2							;									<Z3>
+SONICPtr		DS.L		1							;									<Z3>
+				ENDR									;									<Z3>
+				
+;	void SONICInterrupt()
+
+				WITH		SONICRegs
+				LINK		A6,#OurStack.Sz				;									<Z3>
+				MOVEM.L		A2-A3, -(SP)				; save those we use
+@more
+				MOVEA.L		OurStack.SONICptr(A6),A2	; A2->SONIC regs					<Z3>
+				
+				SMOVE		Int_Status(A2),D0			; get ISR from SONIC
+				MOVE.W		D0,D1						; save it
+				MOVE.W		#(1<<RecdPkt),D2
+				AND.W		D2,D0						; a receive?
+				BEQ.S		@chkXmit
+				SMOVE		D2,Int_Status(A2)			; clear interrupt status
+				BSR			PKTRX						; yes, process it right away
+				BRA.S		@more
+@chkXmit
+				MOVE.W		#(1<<TransDone),D2
+				AND.W		D2,D1						; a xmit complete?
+				BEQ.S		@chkOther
+				SMOVE		D2,Int_Status(A2)			; clear interrupt status
+				BSR			TXDN						; yes, do it right now
+				BRA.S		@more
+@chkOther
+				SMOVE		Int_Status(A2),D0			; get ISR from SONIC again
+				ANDI.W		#OurIntsMask,D0				; only the ones we want
+				BEQ.S		@done						; finished
+
+				MOVEQ		#15, D1						; loop count
+@chkBit
+				BTST.L		D1, D0						; check a bit
+				DBNE		D1, @chkBit					; loop until a bit is on
+
+				SUB.L		D2, D2						; clear 32 bits
+				BSET		D1, D2						; set the bit that is on
+				ADD.W		D1, D1						; get table offset
+
+				LEA			IntTable, A0
+				ADDA.W		(A0, D1.W), A0				; Get address of routine
+
+				SMOVE		D2,Int_Status(A2)			; clear interrupt status
+				JSR			(A0)						; and execute it
+				BRA.S		@more						; look for more work to do
+
+@done
+				MOVEM.L		(SP)+, A2-A3
+				UNLK		A6							;									<Z3>
+				RTS
+
+IntTable
+;	Each interrupt is called with its respective status bit set in D2. It has the option of
+;	when to clear it in the ISR.
+
+				DC.W		RFO-IntTable				; receive FIFO overrun
+				DC.W		MP-IntTable					; MP  tally counter rollover
+				DC.W		FAE-IntTable				; FAE tally counter rollover
+				DC.W		CRC-IntTable				; CRC tally counter rollover
+				DC.W		RBAE-IntTable				; receive buffer overflow
+				DC.W		RBE-IntTable				; receive buffers exhausted
+				DC.W		RDE-IntTable				; receive descriptors exhausted
+				DC.W		TC-IntTable					; timer complete
+				DC.W		TXER-IntTable				; transmit error
+				DC.W		TXDN-IntTable				; transmit complete
+				DC.W		PKTRX-IntTable				; packet received
+				DC.W		PINT-IntTable				; programmable interrupt
+				DC.W		LCD-IntTable				; load CAM done
+				DC.W		HBL-IntTable				; heartbeat lost
+				DC.W		Reserved-IntTable			; reserved
+				DC.W		Reserved-IntTable			; reserved
+;________________
+RFO														; receive FIFO overrun
+MACRxError
+				MOVEA.L		NetStatp, A0				; Get pointer to array
+				ADDQ.L		#1, NetStats.MPerr(A0)		; Increment statistic
+				RTS
+;________________
+MP														; MP  tally counter rollover
+				RTS
+;________________
+FAE														; FAE  tally counter rollover
+				RTS
+;________________
+CRC														; CRC  tally counter rollover
+				RTS
+;________________
+RBAE													; receive buffer overflow
+				BRA.S		MACRxError					; report receive error
+;________________
+RBE														; receive buffers exhausted
+				BRA.S		MACRxError					; report receive error
+;________________
+RDE														; receive descriptors exhausted
+				RTS
+;________________
+TC														; timer complete
+;	This interrupt is used to fix a bug in the SONIC. If a packet has not been received in
+;	the last 10 seconds and there ARE receive descriptors available, AND the current RDA
+;	pointer is at the End Of List, reset the SONIC.
+
+				
+				SMOVE		Silicon_Rev(A2),D0			; check SONIC version
+				CMPI.W		#3,D0
+				BHI.S		@done						; do nothing if rev 4 or later
+				
+				MOVE.L		NextRxDesc,D0				; see if descriptors available
+				BEQ			Set10Seconds				; none available, user is very slow to free buffers
+				SMOVE		Current_RDA(A2),D0
+				BTST		#EOL_Bit,D0
+				BEQ			Set10Seconds				; SONIC is not stuck
+				SMOVE		Int_Status(A2),D0
+				BTST		#RecdPkt,D0					; make sure a packet did'nt arrive
+				BNE			Set10Seconds				; process it if so
+;	SONIC is in a loop, reset it and get going again
+				SMOVE		Command(A2),-(SP)			; save current command status
+				
+				MOVE.L		#1<<SoftReset,D0
+				SMOVE		D0,Command(A2)
+				
+				BSR			RestartSONIC				; and get it going again
+				SMOVE		(SP)+,Command(A2)			; continue with whatever we were doing
+@done
+				RTS
+;________________
+TXER													; transmit error
+				RTS
+;________________
+TXDN													; transmit complete
+				
+				LEA			TxRetries,A0				; A0->retry count
+
+				SMOVE		Int_Status(A2),D0			; check for errors
+				ANDI.W		#(1<<TransError),D0			; any abort errors?
+				BEQ.S		@nextXmit					; no, see if more to xmit
+				
+				SMOVE		D0,Int_Status(A2)			; clear error status
+				
+				ADDQ.L		#1,(A0)						; inc retry count
+				CMPI.L		#TxMaxRetries,(A0)			; past the treshhold?
+				BLO.S		@nextXmit					; give up if so
+				
+				SMOVE		Current_TDA(A2),D0
+				BTST		#EOL_Bit,D0					; make sure we have a Tx descriptor
+				BNE.S		@nextXmit					; give up if not
+				
+				MOVEQ		#(1<<TxEnable), D0
+				SMOVE		D0,Command(A2)				; try retransmitting
+				RTS										; get out
+@nextXmit
+				CLR.L		(A0)						; reset retry count
+				
+				MOVEA.L		IntDRtn,A1
+				JSR			(A1)
+				MOVE.L		D0,-(SP)					; disable interrupts and save old SR
+				
+				LEA			TxTDAptr,A0
+				MOVE.L		(A0),A3						; save ptr to transmitted chain
+				
+				LEA			NextTxTDA,A1
+				MOVE.L		(A1),(A0)					; set any pending chain to current
+				BEQ.S		@callTxComp					; were'nt any pending
+				
+				CLR.L		(A1)						; pending chain now being xmitted
+				MOVE.L		(A0),D0
+				
+				IF			MMU THEN
+				SUB.L		TxTDAptr+llg,D0
+				ADD.L		TxTDAptr+lph,D0				; D0=physical address of curr TDA
+				ENDIF
+				
+				SMOVE		D0,Current_TDA(A2)			; set SONIC TDA ptr
+				
+				MOVEQ		#(1<<TxEnable), D0
+				SMOVE		D0,Command(A2)				; start transmitting pending chain
+@callTxComp
+				MOVEA.L		IntERtn,A0
+				JSR			(A0)						; reenable interrupts
+@doTxComp												; A3->xmitted TDA
+				MOVE.L		TRANParms,-(SP)				; pointer to xmit complete parms
+				MOVEM.L		A3,-(SP)					; pass ptr to xmit buffer descriptor
+				MOVE.L		TRANProc,A0					; xmit completion routine address
+				JSR			(A0)						; call it
+				ADDQ.W		#8,SP						; strip trans parms
+
+				SMOVE		TxPkt.status(A3),D0			; get back status
+				ANDI.W		#$F800, D0
+				MOVEA.L		NetStatp, A0				; Get pointer to array
+				CMPI.W		#$0800, D0					; were there any?
+				BLO.S		@ok							; none
+				BHI.S		@many						; more than one
+				ADDQ.L		#1, NetStats.sCollFrame(A0)	; Increment statistic
+				BRA.S		@coll
+
+@many
+				ADDQ.L		#1, NetStats.mCollFrame(A0)	; inc multiple collision frame
+
+@coll
+				ADDQ.L		#1, NetStats.CollFrame(A0)	; inc collision count
+@ok
+				SMOVE		TxPkt.status(A3),D1			; get back status
+				CMPI.W		#(1<<TransmitOK),D1			; fast check
+				BNE.S		@chkErrs					; not a normal result
+				ADDQ.L		#1, NetStats.TxOK(A0)		; pkt transmitted OK
+				BRA.S		@nxtTDA
+@chkErrs
+				BTST		#TransmitOK,D1
+				BEQ.S		@latechk					; not transmitted
+				ADDQ.L		#1, NetStats.TxOK(A0)		; pkt transmitted OK
+				
+				BTST		#DeferredTx,D1
+				BEQ.S		@latechk
+				ADDQ.L		#1, NetStats.DefTx(A0)		; had a deferred transmission
+@latechk
+				BTST		#OutWindow,D1
+				BEQ.S		@aborts
+				ADDQ.L		#1, NetStats.LateColl(A0)	; out of window
+@aborts
+				BTST		#ExcessColl,D1
+				BEQ.S		@aborts1
+				ADDQ.L		#1, NetStats.ExcessColl(A0)	; excess collisions
+@aborts1
+				BTST		#ExcessDefer,D1
+				BEQ.S		@aborts2
+				ADDQ.L		#1, NetStats.ExcessDef(A0)	; excess deferrals
+@aborts2
+				BTST		#FIFOUnderRun,D1
+				BNE.S		@aborts3					; internal error
+				BTST		#BCMismatch,D1
+				BEQ.S		@nxtTDA
+@aborts3
+				ADDQ.L		#1, NetStats.InMACTxErr(A0)	; internal MAC xmit error
+@nxtTDA
+				MOVEA.L		IntDRtn,A1
+				JSR			(A1)						; disable interrupts
+				
+				SMOVE		Txpkt.frag_count(A3),D0		; get count of fragments in this TDA
+				FragMul		D0							; calc offset to link field
+
+				LEA			FreeTxTDA,A0
+				
+				MOVE.L		(A0),TxPkt.nextTD(A3)		; put this TDA on the free list
+				MOVE.L		A3,(A0)
+				
+				LEA			Txpkt.frag_start(A3),A3
+				LEA			(A3,D0.W),A3				; A3->this TDA link field
+				
+				SMOVE		(A3),D0						; fetch link field
+				BTST		#EOL_Bit,D0
+				BNE.S		@done						; this is the end..my friend
+				
+				SMOVE		Upper_TDA(A2),D1
+				SWAP		D1
+				MOVE.W		D0,D1
+				
+				IF			MMU THEN
+				SUB.L		TxTDAptr+lph,D1
+				ADD.L		TxTDAptr+llg,D1				; D1=logical address
+				ENDIF
+				
+				MOVEA.L		D1,A3						; A3->next TDA in xmitted chain
+
+				MOVEA.L		IntERtn,A1
+				JSR			(A1)						; reenable interrupts
+				
+				BRA			@doTxComp
+@done
+				MOVEA.L		IntERtn,A1
+				JSR			(A1)						; reenable interrupts
+				ADDQ.W		#4,SP						; strip old SR
+				
+				RTS
+;________________
+PKTRX													; packet received
+				MOVE.L		HoldDescHdr,D0				; any descriptors held?
+				BEQ.S		checkDesc					; none to process
+				
+;	Free available receive descriptors from the hold list.
+
+				LEA			HoldDescHdr,A3				; A3->prev link
+				MOVEA.L		D0,A1						; A1->held descriptor
+@chk
+				MOVE.L		Rxpkt.nextRD(A1),D1			; save forward link
+				
+				SMOVE		RxPkt.in_use(A1),D0
+				TST.W		D0							; desc still in use by the SONIC?
+				BMI.S		@nxt						; yes
+				
+				BSR			LinkToRxList				; put on receive list
+				
+				MOVE.L		D1,(A3)						; delete from hold list
+				MOVEA.L		A3,A1						; keep prev link
+@nxt
+				MOVEA.L		A1,A3						; A3->prev link
+				MOVEA.L		D1,A1						; A1->next held desc maybe
+				TST.L		D1
+				BNE.S		@chk						; more to do
+checkDesc
+				MOVE.L		NextRxDesc,D0				
+				BEQ			@done
+				
+				MOVEA.L		D0,A3						; A3->next active descriptor
+				
+				SMOVE		RxPkt.status(A3),D0
+				TST.W		D0							; at logical end of list?
+				BEQ			@done
+
+				MOVE.L		A3,-(SP)					; pass buffer descriptor
+				MOVE.L		RECVparms,-(SP)				; parms ptr for user
+				SMOVE		RxPkt.pkt_ptr1(A3),D0
+				SWAP		D0
+				SMOVE		RxPkt.pkt_ptr0(A3),D1
+				MOVE.W		D1,D0
+				
+				IF			MMU THEN
+				SUB.L		RBAptr+lph,D0
+				ADD.L		RBAptr+llg,D0				; D0=logical address
+				ENDIF
+				
+				MOVE.L		D0,-(SP)					; pointer to packet data
+				SUB.L		D0,D0
+				SMOVE		RxPkt.byte_count(A3),D0
+				MOVE.L		D0,-(SP)					; length of packet received
+				SUB.L		D0,D0
+				SMOVE		RxPkt.status(A3),D0
+				MOVE.L		D0,-(SP)					; receive status
+
+; setup pointer to next descriptor				
+				SUB.L		D1,D1
+				SMOVE		Rxpkt.link(A3),D2			; get lower part of link
+				BTST		#EOL_Bit,D2					; end of list?
+				BNE.S		@FreeQueue					; yes
+				SMOVE		Upper_RDA(A2),D1
+				SWAP		D1							; setup upper part of address
+				MOVE.W		D2,D1						; setup lower part of address
+				
+				IF			MMU THEN
+				SUB.L		RDAptr+lph,D1
+				ADD.L		RDAptr+llg,D1				; D1=logical address
+				ENDIF
+@FreeQueue
+; place descriptor on to-be-freed queue
+				LEA			FreeQ,A1					; A1->to be freed queue
+				CLR.L		Rxpkt.nextRD(A3)			; clear this desc link field
+				CLR.B		Rxpkt.isFree(A3)			; mark as not freed yet
+				TST.L		(A1)+						; check queue head
+				BNE.S		@notEmpty					; has entries on it
+				MOVE.L		A3,(A1)						; put this desc on the end of queue
+				MOVE.L		A3,-(A1)					; and on the front as well
+				BRA.S		@doneQueueing				; that's it
+@notEmpty
+				MOVEA.L		(A1),A0						; A0->tail
+				MOVE.L		A3,Rxpkt.nextRD(A0)			; link tail to this desc
+				MOVE.L		A3,(A1)						; put this desc on the end of queue
+@doneQueueing				
+				MOVEA.L		D1,A3						; A3->next descriptor maybe
+
+				LEA			NextRxDesc,A0
+				MOVE.L		A3,(A0)						; update for next receive
+@doRxCall				
+				MOVEA.L		RECVProc,A0					; addr of receive routine
+				JSR			(A0)						; call it
+
+				MOVE.L		(SP)+,D1					; get back status
+				LEA			16(SP),SP					; strip other parms
+				
+				MOVEA.L		NetStatp, A0				; Get pointer to array
+				MOVE.W		#(1<<ReceivedOK),D0
+				AND.W		D1,D0						; see if errors occured
+ 				BEQ.S		@Checkerrs
+				ADDQ.L		#1, NetStats.RxOK(A0)		; pkt received OK
+
+				MOVE.W		#(1<<MultiRecd),D0
+				AND.W		D1,D0
+				BEQ.S		@chkB
+				ADDQ.L		#1, NetStats.MultiRxOK(A0)	; multicast received OK
+@chkB
+				ANDI.W		#(1<<BroadRecd),D1
+				BEQ			checkDesc
+				ADDQ.L		#1, NetStats.BroadRxOK(A0)	; broadcast received OK
+				BRA			checkDesc
+@Checkerrs
+				BTST		#CRCErr,D1
+				BEQ.S		@chkFAE
+				ADDQ.L		#1, NetStats.FCSerr(A0)		; CRC error
+@chkFAE
+				BTST		#FramAlignErr,D1
+				BEQ			checkDesc
+				ADDQ.L		#1, NetStats.FAerr(A0)		; frame alignment error
+				BRA			checkDesc
+@done
+				Set10									; set timer for 10 seconds
+				RTS
+;________________
+PINT													; programmable interrupt
+				RTS
+;________________
+LCD														; load CAM done
+				RTS
+;________________
+HBL														; heartbeat lost
+				RTS
+;________________
+Reserved												; reserved
+				RTS
+								
+				ENDWITH
+				ENDPROC
+								
+;¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥ SONIC Initializaiton
+
+;	int SONICINIT(	SONICbase,IntInstall,RECVRtn,RECVPrms,
+;					TRANRtn,TRANPrms,MemStart,MemSize,IntDisable,IntEnable,NetStatArray)
+
+SONICINIT		PROC		EXPORT
+
+parms			RECORD		{A6Link}
+LocalSize		EQU			*							; no local vars
+A6Link			DS.L		2							; link and return address
+initp			DS			SONICinitParms				; parameters passed to us
+				ENDR
+				
+				WITH		parms,initp,SONICRegs,TxPkt,RRArec,Rxpkt,CAMDesc
+				
+				LINK		A6,#LocalSize				; save A6
+				MOVE.L		A2,-(SP)					; save this reg
+				
+				MOVEQ		#-1,D0						; possible error
+				CMPI.L		#Min_Mem_Size,MemSize(A6)	; enough memory?
+				BLO			@Ierror						; no
+				
+				MOVEA.L		SONICbase(A6),A2			; A2->SONIC registers				<Z3>
+				
+				LEA			RECVProc,A0
+				MOVE.L		RECVRtn(A6),(A0)
+				
+				LEA			RECVParms,A0
+				MOVE.L		RECVPrms(A6),(A0)
+				
+				LEA			TRANProc,A0
+				MOVE.L		TRANRtn(A6),(A0)
+				
+				LEA			TRANParms,A0
+				MOVE.L		TRANPrms(A6),(A0)
+				
+				LEA			IntDRtn,A0
+				MOVE.L		IntDisable(A6),(A0)
+				
+				LEA			IntERtn,A0
+				MOVE.L		IntEnable(A6),(A0)
+				
+				LEA			NetStatp,A0
+				MOVE.L		NetStatArray(A6),(A0)
+
+				SUB.L		D0,D0						; clear 32 bits
+				SMOVE		D0,Int_Mask(A2)				; disable SONIC interrupts
+				
+				BSET		#SoftReset,D0				; do a software reset on SONIC
+				SMOVE		D0,Command(A2)
+				
+				PEA			SONICInterrupt				; addr of our interrupt handler
+				MOVEA.L		IntInstall(A6),A0			; addr of installation proc
+				JSR			(A0)						; install interrupt handler
+				ADDQ.W		#4,SP
+				
+;	setup SONIC chip configuration				
+				MOVE.L		DataConfig(A6),D0
+				SMOVE		D0,Data_Config(A2)			; setup data configuration
+;	setup reception control
+				SUB.L		D0,D0						; clear 32 bits
+				BSET		#RecvErrors,D0				; receive CRC errors
+				
+				SMOVE		Silicon_Rev(A2),D1
+				CMPI.W		#3,D1
+				BLS.S		@setBrd						; no runts for rev 3 or earlier
+				BSET		#RecvRunts,D0				; receive runt packets
+@setBrd
+				BSET		#RecvBroadCast,D0			; receive broadcasts
+				SMOVE		D0,Recv_Control(A2)
+;	Ensure that descriptors are in the same 64k page
+				MOVE.L		NumRxBuffs(A6),D0			; calculate control memory size
+				MULU		#Rxpkt.RxRDAsize,D0			; memory for recv descriptors
+				
+				ADDI.L		#TxTDAsize * Max_Tx_Packets + RRArecSz + CAMDescSz,D0
+														; xmit descriptors, RRA and CAM
+				ADD.L		MemStart(A6),D0				; calc ending address
+				SUBQ.L		#1,D0						; make it inclusive
+				CLR.W		D0							; trash lower 16 bits
+				
+				MOVE.L		MemStart(A6),D1
+				CLR.W		D1							; get start address page
+				CMP.L		D1,D0						; see if boundry crossed
+				BEQ.S		@AllocateMem				; proceed if not
+								
+				ADDI.L		#$10000,D1					; adjust to 64k boundry
+				SUB.L		MemStart(A6),D1				; calc adjustment amount
+				
+				ADD.L		D1,MemStart(A6)				; update pointer
+				SUB.L		D1,MemSize(A6)				; update size
+@AllocateMem				
+
+;	get memory for TDA				
+				MOVE.L		#TxTDAsize * Max_Tx_Packets,D0
+														; mem for TDA (up to 16 packets)
+				LEA			FreeTxTDA,A1
+				MOVE.L		MemStart(A6),(A1)			; save free txtda ptr
+				
+				IF			MMU THEN
+				LEA			TxTDAPtr,A1
+				BSR			@SetAddresses				; set current phys/log addrs
+				ENDIF
+				
+				MOVEA.L		MemStart(A6),A1				; A1->1st TDA
+				MOVE.L		A1,D1
+
+				IF			MMU THEN
+				SUB.L		TxTDAPtr+llg,D1
+				ADD.L		TxTDAPtr+lph,D1				; D1=physical address of TDA
+				ENDIF
+
+				SWAP		D1
+				SMOVE		D1,Upper_TDA(A2)			; set upper TDA
+				
+				ADD.L		D0,MemStart(A6)				; update pointer
+				SUB.L		D0,MemSize(A6)				; update size
+				MOVEQ		#Max_Tx_Packets-2,D1		; link together all free TDAs
+@linkTDA
+				PEA			TxTDAsize(A1)				; get link to next TDA
+				MOVE.L		(SP),nextTD(A1)				; put in link field of TDA
+				MOVEA.L		(SP)+,A1					; point at next one
+				DBRA		D1,@linkTDA					; do them all (last link = nil)
+				
+;	get memory for RRA
+				MOVEQ		#RRArecSz+CAMDescSz,D0		; mem for 1 RRA and 1 CAM descriptor
+				LEA			RRAptr,A1
+				MOVE.L		MemStart(A6),(A1)			; save RRA ptr
+				
+				IF			MMU THEN
+				BSR			@SetAddresses				; set log/phys addresses
+				ENDIF
+				
+				MOVE.L		MemStart(A6),D1
+				
+				IF			MMU THEN
+				SUB.L		RRAptr+llg,D1
+				ADD.L		RRAptr+lph,D1				; D1=physical address of RRA
+				ENDIF
+				
+				SWAP		D1
+				SMOVE		D1,Upper_RRA(A2)			; set upper 16 bits of RRA addr
+				
+				ADD.L		D0,MemStart(A6)				; update pointer
+				SUB.L		D0,MemSize(A6)				; update size				
+;	get memory for RBA
+				MOVE.L		MemSize(A6),D0
+				
+				DIVU		#Max_Pkt_Size+RxRDAsize,D0
+				EXT.L		D0
+				
+				CMP.L		NumRxBuffs(A6),D0			; more than requested?
+				BLS.S		@usebuffs					; use number if less
+				
+				MOVE.L		NumRxBuffs(A6),D0
+@usebuffs
+				LEA			RxDescs,A1
+				MOVE.L		D0,(A1)						; save buffer/descriptor count
+; 	get memory for RDA
+				LEA			RDAptr,A1
+				MOVE.L		MemStart(A6),(A1)			; set RD list pointer
+				
+				IF			MMU THEN
+				BSR			@SetAddresses				; set log/phys addresses
+				ENDIF
+				
+				LEA			NextRxDesc,A1
+				MOVE.L		MemStart(A6),(A1)			; set next poll address too
+				
+				MOVE.L		RxDescs,D0					; D0=# descriptors
+				MOVE.L		D0,D1
+				MULU		#Rxpkt.RxRDAsize,D1			; get actual allocated descriptor size
+				ADD.L		D1,MemStart(A6)
+				SUB.L		D1,MemSize(A6)
+				SUBQ.L		#1,D0						; convert desc count to base zero
+				MOVEA.L		RDAptr,A0					; A0->start of RDA
+@setRD
+				TST.L		D0							; on last one?
+				BNE.S		@notLast
+				
+				SUB.L		D1,D1						; nil pointer
+				BSET		#EOL_Bit,D1
+				BRA.S		@setLink					; link last to first
+@notLast
+				PEA			RxRDAsize(A0)
+				MOVE.L		(SP)+,D1					; link to next
+				
+				IF			MMU THEN
+				SUB.L		RDAptr+llg,D1
+				ADD.L		RDAptr+lph,D1				; D1=physical address
+				ENDIF
+@setLink
+				SMOVE		D1,RxPkt.link(A0)			; set link
+				MOVEQ		#-1,D1
+				SMOVE		D1,RxPkt.in_use(A0)			; mark descriptor as in use by SONIC
+				LEA			RxRDASize(A0),A0
+				DBRA		D0,@setRD
+
+				PEA			-RxRDASize(A0)
+				LEA			LastDesc,A1
+				MOVE.L		(SP)+,(A1)					; save ptr to last one in list
+;	set pointer to buffer area
+				MOVE.L		RxDescs,D0
+				MULU		#Max_Pkt_Size,D0			; get actual memory used for buffers
+				
+				LEA			RBAptr,A1
+				MOVE.L		MemStart(A6),(A1)			; save ptr to buffer area
+				
+				IF			MMU THEN
+				BSR			@SetAddresses				; set log/phys addresses
+				ENDIF
+
+				ADD.L		D0,MemStart(A6)				; update pointer
+				SUB.L		D0,MemSize(A6)				; update size				
+;	init RRA descriptors
+				MOVEA.L		RRAPtr,A0					; get pointer to RRA				
+				LEA			CAMDescSz(A0),A1			; add in enough for CAM operations
+				
+				PEA			(A1)						; save for later
+				MOVE.L		A1,D0
+				
+				IF			MMU THEN
+				SUB.L		RRAptr+llg,D0
+				ADD.L		RRAptr+lph,D0				; A1=physical address 
+				ENDIF
+				
+				SMOVE		D0,RRA_Read(A2)				; set up RRP
+				SMOVE		D0,RRA_Start(A2)			; save lower 16 bit of RRA addr
+				
+				ADDI.W		#RRArecSz,D0				; ONE descriptor
+				
+				SMOVE		D0,RRA_End(A2)				; and set the end of RRA too
+				SUB.L		D0,D0						; clear 32 bits				
+				SMOVE		D0,RRA_Write(A2)			; force wrap-around RRA
+				
+				MOVE.L		RBAptr,D0
+				
+				IF			MMU THEN
+				SUB.L		RBAptr+llg,D0
+				ADD.L		RBAptr+lph,D0				; D0=physical address 
+				ENDIF
+
+				MOVEA.L		(SP)+,A1					; get ptr to descriptor
+
+				SMOVE		D0,buff_ptr0(A1)			; setup resource descriptor
+				SWAP		D0
+				SMOVE		D0,buff_ptr1(A1)
+				
+				MOVE.L		RxDescs,D1
+				MULU		#Max_Pkt_Size/2,D1			; D1=word count for buffer area
+
+				SMOVE		D1,buff_wc0(A1)				; setup buffer size
+				SWAP		D1
+				SMOVE		D1,buff_wc1(A1)
+				
+				MOVEQ		#-1,D0						; reset all bits in ISR
+				SMOVE		D0,Int_Status(A2)
+				BSR			Set10Seconds				; init timer value
+				
+				SUB.L		D0,D0
+				SMOVE		D0,Command(A2)				; start chip running
+@wait
+				SMOVE		Command(A2),D0				; wait for SONIC to start up
+				BTST		#SoftReset,D0
+				BNE.S		@wait
+				
+				MOVEQ		#ReadRRA,D0
+				BSR			SONICSync					; read RRA descriptor
+@loadRD				
+				MOVE.L		RDAptr,D0
+				
+				IF			MMU THEN
+				SUB.L		RDAptr+llg,D0
+				ADD.L		RDAptr+lph,D0				; D0= physical address
+				ENDIF
+				
+				SMOVE		D0,Current_RDA(A2)			; setup RDA pointers
+				SWAP		D0
+				SMOVE		D0,Upper_RDA(A2)
+				
+				BSR			RestartSONIC				; enable reception and start timer
+				
+				MOVE.L		#OurIntsMask,D0				; setup for our interrupts
+				SMOVE		D0,Int_Mask(A2)				; enable SONIC interrupts
+				MOVE.L		MemSize(A6),D0				; return # unused bytes in usage area
+@IError
+				MOVEA.L		(SP)+,A2
+				UNLK		A6
+				RTS
+
+				IF			MMU THEN
+@SetAddresses
+; set lowest logical/physical addresses for pointer in A1
+				MOVE.L		D0,-(SP)					; save mem size, ptr
+				MOVE.L		A1,-(SP)
+				MOVE.L		D0,-(SP)					; pass logical size
+				MOVE.L		MemStart(A6),-(SP)			; pass logical address
+				MOVEA.L		TransAddr(A6),A0
+				JSR			(A0)						; D0=lowest physical addr
+				ADDQ.W		#8,SP
+				MOVEA.L		(SP)+,A1
+				MOVE.L		D0,lph(A1)					; set lowest physical address
+				MOVE.L		MemStart(A6),llg(A1)		; set lowest logical address
+				MOVE.L		(SP)+,D0					; get back mem size
+				RTS
+				ENDIF
+
+				ENDWITH
+				ENDPROC
+
+;¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥ SONIC ShutDown
+;	void	SONICHALT()
+
+SONICHALT		PROC		EXPORT
+OurStack		RECORD		{A6Link}					;									<Z3> thru next <Z3>
+Sz				EQU			*
+A6Link			DS.L		2
+SONICPtr		DS.L		1
+				ENDR
+				
+				WITH		SONICRegs
+				
+				LINK		A6,#OurStack.Sz
+				MOVE.L		A2,-(SP)
+				
+				MOVEA.L		IntDRtn,A0					; A0->proc to disable interrupts
+				JSR			(A0)						; call it
+				MOVE.L		D0,-(SP)					; save SR returned
+				
+				MOVEA.L		OurStack.SONICptr(A6),A2	; A2->sonic regs					<Z3>
+				BSR			ResetSONIC					; disable packet reception
+				SUB.L		D0,D0
+				SMOVE		D0,Int_Mask(A2)				; disable SONIC interrupts
+				SMOVE		D0,CAM_Enable(A2)			; wipe out the CAM
+				
+				MOVEA.L		IntERtn,A0					;									<Z3>
+				JSR			(A0)						; reenable interrupts				<Z3>
+				ADDQ.W		#4,SP						;									<Z3>
+
+				MOVEA.L		(SP)+,A2
+				UNLK		A6							;									<Z3>
+				RTS										; all done
+				ENDPROC
+
+;¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥ SONIC Transmit
+;	void SONICXMIT(wdsPtr)
+
+parms			RECORD		{A6Link}
+LocalSize		EQU			*
+SaveA2			DS.L		1
+A6Link			DS.L		2
+SONICPtr		DS.L		1							;									<Z3>
+wdsPtr			DS.L		1							; write data structure pointer
+				ENDR
+				
+				PROC
+				EXPORT		SONICXMIT
+				WITH		SONICRegs,TxPkt,parms
+
+noTDA
+				MOVEA.L		IntERtn,A0
+				MOVE.L		D0,-(SP)					; save SR returned by proc
+				JSR			(A0)						; reenable interrupts
+				MOVEQ		#-1,D0
+				UNLK		A6
+				RTS
+SONICXMIT
+				LINK		A6,#LocalSize				; make some room
+				
+				MOVEA.L		IntDRtn,A0					; A0->proc to disable interrupts
+				JSR			(A0)						; call it
+				
+				MOVE.L		FreeTxTDA,D1
+				BEQ.S		noTDA						; If no TDA available
+; it's always faster to not branch
+				MOVE.L		A2,SaveA2(A6)				; save regs
+				MOVE.L		D0,-(SP)					; save SR returned by IntDRtn proc
+
+				LEA			FreeTxTDA,A0
+				MOVEA.L		(A0),A1						; A1->new TDA
+				MOVE.L		nextTD(A1),(A0)				; unlink from free list
+
+				EXG			A1,A2						; save TDA ptr
+				MOVEA.L		IntERtn,A0
+				JSR			(A0)						; reenable interrupts maybe
+				EXG			A1,A2						; restore TDA ptr
+
+				MOVEA.L		wdsPtr(A6),A2				; A2->wds, A1->this TDA
+				
+				SUB.L		D0,D0						; clear 32 bits
+				SMOVE		D0,frag_count(A1)			; init Tx fields
+				SMOVE		D0,pkt_size(A1)
+				SMOVE		D0,status(A1)
+				SMOVE		D0,config(A1)				; start timer after SFD, tx FCS, time
+														; excessive deferrals
+				
+				LEA			frag_start(A1),A0			; A0->fragment fields
+@fragloop
+				SUB.L		D0,D0						; clear 32 bits
+				MOVE.W		(A2)+,D0					; check wds segment len
+				BEQ.S		@chkpkt						; see if everything is ok
+				
+				IF SONIC32 THEN
+				ADDQ.L		#1,frag_count(A1)
+				ADD.L		D0,pkt_size(A1)				; and total packet size
+				ELSE
+				ADDQ.W		#1,frag_count(A1)			; bump count
+				ADD.W		D0,pkt_size(A1)				; and total packet size
+				ENDIF
+				
+				MOVE.L		D0,-(SP)					; save frag size from wds
+				MOVE.L		(A2)+,D0					; get wds ptr
+				SMOVE		D0,(A0)+					; set lower 16 of frag_ptr
+				SWAP		D0
+				SMOVE		D0,(A0)+					; set upper 16
+				MOVE.L		(SP)+,D0
+				SMOVE		D0,(A0)+					; set frag size in TDA
+				BRA.S		@fragloop					; keep going
+@chkpkt
+				SMOVE		pkt_size(A1),D0
+				EXT.L		D0							; make a 32 bit quantity
+
+				SUBI.L		#Min_Pkt_Size,D0			; calc pad size
+				BHS.S		@sendit						; go do it if long enough
+				
+				NEG.L		D0							; convert to positive number
+
+				IF SONIC32 THEN
+				
+				ADDQ.L		#1,frag_count(A1)			; add another fragment for padding
+				ADD.L		D0,pkt_size(A1)				; bump total too
+				
+				ELSE
+				
+				ADDQ.W		#1,frag_count(A1)			; add another fragment for padding
+				ADD.W		D0,pkt_size(A1)				; bump total too
+				
+				ENDIF
+
+				MOVE.L		RBAptr,D1					; start of buffers
+				
+				IF			MMU THEN
+				SUB.L		RBAptr+llg,D1
+				ADD.L		RBAptr+lph,D1				; convert to physical address
+				ENDIF
+				
+				SMOVE		D1,(A0)+					; set lower 16 of frag_ptr
+				SWAP		D1
+				SMOVE		D1,(A0)+					; set upper 16
+
+				SMOVE		D0,(A0)+					; set frag size in TDA
+@sendit
+				MOVEQ		#(1<<EOL_Bit), D0
+				SMOVE		D0,(A0)						; set link field
+				
+				EXG			A1,A2						; save curr frag ptr
+
+				MOVEA.L		IntDRtn,A0					; A0->proc to disable interrupts
+				JSR			(A0)						; call it (SR already on stack from above)
+
+				EXG			A1,A2						; restore curr frag ptr in A1
+				MOVEA.L		SONICptr(A6),A2				; A2->sonic regs								<Z3>
+
+				MOVE.L		NextTxTDA,D0				; check if we already have a chain
+				BNE.S		@haveChain
+				
+				LEA			NextTxTDA,A0				; start a new chain
+				MOVE.L		A1,(A0)
+				BRA.S		@doxmit						; transmit new chain maybe
+@haveChain
+				MOVEA.L		D0,A0						; A0->start of existing chain
+				SMOVE		Upper_TDA(A2),D1
+				SWAP		D1							; get upper TDA address
+@chkTDA				
+				SMOVE		frag_count(A0),D0			; D0=fragment count for this packet
+				FragMul		D0							; calc an offset to the link field
+				LEA			frag_start(A0),A0			; A0->start of fragments for this pkt
+				LEA			(A0,D0.W),A0				; A0->link field for this pkt
+				SMOVE		(A0),D0
+				BTST		#EOL_Bit,D0					; at the last pkt in chain?
+				BNE.S		@setlink					; append to end if so
+				
+				MOVE.W		D0,D1						; D1=physical address of next TDA
+
+				IF			MMU THEN
+				SUB.L		TxTDAPtr+lph,D1
+				ADD.L		TxTDAPtr+llg,D1				; D1=logical addr (upper half)
+				ENDIF
+				
+				MOVEA.L		D1,A0						; A0->next TDA
+				BRA.S		@chkTDA						; keep searching for last TDA
+@setlink
+				MOVE.L		A1,D0						; D0=ptr to new TDA
+				
+				IF			MMU THEN
+				SUB.L		TxTDAPtr+llg,D0
+				ADD.L		TxTDAPtr+lph,D0				; D0=physical address
+				ENDIF
+								
+				SMOVE		D0,(A0)						; update link of last TDA
+@doxmit				
+				LEA			TxTDAptr,A0
+				TST.L		(A0)
+				BNE.S		@done						; transmit already in progress
+				
+				LEA			NextTxTDA,A1
+				MOVE.L		(A1),(A0)					; start transmitting current chain
+				MOVEQ		#0, D0
+				MOVE.L		D0, (A1)					; empty chain
+
+				MOVE.L		(A0),D0
+				
+				IF			MMU THEN
+				SUB.L		TxTDAPtr+llg,D0
+				ADD.L		TxTDAPtr+lph,D0				; D0=physical address of curr TDA
+				ENDIF
+
+				SMOVE		D0,Current_TDA(A2)			; set current SONIC TDA ptr
+				
+				MOVEQ		#(1<<TxEnable), D0			; set command bit
+				SMOVE		D0,Command(A2)				; start transmitting
+@done
+				MOVEA.L		IntERtn,A0
+				JSR			(A0)						; reenable interrupts maybe
+				ADDQ.W		#4,SP
+				MOVEA.L		SaveA2(A6),A2				; restore reg
+				
+				UNLK		A6
+				SUB.L		D0,D0						; good return code
+				RTS
+				ENDWITH
+				ENDPROC
+				
+				;¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥¥ SONIC CAM Load
+;	SONICCAMLOAD(CAMentry,Loadit)
+;	Set/Clear Content Addressable Memory. Return CAM index when setting an entry.
+
+SONICCAMLOAD	PROC		EXPORT
+
+parms			RECORD		{A6Link}
+LocalSize		EQU			*
+A6Link			DS.L		2
+SONICPtr		DS.L		1							;										<Z3>
+CAMentry		DS.W		3							; 48 bit address to set in CAM
+Loadit			DS.L		1							; true if adding CAM entry
+				ENDR
+
+				WITH		parms,SONICRegs,CAMDesc
+				
+				LINK		A6,#LocalSize				; save A6
+				MOVEM.L		A2/D3/D4,-(SP)				; save reg
+
+				MOVEA.L		IntDRtn,A0					; A0->proc to disable interrupts		<Z3>
+				JSR			(A0)						; call it								<Z3>
+				MOVE.L		D0,-(SP)					; save SR returned						<Z3>
+
+				MOVEA.L		SONICptr(A6),A2				; A2->SONIC								<Z3>
+
+				MOVE.L		CAMentry(A6),D1				; D1=upper/middle of 48 bit addr
+				MOVE.W		CAMentry+4(A6),D2			; D2.W=lower "
+				
+				TST.L		Loadit(A6)					; doing a load CAM?
+				BEQ.S		@doClear					; no
+; search for an empty CAM entry
+@wait1
+				SMOVE		Command(A2),D0
+				EORI.W		#(1<<StartTimer)+(1<<RxEnable),D0
+				BNE.S		@wait1						; make sure no other commands active
+				
+				SMOVE		CAM_Enable(A2),D0			; get current CAM map
+				MOVEQ		#15,D3
+@chkMap
+				ASL.W		#1,D0						; check a bit
+				DBCC		D3,@chkMap					; do them all
+				BCC.S		@haveit						; until we find one
+				MOVE.W		D3,D0
+				EXT.L		D0							; D0.L=-1
+				BRA			@Xit						; return error
+@haveit
+				MOVEA.L		RRAptr,A0					; A0->RRA, D3=index to CAM cell
+				
+				ROR.W		#8,D2						; swap bytes in word
+				SMOVE		D2,Port0(A0)				; set lower 16 bits
+				
+				ROR.W		#8,D1						; swap bytes in word
+				SMOVE		D1,Port1(A0)				; set middle "
+
+				SWAP		D1				
+				ROR.W		#8,D1						; swap bytes in word
+				SMOVE		D1,Port2(A0)				; set upper "
+				
+				SMOVE		CAM_Enable(A2),D0			; get current CAM map
+				BSET		D3,D0						; set the new one
+				SMOVE		D0,enable(A0)				; set bit map for CAM
+				
+				BSR.S		LoadCAMcells				; load descriptor and CAM enable reg
+				
+				MOVE.L		D3,D0						; set function result
+				BRA.S		@Xit
+@doClear
+				BSR			ResetSONIC					; let transmits/receives complete
+				
+				MOVEQ		#15,D3
+				SMOVE		CAM_Enable(A2),D0			; get current CAM map
+@compCAM
+				ASL.W		#1,D0						; check cell
+				DBCS		D3,@compCAM					; until we have an active one
+				BCS.S		@compareit
+@notfound
+				BSR			RestartSONIC				; get SONIC going again
+				MOVE.W		D3,D0
+				EXT.L		D0							; D0.L=-1
+				BRA.S		@Xit						; return error (did'nt find entry)
+@more
+				SUBQ		#1,D3						; keep index straight
+				BMI.S		@notfound
+				BRA.S		@compCAM
+@compareit												; compare CAM to addr in D1/D2
+				SMOVE		D3,CAM_EntryPtr(A2)			; select CAM cell to read
+				SMOVE		CAM_Port1(A2),D4			; get middle 16 bits
+				ROR.W		#8,D4						; normalize it
+				MOVE.W		D4,-(SP)					; save it
+				SMOVE		CAM_Port0(A2),D4			; get upper 16 bits
+				ROR.W		#8,D4						; normalize it
+				MOVE.W		D4,-(SP)					; save it
+				CMP.L		(SP)+,D1					; same as the one we want?
+				BNE.S		@more						; no, keep checking
+				
+				SMOVE		CAM_Port2(A2),D4			; get lower 16
+				ROR.W		#8,D4						; normalize it
+				CMP.W		D4,D2						; same?
+				BNE.S		@more						; look again if not
+				
+				MOVEA.L		RRAptr,A0					; A0->CAM descriptor
+				
+				SUB.L		D2,D2
+				SMOVE		D2,Port0(A0)				; put zero entry in cell
+				SMOVE		D2,Port1(A0)
+				SMOVE		D2,Port2(A0)
+				SMOVE		CAM_Enable(A2),D0			; get current CAM map
+				BCLR		D3,D0						; clear the one to delete
+				SMOVE		D0,enable(A0)				; and do it
+				
+				BSR			RestartSONIC				; get SONIC going again
+				BSR.S		LoadCAMcells				; clear the entry now
+				SUB.L		D0,D0						; clear 32 bits
+@Xit
+				MOVEA.L		IntERtn,A0					;										<Z3>
+				JSR			(A0)						; reenable interrupts					<Z3>
+				ADDQ.W		#4,SP						;										<Z3>
+
+				MOVEM.L		(SP)+,A2/D3/D4
+				UNLK		A6
+				RTS
+
+				
+LoadCAMcells											; setup CAM cells and enable register
+;	D3=base zero index of CAM cell, A0->CAM load descriptor
+				SMOVE		D3,Entry_ptr(A0)			; set base zero index to CAM cell
+				MOVE.L		A0,D0
+				
+				IF			MMU THEN
+				SUB.L		RRAptr+llg,D0
+				ADD.L		RRAptr+lph,D0				; D0=physical address
+				ENDIF
+				
+				SMOVE		D0,CAM_DescPtr(A2)			; set current descriptor ptr
+				MOVEQ		#1, D0
+				SMOVE		D0,CAM_Count(A2)			; set one cell only
+
+				MOVEQ		#LoadCAM,D0
+				BRA			SONICSync					; do it now & return
+				ENDWITH
+				ENDPROC
+				
+				END
+				

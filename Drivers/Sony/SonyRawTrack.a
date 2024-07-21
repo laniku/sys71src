@@ -1,0 +1,492 @@
+;
+;	File:		SonyRawTrack.a
+;
+;	Contains:	Support for the Raw Track Dump control call
+;
+;	Written by:	Steve Christensen		09-Nov-90
+;
+;	Copyright:	© 1990-1992 by Apple Computer, Inc.  All rights reserved.
+;
+;   This file is used in these builds: Mac32
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 2/18/93	rab		Added a TestFor hwCbPwrMgr around the bsr to TurnIWMon so that
+;									CPUs without a PwrMgr won't get an unimplemented trap error.
+;		 <1>	 12/7/92	rab		first checked in
+;		<H9>	 9/22/92	DHN		Fixed problem in ReadMFM with SWIM2 ASIC where rHandShake bit 8
+;									(data avail) goes high before its other bits are valid. We read
+;									rHandShake again to get the valid bits. There are other related
+;									fixes.
+;		<H8>	 7/21/92	NJV		Removed hasSonora1 conditionalized code (no longer needed)
+;		<H7>	  6/4/92	CMP		Fixed RawTrackDump to work properly for GCR disks with SWIM2.
+;		<H6>	  3/6/92	CMP		Increased mByteTOCnt to 60 to accomodate 33Mhz. CPUs.
+;		<H5>	12/20/91	JC		Temporary Fix for problem in Sonora1
+;		 <4>	11/14/91	SWC		Moved SWIM2 check in RawRead to SonyPatches.a. Converted the SCC
+;									polling code to a macro to make it easier to overpatch.
+;		 <3>	10/24/91	CMP		Updated comment header for Horror ROM
+;		 <2>	10/18/91	CMP		Added support for SWIM2.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;	  Pre-HORROR ROM comments begin here.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;		 <3>	  7/3/91	HJR		Changed hasPowerMgr conditional to hasPwrControls.
+;		 <2>	 4/22/91	ag		SWC/Fixed the parameter checking to be consistent with the IOP
+;									version. It was returning paramErr if the user specified index
+;									search mode for a GCR disk (no index pulse). It now forces the
+;									search mode to immediate instead.
+;		 <1>	 2/18/91	HJR		first checked in
+;				 11/9/90	SWC		New today.
+;__________________________________________________________________________________________________
+
+			BLANKS	ON
+			STRING	ASIS
+
+
+;  call parameters (relative to csParam)
+
+clockBuffer	EQU		0
+dataBuffer	EQU		4
+byteCount	EQU		8
+numDone		EQU		12
+searchMode	EQU		16
+theTrack	EQU		18
+side		EQU		20
+sector		EQU		21
+
+;  searchMode values
+
+searchNow	EQU		0
+searchAddr	EQU		1
+searchData	EQU		2
+searchIndex	EQU		3
+
+;  misc stuff
+
+indexAddr	EQU		tachAdr						; drive address to read the index pulse from
+
+rtdParams	EQU		sectMap						; pointer to params in parameter block
+												; (steal sectMap since we don't use it at all)
+
+
+;__________________________________________________________________________________________________
+;
+; Routine:	CtlRawTrackDump
+;
+; Inputs:	A0 -- pointer to caller's parameter block
+;			A1 -- pointer to SonyVars
+;			D0 -- error code if the drive number is invalid or the drive is not installed, else zero
+;			D1 -- drive locals offset
+;
+; Outputs:	D0 -- result code
+;
+; Trashes:	D1-D7,A0-A6
+;
+; Function:	The call reads all or part of a track and returns the raw, unmassaged data it
+;			finds there so that applications can access a floppy disk at a very low level
+;			without having to directly access the hardware.  The following parameters are
+;			passed starting at csParam:
+;
+;				 0:	clockBuffer		pointer to packed bit array (MFM disks only), or nil
+;				 4:	dataBuffer		pointer to raw track data, or nil
+;				 8:	byteCount		number of bytes requested
+;										(dataBuffer must be able to hold this many bytes)
+;				12:	numDone			number of bytes actually read (² byteCount)
+;				16:	searchMode		when to start collecting bytes:
+;										0 = as soon as spindle motor is up to speed
+;										1 = after reading an address field
+;										2 = after reading a data field
+;										3 = at the index mark (MFM disks only)
+;				18:	track			which track to read (0-79)
+;				20:	side			which side to read (0-1)
+;				21: sector			which sector to synchronize on (0-255)
+;
+;			If clockBitsBuffer is non-nil, it must point to a buffer that's at least 1/8th
+;			the size of dataBuffer.  It consists of a packed array of bits signifying whether
+;			or not the corresponding byte in dataBuffer is a mark or data byte.  If a bit
+;			is equal to "1", the byte is an MFM mark byte; if it's a "0", the byte is an
+;			MFM data byte.  Bits for ASCENDING data bytes are arranged in DESCENDING order
+;			within a byte, i.e., bit 7 represents byte 0, bit 6 represents byte 1, etc.
+;
+;			NOTE: If both clockBitsBuffer and dataBuffer are nil, the call will do nothing.
+;				  This provides a way for applications to determine if the call exists
+;				  without first having to allocate large buffers.
+;__________________________________________________________________________________________________
+
+CtlRawTrackDump			
+			TST.W	D0
+			BNE		DiskDone					; -> bad drive number or no drive
+
+			LEA		-512(SP),SP 				; (get space for a buffer)
+			MOVE.L	SP,DiskBuffer(A1)
+
+;  check all parameters and bail if any are out of range...
+
+			LEA		csParam(A0),A0				; point to the start of the passed parameters
+			MOVE.L	A0,rtdParams(A1)			;  and save the address for later
+			CLR.L	numDone(A0)					; numDone=0
+			MOVE.L	(A0)+,D0					; are clockBuffer and dataBuffer both nil?
+			OR.L	(A0)+,D0
+			BEQ.S	@toRTDone					; -> yes, just exit
+			ADDQ.W	#searchMode-dataBuffer-4,A0	; (skip over byteCount)
+			MOVEQ	#paramErr,D0				; assume something's out of range
+			MOVE.W	(A0)+,D7					; get the search mode
+			CMPI.W	#searchIndex,D7				; valid search mode?									<2>
+			BHI.S	@toRTDone					; -> nope, bail											<2>
+			BNE.S	@CommonMode					; -> common MFM/GCR search mode							<2>
+			TST.B	mfmDisk(A1,D1)				; is this an MFM disk?									<2>
+			BMI.S	@CommonMode					; -> yes, all modes are OK								<2>
+
+			CLR.W	-2(A0)						; for GCR, force "index search" to "immediate search"	<2>
+@CommonMode	MOVE.W	(A0)+,D2					; get the track number									<2>
+			CMPI.W	#80,D2						; is it in range?
+			BHS.S	@toRTDone					; -> nope
+			ROL.W	#8,D2						;  D2.W=[track][0]
+			MOVE.B	(A0)+,D2					; get the sector number
+			CMPI.B	#2,D2						; is it in range?
+@toRTDone	BHS		@RTDone						; -> nope
+			ASL.B	#3,D2						; shift it into bit 3
+			ROL.W	#8,D2						;  D2.W=[0][0][0][0][side][track (11 bits)]
+			MOVE.W	D2,sideTrack(A1)			; save the side and track numbers
+			MOVEQ	#0,D2
+			MOVE.B	(A0)+,D2
+			MOVE.W	D2,curSector(A1)			; save the sector number
+
+;  setup the hardware as appropriate...
+
+		IF hasPwrControls THEN					;														<3> HJR
+			TestFor	hwCbPwrMgr					; do we have a PowerMgr?								<SM2>
+			BEQ.S	@pmgrdone					; if not, skip this call								<SM2>
+			BSR		TurnIWMon					; turn the IWM on with a power manager call
+@pmgrdone										;														<SM2>
+		ENDIF
+
+			TST.B	isSWIM(A1)					; is a SWIM installed?
+			BPL.S	@NoSWIM						; -> no, skip
+			BSR		SetChipMode					; set up the mode for MFM or GCR
+			BNE		@RTDone						; -> couldn't initialize the chip
+@NoSWIM
+			BSR		DiskSelect					; re-select the interface
+			BSR 	FVPowerUp					;  and start up the drive (synchronously)
+			BSR		SpdSeek 					; seek to track and adjust speed if needed
+			BNE.S	@RTDone						; -> couldn't seek so just exit with an error
+
+;  OK, we're on the selected track, so figure out where to start reading...
+
+			MOVEQ	#4,D0						; setup the poll stack just in case 
+			BSR		SetupPoll					;  it's the immediate or index search mode
+
+			MOVEA.L	rtdParams(A1),A0			; point to our parameters
+			MOVE.W	searchMode(A0),D7			;  so we can get the search mode (trashed by SpdSeek)
+
+			CMPI.W	#searchIndex,D7				; do we need to synch up on the index mark?
+			BNE.S	@NotIndex					; -> nope
+			BSR.S	SyncOnIndex					; go wait for the index pulse before beginning
+			BEQ.S	@ReadNow					; -> we found it so start reading
+			BRA.S	@RTCleanup					; -> couldn't find the index pulse
+
+@NotIndex	TST.W	D7							; do we just want to start reading?
+
+			BEQ.S	@ReadNow					; -> yes, go for it!
+
+;  sync up on the desired sector by first looking for its address field...
+
+			MOVE.W	#255,D6						; since we can handle sector numbers 0-255...
+
+@SyncLoop	BSR		RdAddrSetup					; read the next address mark
+			BMI.S	@NextMark					; -> error, ignore this one
+
+			CMP.W	sideTrack(A1),D1			; is this the one we want?
+			BNE.S	@NextMark					; -> no, keep looking
+
+			CMP.W	curSector(A1),D2			; is this the sector we want?
+			BEQ.S	@FoundAddr					; -> yes, all done
+
+@NextMark	BSR		toEmptyPD					; get rid of poll data (saves D0 in DskErr)
+			DBRA	D6,@SyncLoop				; -> keep looking
+			MOVEQ	#sectNFErr,D0				; return "sector not found"
+			BRA.S	@RTDone
+
+@FoundAddr	SUBQ.W	#searchAddr,D7				; start reading after address field?
+			BEQ.S	@ReadNow					; -> yes!
+
+;  if we get here, we need to first read this sector's data field...
+
+			MOVEA.L	diskBuffer(A1),A0			; point to our stack buffer for someplace to put the data
+			CLR.B	DskVerify					; don't verify the data
+			BSR		RdData						; go read the data field
+			BMI.S	@RTDone						; -> an error occurred, so bail
+
+;  we're now in the correct position on the disk to begin collecting raw data, so setup and go...
+
+@ReadNow	BSR.S	RawRead						; go read the bytes
+			BNE.S	@RTCleanup					; -> something bad happened
+
+			MOVEA.L	SonyVars,A1					; point to the driver's variables
+			MOVEA.L	rtdParams(A1),A1			;  and from there point to our parameters
+			MOVE.L	byteCount(A1),numDone(A1)	; we were successful, so update how much we read
+
+@RTCleanup	BSR		toEmptyPD					; get rid of poll data (saves D0 in DskErr)
+			ANDI.W	#$F8FF,SR					; turn interrupts back on
+@RTDone		LEA 	512(SP),SP 					; clean up the stack
+			BRA 	DskRWOff					; share SonyRWT exit routine
+
+
+;__________________________________________________________________________________________________
+;
+; Routine:	SyncOnIndex
+;
+; Inputs:	D1 -- offset to drive-specific variables
+;			A1 -- pointer to driver's variables
+;
+; Outputs:	D0 -- result code
+;
+; Trashes:	D0-D2,A0,A2 (all other registers are preserved)
+;
+; Function:	waits for the start of the index pulse (or times out if it doesn't see it)
+;__________________________________________________________________________________________________
+
+SyncOnIndex	MOVE.L	(SP)+,DskRtnAdr				; save the return address
+
+			MOVEQ	#indexAddr,D0				; select the index sense drive address
+			BSR		AdrDisk
+
+			MOVEQ	#100+10,D2					; assume HD disk -> 600rpm = 100ms (+10%)
+			TST.B	twoMegFmt(A1,D1)			; is it?
+			BMI.S	@SetTimeout
+			ADD.W	D2,D2						; no, it's 720K -> 300rpm = 200ms (+10%)
+@SetTimeout	MULU	TimeDBRA,D2					; figure out how many iterations are in that time
+
+			MOVEA.L	IWM,A4						; point to the handshake register for speed
+			LEA		rHandshake(A4),A4
+
+			MOVEQ	#NoErr,D0					; assume we'll sync up OK
+
+@WtIndexLo	_PollSCC							; poll the SCC modem port				<H4>
+@NoSCCLo	
+
+			BTST	#3,(A4)						; is the index pulse low yet?
+			BEQ.S	@WtIndexHi					; -> yes, wait for it to go high
+			SUBQ.L	#1,D2
+			BGT.S	@WtIndexLo
+			BRA.S	@NoIndex
+
+@WtIndexHi	_PollSCC							; poll the SCC modem port				<H4>
+@NoSCCHi
+
+			BTST	#3,(A4)						; is the index pulse high yet?
+			BNE.S	@IndexDone					; -> yes, we're sync'd up
+			SUBQ.L	#1,D2
+			BGT.S	@WtIndexHi
+
+@NoIndex	MOVEQ	#noIndexErr,D0				; timed out waiting for index
+
+@IndexDone	BRA		DskRtn						; set CCR and return
+
+
+
+;__________________________________________________________________________________________________
+;
+; Routine:	RawRead
+;
+; Inputs:	A5 -- pointer to 6522 A-reg (has head sel, wait/req)
+;			A6 -- pointer to SCC channel A data register
+;
+; Outputs:	D0 -- result code
+;
+; Trashes:	D1-D3,A0-A4 (all other registers are preserved)
+;
+; Function:	reads data bytes into data buffer and clock bytes into clockBuffer
+;__________________________________________________________________________________________________
+
+RawRead		BSR		GetDrv1						; setup A1,D1
+			MOVEQ	#RdDtaAdr,D0				; assume we want side 0
+			BTST	#3,SideTrack(A1)			; is it?
+			BEQ.S	@SelectSide					; -> yes
+			MOVEQ	#RdDta1Adr,D0				; use the side 1 address
+@SelectSide	BSR		AdrDisk						; select the head
+
+			MOVEA.L	rtdParams(A1),A4			; point to our parameters:
+			MOVEA.L	(A4)+,A2					;	clockBuffer
+			MOVEA.L	(A4)+,A0					;	dataBuffer
+			MOVE.L	(A4)+,D0					;	byteCount
+
+			TST.B	mfmDisk(A1,D1)				; is this an MFM disk?					<SM1>
+			BMI.W	ReadMFM						; -> yes, go read it					<SM1>
+			CMP.B	#-2,isSWIM(A1)				; do we have a SWIM2?					<SM1>
+			BEQ.W	ISMReadGCR					; -> yes, read gcr the ISM way			<SM1>
+			BRA.S	ReadGCR						; no, read GCR the old fashioned way	<SM1>
+
+
+;__________________________________________________________________________________________________
+;
+; Routine:	ReadMFM
+;
+; Inputs:	D0 -- number of bytes to read
+;			D1 -- offset to drive-specific variables
+;			A0 -- pointer to dataBuffer
+;			A1 -- pointer to driver's variables
+;			A2 -- pointer to clockBuffer
+;			A5 -- pointer to 6522 A-reg (has head sel, wait/req)
+;			A6 -- pointer to SCC channel A data register
+;
+; Outputs:	D0 -- result code
+;
+; Trashes:	D1-D3,A0,A2-A4 (all other registers are preserved)
+;
+; Function:	reads raw data starting with the next mark byte after a sync field
+;__________________________________________________________________________________________________
+
+ReadMFM		MOVE.L	(SP)+,DskRtnAdr				; save the return address
+
+			MOVEA.L	IWM,A4
+			LEA		rHandshake(A4),A3			; point to the handshake and mark registers for speed
+			LEA		rMark(A4),A4
+
+			TST.B	rError-rMark(A4)			; clear the error register
+			MOVE.B	#$18,wZeroes-rMark(A4)		; clear the write and action bits
+			MOVE.B	#$01,wOnes-rMark(A4)		; toggle the clFIFO bit to clear out
+			MOVE.B	#$01,wZeroes-rMark(A4)		;  any data in the FIFO
+			TST.B	rError-rMark(A4)			; clear the error register again for grins
+			MOVE.B	#$08,wOnes-rMark(A4)		; turn on the action bit: GO!
+
+			MOVEQ	#-1,D2						; initial timeout counter (needs to be tuned)
+			BRA.S	@StartRead
+
+@Wait4Byte	_PollSCC							; poll the SCC modem port				<H4>
+
+@NoSCCData	TST.B	(A3)						; wait for a byte						<H9>
+			DBMI	D2,@Wait4Byte
+			BPL.S	RawReadTOErr				;-> timeout										<SM1>
+			MOVE.B	(A3),D3						;Get the handshake register with valid bits		<SM1>
+			MOVEQ	#mByteTOCnt,D2				; reset the timeout counter for the next byte	<SM1>
+
+			MOVE.B	(A4),(A0)+					; read the current byte into dataBuffer
+
+			LSR.B	#1,D3						; bit 0 is the mark bit
+			ADDX.B	D1,D1						; shift it into bit 0 to acculumate it
+			BCC.S	@NextByte
+			MOVE.B	D1,(A2)+					; we've grabbed 8 bits, so stuff them into clockBuffer
+@StartRead	MOVEQ	#1,D1						; initialize the "bits" register (8 shifts will set C=1)
+
+@NextByte	SUBQ.L	#1,D0						; decrement the byte count
+			BGE.S	@Wait4Byte					; -> more left to do
+
+			CMPI.B	#1,D1						; is the last clockBits byte partially filled?
+			BEQ.S	@ReadOK
+@AlignBits	ADD.B	D1,D1						; no, shift the bits so they start at bit 7 down
+			BCC.S	@AlignBits
+			MOVE.B	D1,(A2)+
+
+@ReadOK		MOVEQ	#NoErr,D0
+
+RawReadExit	MOVE.B	#$18,wZeroes-rMark(A4)		; clear the write and action bits to turn everything off
+			BRA		DskRtn						; set CCR and return
+
+RawReadTOErr
+			MOVEQ	#dataTOErr,D0				; timed out waiting for a byte
+			BRA.S	RawReadExit
+
+
+;__________________________________________________________________________________________________
+;
+; Routine:	ReadGCR
+;
+; Inputs:	D0 -- number of bytes to read
+;			D1 -- offset to drive-specific variables
+;			A0 -- pointer to dataBuffer
+;			A1 -- pointer to driver's variables
+;			A2 -- pointer to clockBuffer (not used)
+;			A5 -- pointer to 6522 A-reg (has head sel, wait/req)
+;			A6 -- pointer to SCC channel A data register
+;
+; Outputs:	D0 -- result code
+;
+; Trashes:	D1-D2,A0,A4 (all other registers are preserved)
+;
+; Function:	reads raw data as soon as possible
+;__________________________________________________________________________________________________
+
+ReadGCR		MOVE.L	(SP)+,DskRtnAdr				; save the return address
+
+			MOVEA.L	IWM,A4						; point to the data register for speed
+			LEA		q6L(A4),A4
+
+			MOVEQ	#-1,D2						; initial timeout counter (needs to be tuned)
+			BRA.S	@StartRead
+
+@Wait4Byte	_PollSCC							; poll the SCC modem port				<H4>
+
+@NoSCCData	MOVE.B	(A4),D1						; wait for a byte
+			DBMI	D2,@Wait4Byte
+			BPL.S	@ReadTOErr					; -> timed out
+
+			MOVE.B	D1,(A0)+					; put the current byte into dataBuffer
+
+			MOVEQ	#mByteTOCnt,D2				; reset the timeout counter for the next byte
+
+@StartRead	SUBQ.L	#1,D0						; decrement the byte count
+			BGE.S	@Wait4Byte					; -> more left to do
+			MOVEQ	#NoErr,D0
+
+@ReadExit	BRA		DskRtn						; set CCR and return
+
+@ReadTOErr	MOVEQ	#dataTOErr,D0				; timed out waiting for a byte
+			BRA.S	@ReadExit
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ		<SM1> begin
+;
+; Routine:	ISMReadGCR
+;
+; Inputs:	D0 -- number of bytes to read
+;			D1 -- offset to drive-specific variables
+;			A0 -- pointer to dataBuffer
+;			A1 -- pointer to driver's variables
+;			A2 -- pointer to clockBuffer
+;			A5 -- pointer to 6522 A-reg (has head sel, wait/req)
+;			A6 -- pointer to SCC channel A data register
+;
+; Outputs:	D0 -- result code
+;
+; Trashes:	D1-D3,A0,A2-A4 (all other registers are preserved)
+;
+; Function:	reads raw data starting with the next mark byte after a sync field
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+
+ISMReadGCR	MOVE.L	(SP)+,DskRtnAdr				; save the return address
+
+			MOVEA.L	IWM,A4
+			LEA		rHandshake(A4),A3			; point to the handshake and mark registers for speed
+			LEA		rMark(A4),A4
+
+			TST.B	rError-rMark(A4)			; clear the error register
+			MOVE.B	#$18,wZeroes-rMark(A4)		; clear the write and action bits
+			MOVE.B	#$01,wOnes-rMark(A4)		; toggle the clFIFO bit to clear out
+			MOVE.B	#$01,wZeroes-rMark(A4)		;  any data in the FIFO
+			TST.B	rError-rMark(A4)			; clear the error register again for grins
+			MOVE.B	#$08,wOnes-rMark(A4)		; turn on the action bit: GO!
+
+			MOVEQ	#-1,D2						; initial timeout counter (needs to be tuned)
+			BRA.S	@StartRead
+
+@Wait4Byte	_PollSCC							; poll the SCC modem port				<H4>
+
+			TST.B	(A3)						; wait for a byte
+			DBMI	D2,@Wait4Byte
+			BPL.S	@ReadTOErr					; -> timed out
+
+			MOVEQ	#mByteTOCnt,D2				; reset the timeout counter for the next byte
+
+			MOVE.B	(A4),(A0)+					; read the current byte into dataBuffer
+
+@StartRead	SUBQ.L	#1,D0						; decrement the byte count
+			BGE.S	@Wait4Byte					; -> more left to do
+
+			MOVEQ	#NoErr,D0
+@ReadExit	MOVE.B	#$18,wZeroes-rMark(A4)		; clear the write and action bits to turn everything off
+			BRA		DskRtn						; set CCR and return
+
+@ReadTOErr	MOVEQ	#dataTOErr,D0				; timed out waiting for a byte
+			BRA.S	@ReadExit					;										<SM1> end
+
+
+

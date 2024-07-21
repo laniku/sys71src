@@ -1,0 +1,1269 @@
+;
+;	File:		StartBoot.a
+;
+;	Contains:	This part of the Start Manager locates the Startup Device, loads its driver
+; 				(if it hasn't already been loaded by InitIO), and asks the driver to get the boot blocks.
+;				It uses information in the boot blocks to initialize system variables,
+;				decide whether to load a debugger, and launch a Startup Application.
+;
+;	Written by:	Larry Kenyon				February 1985
+;	modified by Wayne R. Loofbourrow		August 1986
+;
+;	Copyright:	© 1985-1994 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM58>	 1/28/94	chp		Roll back <SM56> which is no longer required.
+;	  <SM57>	 12/6/93	DCB		ShutInit was being called twice. The ShutDown queue is already
+;									setup in StartInit.a. The second call to it in InitSys7Toolbox
+;									blows away all ShutDown tasks that have been installed since the
+;									system booted. Since this is undesirable I am getting rid of the
+;									second ShutInit.
+;	  <SM56>	11/10/93	chp		Disable LateLoad on TNT (for now).
+;	  <SM55>	 11/7/93	SAM		Roll in <MC5> from mc900ftjesus.
+;	   <MC5>	 11/6/93	SAM		Removed <MC3>.  Eric beat me to it.  VM pokes the level 4 irq
+;									handler into the supervisior vector table itself.
+;	  <SM54>	10/15/93	SAM		Roll in <MC4> from mc900ftjesus.
+;	   <MC4>	10/15/93	SAM		For PDM.  The DMA irq hander is now installed in the supervisor
+;									vector table when VM is on.
+;	  <SM53>	 9/29/93	SAM		From mc900ftjesus.
+;	   <MC3>	 9/27/93	SAM		Cosmetic changes.
+;	   <MC2>	 9/26/93	pdw		Removed extra OptimizePACKs.
+;	  <SM52>	  9/2/93	IH		Add Display Manager Install to boot process.
+;	  <SM51>	  8/5/93	JDR		integrate Component Mgr from Reality
+;	  <SM50>	  8/4/93	JDR		Integrate sound manager 3.0 project.
+;	  <SM49>	 7/20/93	SAM		Cleaned up this file a bit.  Rewrote what used to be
+;									"installmgr."  Removed a patch file in the process.  This change
+;									fixes the "the top 1/3 of my Cyclone system heap is not heal
+;									down with VM on" and quite a host of others...  Moved all that
+;									disabled password junk to the end of the file.
+;	  <SM48>	 5/30/93	SAM		Commented out Robert's password thing and the syserr F-Line
+;									patch that would destroy the pc of the offending instruction.
+;									Moved the ROM_EM stuff to Tidbits.
+;	  <SM47>	  4/9/93	SAM		Commented out the calls to init Bass (they've been moved to
+;									StartInit. (INSTALLBASSCOMMON and FORCEINITFONTSCALL)
+;	  <SM46>	 3/25/93	RB		Added Robert Polic's password-on-boot code from Ludwig.
+;	  <SM45>	 2/13/93	PW		Reenabled LateLoad for PDM.
+;	  <SM44>	  2/6/93	RC		Comment out LateLoad for PDM since the last change caused PDM to
+;									Hang on Boot
+;	  <SM43>	  2/5/93	PN		Adding scsiLateLoad into the end of InstallMgr
+;	  <SM42>	 1/12/93	PN		Fix a bug where in InitFonts it used emSplineKey which is not
+;									yet initialized. So the call InstallBassCommon has to precede
+;									Initfonts.  InitFonts is taken out of this file because it is
+;									called in the boot block before Welcome to Macintosh.
+;	  <SM41>	12/16/92	SWC		Moved InitEvents->OSEventMgr.a and CenterRect->StartBoot.a.
+;									Removed dead code.
+;	  <SM40>	 12/3/92	PN		Add AfterBootSetApplBase to the InstallMgr to patch out
+;									SetApplBase trap at Gibbly time
+;	  <SM39>	11/24/92	RB		Use the feature hasROM_EM so it can be easily taken out, because
+;									Steve Glass doesn't want the extra feature in his ROMs.
+;	  <SM38>	11/23/92	RB		Moved an LC930 conditional.
+;	  <SM37>	11/20/92	rab		Changed BootMe to call ReBoot if execution of the Boot Blocks
+;									fail. This allows BootMask to be updated and proper booting to
+;									continue if a device with Boot Blocks but no System is
+;									encountered.
+;	  <SM36>	11/18/92	RB		Add a call to the Disk Cache installation routine from the
+;									InitManagers call.
+;	  <SM35>	 11/5/92	RB		Add a call to check the state of the extensions at the end of
+;									InstallMgr.
+;	  <SM34>	 11/3/92	rab		Horror ROM sync-up. Rolled CloseNetBootPatch from Horror
+;									StartInit.a into Reboot.
+;	  <SM33>	10/30/92	HY		Add "Ginty" support to boot process.
+;	  <SM32>	10/28/92	PN		Remove LoadProcessMgrSegmentLowerInSysHeap since it's been done
+;									in BootCode3.a and call the QDSecondaryInit.
+;	  <SM31>	10/26/92	RB		Exclude any unused code from the LC930 build (1 Meg ROM). System
+;									7 never returns control to the ROM after executing the Boot
+;									blocks, and we are System 7 based.
+;	  <SM30>	 9/15/92	RB		The Boot code in Cube-e has a list of ROMs it knows about
+;									(Boot1.a), as it finds a ROM it sets up a parameter block
+;									pointer in d7, but if it does not find the ROM id d7 is never
+;									setup and later used as am parameter block, therefore the last
+;									value in d7 gets used as param block pointer and memory
+;									somewhere is trashed. So just in case set d7 to our boot time
+;									param block before we execute the boot blocks.
+;     <SM29>     9/10/92    AEK     Removed call to InstallTimeMgr (not needed if new TM in ROM)
+;                                   NOTE: TimeMgrPatch.a should now be removed from ROM builds
+;	  <SM28>	 8/20/92	PN		Call InstallSndPrimitives at boot time
+;	  <SM27>	 7/13/92	CCH		Don't call the _VM trap unless it's implemented.
+;	  <SM26>	 6/30/92	PN		Adding init routines to set up CommToolbox in SuperMario
+;	  <SM25>	 6/30/92	JSM		InstallSpeedScrollGlob is now InitScrollSpeedGlobals.
+;	  <SM24>	 6/26/92	FM		Remove call to resource manager install proc since all it does
+;									is unimplement the AddReference and RmvReference traps. We can
+;									do that in DispTable.a.o
+;	  <SM23>	 6/25/92	PN		Move InitFasterInvals into StartInit.a
+;	  <SM22>	 6/12/92	PN		Roll in patchIIciROM.a. Check for PowerBook140 and set the
+;									boxflag is moved to StartInit.a.
+;	  <SM21>	 6/11/92	PN		Roll in patchIIciROM.a installing vector for the "FPU not
+;									installed" dialog box if we don't have FPU.  Install optimized
+;									package4 and package5.  Check and put in the correct boxflag for
+;									PowerBook140.
+;	  <SM20>	 6/10/92	JSM		InstallDilogGlobals is now InitDialogMgrGlobals.
+;	  <SM19>	 5/16/92	kc		Remove call to ADBMouseInit. This patch is already rolled
+;									inline.
+;	  <SM18>	  5/6/92	TN		Initialize the Notification Manager here instead of from an
+;									InstallProc.
+;	  <SM17>	 4/27/92	PN		Put VMSecondaryInitialization and add a routine to init global
+;									memory for scrollspeedfix
+;	  <SM16>	 4/22/92	PN		Roll in hasSoftPowerOff and GestaltColorQuickDrawFeatures into
+;									GestaltFunctions and remove these routines from InstallMgr. Also
+;									FontMgr Gestalt moves to GestaltFunction.a
+;	  <SM15>	 4/16/92	PN		Adding TrueType initialized call (SplineCall) to the start code
+;	  <SM14>	 4/14/92	kc		Add call to BTreeInstall.
+;	  <SM13>	  4/8/92	RLM		add call to init DialogMgrGlobals
+;	  <SM12>	 3/31/92	PN		Adding Init routines for ComponentMgr and TextServiceMgr
+;	  <SM11>	 3/24/92	PN		Remove SoundMgr initialization stuff and adding
+;									ProcessMgrSegmentTweak
+;	  <SM10>	 3/11/92	PN		Adding MiscPatches into the InstallMgr
+;	   <SM9>	 3/10/92	PN		Adding call to initialize soundmgr
+;	   <SM8>	  3/6/92	PN		Taking out HFSInit and BTReeinstall
+;	   <SM7>	  3/4/92	PN		Putting InstallMgr back in
+;	   <SM6>	  3/3/92	kc		Roll out all SuperMario changes and move them into StartInit.a.
+;	   <SM5>	 2/19/92	RLM		move installs
+;	   <SM4>	 2/13/92	PN		Add InstallMgr.
+;	   <SM3>	 2/13/92	RLM		Add NotificationMgrPatch roll-ins
+;	   <SM2>	 2/12/92	RLM		InstallProc roll-in from SCSILinkPatch.a.
+;									• Pre-SuperMario Comments Follow •
+;		 <8>	 1/20/92	PN		Roll-in linkedpatches into MenuMgr.a
+;		 <7>	  1/7/92	PN		Call AliasMgr installation routines
+;		 <6>	 10/1/91	JSM		Don’t use hasADB conditional, all future ROMs will support ADB.
+;		 <5>	 9/27/91	JSM		Don’t use hasCQD conditional, all future ROMs will have color
+;									QuickDraw.
+;		 <4>	 9/16/91	JSM		Cleanup header.
+;		 <3>	 6/12/91	LN		removed #include 'HardwareEqu.a'
+;		 <2>	 1/11/90	CCH		Added include of “HardwarePrivateEqu.a”.
+;	   <2.1>	 9/18/89	djw		Changed secondary_init from a trap to a subroutine call
+;	   <2.0>	 8/22/89	SES		Removed references to nFiles. Changed include DeclRomEqu.a to
+;									RomEqu.a. Changed include xFixMath.a to FixMath.a and added equ
+;									so that _FracMul will use trap instead of jsr. Changed
+;									sRsrc_BootRec & sRsrc_Flags to sRsrcBootRec & sRsrcFlags.
+;	   <1.9>	 6/29/89	GGD		Added BigJSR to InitADBDrvr to fix link problems as we expand.
+;	   <1.8>	 6/14/89	SWC		Fixed a bug in LoadOne: I wasn't shifty enough...
+;	   <1.7>	 6/10/89	SWC		Changed INIT loading so if a ROM-based version exists, it will
+;									be used instead of the disk version, unless there is a ROM
+;									override.
+;	   <1.6>	 5/24/89	GGD		Converted to feature based conditionals.
+;	   <1.5>	 4/10/89	gmr		Changed ReBoot to not call eject if the boot drive was not
+;									ejectable (DIP=08), and after calling eject, if the drive was
+;									not ejectable (DIP=$48), clear the BootMask bit for the drive
+;									(e.g. on RAM disks) so we won't keep trying to boot off them.
+;	   <1.4>	  4/3/89	MSH		Fixed ShowStartScreen for HcMac.
+;	   <1.3>	 2/20/89	djw		Added call to _SecondaryInit after patches are loaded.
+;	   <1.2>	11/17/88	GGD		Moved file system initialization code from StartBoot into TFS.a
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	  <•1.4>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.3>	 9/10/88	rwh		Make relative System heap sizing use BufPtr for ALL machines so
+;									that
+;	   <1.2>	 6/15/88	MSH		CompSysHeap uses BufPtr instead of MemTop, if HcMac.
+;	   <1.1>	  6/7/88	MSH		Converted to using Mac ][ boot screen code for HcMac.
+;	   <1.0>	 2/10/88	BBM		Adding file for the first time into EASE…
+;	  <C932>	 11/5/87	EMT		Roll in S161 - preserve high bit of SPVolCtl.
+;	  <C914>	10/29/87	rwh		Port to Modern Victorian (on MvMac)
+;	  <C874>	  9/2/87	MSH		Port to HcMac (Laguna)
+;	 <PB131>	  6/2/87	JTC		Roll in fix to detach DSAT=2 after loading, as defense against
+;									subsequent switch-launches.
+;	  <C840>	 2/20/87	EHB		When drawing to new grafPort, get proper bounds
+;	  <C793>	 2/11/87	JTC		Use _InitApplZone as well as _SetApplBase in _InitLoop, to get
+;									full advantage of the initialization attendant thereto.
+;	  <C785>	 2/10/87	GWN		Preserve the spsPointer field.
+;	  <C741>	  2/2/87	JTC		Cleanups after yet another code review.
+;	  <C720>	 1/29/87	GWN		Cleared spExtDev field where neccessary.
+;	  <C681>	 1/26/87	JTC		Clean up after StartSearch (really SCSILoad) splits the sys/app
+;									zones into 2 pieces. Just reset the globals and go...
+;	  <C692>	 1/25/87	GWN		Changed sType to 8-bytes.
+;	  <C682>	 1/24/87	WRL		Allow a PICT 0 resource in the StartupScreen file. This allows
+;									the startup screen to take up a lot less space, and it allows
+;									for color startup screens.
+;	  <C641>	 1/15/87	GWN		Get seOSType and seReserved from PRAM.
+;	  <C592>	  1/5/87	GWN		Added code to erase happy Mac (Need to add a test to see if
+;									necessary).
+;	  <C587>	  1/4/87	JTC		Tricky changes for dynamic system heap sizing. See related
+;									comment atop StartInit.a.
+;	  <C565>	12/22/86	RDC		Hack system heap code to ensure 96K heap for NuMac
+;	  <C534>	12/14/86	GWN		Fixed another bug in OpenSlots.
+;	  <C525>	12/14/86	GWN		Zapped a bug.
+;	  <C470>	11/30/86	EHB		Clear flag so devices will get initialized from resource file.
+;	  <C457>	11/23/86	EHB		Added call to initialize GrafDevices for all video cards.
+;	  <C469>	11/21/86	GWN		Modified code to Open all slot drivers: A slot driver will not
+;									be loaded if the fOpenAtStart sResource flag is clear (Default
+;									setting, if no flag register is present, is yes).
+;	  <C452>	11/21/86	GWN		Added code to Open all slot drivers.
+;	  <A403>	11/11/86	WRL		Fix to handle old HD20 drivers which pretended hard disks were
+;									ejectable. This caused them to be retried forever if the System
+;									file isn't present.
+;	  <A286>	10/28/86	WRL		Put in a check to make sure proposed system heap size is
+;									reasonable.
+;	  <A271>	10/27/86	BB		Changed switcher table set up for WDCBs and PMSP to use use long
+;									addresses.
+;	  <C277>	10/27/86	SMH		Changed the mouse tracking init code in Startinit.a,
+;									startboot.a, CCrsrCore.a and CrsrCore.a for Time Averageing
+;	  <C218>	10/14/86	SMH		Changed the mouse tracking init code in Startinit.a, startboot.a
+;									and kbd.a
+;	  <C206>	 10/9/86	bbm		Modified to mpw aincludes.
+;	  <C152>	 9/13/86	WRL		Major cleanup after code review. Modified boot block version
+;									paradigm to allow for relative system heap sizes. Removed
+;									InitDrvr subroutine - it is now called from kbd.a as
+;									InitADBDrvr. We now unmount the boot volume if we discover that
+;									it has no system file. Replaced search for boot device with code
+;									in StartSearch.
+;	  <C108>	  8/6/86	WRL		Aladdin wants a 96k system heap as well. Removed load of "ADBS"
+;									resources for NuMac - new ADB not in yet.
+;	  <C104>	  8/4/86	WRL		CSL Added temporary fix for loading "ADBS" resources
+;	   <C56>	  7/1/86	WRL		[NuMac] Increased system heap to 96k. Removed old check for 128k
+;									machine.
+;	   <C46>	 6/16/86	WRL		Changed label NoDir to @NoDir so as not to conflict with Slot
+;									equates. Changed JSR InitCache to BigJsr.
+;				 1/20/86	ELR		Added ROM75Fix bug patches: (1) set up BootDrive before
+;									prefixing to StartUp App folder; (2) don't skip OpenWD if folder
+;									is the root - the File System should return a VRefNum anyways,
+;									and the SetVol is needed to find a file in the root if current
+;									prefix is to a folder.
+;
+
+
+			BLANKS	ON
+			STRING	ASIS
+
+			PRINT	OFF
+			LOAD	'StandardEqu.d'
+			INCLUDE	'HardwarePrivateEqu.a'
+
+FixMathNonPortable 		EQU		1
+			INCLUDE	'FixMath.a'
+
+			INCLUDE	'SlotMgrEqu.a'
+			INCLUDE	'ROMEqu.a'
+			INCLUDE	'ColorEqu.a'
+			INCLUDE	'Aliases.a'
+			INCLUDE	'DisplaysPriv.a'
+			INCLUDE	'GestaltEqu.a'
+			INCLUDE	'AtalkPrivateEQU.a'				; 														<SM34>
+
+			INCLUDE	'UniversalEqu.a'				;														<SM33>
+			INCLUDE	'EDiskEqu.a'					;														<SM33>
+			INCLUDE 'MMUEqu.a'						;														<SM36>
+			INCLUDE 'BootEqu.a'						;														<SM36>
+
+			PRINT	ON
+			MACHINE	MC68020							;														<SM33>
+
+
+MyIOPBA6	EQU 	-$400							; A6 offset for IO parameter block
+MyPortA6	EQU 	-$200							; A6 offset for port
+MyOwnBufA6	EQU 	$400							; A6 offset for OwnBuf
+MyScrnImA6	EQU 	$800							; A6 offset for screen image
+DIP			EQU		-3								; DiskInPlace offset in DQE
+VMGlobals	EQU		$0B78							; VMGlobals [V0 constant]								<SM49>
+
+
+;---------------------------------------------------
+; IMPORTs
+;---------------------------------------------------
+
+			IMPORT	FindStartupDevice				; StartSearch.a											<SM49>
+			IMPORT	AddVidDevice
+			IMPORT	OpenSDrvr
+			IMPORT	ADDFONTSTOCHAIN					;														<SM15>
+			IMPORT	AfterBootSetApplBase        	; MemMgrBoot.a
+			IMPORT	ALIASMGRINSTALL					;
+			IMPORT	CacheInstall					; DiskCache.a
+			IMPORT	ClearSysErrorUpdateRect			;
+			IMPORT	__InitComponentManager
+			IMPORT	ExtBTreeInstall					;
+			IMPORT	HelpMgrInstall					;
+			IMPORT	InitDialogMgrGlobals			;
+			IMPORT	InitScrollSpeedGlobals			;
+			IMPORT	InitSystemMenuList				;
+			IMPORT	InitValidateMenuBarSemaphore	;
+			IMPORT	MiscPatchesInstall				;
+			IMPORT	NewGestaltSelectors				;
+			IMPORT	NMINIT							;
+			IMPORT	PPCINSTALL						;
+			IMPORT	SetupGestalt					;
+			IMPORT	SetupGlobals					;
+			IMPORT	ShutInit						; ShutdownMgr.a
+			IMPORT	SlotMgrSecondaryInitializationIIci
+			IMPORT	TSMgrInstall					; TSMDispatch.a (Text Services Manager)
+			IMPORT	LateLoad						; SCSILateLoad.a
+			IMPORT	MakeIconData
+			IMPORT	DavesRandomVideoStuff
+			IMPORT	InitADBDrvr
+
+BootMe		PROC	EXPORT
+
+			EXPORT	InitSys7Toolbox
+			EXPORT	OpenSlots
+
+
+			BSR		CheckForROMDisk					; Check if we would like to boot a ROM disk				<SM33>
+			TST.W	D0								; Did we find a bootable ROM disk?						<SM33>
+			BEQ.S	@foundBootDisk					; If so then we've got startup device, now call BBs		<SM33>
+			BSR		FindStartupDevice				; Find the startup device & load boot blocks.
+													; (see StartSearch.a)
+
+; SCSI people mess with the zones.  Reunify the sys and app zones for
+; possible expansion.  Code borrowed from StartInit.
+
+@foundBootDisk										;														<SM33>
+			MOVE.L	SysZone,A0						; get the REAL zone
+			MOVE.L	A0,TheZone						; make it THE REAL zone
+			MOVE.L	A0,ApplZone						; good-bye to the app zone
+			MOVE.L	bkLim(A0),HeapEnd				; one last pertinent global
+
+;------------------------------------------------------------------------------------------------
+; A5	=	points to "A5 world" data, the first long of which is a pointer to QuickDraw globals.
+; A6	=	points to the boot blocks, which have been read from the Startup Device.
+; SP	=	I/O parameter block = -$400(A6).
+;------------------------------------------------------------------------------------------------
+
+
+TheBoot
+
+
+;------------------------------------------------------------------------------------------------
+;	Install vector for the “FPU not installed” dialog box if we don’t have an
+;	FPU or an MMU.
+
+	IF 0 THEN										; <SM48>
+			move.l	#gestaltFPUType,d0				; do we have an FPU ?									<SM21>
+			_Gestalt
+			cmp.w	#gestaltNoFPU,a0				; if this has FPU, then we skip							<SM21>
+			bne.s	@hasFPU							; ..the installation of this patch						<SM21>
+			lea		NewFLineRoutine,a0				; get the address of our F-Line routine into A0			<SM21>
+			move.l	A0,Line1111						; Make F-traps come to us first							<SM21>
+@hasFPU
+	ENDIF
+			BSR		OptimizePACKs					; Optimize Pack4 and Pack5								<SM21>
+
+;------------------------------------------------------------------------------------------------
+;	check for executable boot blocks
+;------------------------------------------------------------------------------------------------
+
+MyExecMask	EQU		BBNewMask+BBExecMask
+
+			MOVE.B	BBVersion(A6),D1				; Get high byte of bb version number
+
+			CMP.B	#BBOldExecVers,D1				; Are these old executable boot blocks?
+			BEQ.S	@ExecBB							; If so, execute them
+
+			AND.B	#MyExecMask,D1					; Only check New and Exec bits
+			CMP.B	#MyExecMask,D1					; Are these new executable boot blocks?
+			BNE.S	@NoExec							; If not, don't execute them
+
+@ExecBB		LEA		MyIOPBA6(A6),A0					; point to parameter block								<SM30>
+			MOVE.L	A0,D7							; set it where Boot blocks want it						<SM30>
+			JSR 	BBEntry(A6) 					; Execute the boot blocks
+@NoExec
+
+;------------------------------------------------------------------------------------------------
+;	reboot if the boot blocks fail
+;------------------------------------------------------------------------------------------------
+
+ReBoot		move.w	BootDrive,D3					; Get current boot drive number
+			move.w	BtDskRfN,d1						; Get current drive ref num
+
+			bsr		getDiskInPlace					; Get DiskInPlace for the boot drive
+			cmpi.b	#8,d0							; are we ejectable?
+			beq.s	@DisableNextTime				; No, don't do eject
+			move.b	d0,-(sp)						; save it
+
+			LEA 	MyIOPBA6(A6),A0 				; use stack parameter block
+			MOVE.W	BtDskRfN,IORefNum(A0)			; driver refnum
+			MOVE.W	#EjectCode,CSCode(A0)
+			MOVE.W	D3,IODrvNum(A0) 				; d3 = BootDrive, must be a drive# here!
+			_Control								; eject the bad diskette
+			BNE.S	@DisableNextTime				; If not ejectable, don't try again
+
+			move.b	(sp)+,d0						; restore DiskInPlace byte
+			cmpi.b	#8,d0							; were we ejectable?
+			bge		@DisableNextTime				; no, don't boot from this drive again
+
+; ((( -------------------- Systems with HD20 --------------------
+			CMP.W	#$FFFE,BtDskRfN					; HD20's can pretend they're ejectable
+			BNE.S	@1								; Branch if it's not an HD20
+; ))) -------------------- Systems with HD20 --------------------
+
+@DisableNextTime
+			MOVE.W	BootMask,D0
+			BCLR	D3,D0
+			MOVE.W	D0,BootMask
+@1
+		IF	HasNetBoot THEN							;														<SM34>
+			lea 	MyIOPBA6(a6),a0 				; use stack parameter block
+			move	#-(49+1),ioRefNum(a0)			; refnum of the netBoot driver
+			_Close									; close that puppy
+			moveq.l	#-1, d0							; a register to clear lomem with
+			move.l	d0,AGBHandle					; clear the appletalk dispatch vector
+			move.l	d0,AtalkHk2						; clear the LapManager hook
+		ENDIF										;														<SM34>
+			bra		BootMe							; time to try again										<SM37>
+
+
+
+;________________________________________________________________________________________________
+		IF 0 THEN									;	<SM49>														<SM49>
+			IMPORT	IRQException					;
+NewFLineRoutine
+
+			cmp.w	#$002C,6(sp)					;make sure that this is our stack frame. If not			<SM21>
+			bne.s	OldFLineRoutine					;..then jump thru the old exception vector				<SM21>
+
+			MOVEM.L	A0/D0,-(SP)						; Save these two registers								<SM21>
+
+			move.l	8+2(sp),a0						;get the address of the instruction word that caused	<SM21>
+			move.w	(a0),d0							;..this exception. Then copy the word into DO			<SM21>
+			and.w	#%0000111000000000,d0			;get just the co-processor ID from the instruction		<SM21>
+			cmp.w	#%0000001000000000,d0			;if it’s not one, then it isn’t a FPU instruction		<SM21>
+			bne.s	stackError						;..so return thru the old FPU replacement routine		<SM21>
+			lea		continue,a0						;change the saved return address to our continuation	<SM21>
+			move.l	a0,8+2(sp)						;..point and return out of exception mode.				<SM21>
+
+			MOVEM.L	(SP)+,A0/D0						; Restore the regs										<SM21>
+			rte
+
+continue	move.w	#dsNoFPU,d0						;this displays the dialog that lets the user			<SM21>
+			_SysError								;..return to the finder (FPU type)						<SM20>
+
+stackError	MOVEM.L	(SP)+,A0/D0						; Restore the regs										<SM21>
+
+OldFLineRoutine
+			lea		IRQException,a1					;														<SM21>
+			jmp		-6(a1)							;jump back to Line1111            						<SM21>
+		ENDIF
+
+;____________________________________________________________________________
+;	SANE Package Optimization
+;
+;	Optimize the SANE packages which are ROM Resources, by having the dispatch
+;	table entry point right to the first instruction of the package, instead
+;	of going through the Package Manager which finds the package by de-referencing
+;	a handle.
+;
+
+OptimizePACKs
+			lea		@PackOptTable,a3				; point to the optimization table						<SM21>
+@optLoop	move.w	(a3)+,d0						; get the package number								<SM21>
+			bmi.s	@done							; exit at end of list									<SM21>
+			move.w	d0,-(sp)						; push the package number								<SM21>
+			_InitPack								; get the ROM resource, update AppPacks table			<SM21>
+			move.w	(a3)+,d1						; get the trap word										<SM21>
+			move.w	(a3)+,a0						; get the low mem address								<SM21>
+			move.l	(a0),d0							; get the handle										<SM21>
+			beq.s	@optLoop						; if null, skip it										<SM21>
+			movea.l	d0,a0							; setup to de-reference it								<SM21>
+			move.l	(a0),d0							; get a pointer to the routine							<SM21>
+			beq.s	@optLoop						; if null, skip it										<SM21>
+			movea.l	d0,a0							; setup pointer to code									<SM21>
+			cmpi.b	#$60,(a0)						; see if first instruction is a BRA.S					<SM21>
+			bne.s	@branchOptDone					; if not, don't optimize it								<SM21>
+			move.w	(a0)+,d0						; get the BRA.S instruction								<SM21>
+			ext.w	d0								; extend the branch displacement						<SM21>
+			adda.w	d0,a0							; update the entry point address						<SM21>
+@branchOptDone
+			move.w	d1,d0							; setup the trap word									<SM21>
+			_SetTrapAddress							; go directly to the first instr of the package			<SM21>
+			bra.s	@optLoop						; optimize the next package								<SM21>
+
+@PackOptTable
+			dc.w	4								; package number 4										<SM21>
+			_FP68K									; trap name for PACK 4									<SM21>
+			dc.w	AppPacks+4*4					; low mem address of handle to PACK 4					<SM21>
+
+			dc.w	5								; package number 5										<SM21>
+			_Elems68K								; trap name for PACK 5									<SM21>
+			dc.w	AppPacks+5*4					; low mem address of handle to PACK 5					<SM21>
+
+			dc.w	-1								; package number -1, end of list						<SM21>
+@done
+			rts
+
+
+;________________________________________________________________________________________________
+;  Routine:		getDiskInPlace
+;  Inputs:		D1.b = BtDskRfN, boot disk ref num
+;				D3.b = BootDrive - Boot Drive Number
+;
+;  Outputs:		D0.b = DiskInPlace byte if Drive Queue element is found
+;				   	 = 0 if not found (shouldn't happen)
+;  Destroys:	A0
+;  Calls:		none
+;  Called by:	ReBoot
+;
+;  Function:	Searches the drive queue for the Drive Queue Element
+;				associated with the boot drive, and returns the DiskInPlace byte
+;				if DQE was found, otherwise return 0
+;________________________________________________________________________________________________
+
+getDiskInPlace										; find the drive queue element
+			lea		DrvQHdr+QHead-QLink,a0			; get the drive queue head
+@search		move.l	QLink(a0),d0					; check next drive queue element
+			beq.s	@done							; if drive queue is empty, assume ejectable
+			movea.l	d0,a0							; a0 := drive queue element
+			cmp.w	DQDrive(a0),d3					; check for a drive match
+			bne.s	@search							; keep looking if not our drive
+			cmp.w	DQRefNum(a0),d1					; check for a drive queue ref num match
+			bne.s	@search							; keep looking if not for our driver
+
+			move.b	DIP(a0),d0						; return the DiskInPlace byte
+@done		rts
+
+
+;________________________________________________________________________________________________			<SM33>
+; CheckForROMDisk
+;
+; The following code supports the "Ginty" ROM disk architecture (System Disk in ROM).
+; The idea is to pass control to the ROM disk so it can decide whether or not
+; to boot from the ROM disk.  If there is no ROM disk present or this particular machine
+; does not support it then we continue as usual in the boot process.
+;
+; Input:	nothing
+; Output:	D0.W = non-zero if no ROM disk was found or if one was it was non-bootable
+;			D0.W = zero means we found a bootable ROM disk.  The code in the ROM disk
+;					already called FinderStartupDevice.
+;________________________________________________________________________________________________
+
+CheckForROMDisk
+			move.l	UnivROMFlags,d0					; get external features flag
+			btst.l	#ProductInfo.SupportsROMDisk,d0 ; see if machine supports ROM disks?
+			beq.s	@noROMDisk						; if not then just continue as usual
+
+			bsr.s	FindROMDisk						; check if we have a ROM disk
+			beq.s	@foundROMDisk
+
+			move.l	UnivROMFlags,D0					; get external feature flags
+			btst.l	#ProductInfo.V8ChipBit,D0		; are we on a VISA decoder machine?
+			beq.s	@NoROMDisk						; if not then we're done
+;
+; ---- At this pt we need to check ROM space one more time but with the C/D slot bit XOR'ed in the ----
+; ---- Miscellaneous Setup Register ($50F26009), we need to do this because we cannot tell if we   ----
+; ---- have a PDS/PCMCIA flash card installed or a ROM exp. SIMM.  With this bit cleared no DSACK  ----
+; ---- is generated by the ASIC and with it set DSACK is generated by the PDS card attached.       ----
+
+			move.l	#$50F26009,A0					; Miscellaneous Setup Register in VIA2 space
+			bfchg	(A0){4:1}						; complement the C/D bit field in setup register
+			bsr.s	FindROMDisk						; check for bootable ROM disk
+			beq.s	@foundROMDisk					;
+
+			move.l	#$50F26009,A0					; Miscellaneous Setup Register in VIA2 space
+			bfchg	(A0){4:1}						; set field back to original setting
+			bra.s	@NoROMDisk						;
+;
+;	At this point, A0 points to the beginning of the header for the RomDisk driver.
+;	(A0 gets set in routine FindROMDisk)
+;
+@foundROMDisk
+			with	GintyHeader
+
+			move.l	HdrBootCode(A0),D0				; get the offset to search routine
+			beq.s	@NoROMDisk						; it's zero, so no search routine
+			adda.l	HdrBootCode(A0),A0				; point to search routine
+			jsr		(A0)							; call the ROM Disk search/open routine
+			tst.w	D0								; see if it found the boot blocks
+			beq.s	@FoundDevice					; ready to boot (A6 points to boot blocks)
+
+; ------------ If we get here, we didn't find a ROMDisk ------------
+;
+@noROMDisk	st		d0								; set d0 to TRUE to indicate no ROM disk
+@FoundDevice
+			rts
+
+
+;------------------------------------------------------------------------------------------------
+;	Search through ROM looking for the special ROM disk header info.
+;	If found, check for boot blocks.  Adapted from code in EDiskDrvr.a.
+;
+;	Returns EQ if we found a ROM disk with boot blocks, NE if not.
+;	If ROM disk found then A0 contains a ptr to the ROM Disk header.
+;
+;	Destroys D0,A0
+
+FindROMDisk
+			movem.l	d1/a2-a4,-(sp)					; save registers
+
+			movea.l	RomBase,a2						; start searching at the base of ROM
+			move.l	a2,d1
+			addi.l	#ROMSize,d1						; end of ROM space to search
+@RomDiskLoop
+			move.w	sr,-(sp)						; save old interrupt mask
+			ori.w	#HiIntMask,sr					; disable interrupts (stealing BusErrVct)
+			move.l	BusErrVct,-(sp)					; save old bus error vector
+			lea		@NotFound,a0					; new handler address
+			move.l	a0,BusErrVct					; setup bus error handler
+			movea.l	sp,a4							; mark the stack
+
+			lea		HeaderTemplate,a3				; point to expected values
+			lea		HdrBlockSize(a2),a0				; point to header data
+			moveq.l	#(HdrDeviceSize-HdrBlockSize)/4-1,d0	; loop counter
+@SigCmpLoop
+			cmpm.l	(a0)+,(a3)+						; compare the values
+			dbne	d0,@SigCmpLoop					; compare the blocks
+@NotFound
+			movea.l	a4,sp							; pop stack in case of bus error
+			move.l	(sp)+,BusErrVct					; restore bus error vector
+			move.w	(sp)+,sr						; restore interrupt mask
+			addq.w	#1,d0							; see if we had a match
+			bne.s	@NextBlock						; no, check next block
+			move.l	a2,a0							; save our position in ROM
+			moveq	#0,d0							; set cc to EQ
+			bra.s	@Done							; return EQ
+@NextBlock
+			adda.l	#RomDiskAlign,a2				; point to next block to check
+			move.l	d1,a0
+			cmpa.l	a0,a2							; see if end reached
+			blo.s	@RomDiskLoop					; search the entire space
+			moveq	#1,d0							; set cc to NE
+@Done
+			movem.l	(sp)+,d1/a2-a4					; restore registers
+			rts
+
+			endwith									; GintyHeader
+
+
+			string	asis							; no length on strings
+			align	2
+HeaderTemplate
+			dc.w	512								; signature block size
+			dc.w	1								; version number 1
+			dc.b	'Ginty '						; 12 byte signature
+			dc.b	'HYGWGA'						; (brought to you by et. al)
+
+
+;______________________________________________________________________________________
+; All the 7.0 managers are installed here, the Gibbly calls us via a ROM vector at
+; the start or the ROM.
+;
+; Sure would have been nice if each of these generic routines were commented when
+; they were added.... (Sigh)  Rewrote most of this code today <SM49>. 			<SAM>
+;
+;______________________________________________________________________________________
+
+InitSys7Toolbox
+			_InitAllPacks							; Make sure the Packs are available at this time
+
+			BSR.L	NewGestaltSelectors				;
+
+			; Don't call ShutInit here since it blows away existing shutdown tasks <SM56>
+
+			BSR.L	ALIASMGRINSTALL
+
+			BSR.L	SetupGlobals					; Comm Toolbox											<SM26>
+			BSR.L	SetupGestalt					;														<SM26>
+
+			BSR.L	InitDialogMgrGlobals
+			BSR.L	InitScrollSpeedGlobals			; scrollbar scrolling speed
+			BSR.L	ExtBTreeInstall
+			BSR.L	PPCINSTALL
+			BSR.L	NMINIT
+			BSR.L	InitValidateMenuBarSemaphore
+			BSR.L	InitSystemMenuList
+			BSR.L	MiscPatchesInstall
+			CLR.L	-(SP)							; unused parameter for system builds
+			BSR.L	__InitComponentManager
+			BSR.L	ClearSysErrorUpdateRect			; ToolboxEventMgrPatches
+			BSR.L	TSMgrInstall
+			BSR.L	HelpMgrInstall
+			BSR.L	ADDFONTSTOCHAIN					; FontFolder											<SM15>
+
+	; ADBSecondaryInitialization					; <SM49> SAM (from here down...)
+
+			BSR.L	InitADBDrvr						; Another reinit
+
+			
+	; Display Manager
+	
+		IF hasDisplayMgr THEN						; <52>
+			SUBQ	#2,A7
+			_DMInstallDisplayManager				; Display Manager
+			ADDQ	#2,A7
+		ENDIF										; <52>
+
+	; SlotMgrSecondaryInitializationIIci
+
+			SUB.W	#spBlock.spBlockSize,SP			; Make room for a slot parameter block on the stack
+			MOVEA.L	SP,A0							; Point A0 to the record
+			BSET	#fWarmStart,spBlock.spFlags(A0)	; Set warm start flag
+			_SecondaryInit							; Wake everybody up again
+			ADD.W	#spBlock.spBlockSize,SP			; Remove the param block from the stack
+			BSR		OpenSlots						; Open all slot drivers...
+
+	; ColorQDSecondaryInitialization
+
+			JSR		DavesRandomVideoStuff			; re-do CheckDevices and video driver patching.
+			MOVE.L	(a5),-(sp)						; point to the same globals we are using now
+			_InitGraf								; catch all the new devices
+			_InitPalettes							; me too...
+
+	; SetUpIconCluts
+
+			PEA		([ExpandMem],ExpandMemRec.emIconCluts)
+			JSR		MakeIconData
+
+	; FontMgrSecondaryInitialization
+
+			_InitFonts								; Reinit the font manager (in case a new one's just been loaded)
+
+	; File System Cache
+
+			BSR		AdjustBarrier								; Get the limit to bufPtr in A2
+			BTST	#extensionsEnabledBit,ExtensionsEnabledByte	; Have extensions been disabled?
+			BNE.S	@normal										; -> No. Use the default limit
+
+			MOVE.L	BufPtr,d2						; Extensions disabled.  Limit the cache to 64k
+			SUB.L	#$10000,d2						; give the cache 64K
+			BRA.S	@continue						; -> Join the common code
+
+@normal		MOVE.L	BootGlobals.bufPtrLimit(a5),d2	; Get the current limit
+			ADD.L	#elbowRoomCacheCantHave,d2		; Reserve 32k or so to assure we can boot
+@continue	BSR.L	CacheInstall					; Install the disk cache
+	;
+	;
+			BSR.L	LateLoad						; Wait for SCSI devices present last time (that may not be ready yet)
+													; Load their drivers if they come up to speed.
+
+	; VM Final Initialization
+
+	; If VM loaded, we need to call MemoryDispatch with selector (-1) so VM can hold the system heap,
+	; unhold the boot stack, patch the cursor task, and enable user mode.
+
+			TST.L	VMGlobals						; Has VM installed itself?
+			BMI.S	@noVM							; -> No.  No Memory Dispatch
+
+@hasVM		MOVEQ	#-1,D0							; Finish VM initialization selector
+			_MemoryDispatch							; Call VM.
+			BRA.S	@Done							; ->> Jump to end
+
+@noVM		LEA		AfterBootSetApplBase,A0			; Patch _SetAppBase to call _InitZone before and after
+			MOVE.W	#$A057,D0						; it calls the real SetAppBase.  Do this only if VM is
+			_SetTrapAddress ,NewOS					; not installed, or you'll look like a Cyclone.
+
+@Done		RTS										; Return to boot3 (or Gibbly)
+													; 									<SM449> SAM  (End of today's mods)
+; •• End of InitSys7Toolbox ••
+;______________________________________________________________________________________
+
+;--------------------------------------------------------------------
+; Open all slot drivers which request to be opened at Start time.
+; Destroys	no registers.
+; Note: *** A0, A1, D3 & D4 must be preserved by OpenSDrvr,OpenBDrvrs and AddVidDevice.
+;--------------------------------------------------------------------
+
+OpenSlots
+			WITH	spBlock, seBlock
+
+			MOVEM.L	A0-A1/D0-D4,-(SP)				; Save registers
+
+			LEA		-IOQElSize(SP),SP				; Allocate parameter block for device manager calls.
+			MOVE.L	SP,A1
+			CLR.B	IOPermssn(A1)					; r/w permissions
+
+			SUB 	#spBlockSize,SP					; Allocate parameter block for SDM calls.
+			MOVE.L	SP,A0
+			CLR.B	spSlot(A0)						; Start with slot #0.
+			CLR.B	spExtDev(A0)
+			CLR.B	D3								; Start with sResource ID #0
+
+;  Search for next sResource and open the driver if the fOpenAtStart flag is set (or sRsrc_Flags are missing).
+													;REPEAT
+@Repeat		MOVE.B	D3,spId(A0)						;  Restore the sResource Id
+			_sNextsRsrc								;  Find next sResource
+			BNE.S	@Done							;  Done if no more sResources
+													;
+			MOVE.B	spId(A0),D3						;  Save the sResource id
+			MOVE.L	spsPointer(A0),D4				;  Save the sPointer
+
+			MOVE.B	#sRsrcFlags,spId(A0)			;  Read the sResource flags
+			_sReadWord								;  IF sRsrc_Flags are missing THEN
+			BNE.S	@10								;     default = flag is set, Open the drvr
+			MOVE.W	spResult+2(A0),D0
+			BTST.L	#fOpenAtStart,D0				;  IF fOpenAtStart flag is not set THEN
+			BEQ.S	@Repeat							;  	 do not open the driver
+
+@10			MOVE.B	#sRsrcBootRec,spId(A0)
+			_sFindStruct							;  IF there is no sBoot Record THEN
+			BNE.S	@20								;	 Branch
+													;  ELSE
+			MOVE.B	D3,spId(A0)						;    Restore the sResource Id
+			MOVE.L	D4,spsPointer(A0)				;  	 Restore the sPointer
+			BSR		OpenBDrvrs						;    Open all drivers for this device
+			BRA.S	@Repeat							;  	 continue with loop
+
+@20			MOVE.B	D3,spId(A0)						;  Restore the sResource Id
+			BSR		OpensDrvr						;  Try to open the driver
+			BNE.S	@Repeat							;  If error THEN it can't be opened
+
+;  If it is a video card, then install into device chain
+
+			CMP.L	#(CatDisplay<<16)++TypVideo,spCategory(A0)	; Check for proper <Category><Type>
+			BNE.S	@Repeat							; continue loop if not
+			CMP.W	#DrSWApple,spDrvrSW(A0)			; Check for an Apple driver interface
+			BNE.S	@Repeat							;  =>no, not a video card
+			BSR		AddVidDevice					;  else add video device to device list
+
+@Until		BRA.S	@Repeat							;UNTIL (no more sResources)
+
+@Done		LEA		IOQElSize+spBlockSize(SP),SP	;Deallocate parameter blocks.
+
+
+;-------------------------------------
+; Clear flag so InitGraf will load screen configuration from system file
+; (Flag was set in InitVidDeflt to avoid initialization before all devices open)
+;-------------------------------------
+
+			MOVE.L	DeviceList,A0					;get first device in list
+			MOVE.L	(A0),A0							;point to this device
+			BCLR	#AllInit,GDFlags(A0)			;say devices not initialized
+
+			MOVEM.L	(SP)+,A0-A1/D0-D4				;Restore registers
+			RTS
+
+
+;------------------------------------------------------------------------------------------------
+; PROCEDURE:OpenBDrvrs
+; Execute sBoot code to load in all drivers for this hw device
+;  	A0 -> Pointer to SDM parameter block.
+; Destroys	no registers
+; Called by : OpenSlots.
+;------------------------------------------------------------------------------------------------
+
+OpenBDrvrs	MOVE.B	spSlot(A0),-(SP)				;Save slot
+			MOVE.B	spId(A0),-(SP)					;Save Id
+			MOVEM.L	D0-D3/A0-A1,-(SP)				;Save registers.
+
+			SUB		#seBlockSize,SP					;Allocate parameter block for code executed by _sExec.
+			MOVE.L	SP,A1
+			MOVE.L	A1,spsExecPBlk(A0)				;Save pointer to se parameter block.
+
+
+;  Get the default OS of Startup Device (Use the same OS type to load the drivers)
+			MOVE.L	A0,D3							;Save A0
+			SUBQ.L	#2,SP							;Make room for parameters
+			MOVE.L	SP,A0							;Point to the parameter block
+			_GetOSDefault							;Get info about the default device
+			MOVE.W	(SP)+,D2						;D2 <- <Reserved><OSType>
+			MOVE.L	D3,A0							;Restore A0
+
+
+;  Set the parameters for the code in sExec.
+			MOVE.B	spSlot(A0),seSlot(A1)			;Slot,
+			MOVE.B	spId(A0),sesRsrcId(A1)			;sResource.
+			CLR.B	sePartition(A1)					;Partition,
+			CLR.B	seDevice(A1)					;Device, and
+			MOVE.B	D2,seOSType(A1)					;Default OS
+			LSR.L	#8,D2
+			MOVE.B	D2,seReserved(A1)				;Reserved field
+			MOVE.B	#sbState1,seBootState(A1)		;State of StartBoot code.
+
+
+;  Execute the code in the sBoot record.
+			MOVE.B	#sRsrcBootRec,spId(A0)			;Execute the code:
+			_sExec									;  On entry to the boot code, A0 points to the SE parameter block.
+
+
+;  Exit.
+			ADD		#seBlockSize,SP					;De-Allocate SE parameter block.
+			MOVEM.L	(SP)+,D0-D3/A0-A1				;Restore registers.
+			MOVE.B	(SP)+,spId(A0)					;Restore Id
+			MOVE.B	(SP)+,spSlot(A0)				;Restore slot
+
+			RTS
+
+AdjustBarrier	;																				<38>
+
+; Adjust BootGlobals.bufPtrLimit(a5) to have:
+;	MAX( sysHeap.bkLim + minProcessMgrSpace, static limits (i.e. boot globals & vm limits) )
+
+; Trashes:	a0/d0
+
+			move.l	SysZone,a0
+			move.l	a0,d0							; copy baseAddr of SysZone
+			move.l	bkLim(a0),a0
+			add.l	#initialSysHeapSize,d0
+			cmp.l	d0,a0							; if heap is small because we’re on a small RAM machine
+			bhs.s	@enoughReservedForSysHeap		;   pretend heap is at initialSysHeapSize because it will
+													;   be that big soon anyway.
+			move.l	d0,a0							;   Set to be the minimum we’d ever consider.
+@enoughReservedForSysHeap
+			add.l	#minProcessMgrSpace,a0			; where the process mgr heap would end if we
+													; created it right now
+			cmp.l	BootGlobals.bufPtrLimit(a5),a0	; processMgrHeap.bkLim > current barrier?
+			bls.s	@dont							; if not, don’t adjust
+
+			move.l	a0,BootGlobals.bufPtrLimit(a5)	; set new barrier
+@dont
+			rts
+
+			ENDP
+
+
+	IF 0 THEN
+;------------------------------------------------------------------------------------------
+; CheckPassword;															<SM46> rb, start
+;
+; Here we will check to see if the machine is password protected, and if so, display
+; a dialog to enter the password.  Three strikes and we shut down.
+;
+; Input:	nothing
+; Output:	nothing
+;------------------------------------------------------------------------------------------
+
+CheckPassword	PROC	EXPORT
+
+MyStack		RECORD	0,DECREMENT
+DialogRect		DS.W	4
+ItemRect		DS.W	4
+NewPass			DS.B	8
+PRAMPass		DS.B	8
+PassLength		DS.B	1
+myFiller		DS.B	1
+myTimer			DS.L	1
+MyFrameSize		EQU		*
+			ENDR
+
+				WITH	MyStack
+
+				Link	A6,#MyFrameSize				; Stack frame.
+				Movem.l	D0-D7/A0-A5,-(Sp)			; Save everyone.
+
+				Lea		@LockFunction,A0			; Function pointer.
+				Move.l	#'lock',D0					; Selector code.
+				_NewGestalt							; Install it.
+
+				Lea		PassLength(A6),A0
+				Move.l	#$00010045,D0				; Get #, addr PRAM bytes.
+				_ReadXPram							; Read password checksum.
+				Move.b	(A0),D3						; Is there a password?
+				Beq		@ExitCheck					; No? Then done.
+				Btst	#3,D3						; Disabled?
+				Bne		@ExitCheck					; Yes? Then leave.
+				And.b	#$F,(A0)					; Just save length.
+				Addq.b	#1,(A0)						; Make one based.
+
+				Lea		PRAMPass(A6),A0				; PRAM password.
+				Move.l	#$00040004,D0				; Get #, addr PRAM bytes.
+				_ReadXPram							; Read password.
+				Lea		4(A0),A0					; PRAM password.
+				Move.l	#$000300AB,D0				; Get #, addr PRAM bytes.
+				_ReadXPram							; Read password.
+				Lea		3(A0),A0					; PRAM password.
+				Move.l	#$000100BC,D0				; Get #, addr PRAM bytes.
+				_ReadXPram							; Read password.
+				Subq.w	#7,A0						; Start of password.
+
+				Moveq	#7,D0						; Loop.
+@DecryptLoop	Eor.b	D3,(A0,D0.w)				; Decrypt password.
+				Dbra	D0,@DecryptLoop				; Loop till done.
+
+				Moveq	#0,D0						; Init register.
+				Move.b	PassLength(A6),D0			; Length of password.
+				Subq.w	#1,D0						; For looping.
+				Moveq	#0,D1						; Odd parity.
+				Moveq	#0,D2						; Even parity.
+@ParityLoop		Move.b	(A0)+,D4					; Byte.
+				Moveq	#7,D5						; Loop.
+				Moveq	#0,D6						; Counter.
+@0				Rol.b	#1,D4						; Check bit.
+				Bcc.s	@Next						; Not set? Then continue.
+				Addq.w	#1,D6						; Bump counter.
+@Next			Dbra	D5,@0						; Loop till done with byte.
+				Ror.b	#1,D6						; Check for even or odd.
+				Bcs.s	@Odd						; Set? Then odd.
+				Addq.w	#1,D2						; Bump even.
+				Bra.s	@1
+@Odd			Addq.w	#1,D1						; Bump odd.
+
+@1				Dbra	D0,@ParityLoop				; Do next byte.
+				Asr.b	#4,D3						; Parity in low 4 bits.
+				And.b	#$F,D3
+				Lsl.b	#2,D1						; Move odd parity up 2.
+				And.b	#3,D2						; Strip extra even parity bits.
+				Or.b	D2,D1						; Or together.
+				And.b	#$F,D1						; Strip extras.
+				Cmp.b	D1,D3						; Match?
+				Bne		@ExitCheck					; No? Then leave.
+
+				Move.l	(A5),A3						; Quickdraw globals.
+				Lea		screenBits(A3),A0			; Port bitmap.
+
+				Lea		DialogRect(A6),A2			; The rect.
+				Move.w	bounds+bottom(A0),D1		; Center it.
+				Move.w	DRect+bottom,D0
+				Sub.w	DRect+top,D0
+				Sub.w	D0,D1
+				Asr.w	#1,D1
+				Move.w	D1,top(A2)
+				Add.w	D0,D1
+				Move.w	D1,bottom(A2)
+
+				Move.w	bounds+right(A0),D1
+				Move.w	DRect+right,D0
+				Sub.w	DRect+left,D0
+				Sub.w	D0,D1
+				Asr.w	#1,D1
+				Move.w	D1,left(A2)
+				Add.w	D0,D1
+				Move.w	D1,right(A2)
+
+				Move.l	A2,-(Sp)
+				_EraseRect
+				Move.l	A2,-(Sp)
+				_FrameRect
+				Addq.w	#3,top(A2)
+				Addq.w	#3,left(A2)
+				Subq.w	#3,bottom(A2)
+				Subq.w	#3,right(A2)
+				Move.l	A2,-(Sp)
+				_FrameRect
+				Addq.w	#1,top(A2)
+				Addq.w	#1,left(A2)
+				Subq.w	#1,bottom(A2)
+				Subq.w	#1,right(A2)
+				Move.l	A2,-(Sp)
+				_FrameRect
+
+				Lea		ItemRect(A6),A4				; Item rect.
+				Lea		ItemList,A2					; Dialog items.
+				Move.w	(A2)+,D7					; Loop counter.
+@ItemLoop		Move.l	DialogRect(A6),top(A4)
+				Move.l	DialogRect(A6),bottom(A4)
+
+				Tst.l	(A2)+						; Ignore handle.
+				Move.w	(A2)+,D0
+				Add.w	D0,top(A4)					; Set rect.
+				Move.w	(A2)+,D0
+				Add.w	D0,left(A4)
+				Move.w	(A2)+,D0
+				Add.w	D0,bottom(A4)
+				Move.w	(A2)+,D0
+				Add.w	D0,right(A4)
+				Cmp.b	#editText,(A2)+				; Edit item?
+				Beq.s	@DrawEdit					; Yes? Then draw it.
+
+				Tst.b	(A2)+						; Skip length.
+				Move.l	A4,-(Sp)					; Rect.
+				Tst.l	-(Sp)						; Room for resource handle.
+				Move.w	(A2)+,-(Sp)					; Resource ID.
+				_GetIcon							; Load icon.
+				_PlotIcon
+				Bra.s	@NextItem
+
+@DrawEdit		Move.l	A4,-(Sp)					; Rect.
+				_FrameRect							; Frame it.
+				Tst.b	(A2)+
+
+@NextItem		Dbra	D7,@ItemLoop
+
+				Move.l	Ticks,myTimer(A6)			; Init timeout value.
+				Add.l	#5*60*60,myTimer(A6)		; Timeout after five minutes.
+				Moveq	#2,D5						; Number of retries (-1).
+				Moveq	#0,D7						; Last key hit.
+@RetryLoop		Moveq	#0,D6						; Number of keys.
+				Lea		NewPass(A6),A3				; Start of password.
+				Lea		ItemRect(A6),A0				; Item rect.
+				Move.l	DialogRect(A6),top(A0)
+				Move.l	DialogRect(A6),bottom(A0)
+				Move.w	EditRect+top,D0
+				Addq.w	#6,D0
+				Add.w	D0,top(A0)
+				Addq.w	#5,D0
+				Add.w	D0,bottom(A0)
+
+				Move.w	EditRect+left,D0
+				Addq.w	#4,D0
+				Add.w	D0,left(A0)
+				Addq.w	#5,D0
+				Add.w	D0,right(A0)
+
+@CharLoop		Lea		KeyMap,A2					; Pointer to key map.
+				Moveq	#0,D0						; Starting offset.
+				Moveq	#2,D1						; Loop.
+				Bclr	#31,D7						; Keyup flag.
+@KeyLoop		Moveq	#31,D4						; Bits to check.
+				Move.l	(A2)+,D2					; Keys.
+@BitLoop		Rol.l	#1,D2						; Check bit.
+				Bcc		@NextBit					; 0? Then check next bit.
+				Lea		ShiftMap,A1					; Shift key map.
+				Btst	#0,KeyMap+7					; Shift key down?
+				Bne.s	@CheckKey					; Yes? Then we have the right char.
+				Lea		CapsMap,A1					; Capsdown key map.
+				Btst	#1,keyMap+7					; Caps lock?
+				Bne.s	@CheckKey					; Yes? Then we have the right char.
+				Lea		LowerMap,A1					; Must be lowercase map.
+
+@CheckKey		Move.b	0(A1,D0),D3					; The character.
+				Ble.s	@NextBit					; Yes? Then check next one.
+				Bset	#31,D7						; Set keydown flag.
+				Cmp.b	D3,D7						; Same as last key?
+				Beq.s	@CharLoop					; Yes? Then start scanning again.
+				Move.b	D3,D7						; Set last char.
+				Cmp.b	#$0D,D3						; Return or Enter?
+				Beq		@CheckPass					; Yes? Then check password.
+				Cmp.b	#$1B,D3						; Escape?
+				Beq		@ShutDown					; Yes? Then shutdown.
+
+				Cmp.b	#$08,D3						; Backspace?
+				Bne.s	@InstallChar				; No? Then use char.
+				Tst.w	D6							; Any chars entered?
+				Beq.s	@NextBit					; No? Then continue.
+				Subq.w	#1,D6						; Decrement count.
+
+				Movem.l	D0-D2,-(Sp)					; Save registers.
+				Lea		ItemRect(A6),A0
+				Subq.w	#6,left(A0)
+				Subq.w	#6,right(A0)
+				Move.l	A0,-(Sp)
+				_EraseRect
+				Movem.l	(Sp)+,D0-D2					; Restore registers.
+				Bra.s	@NextBit					; Check next one.
+
+@InstallChar	Cmp.w	#8,D6						; Maxed out?
+				Beq.s	@NextBit					; Yes? Then check next bit.
+				Move.b	D3,0(A3,D6.w)				; Install char.
+				Addq.w	#1,D6						; Increment count.
+
+				Movem.l	D0-D2,-(Sp)					; Save registers.
+				Pea		ItemRect(A6)
+				Move.l	(A5),A0						; Quickdraw globals.
+				Pea		black(A0)					; Use black as background
+				_FillOval							; Draw bullet.
+				Movem.l	(Sp)+,D0-D2					; Restore registers.
+				Lea		ItemRect(A6),A0
+				Addq.w	#6,left(A0)
+				Addq.w	#6,right(A0)
+				Bra.s	@CharLoop					; Start scanning again.
+
+@NextBit		Addq.w	#1,D0						; Next offset.
+				Dbra	D4,@BitLoop					; Check next bit.
+				Dbra	D1,@KeyLoop					; Next KeyMap long.
+				Move.l	Ticks,D1					; Current tick count.
+				Cmp.l	myTimer(A6),D1				; Timeout yet?
+				Bgt		@ShutDown					; Yes? Then shutdown.
+				Tst.l	D7							; Key down?
+				Bmi.s	@CharLoop					; Yes? Then loop.
+				Moveq	#0,D7						; No? Then reset last key.
+				Bra.s	@CharLoop					; Keep looping.
+
+@CheckPass		Tst.w	D6							; Length 0?
+				Beq.s	@ShutDown					; Yes? Then shutdown.
+				Cmp.b	PassLength(A6),D6			; Same length?
+				Bne.s	@NextTry					; No? Then try again.
+				Lea		PRAMPass(A6),A0				; Saved password.
+@CheckLoop		Move.b	(A3)+,D0					; The character.
+				Cmp.b	(A0)+,D0					; Match?
+				Bne.s	@NextTry					; No? Then retry.
+				Subq.w	#1,D6						; Decrement count.
+				Bne.s	@CheckLoop					; Check next one.
+				Bra.s	@Exit						; Done? Then we've passed.
+
+@NextTry		Lea		ItemRect(A6),A0				; Item rect.
+				Move.l	DialogRect(A6),top(A0)
+				Move.l	DialogRect(A6),bottom(A0)
+				Move.w	EditRect+top,D0
+				Addq.w	#2,D0
+				Add.w	D0,top(A0)
+				Move.w	EditRect+left,D0
+				Addq.w	#2,D0
+				Add.w	D0,left(A0)
+				Move.w	EditRect+bottom,D0
+				Subq.w	#2,D0
+				Add.w	D0,bottom(A0)
+				Move.w	EditRect+right,D0
+				Subq.w	#2,D0
+				Add.w	D0,right(A0)
+
+				Moveq	#2,D3
+@FlashLoop		Pea		ItemRect(A6)
+				_InverRect
+				Lea		6,A0
+				_Delay
+				Pea		ItemRect(A6)
+				_InverRect
+				Lea		6,A0
+				_Delay
+				Dbra	D3,@FlashLoop
+				Pea		ItemRect(A6)
+				_EraseRect
+				Dbra	D5,@RetryLoop				; Retry.
+
+@ShutDown		Move.w  #1,-(SP)
+  				_ShutDown
+
+@Exit			Lea		DialogRect(A6),A2
+				Subq.w	#4,top(A2)
+				Subq.w	#4,left(A2)
+				Addq.w	#4,bottom(A2)
+				Addq.w	#4,right(A2)
+				Move.l	A2,-(Sp)					; The rect.
+				Move.l	(A5),A3						; Quickdraw globals.
+				Pea		gray(A3)					; Use gray as background
+				_FillRect							; Erase the rectangle to the desktop pattern
+
+@ExitCheck		Movem.l	(Sp)+,D0-D7/A0-A5			; Restore everybody.
+				Unlk	A6
+				Rts
+
+@LockFunction	Move.l	(Sp)+,4(SP)					; Return address.
+				Move.l	(Sp)+,A0					; VAR responce.
+				Move.l	#'yep!',(A0)				; Set responce.
+				Move.w	#noErr,4(Sp)				; Set OSErr to noErr.
+				Rts									; Return.
+
+DRect			Dc.w	0,0,50,124					; Dialog rect.
+
+ItemList		Dc.w	1							; Number of items - 1.
+
+				Dc.l	0							; Place holder for handle.
+EditRect		Dc.w	13,53,29,108				; EditText rect.
+				Dc.b	editText					; Item type (edit text).
+				Dc.b	0							; Item length & title.
+
+				Dc.l	0							; Place holder for handle.
+				Dc.w	5,8,37,40					; Icon rect.
+				Dc.b	iconItem+itemDisable		; Item type (icon/disabled).
+				Dc.b	2,$72,$70					; Item length, resource ID.
+
+ModifierMap		Dc.b	$37,$38,$39,$3A,$3B,$00		; Command,Shift,Caps,Option,Ctl.
+CursorMap		Dc.b	$7B,$7C,$7D,$7E				; <,>,^,v
+
+ShiftMap		Dc.b	'X','Z','G','H','F','D','S','A'	; 00
+				Dc.b	'R','E','W','Q','B',$00,'V','C'	; 08
+				Dc.b	'%','^','$','#','@','!','T','Y'	; 10
+				Dc.b	'O','}',')','*','_','&','(','+'	; 18
+				Dc.b	'"','J','L',$0D,'P','I','{','U'	; 20
+				Dc.b	'>','M','N','?','<','|',':','K' ; 28
+				Dc.b	$FF,$00,$1B,$00,$08,'~',' ',$00	; 30
+				Dc.b	$00,$00,$00,$00,$FF,$FF,$FF,$FF	; 38
+				Dc.b	$00,$00,'+',$00,'*',$00,'.',$00	; 40
+				Dc.b	$00,'-',$00,$0D,'/',$00,$00,$00	; 48
+				Dc.b	'5','4','3','2','1','0',$00,$00	; 50
+				Dc.b	$00,$00,$00,'9','8',$00,'7','6'	; 58
+
+CapsMap			Dc.b	'X','Z','G','H','F','D','S','A'	; 00
+				Dc.b	'R','E','W','Q','B',$00,'V','C'	; 08
+				Dc.b	'5','6','4','3','2','1','T','Y'	; 10
+				Dc.b	'O',']','0','8','-','7','9','='	; 18
+				Dc.b	$27,'J','L',$0D,'P','I','[','U'	; 20
+				Dc.b	'.','M','N','/',',','\',';','K'	; 28
+				Dc.b	$FF,$00,$1B,$00,$08,'`',' ',$00	; 30
+				Dc.b	$00,$00,$00,$00,$FF,$FF,$FF,$FF	; 38
+				Dc.b	$00,$00,'+',$00,'*',$00,'.',$00	; 40
+				Dc.b	$00,'-',$00,$0D,'/',$00,$00,$00	; 48
+				Dc.b	'5','4','3','2','1','0',$00,$00	; 50
+				Dc.b	$00,$00,$00,'9','8',$00,'7','6'	; 58
+
+LowerMap		Dc.b	'x','z','g','h','f','d','s','a'	; 00
+				Dc.b	'r','e','w','q','b',$00,'v','c'	; 08
+				Dc.b	'5','6','4','3','2','1','t','y'	; 10
+				Dc.b	'o',']','0','8','-','7','9','='	; 18
+				Dc.b	$27,'j','l',$0D,'p','i','[','u'	; 20
+				Dc.b	'.','m','n','/',',','\',';','k'	; 28
+				Dc.b	$FF,$00,$1B,$00,$08,'`',' ',$00	; 30
+				Dc.b	$00,$00,$00,$00,$FF,$FF,$FF,$FF	; 38
+				Dc.b	$00,$00,'+',$00,'*',$00,'.',$00	; 40
+				Dc.b	$00,'-',$00,$0D,'/',$00,$00,$00	; 48
+				Dc.b	'5','4','3','2','1','0',$00,$00	; 50
+				Dc.b	$00,$00,$00,'9','8',$00,'7','6'	; 58
+				ENDP									;						<SM46> rb, end
+		ENDIF
+
+
+			END

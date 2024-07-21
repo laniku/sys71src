@@ -1,0 +1,596 @@
+;_______________________________________________________________________
+;
+;	File:		SlotInterrupts.a
+;
+;	Contains:	This file contains the core routines pertaining to the slot interrupt
+;				queue manager as well as some table initialization routines called
+;				at startup time.  Slot interrupts are handled by the slot interrupt
+;				dispatcher which finds the interrupting slot and then looks through
+;				the slot's interrupt queue for an interrupt routine to call.
+;
+;				SIntINSTALL installs a routine into the slot interrupt queue poll list 
+;				while SIntREMOVE removes it.  There is one queue per slot, with a system
+;				heap table of ptrs pointing to the head of each queue.  A low mem variable,
+;				SlotQDT, points to the system heap table.  
+;
+;	Written by:	Rich Castro	22-July-86
+;	Rewritten by:  Gary Davidian 16-April-89
+;
+;	Copyright:	© 1986-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM12>	 11/9/93	KW		added some eieioSTP macros.  Only expands for CygnusX1 ROM
+;	  <SM11>	 10/6/93	RC		Added forPDMProto to build conditional of the interrupt line
+;									hack
+;	  <SM10>	 9/10/93	RC		Added check fo BART1 to the below hack, so this would only
+;									happen on EVT1 Cold Fusions
+;	   <SM9>	  9/3/93	GMR		Added a hack for Cold Fusion EVT1 units to fix the slot ID's
+;									being wired incorrectly.
+;	   <SM8>	  8/2/93	GMR		Added hack for EVT1/2 PDM machines which swaps the slot
+;									interrupt lines for those boards.
+;	   <SM7>	10/18/92	CCH		Added a nop to support non-serialized IO space.
+;	   <SM6>	 8/24/92	PN		Take out CycloneboxEVT1 stuff
+;	   <SM5>	 6/30/92	kc		Rename EclipseVia2SlotInt to DAFBVia2SlotInt. Move SlotInterrupt
+;									handlers from InterruptHandlers.a.
+;	   <SM4>	 5/16/92	kc		Roll in Horror changes. Comments follow:
+;		<H2>	 2/14/92	JC		Export RunSlotHandlers for use by Sonora Level 3 interrupt for
+;									Sonic Ethernet
+;		 <9>	  5/4/92	JSM		Roll-in change from SuperMario: Changed the mask value used for
+;									Interrupts on Quadra900.
+;		 <8>	  5/4/92	JSM		Get rid of conditionals: this file is only used in ROM builds,
+;									so Cpu is always ≥ 020, hasMac2Via2, hasEclipseVia2, hasRBV, and
+;									hasOSS are always true.
+;		 <7>	 9/16/91	JSM		Cleanup header.
+;		 <6>	 6/12/91	LN		removed #include 'HardwareEqu.a'
+;		 <5>	 9/19/90	BG		Removed <4>. 040s are behaving more reliably now.
+;		 <4>	 7/20/90	BG		Added EclipseNOPs to handle flakey 040s.
+;		 <3>	 2/19/90	BG		Add Eclipse VIA2 support to SlotMgr.
+;		 <2>	 1/11/90	CCH		Added include of “HardwarePrivateEqu.a”.
+;	   <1.4>	  8/7/89	GGD		Roll in patch to change SIntInstall to handle equal priorities
+;									the same as the Mac II, Most recently installed is run sooner.
+;	   <1.3>	 4/16/89	GGD		Completely re-written and faster, uses new internal data
+;									structures, supports all 15 slots, removed slot priority
+;									(priority within a slot is still used). Made more universal.
+;	   <1.2>	  3/6/89	GGD		Moved SlotInt from InterruptHandlers.a to SlotInterrupts.a.
+;									Modified to use feature based conditionals. Changed RBV register
+;									usage now that equates are offsets from RBVBase, instead of
+;									being absolute addresses.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.5>	10/24/88	djw		Modified InitSPTbl and InitSDTbl to alloc space for all
+;									supported slots.
+;	  <•1.4>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.3>	  7/6/88	BBM		Changed sqHeadSize back to sqHDSize
+;	   <1.2>	 2/16/88	BBM		Changed sqHDSize to sqHeadSize
+;	   <1.1>	 2/15/88	BBM		modified for mpw 3.0 equates
+;	   <1.0>	 2/10/88	BBM		Adding file for the first time into EASE…
+;	  <C914>	 10/8/87	rwh		Changed 'Via2IntMask' to 'SlotIntMask' to make it more general
+;									for Modern Victorian.
+;	  <C665>	 1/22/87	RDC		Code review cleanup changes
+;	  <C582>	  1/2/87	RDC		Misc cleanup
+;	  <C556>	12/19/86	FJL		Changed NumSlots to sNumSlots for GWN.
+;	  <C422>	11/18/86	RDC		Added check of queue type in all routines
+;	  <C328>	 11/2/86	RDC		Added copyright notice
+;	  <C224>	10/15/86	RDC		Return Dequeue error code from SIntRemove Added error checking
+;									for valid slot #
+;	  <C166>	10/11/86	RDC		Substantially rewrote SIntInstall to include priority handling
+;									of slot interrupt queue elements
+;	  <C147>	10/10/86	RDC		Added init routines for slot priority and interrupt dispatch
+;									tables
+;	  <C206>	 10/9/86	bbm		Modified to mpw aincludes.
+;
+
+			print	off
+			LOAD	'StandardEqu.d'
+			INCLUDE	'HardwarePrivateEqu.a'
+			INCLUDE 'SlotMgrEqu.a'
+			INCLUDE 'UniversalEqu.a'
+			print	on
+			print	nomdir
+
+			machine	mc68020
+
+
+SIntCORE 	PROC	EXPORT	
+
+			WITH	SlotIntQElement,slotIntGlobals
+
+			EXPORT	InitSPTbl,InitSDTbl
+			EXPORT	SIntINSTALL,SIntREMOVE,DAFBVia2SlotInt,PSCVIA2SlotInt,NiagraVIA2SlotInt
+			EXPORT	SlotInt,SlotIntCommon,Via2SlotInt,RbvSlotInt,OssSlotInt
+
+			EXPORT	RunSlotHandlers		; accessed by level 3 Sonic Interrupt on <H2>
+										; Sonora based systems
+
+
+;_______________________________________________________________________
+;
+; Routine:		GetSlotIntQHead
+;
+; Arguments:	D0 (input) :	video card slot ($0..$E possible)
+;				D0 (output):	error code
+;				A1 (output):	address of pointer to first SlotIntQElement
+;
+; Function: 	Utility routine to do check for valid slot number, and return
+;				the address of the associated slot slotIntInfo record.
+;				If the queue type is wrong, or the slot number is out of range,
+;				an error code will be returned, and the routine will return to
+;				the callers caller, instead of directly to the caller.
+;
+; Called by:	SIntInstall, SIntRemove
+;
+; Registers Used: D0,A1
+;_______________________________________________________________________
+
+GetSlotIntQHead
+			cmpi.w 	#SIQType,SQType(A0)	; is it the proper type?
+			bne.s	@wrongType			; if not, report the error
+			ext.w	d0					; ignore high byte
+			cmpi.w	#sLastSlot,d0		; check for valid slot #
+			bgt.s	@slotTooBig			; return error if too big
+			lea		([SlotQDT],d0.w*4,slotIntQHeads-SQLink),a1	; get address of queue header
+			rts							; return with success
+
+@wrongType	moveq.l	#VTypErr,d0 		; queue element type is wrong
+			bra.s	@error				; report the error
+
+@slotTooBig	move.w	#smSlotOOBErr,d0	; return with slot # error
+@error		addq.w	#4,sp				; pop the return address
+			rts							; return to callers caller
+
+
+;_______________________________________________________________________
+;
+; Routine:		SIntINSTALL
+;
+; Arguments:	D0 (input) :	slot number for routine ($0..$E possible)
+;				A0 (input) :	ptr to queue element
+;				D0 (output):	error code -	0  no error
+;
+; Function: 	Installs a slot interrupt poll routine which is called when
+;				a slot interrupt occurs. The queue element is installed in
+;				in priority order, $FF highest (first), $00 lowest (last).
+;
+;				When elements with EQUAL priorities exist, the most recently
+;				installed one is run sooner.
+;
+;				Only low byte of priority word is used (0-255 range).
+;				Priorities 200-255 are reserved by Apple.]
+;
+;				The Mac II used to maintain priority across slots, which was
+;				used when multiple slots interrupted AT THE SAME TIME.
+;				We no longer support this, and prioritize by slot number instead.
+;				This will be removed from the Mac II in system 7.0
+;
+;				The Mac II had a bug in SIntInstall, which had $FF as the highest
+;				priority across slots, but had $FF as the lowest within a slot.
+;				Most cards used the priority order as documented, ($FF highest), so
+;				we will retain that ordering.
+;				This will be fixed in the Mac II in System 7.0.
+;
+; Registers Used: D0,D1,D2,A0,A1
+;_______________________________________________________________________
+
+SIntINSTALL	bsr.s	GetSlotIntQHead		; a1 := pointer to qheader
+			move.b	SQPrio+1(a0),d0		; get the priority (low byte of word)
+			move.w	sr,-(sp)			; save interrupt level
+			ori.w	#HiIntMask,sr		; disable interrupts
+@PrioritySearch
+			move.l	SQLink(a1),d1		; get next queue element to check
+			beq.s	@insert				; if end of list, insert before this
+			exg.l	a1,d1				; swap previous and current pointers
+			cmp.b	SQPrio+1(a1),d0		; compare priorities
+			blo.s	@PrioritySearch		; loop until lower priority found				<1.4>
+										; if equal, insert newer in front of older		<1.4>
+			exg.l	d1,a1				; a1 points to previous, d1 points to current
+@insert									; insert before the lower priority element
+			move.l	d1,SQLink(a0)		; remainder of queue goes after new element
+			move.l	a0,SQLink(a1)		; new element goes after previous element
+			move.w	(sp)+,sr			; restore interrupt level
+			moveq.l	#noErr,d0			; return success
+			rts							; all done
+
+
+;_______________________________________________________________________
+;
+; Routine:		SIntREMOVE
+;
+; Arguments:	D0 (input) :	slot number for routine ($0..$E possible)
+;				A0 (input) :	ptr to queue element to remove
+;				D0 (output):	error code -	0 = no error
+;
+; Function:		Removes a poll routine from the slot interrupt queue. 
+;
+; Registers Used: D0,D1,A1
+;
+;_______________________________________________________________________
+
+SIntREMOVE	bsr.s	GetSlotIntQHead		; a1 := pointer to qheader
+			moveq.l	#qErr,d0			; error code in case it's not found
+			move.w	sr,-(sp)			; save interrupt level
+			ori.w	#HiIntMask,sr		; disable interrupts
+@search		move.l	SQLink(a1),d1		; get next queue element to check
+			beq.s	@notFound			; if end of list, nothing to remove
+			exg.l	a1,d1				; swap previous and current pointers
+			cmpa.l	a0,a1				; see if this is the one to remove
+			bne.s	@search				; loop until removee is fount
+
+			movea.l	d1,a1				; a1 points to previous
+			move.l	SQLink(a0),SQLink(a1)	;  remainder of queue goes after previous element
+			moveq.l	#noErr,d0			; return success
+
+@notFound	move.w	(sp)+,sr			; restore interrupt level
+			rts							; all done
+
+;_______________________________________________________________
+;
+; Secondary Dispatch routines for slot interrupts
+;
+; On Entry: 	A1.L = VIA2/RBV/OSS base address
+;				D0-D3/A0-A3 have been saved
+;
+;____________________________________________________________________________
+
+SlotInt
+PSCVIA2SlotInt
+			MoveQ	#~$78, D0			; mask for slot bits (active low)
+										; 	(slots c,d,e, onboard video vbl)
+			Or.b	PSCVIA2SInt(a1), D0	; read and mask slot interrupt indicators
+			Not.l	D0					; convert to active high bit mask					
+			Bne.l	SlotIntCommon		; if interrupt pending, service it					
+			Rts							; if not, return from interrupt			<SM4> rb, end			
+
+DAFBVia2SlotInt
+			move.b	#$02,vIFR(a1)		; reset the VIA any slot interrupt flag				<3>
+	if nonSerializedIO then
+			nop							; force write to complete							<SM7>
+	endif
+			moveq.l	#~$7F,d0			; mask for slot bits (active low) (5 slots+Enet+Video)	<3> <9>
+			or.b	vBufA(a1),d0		; read and mask slot interrupt indicators			<3>
+			not.l	d0					; convert to active high bit mask					<3>
+			bne		SlotIntCommon		; if interrupt pending, service it					<3>
+			rts							; if not, return from interrupt						<3>
+
+; ••• These need moved (into HardwarePrivateEqu.a?) •••
+AIV3Base		EQU		$FEE00000			; base address of AIV3 (Apple Integrated VIA 3)
+AIV3SlotInt		EQU		$0002
+VBLIRQ			EQU		6
+
+AIV3Int			EQU		$0003
+AnySlot			EQU		1
+
+NiagraVIA2SlotInt
+			move.b	#$02,vIFR(a1)			; reset the VIA any slot interrupt flag	
+
+			lea		AIV3Base,a0				; get base address
+			btst	#AnySlot,AIV3Int(a0)	; any of our slots interrupting?
+			beq.s	@notOurs				; no, exit
+
+			moveq	#0,D0					; clear the register
+			btst	#VBLIRQ,AIV3SlotInt(a0) ; check for VSC interrupt pending
+			bne.s	@notOurs				; IF VBLIRQ pending THEN
+			ori.b	#%00100000,D0			; 	set slot E interrupt flag
+			bra		SlotIntCommon	
+@notOurs
+			rts								; if not, return from interrupt				<SM6> rb, end			
+
+Via2SlotInt
+		eieioSTP
+			move.b	#$02,vIFR(a1)		; reset the VIA any slot interrupt flag
+		eieioSTP
+			moveq.l	#~$3F,d0			; mask for slot bits (active low)
+		eieioSTP
+			or.b	vBufA(a1),d0		; read and mask slot interrupt indicators
+			not.l	d0					; convert to active high bit mask
+		eieioSTP
+			bne		SlotIntCommon		; if interrupt pending, service it
+			rts							; if not, return from the interrupt
+
+RbvSlotInt
+		eieioSTP
+			move.b	#$82,RvIFR(a1)		; reset the RBV any slot interrupt flag
+		eieioSTP
+			moveq.l	#~$7F,d0			; mask for slot bits (active low)
+		eieioSTP
+			or.b	RvSInt(a1),d0		; get slot interrupt indicators
+		eieioSTP
+			not.l	d0					; convert to active high bit mask
+
+;••••••••••••																		<SM8>
+; for PDM's with EVT1/2 boards, we need a small hack to swap the
+; slot interrupt lines, since they're reversed on the logic board.
+; AMIC versions >= 3 are used on EVT3 and greater boards, so
+; we'll check for it and avoid the hack if it's present.  Remove this hack
+; when we no longer need to support EVT1/2 boards.
+
+		IF hasHMC AND forPDMProto THEN	;											<sm11>
+			TestFor	AMICExists			; do we have an AMIC?
+			beq.s	@hackDone			; no, skip the hack
+			
+			btst.b	#2,RvSEnb(a1)		; see if bit 2 is enabled (set)
+			bne.s	@chkCF1				; yes, we have a new AMIC (>=3), see if CF EVT1
+			move.b	#$84,RvSEnb(a1)		; try setting bit 2
+			btst.b	#2,RvSEnb(a1)		; did it set?
+			beq.s	@doPDMHack			; no, must be AMIC1/2 (EVT1/2)
+			move.b	#$04,RvSEnb(a1)		; else, restore it
+			bra.s	@hackDone			; and skip the hack
+
+@chkCF1		lea		$5ffffffe,a0		; get CPU ID reg							<SM9>
+			move.b	(a0)+,d1			;											<SM9>
+			cmpi.b	#$30,d1				; are we a CF EVT1?							<SM9>
+			bne.s	@hackDone			; no, exit									<SM9>
+			move.b	(a0),d1				;											<SM9>
+			cmpi.b	#$13,d1				; check 2nd byte of id						<SM9>
+			bne.s	@hackDone			; not CF, no hack							<SM9>
+
+			lea		$F0000008, a0		; get Bart ID Register						<SM10>
+			move.l	(a0), d1			;											<SM10>
+			cmp.l	#$43184000, d1		; is this the first rev of Bart				<SM10>
+			bne.s	@hackDone			; new bart, so don't do hack				<SM10>
+
+			move.b	d0,d1				; yes get interrupt bits					<SM9>
+			andi.b	#%00001100,d1		; get slot int bits  ..CB (we loose slot E)	<SM9>
+			lsl.b	#1,d1				; map over into      .DC.					<SM9>
+			andi.b	#%11100011,d0		; keep VBL & slot E (VDS) bits				<SM9>
+			or.b	d1,d0				; 'or' slots C,D into other bits			<SM9>
+			bra.s	@hackDone			; and continue processing					<SM9>
+
+
+@doPDMHack	andi.w	#$78,d0
+			lsr.w	#3,d0
+			move.b	@swapTbl(d0.w),d0
+			lsl.w	#3,d0
+@hackDone
+		ENDIF
+;••••••••••••																		<SM8>
+		
+			and.b	RvSEnb(a1),d0		; only look at enabled ones
+			bne.s	SlotIntCommon		; if interrupt pending, service it
+			rts							; if not, return from the interrupt
+
+		IF hasHMC THEN					;											<SM8>
+@swapTbl	dc.b	$00					; 0000
+			dc.b	$04					; 0001
+			dc.b	$02					; 0010
+			dc.b	$06					; 0011
+			dc.b	$01					; 0100
+			dc.b	$05					; 0101
+			dc.b	$03					; 0110
+			dc.b	$07					; 0111
+			
+			dc.b	$08					; 1000
+			dc.b	$0c					; 1001
+			dc.b	$0a					; 1010
+			dc.b	$0e					; 1011
+			dc.b	$09					; 1100
+			dc.b	$0d					; 1101
+			dc.b	$0b					; 1110
+			dc.b	$0f					; 1111
+		ENDIF
+			
+			
+OssSlotInt
+			moveq.l	#$3F,d0				; mask for slot bits (active high)
+			and.b	OSSIntStat+1(a1),d0 ; get slot interrupt indicators
+			bne.s	SlotIntCommon		; if interrupt pending, service it
+			rts							; if not, return from the interrupt
+
+SlotIntCommon
+			subq.l	#4,sp				; allocate a long (only a byte is used)
+			move.b	d0,(sp)				; save the interrupt pending bit mask
+
+@loop		move.b	SlotPriority(d0.w),d0	; get slot number / bit number
+			bclr.b	d0,(sp)				; clear the bit
+			lsr.b	#4,d0				; get the slot number
+			bsr.s	RunSlotHandlers		; run the handlers for this slot
+			bne.s	@noHandler			; if couldn't be serviced, die with sys error
+			move.b	(sp),d0				; see if any other slots were pending
+			bne.s	@loop				; loop until all slots serviced
+
+			addq.l	#4,sp				; pop the pending bits
+
+;	Because AnySlot is edge triggered on some machines, we must make sure that all
+;	slot interrupts go away, causing AnySlot to go away, so that the next slot interrupt
+;	will cause an edge transition on AnySlot.  We loop back to be start of the handler
+;	to see if any slot interrupts occurred since we last checked, and only exit when they
+;	all go away.
+
+			movea.l	VIA2RBVOSS,a1		; get base address of chip with slot int reg
+			movea.l	Via2DT+4*ifCA1,a0	; get the handler address
+		eieioSTP
+			jmp		(a0)				; loop until no slots interrupting
+
+@noHandler	_SysError					; no handler for slot interrupt
+
+
+RunSlotHandlers
+			lea		([SlotQDT],d0.w*4,slotIntQHeads-SQLink),a1	; get address of queue header
+@RunNext	move.l	SQLink(a1),d0		; get next queue element
+			beq.s	@notFound			; if end of queue reached, return error
+			movea.l	d0,a1				; setup queue element pointer
+			move.l	a1,-(sp)			; save queue element pointer
+			movea.l	SQAddr(a1),a0		; get poll routine address
+			movea.l	SQParm(a1),a1		; stuff optional A1 param
+			jsr		(a0)				; call the handler
+			movea.l	(sp)+,a1			; restore the queue element pointer
+			tst.w	d0					; see if the int was serviced
+			beq.s	@RunNext			; if not, try the next handler
+			moveq.l	#noErr,d0			; if handled, return with success
+			rts							; all done
+
+@notFound	moveq.l	#dsBadSlotInt,d0	; return with an error if no handler
+			rts							; all done
+
+
+SlotPriority
+			dc.b	$00					; 0 0 0 0 0 0 0 0 - no interrupt
+			dc.b	$90					; 0 0 0 0 0 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 0 0 0 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 0 0 0 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 0 0 0 0 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 0 0 0 0 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 0 0 0 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 0 0 0 1 1 1 - Slot 9 (bit 0)
+			dc.b	$C3					; 0 0 0 0 1 0 0 0 - Slot C (bit 3)
+			dc.b	$90					; 0 0 0 0 1 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 0 0 1 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 0 0 1 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 0 0 0 1 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 0 0 0 1 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 0 0 1 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 0 0 1 1 1 1 - Slot 9 (bit 0)
+			dc.b	$D4					; 0 0 0 1 0 0 0 0 - Slot D (bit 4)
+			dc.b	$90					; 0 0 0 1 0 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 0 1 0 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 0 1 0 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 0 0 1 0 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 0 0 1 0 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 0 1 0 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 0 1 0 1 1 1 - Slot 9 (bit 0)
+			dc.b	$C3					; 0 0 0 1 1 0 0 0 - Slot C (bit 3)
+			dc.b	$90					; 0 0 0 1 1 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 0 1 1 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 0 1 1 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 0 0 1 1 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 0 0 1 1 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 0 1 1 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 0 1 1 1 1 1 - Slot 9 (bit 0)
+			dc.b	$E5					; 0 0 1 0 0 0 0 0 - Slot E (bit 5)
+			dc.b	$90					; 0 0 1 0 0 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 1 0 0 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 1 0 0 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 0 1 0 0 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 0 1 0 0 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 1 0 0 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 1 0 0 1 1 1 - Slot 9 (bit 0)
+			dc.b	$C3					; 0 0 1 0 1 0 0 0 - Slot C (bit 3)
+			dc.b	$90					; 0 0 1 0 1 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 1 0 1 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 1 0 1 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 0 1 0 1 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 0 1 0 1 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 1 0 1 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 1 0 1 1 1 1 - Slot 9 (bit 0)
+			dc.b	$D4					; 0 0 1 1 0 0 0 0 - Slot D (bit 4)
+			dc.b	$90					; 0 0 1 1 0 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 1 1 0 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 1 1 0 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 0 1 1 0 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 0 1 1 0 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 1 1 0 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 1 1 0 1 1 1 - Slot 9 (bit 0)
+			dc.b	$C3					; 0 0 1 1 1 0 0 0 - Slot C (bit 3)
+			dc.b	$90					; 0 0 1 1 1 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 1 1 1 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 1 1 1 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 0 1 1 1 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 0 1 1 1 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 0 1 1 1 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 0 1 1 1 1 1 1 - Slot 9 (bit 0)
+			dc.b	$06					; 0 1 0 0 0 0 0 0 - Slot 0 (bit 6)
+			dc.b	$90					; 0 1 0 0 0 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 0 0 0 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 0 0 0 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 1 0 0 0 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 1 0 0 0 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 0 0 0 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 0 0 0 1 1 1 - Slot 9 (bit 0)
+			dc.b	$C3					; 0 1 0 0 1 0 0 0 - Slot C (bit 3)
+			dc.b	$90					; 0 1 0 0 1 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 0 0 1 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 0 0 1 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 1 0 0 1 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 1 0 0 1 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 0 0 1 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 0 0 1 1 1 1 - Slot 9 (bit 0)
+			dc.b	$D4					; 0 1 0 1 0 0 0 0 - Slot D (bit 4)
+			dc.b	$90					; 0 1 0 1 0 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 0 1 0 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 0 1 0 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 1 0 1 0 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 1 0 1 0 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 0 1 0 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 0 1 0 1 1 1 - Slot 9 (bit 0)
+			dc.b	$C3					; 0 1 0 1 1 0 0 0 - Slot C (bit 3)
+			dc.b	$90					; 0 1 0 1 1 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 0 1 1 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 0 1 1 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 1 0 1 1 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 1 0 1 1 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 0 1 1 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 0 1 1 1 1 1 - Slot 9 (bit 0)
+			dc.b	$E5					; 0 1 1 0 0 0 0 0 - Slot E (bit 5)
+			dc.b	$90					; 0 1 1 0 0 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 1 0 0 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 1 0 0 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 1 1 0 0 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 1 1 0 0 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 1 0 0 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 1 0 0 1 1 1 - Slot 9 (bit 0)
+			dc.b	$C3					; 0 1 1 0 1 0 0 0 - Slot C (bit 3)
+			dc.b	$90					; 0 1 1 0 1 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 1 0 1 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 1 0 1 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 1 1 0 1 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 1 1 0 1 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 1 0 1 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 1 0 1 1 1 1 - Slot 9 (bit 0)
+			dc.b	$D4					; 0 1 1 1 0 0 0 0 - Slot D (bit 4)
+			dc.b	$90					; 0 1 1 1 0 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 1 1 0 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 1 1 0 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 1 1 1 0 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 1 1 1 0 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 1 1 0 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 1 1 0 1 1 1 - Slot 9 (bit 0)
+			dc.b	$C3					; 0 1 1 1 1 0 0 0 - Slot C (bit 3)
+			dc.b	$90					; 0 1 1 1 1 0 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 1 1 1 0 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 1 1 1 0 1 1 - Slot 9 (bit 0)
+			dc.b	$B2					; 0 1 1 1 1 1 0 0 - Slot B (bit 2)
+			dc.b	$90					; 0 1 1 1 1 1 0 1 - Slot 9 (bit 0)
+			dc.b	$A1					; 0 1 1 1 1 1 1 0 - Slot A (bit 1)
+			dc.b	$90					; 0 1 1 1 1 1 1 1 - Slot 9 (bit 0)
+
+;_______________________________________________________________________
+;
+; Routine:		InitSDTbl
+;
+; Arguments:	D0 (output):	error code
+;
+; Function:		Creates and initializes a slot interrupt dispatch table in 
+;				the system heap. A pointer to the table is saved in low 
+;				memory as SlotQDT. This table is used by the slot interrupt 
+;				handler to dispatch a slot interrupt to the appropriate
+;				routine.  Each entry in the table points to a slot queue
+;				header which in turns points to one or more slot queue
+;				elements.
+;
+; Called from:	InitSlots routine in OS:StartInit.a
+;				
+; Registers Used: D0,A0,A1
+;_______________________________________________________________________
+
+			with	slotVBLInfo
+InitSDTbl	move.l	#sIntGlobalSize,d0	; alloc space for all possible slots
+			_NewPtr	,sys,clear			; create table in system heap, cleared
+			move.l	a0,SlotQDT			; save ptr to table in low mem
+			
+			lea		slotVBLInfos+\
+					slotVBLQHdr-\
+					slotVBLInfo(a0),a1	; setup pointer to first slotVBLInfos record
+			moveq.l	#TotalSlots-1,d0	; setup loop counter for all possible slots
+
+@init		move.l	a1,(a0)+			; point to the slotIntInfo record for this slot
+			adda.w	#sVBLInfoSize,a1	; point to next slotIntInfo record
+			dbra	d0,@init			; init all possible slots
+			moveq.l	#noErr,D0			; indicate success (remove this, can't fail)
+			rts							; all done
+			endwith
+
+
+InitSPTbl	RTS							; this routine no longer exists (remove this)
+
+			END 
+

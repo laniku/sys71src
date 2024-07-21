@@ -1,0 +1,428 @@
+;
+;	File:		CacheIO.a
+;
+;	Contains:	These routines provide disk IO for the TFS caching routines.
+;
+;	Written by:	Bill Bruffey
+;
+;	Copyright:	© 1985-1994 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 1/29/94	DCB		Roll in changes from MissingLink to support Async SCSI.
+;	   <SM2>	 2/17/93	CSS		Save additional registers in BasicIO's completion routine. Per
+;									Radar bug #1063342.
+;	   <SM1>	 4/1/92		kc		Rolled in PatchBasicIO from FileMgrPatches.a.
+;									¥ Pre-SuperMario comments follow ¥
+;		 <2>	 9/10/91	JSM		Add a header.
+;	   <1.2>	  3/2/89	DNF		removed references to forROM; HFS now builds identically for ram
+;									or rom
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	  <¥1.1>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				 9/25/86	BB		Updated to use new MPW equate files.
+;				 9/15/86	BB		Modified WriteBlock to fix problem with tag set up for volume
+;									blocks.
+;				 9/15/86	BB		Modified BasicIO to fix asynch problem and OffLinErr problem.
+;				10/22/85	LAK		Added ReadOwnBuf, WriteOwnBuf for local buffer support.
+;				 10/2/85	LAK		Added vectored routines for ROM assembly.
+;				 10/1/85	LAK		Added routines RdBlocks and WrBlocks. Added Ref of TFSVCBTst.
+;									ALL I/O now goes thru one routine, BasicIO.
+;				 9/10/85	LAK		Pass OffLinErr thru as OffLinErr for Mount problems.
+;				  9/9/85	LAK		Pass OffLinErr thru as VolOffLinErr for Mount problems.
+;				  8/9/85	BB		Modified to use VCB pointer in CQH.
+;				  8/1/85	BB		Added code to set up tag data.
+;				 7/14/85	PWD		Changed I/O completion routine to check for synchronous driver
+;									behavior, and avoid stacking trap completions.
+;				 6/12/85	BB		Added code to check for A6 stack overflow and to maintain the
+;									stack 'high water mark'.
+;				 5/16/85	BB		Cleaned the code up some.
+;				 3/26/85	BB		Modified to support both file and volume IO.
+;				 3/16/85	BB		Added asynchronous IO.
+;				 3/16/85	BB		Renamed from TFSIO to CacheIO.
+;				 3/15/85	BB		Modified to use A6 stack.
+;				 1/19/85	BB		Extracted from Cache routines.
+;
+;
+
+;_________________________________________________________________________________
+;
+; External
+;  Routines:	ReadBlock	-  Reads a block from disk into a cache buffer.
+;				WriteBlock	-  Writes a block to disk from a cache buffer.
+;				RdBlocks	- read a contiguous set of disk blocks to user's buffer
+;				WrBlocks	- read a contiguous set of disk blocks to user's buffer
+;
+; Vectored routines:
+;
+;	Four routines have been vectored to enable an alternative cacheing scheme to
+;	replace the default one.  The vectors were placed to allow the replacing of
+;	the Cache routines (GetBlock, RelBlock, etc.) while retaining the low-level
+;	I/O routines which are not cache-specific (RdBlocks, WrBlocks, SetUpTags, and
+;	BasicIO).  Note that ReadBlock and WriteBlock are cache-specific up to BasicIO.
+;
+;_________________________________________________________________________________
+
+
+			BLANKS		ON
+			STRING		ASIS
+
+			PRINT		OFF
+			LOAD		'StandardEqu.d'
+			include		'HardwarePrivateEqu.a'
+			include		'SysPrivateEqu.a'
+			include		'FileMgrPrivate.a'
+			include		'SCSI.a'
+			include		'SCSIPriv.a'
+			PRINT		ON
+			PRINT		NOGEN
+
+CacheIO 	PROC	EXPORT
+
+			EXPORT	ReadBlock,WriteBlock,RdBlocks,WrBlocks
+			EXPORT	ReadOwnBuf,WriteOwnBuf								; <22Oct85>
+
+			EXPORT	vBasicIO,vRdBlocks,vWrBlocks,vSetUpTags
+			EXPORT	SCSINotBusy
+
+			IMPORT	TFSVCBTst
+
+
+;_________________________________________________________________________________
+;
+; Routine		ReadBlock (Read Block)
+;
+; Function: 	Reads a block from disk into a specified cache buffer.
+;
+; Input:		A3.L - CQH pointer
+;				A4.L - CBH pointer
+;
+; Output:		D0.W - error code
+;						  0 = ok
+;						  other = error
+;
+; Called by:	GetBlock
+;_________________________________________________________________________________
+
+ReadOwnBuf
+ReadBlock
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1-D7/A0-A5,-(A6)	; Save away almost all registers on TFS stack
+
+			MOVEQ	#0,D1				; indicate 'read' operation
+			BRA.S	RWSetup 			; use common code ->
+
+;_________________________________________________________________________________
+;
+; Routine		WriteBlock (Write Block)
+;
+; Function: 	Writes contents of cache buffer to disk
+;
+; Input:		A3.L - CQH pointer
+;				A4.L - CBH pointer
+;
+; Output:		D0.W - error code
+;						  0 = ok
+;						  other = error
+;
+; Called by:	FlushCache,GetBlock,RelBlock
+;_________________________________________________________________________________
+
+WriteOwnBuf 							; A2=VCB ptr, A4=OwnBuf ptr - CBHData, (A1,D1)=FCB Ptr
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack		<22Oct85>
+			MOVEM.L D1-D7/A0-A5,-(A6)	; Save almost all regs on TFS stack 	<22Oct85>
+			BRA.S	WrBlkCom			; share code							<22Oct85>
+
+WriteBlock
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1-D7/A0-A5,-(A6)	; Save away almost all registers on TFS stack
+
+; set up tag data
+
+			MOVEA.L CBHVCBPtr(A4),A2	; A2 = VCB ptr
+			MOVE.L	CBHDBlk(A4),D0		; pass D0=disk blk if not a file blk	<02Oct85>
+			MOVE.W	CBHFRefNum(A4),D1	; file refnum or 0
+			BEQ.S	TagCont				; br if volume block					<15Sep86>
+
+WrBlkCom
+			MOVE.L	FCBSPtr,A1			; pass A1=FCB ptr for files
+			MOVE.L	CBHFlBlk(A4),D0 	; ...file block number
+TagCont									;										<15Sep86>
+			BSR 	SetUpTags			; share code with WrBlocks
+			MOVEQ	#1,D1				; indicate 'write' operation
+
+; set up IO parameter block (ReadBlock code joins here)
+
+RWSetUp
+			LEA 	Params,A0			; use FS IO param block
+
+			MOVE.W	VCBDrvNum(A2),IODrvNum(A0) ; drive number
+			MOVE.W	VCBDRefNum(A2),IORefNum(A0) ; driver refnum
+			LEA 	CBHData(A4),A1		; addr(cache buffer)
+			MOVE.L	A1,IOBuffer(A0) 	;
+			MOVE.W	#1,IOPosMode(A0)	; position mode 1 (from disk start)
+			MOVE.L	#BufSiz,IOByteCount(A0) ; always r/w 512 bytes				<22Oct85>
+
+			MOVE.L	CBHDBlk(A4),D0		; physical disk block
+			IF		HFSDebug THEN
+			BNE.S	@1					; should never be zero
+			_HFSDebug  $420
+@1
+			ENDIF
+
+			LSL.L	#8,D0				; ...x 512
+			ADD.L	D0,D0				;
+			MOVE.L	D0,IOPosOffset(A0)	; ... gives disk address
+
+;_______________________________________;
+;
+; All I/O goes through this routine . . .
+;_______________________________________;
+
+BasicIO:
+			MOVE.L	jBasicIO,-(SP)		; jumptable entry for BasicIO			<02Oct85>
+			RTS 						; go there								<02Oct85>
+vBasicIO								; 'vectored' BasicIO routine			<02Oct85>
+
+VolatileRegs	REG	A0-A1/D1-D2
+
+			MOVE.L	A6,HFSStkPtr		; save stack ptr
+
+			IF		HFSDebug THEN
+			TST.W	IODrvNum(A0)		; should never be zero
+			BNE.S	@1					; br if not
+			_HFSDebug $421
+
+@1			MOVE.L	HFSStkTop,D0		; check for stack overflow
+			SUBI.L	#HFSStkLen,D0		;
+			CMP.L	A6,D0				;
+			BLE.S	@2					; ok ->
+			_HFSDebug HFSStkOvf
+@2
+			ENDIF
+
+; read/write the disk block
+
+			TST.B	FSCallAsync 			; was FS call async?
+			BNE.S	rwAsync 				; br if so (keep it that way)
+			TST.B	D1						; 'read' operation?
+			BNE.S	@3						; no, must be a 'write' ->
+
+			_Read							; read it synchronously
+			BRA.S	RWCont1 				; then continue
+
+@3			_Write							; write it synchronously
+			BRA.S	RWCont1 				; then continue
+
+rwAsync
+
+;		We're about to send an async request to a driver.  We have to make sure that
+; that request isn't going to collide with another SCSI transaction.
+;
+;		Old (synchronous) SCSI drivers (pre-7.2 HD Setup and 3rd parties') have no
+; way of responding to a a request if they attempt to get the SCSI bus and fail 
+; because the bus is busy.  There is no easy way for them to yield asynchronously
+; and resume execution when the bus is free.  In other words, even though we're sending
+; them an async request, they handle it synchronously.
+;		Under System 7.0, file sharing causes File System I/O to occur at deferred
+; task time, making it quite likely that I/O will collide with an already executing
+; SCSI transaction, such as one started by CD-Remote or a scanner.  Although the new
+; async SCSI Manger eliminates this problem for drivers that use the new asynchronous
+; API, we still have to handle old drivers that use the old SCSI Manager API., we'll have to settle for avoiding situations where SCSI transactions will
+; collide.  To do this, there's support in the SCSI Manager to call the vector
+; jFSSCSIWakeUp every single time the SCSI manager frees the SCSI bus.
+;
+;		All interrupt-level users of the old SCSI Manager interface free the bus up
+; before returning.  i.e. they aren't asynchronous users of the bus.  So, we only
+; have to worry about interrupting event-level users of the bus.  We are also assuming
+; that any other interrupt-level users of the bus (such as polling routines for CD-ROMs
+; or removables) know how to deal with a busy bus, i.e. they figured all this out too.
+
+
+; Check to see if the lucky driver is in the old synchronous SCSI driver range.  This
+; check assumes that all drivers that have loaded themselves above this range are 
+; asynchronous (i.e. any multi-bus aware drivers must be asynchronous).
+
+			MOVE.W	IORefNum(A0), D0		; get refNum
+			CMP.W	#$FFDF, D0				; below old SCSI driver range?  (FFDF=ID 0)
+			BHI.S	SCSINotBusy				; yes-> not an old SCSI refNum
+			CMP.W	#$FFD9, D0				; above?						(FFD7=ID 6)
+			BLO.S	SCSINotBusy				; yes-> not an old SCSI refNum
+											; it is an old SCSI refNum:
+
+			MOVEM.L VolatileRegs, -(sp)		; save across _SCSIBusy
+			CLR.W	-(sp)					; space for function result
+			_SCSIBusy						; is the SCSI bus busy?
+			TST.W	(sp)+
+			MOVEM.l	(sp)+, VolatileRegs
+			BEQ.S	SCSINotBusy				; no -> make call to driver
+											; yes: make fsSCSIDefer and return (asynchronously)
+			MOVEM.L D1-D7/A0-A5,-(A6)		; Save away almost all registers on TFS stack
+			MOVE.L	A6,HFSStkPtr			; save stack ptr
+			BSET.B	#fsSCSIDefer, FSBusy	; remind ourselves that we're waiting for SCSI
+			RTS
+
+SCSINotBusy
+			LEA 	RWIOComp,A1 		; IO completion address
+			MOVE.L	A1,IOCompletion(A0) ;
+
+			BCLR	#HFSContd,HFSFlags	; Clear 'premature-continuation' flag
+
+			TST.B	D1					; 'read' operation?
+			BNE.S	@1					; no, must be a 'write' ->
+
+			_Read	,ASYNC				; read it asynchronously
+			BRA.S	@2					;
+
+@1			_Write	,ASYNC				; write it asynchronously
+
+@2			BEQ.S	@3					; br if no immediate error
+			TST.W	IOResult(A0)		; immediate error? for sure?
+			BLE.S	RWCont				; br if so (otherwise, driver just
+										;  passed back some garbage . . .)
+@3			BSET	#HFSContd,HFSFlags	; We're now returning from the trap
+			BNE.S	RWCont1				; If we already returned, do I/O comp. now
+
+RWRTS		RTS 						; return to caller (complete asynchronously)
+
+; IO completion routine
+
+RWIOComp
+			BSET	#HFSContd,HFSFlags	; We're continuing now
+			BEQ.S	RWRTS				; If trap didn't really return ,ASYNC
+										; ... then RTS now (we'll be back)
+RWCont
+			MOVEM.L D1-D7/A0-A6,-(SP)	; preserve all significant registers
+			PEA 	RWCont2 			; return to here to restore regs
+
+RWCont1
+			MOVEA.L HFSStkPtr,A6		; Recover HFS' private stack pointer
+			MOVEM.L (A6)+,D1-D7/A0-A5	; Retrieve registers off A6 stack
+			MOVE.L	(A6)+,-(SP) 		; pop ret address off HFS stack
+
+			TST.W	D0					; any errors?
+			BEQ.S	@1					; br if not
+			CMP.W	#OffLinErr,D0		; Offline?
+			BEQ.S	@1					; br if so
+
+			CMP.W	#notEnoughMemoryErr,D0	; was VM able to hold down enough physical memory?
+			BEQ.S	@1						; send this error through
+			MOVE.W	D0,FSIOErr			; save original error for debugging
+			MOVEQ	#IOErr,D0			; transform it to generic IO error
+@1			TST.W	D0					; set up condition codes
+			RTS 						; return to caller with error code
+
+RWCont2 	MOVEM.L (SP)+,D1-D7/A0-A6	; restore significant registers
+			RTS 						; we're done with it!
+
+
+;_________________________________________________________________________________
+;
+; Routine:		RdBlocks, WrBlocks
+;
+; Function: 	Read/write a consecutive number of blocks from/to the disk.  The I/O
+;				is done directly to/from the user's buffer.  This routine is in the
+;				cache to allow future caching schemes to buffer entire files if the
+;				room exists.
+;
+; Input:		A0.L  - user parameter block ptr
+;		   (A1,D1.W)  - FCB pointer
+;				A2.L  - VCB Ptr
+;				D3.L  - disk start block
+;				D6.L  - bytecount to read/write
+;
+; Output:		D0.W  - error code
+;				All other registers preserved
+;
+; Called by:	CacheRdIP,CacheWrIP
+;
+;_________________________________________________________________________________
+
+RdBlocks:
+			MOVE.L	jRdBlocks,-(SP) 	; jumptable entry for vRdBlocks 		<02Oct85>
+			RTS 						; go there								<02Oct85>
+vRdBlocks								; 'vectored' RdBlocks routine			<02Oct85>
+
+			MOVEQ	#0,D0				; indicate 'read' operation 			<01Oct85>
+
+; RWBlksSub sets up the read/write block
+
+RWBlksSub:
+			MOVE.L	(SP)+,-(A6) 		; save caller's addr                    <01Oct85>
+			MOVEM.L D1-D7/A0-A5,-(A6)	; Save away almost all registers on HFS stack
+
+			MOVE.L	IOBuffer(A0),A5 	; user buffer address
+			ADD.L	IOActCount(A0),A5	; buffer start + count so far = target
+
+			MOVE	D0,D1				; save r/w indication
+			MOVEQ	#$40,D0 			; bit 6 mask
+			AND.B	IOPosMode+1(A0),D0	; save verify mode bit
+
+			LEA 	Params,A0			; fixed file system I/O param block
+			MOVE.W	VCBDRefNum(A2),IORefNum(A0) ; driver refnum
+			MOVE.W	VCBDrvNum(A2),IODrvNum(A0) ; tell it which drive we want
+			MOVE.L	A5,IOBuffer(A0) 	; buffer address
+			MOVE.L	D6,IOReqCount(A0)	; block size
+			MOVE.W	#1,IOPosMode(A0)	; position mode 1 (from disk start)
+			OR.B	D0,IOPosMode+1(A0)	; pass verify bit on to the disk driver
+
+			MOVE.L	D3,D0				; convert from block to byte address
+			LSL.L	#8,D0				; ...x 512
+			ADD.L	D0,D0				;
+			MOVE.L	D0,IOPosOffset(A0)	; absolute address
+
+			BRA 	BasicIO 			; head for the I/O sphincter
+
+WrBlocks:
+			MOVE.L	jWrBlocks,-(SP) 	; jumptable entry for vWrBlocks 		<02Oct85>
+			RTS 						; go there								<02Oct85>
+vWrBlocks								; 'vectored' WrBlocks routine			<02Oct85>
+
+			MOVE.L	D5,D0				; current file position
+			LSR.L	#8,D0				; form current file block
+			LSR.L	#1,D0				; start file block
+			BSR.S	SetUpTags
+
+			MOVEQ	#1,D0				; indicate 'write' operation
+			BRA.S	RWBlksSub			; share code with read
+
+SetUpTags:
+			MOVE.L	jSetUpTags,-(SP)	; jumptable entry for vSetUpTags		<02Oct85>
+			RTS 						; go there								<02Oct85>
+vSetUpTags								; 'vectored' SetUpTags routine			<02Oct85>
+
+			TST.W	D1							; is it a file block?
+			BEQ.S	@3							; br if not
+
+			MOVE.L	FCBFlNm(A1,D1),BufTgFNum	; set up file number
+			MOVE.L	D0,BufTgFFlg				; ...file block number
+			MOVE.B	FCBMdRByt(A1,D1),BufTgFFlg	; ...flags byte
+
+			MOVE.L	FCBFType(A1,D1),HFSTagData	; set Finder file type
+			MOVE.L	FCBDirID(A1,D1),HFSTagData+4  ; ...and parent DirID
+
+@1			JSR 	TFSVCBTst					; is it MFS or is it HFS?		<01Oct85>
+			BNE.S	@4							; br if not Memorex 			<01Oct85>
+
+			MOVE.L	VCBWrCnt(A2),BufTgDate		; set write count in tag data	<01Oct85>
+			ADDQ.L	#1,VCBWrCnt(A2) 			; bump volume write count		<01Oct85>
+
+@2			RTS
+
+; set up for non-file block . . .
+
+@3			MOVE.L	D0,BufTgFFlg				; filblk = logical block on volume
+			MOVEQ	#FSRtParID,D0
+			MOVE.L	D0,BufTgFNum				; filnum = parent DirID of root
+
+			CLR.L	HFSTagData					; no HFS tag data for volume level IO
+			CLR.L	HFSTagData+4				;
+			BRA.S	@1							; rejoin
+
+@4			MOVE.L	Time,BufTgDate				; use date for MFS				<01Oct85>
+			RTS
+
+			END 
+
+

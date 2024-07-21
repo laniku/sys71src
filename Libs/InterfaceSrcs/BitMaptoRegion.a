@@ -1,0 +1,650 @@
+;
+;	File:		BitMaptoRegion.a
+;
+;	Contains:	FUNCTION BitMapToRegionGlue(region: RgnHandle;bMap: BitMap): OSErr;
+;
+; 				Given a region and bitmap, BitMapRgn makes the region a bounding
+;				region for the 'map. If it can't get memory it will return a
+;				Memory Manager-type error and an empty region gibbley. Note that
+;				the region might also be empty with no error (if the bounds is an
+;				empty rectangle or there are no 1 bits in the bitmap). Lastly,
+;				if the region would have to exceed 32K it returns a result of
+;				-500 (rgnTooBigErr).
+;
+;				The bMap parameter may be a pointer to a bitmap, a pointer to a 
+;				pixmap, or a pointer to a portBits field in a color grafport.
+;				In the latter two cases, if the pixmap is not 1-bit deep, an error
+;				result of -148 (pixmapTooDeepErr) is returned.
+;
+; 				(the nibble state machine idea is from the Finder MaskToRgn routine)
+;
+;	Copyright:	© 1988-1992 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	10/28/92	SWC		Changed the INCLUDEs to a LOAD of StandardEqu.d.
+;		<SM2>	10/26/92	CSS		Change a short branch to a word branch.
+;		 <2>	 7/24/91	MH		Added conditional wrapper(s) to prevent duplication of public
+;									interface declarations: rgnTooBigErr, pixmapTooDeepErr
+;
+
+			LOAD		'StandardEqu.d'
+
+	IF (&TYPE('Debugging') = 'UNDEFINED') THEN
+Debugging		EQU				0					;debugging flag (1 = TRUE)
+	ENDIF
+
+;________________________________________________________________________________
+;
+;		FUNCTION BitMapToRegionGlue(region: RgnHandle;bMap: BitMap): OSErr;
+;
+;________________________________________________________________________________
+;
+;Theory
+;		We scan each line of the bitmap and pump inversion points (ip's) into the region
+;		to put the areas with ones in the bitmap into the region and the areas
+;		with zeroes outside the region.
+;
+;		In order to keep track of where we are in "inversion land" we use two
+;		techniques:
+
+;		The first is a scanline buffer which records the changes
+;		(zeroes to ones and vice versa) as we go. Wherever a change occurs (a
+;		1 next to a 0 in the buffer) we need to put out an inversion point.
+
+;		The second is a togglin' flag which tells us whether we are "inverted" or not.
+;		Since we use a state machine in the innermost (nibble) loop to churn out
+;		ip's, the input to the state machine must be complemented if the flag is set.
+
+;		The loop stuff looks like this:
+;			outer line loop (grows handle in anticipation of worst case for next line)
+;			longword loop for current line (puts out inter-long ip's as needed)
+;			loop for 4 nibbles in current long (calls state maching for each nibble)
+;
+;________________________________________________________________________________
+
+BitMapRgnTrap		EQU		$A8D7
+UnimplementedTrap	EQU		$A89F
+isCPort				EQU		14		;bit 14 in rowbytes means portBits in CGrafPort
+
+		MACRO
+		SafeDisposeHandle
+		MOVE.L	A0,D0
+		BEQ.S	@0
+		_DisposHandle
+@0
+		ENDM
+
+BitMapToRegionGlue	PROC	EXPORT
+;let's check for the existence of the trap
+		MOVE.W	#BitMapRgnTrap,D0
+		_GetTrapAddress newTool
+		MOVE.L	A0,A1							;stash address in A1
+		MOVE.W	#UnimplementedTrap,D0
+		_GetTrapAddress	newTool					;unimplemented trap is in A0
+		CMP.L	A0,A1							;unimplemented?
+		BEQ.S	RunRAM							;skip if so
+
+		JMP		(A1)							;go to _BitMapRgn
+
+;the trap is unimplemented, run the RAM version
+RunRAM
+
+BMFrame		RECORD	{A6Link},DECR
+result		DS.W	1
+
+paramTop	EQU		*
+
+regionH		DS.L	1
+bMapPtr		DS.L	1
+
+paramSize	EQU		paramTop-*
+
+return		DS.L	1
+A6Link		DS.L	1
+
+rowLongs	DS.L	1							;number of longwords per line
+rightMask	DS.L	1							;mask for rightmost long of each line
+slHandle	DS.L	1							;handle to scanline buffer
+numLines	DS.W	1							;number of lines in bitmap
+rowNumBytes	DS.W	1							;rowbytes from the bitmap
+startSize	DS.W	1							;size of region at start of line
+lastLineH	DS.L	1							;last line (zeroes) handle
+
+handSize	DS.L	1							;size of handle (avoid calls to GetHandleSize)
+max2Add		DS.L	1							;worst case for bytes we could add for next line
+
+localSize	EQU		*
+			ENDR
+
+		WITH	BMFrame
+		LINK	A6,#localSize
+		MOVEM.L	A2-A5/D3-D7,-(SP)				;save work registers
+
+		CLR.L	slHandle(A6)					;no scanline handle, yet
+		CLR.W	result(A6)						;function result presumed zero at start
+
+		MOVE.L	regionH(A6),A0
+		MOVE.L	(A0),A2
+		MOVEQ	#0,D0
+		MOVE.W	(A2),D0							;get size of region
+		MOVE.L	D0,handSize(A6)					;save it long
+
+;get boundary rectangle so we can tell how to process the bitmap
+
+		MOVE.L	bMapPtr(A6),A1					;get bitmap pointer
+		MOVE.W	rowBytes(A1), D0				;rowbytes
+		BPL.S	@1								;it's a bitmap so go ahead
+		BTST	#isCPort, D0					;is this a ptr to portBits?
+		BEQ.S	@2								;nope; it's a ptr to a pixmap
+		MOVE.L	baseAddr(A1), A0				;get the PixMapHandle
+		MOVE.L	(A0), A1						;and get the real ptr to pixmap
+@2
+		CMP.W	#1, pmPixelSize(A1)				;is it 1 bit per pixel deep?
+		BEQ.S	@1								;if yes, we're fine
+		MOVE.W	#pixmapTooDeepErr, D0			;return an error otherwise
+		BRA		BMRBadEmpty						;clean up and bail out
+@1
+		MOVE.W	rowBytes(A1), rowNumBytes(A6)	;get the rowbytes from the bit/pixmap
+		ANDI.W	#$7FFF, rowNumBytes(A6)			;mask off pixmap flag
+		MOVE.L	bounds+topLeft(A1),D2			;get topLeft
+		MOVE.W	bounds+right(A1),D0				;get right
+
+;figure the number of longs per row (according to width, not rowbytes)
+;so we can get a scanline buffer
+		SUB.W	D2,D0							;right - left
+		BLE		BMREmptyOut						;if empty rect. then empty region
+		EXT.L	D0
+		MOVE.L	D0,D4
+		ADD.L	D4,D4							;double width for 2 bytes/ip
+		ADDQ.L	#4+2,D4							;add 4 bytes for y value and $7FFF word
+												;add 2 more for the $7FFF if the last line
+		ADD.L	D4,D4							;double, just 'cause I feel like it!
+		MOVE.L	D4,max2Add(A6)					;save max. bytes for a given line
+
+		MOVEQ	#32,D7							;(side effect: clear high word of D7)
+		DIVU	D7,D0							;number of longs = width/32
+
+;get a mask for the rightmost long into rightMask
+		MOVE.L	D0,D3							;save remainder(hi word)
+		SWAP	D3								;get remainder from width/32
+		MOVEQ	#-1,D1							;default rightmost long mask
+		TST.W	D3								;zero remainder?
+		BEQ.S	@0								;yes, $FFFF is a good mask
+		ADDQ.W	#1,D0							;we need one more long
+		SUB.W	D3,D7							;32 - remainder = zero bits to shift in
+		ASL.L	D7,D1							;get proper mask
+@0		MOVE.L	D1,rightMask(A6)
+		EXT.L	D0
+		MOVE.L	D0,rowLongs(A6)					;save # of longs
+		ASL.L	#2,D0							;longs => bytes
+
+;get the scanline buffer (D0 = number of bytes per line)
+		_NewHandle clear 						;get a scanline buffer (of zeroes)
+		BNE		BMRBadEmpty						;if we failed then return a NIL handle
+
+		MOVE.L	A0,slHandle(A6)					;save buffer handle
+
+;figure the number of lines
+		MOVE.L	D2,D3
+		SWAP	D3								;get top
+		MOVE.W	bounds+bottom(A1),D0			;get bottom
+		SUB.W	D3,D0							;bottom - top
+		BLE		BMREmptyOut						;if empty rect. then empty region
+
+		MOVE.W	D0,numLines(A6)					;number of lines
+		MOVE.L	baseAddr(A1),A4					;point to start of map
+		MOVE.W	#rgnData,D7						;initial region size
+
+;OK, now we start the loops.
+;	A1 will point to the bitmap long,
+;	A2 to the region.
+;	A3 points to the current scanline buffer long.
+;	A4 will point to the row in the map.
+;	A5 points to the current word (= size + A2)
+;	D1 holds the current long (modified).
+;	D2 holds the leftmost coordinate of bitmap.bounds.
+;	D3 has the y coordinate, and
+;	D4 the x coordinate (high word stays clear!).
+;	D5 has number of longs remaining for current line.
+;	D6 holds the (on or off) value of the "beam" (for the line).
+;	D7 holds the size outside the longword loop (used as scratch while nibbling).
+;	   (we assume at the very end that D7's high word has remained clear)
+
+BMRHScramLine
+		MOVE.L	regionH(A6),A2
+		MOVE.L	(A2),A2							;point to start of region
+
+BMRLineLoop
+  		LEA		(A2,D7.W),A5					;point to new region start + size
+
+		MOVE.L	handSize(A6),D1					;get handle size
+		SUB.W	D7,D1							;handle size - region size
+		CMP.L	max2Add(A6),D1					;is there enough for worst case on next line?
+		BGE.S	@1								;skippy if so
+
+		MOVE.L	handSize(A6),D0					;get handle size
+		ADD.L	max2Add(A6),D0					;add more than enough for worst case on next line
+		MOVE.L	D0,handSize(A6)					;save new size
+		MOVE.L	regionH(A6),A0					;region handle
+		_SetHandleSize
+		BNE		BMRBadEmpty						;if we failed then return a NIL handle
+		BRA.S	BMRHScramLine					;rederef. handle and recompute current pointer
+@1
+
+		MOVE.W	D2,D4							;get current x coordinate from left
+		MOVEQ	#0,D6							;beam initially off
+		MOVE.L	A4,A1							;start of current line into map pointer
+		MOVE.L	rowLongs(A6),D5					;longs remaining for current line
+		MOVE.L	slHandle(A6),A3					;A3 points to the current "differences" long
+		MOVE.L	(A3),A3
+
+; Note: within this loop we assume that nothing will be done to move the heap
+
+		MOVE.W	D3,D0							;get y position
+		BSR		OutputRgnWord					;output y pos to region
+
+		MOVE.W	D7,startSize(A6)				;save size at line start (a la Derwood)
+		BRA		NextBMRLong						;enter the long loop
+
+BMRLongLoop
+		MOVE.L	(A1)+,D0						;fetch the next long for this line
+BMRLastLEntry
+		MOVE.L	(A3),D1							;get differences long
+
+		EOR.L	D0,D1							;compute the differences
+		BNE		BMRDiff							;if not the same, skip ahead
+
+BMRSame
+;since we want to skip this long (it matches the previous line) we need to
+;put out an ip if the beam is on
+ 		TST.B	D6								;beam on?
+ 		BEQ.S	@1								;skip if not
+ 		MOVE.W	D4,(A5)+						;pump it out
+ 		MOVEQ	#0,D6							;beam off
+
+@1
+		ADD.W	#32,D4							;slip to next long's x coordinate
+@2 		ADDQ.W	#4,A3							;to next changes buffer long
+		BRA		NextBMRLong
+
+;----------------------------------------------------------------------------------------
+
+; Start of State Machine
+
+; Handle state 0001
+
+BMRState1
+		ADDQ.W	#3,D4							;bump x by 3
+State1Common
+		MOVE.W	D4,(A5)+						;generate one
+;Tog1StateDone
+		ADDQ.W	#1,D4							;bump x by one more
+TogStateDone
+		NOT.B	D6								;toggle state
+		RTS
+
+; Handle state 0010
+
+BMRState2
+		ADDQ.W	#2,D4							;bump x by 2
+		MOVE.W	D4,(A5)+						;generate one
+Gen1BumpBy1
+		BSR.S	Gen1InvPoint					;and another one
+BumpBy1
+		ADDQ.W	#1,D4							;bump once more
+		RTS										;state doesn't change
+
+; Handle state 0011
+
+BMRState3
+		ADDQ.W	#2,D4							;bump x by 2
+		MOVE.W	D4,(A5)+						;generate one
+		ADDQ.W	#2,D4							;bump
+		BRA.S	TogStateDone					;toggle the state
+
+; Handle state 0100
+
+BMRState4
+		BSR.S	Gen1InvPoint
+		BSR.S	Gen1InvPoint
+BumpBy2
+		ADDQ.W	#2,D4
+		RTS
+
+; Handle state 0101
+
+BMRState5
+		BSR.S	BMRState4						;start out as state 4
+		SUBQ	#1,D4
+		BRA.S	State1Common					;use common code
+
+; Handle state 0110
+
+BMRState6
+		BSR.S	Gen1InvPoint
+		ADDQ.W	#1,D4
+		BRA.S	Gen1BumpBy1
+
+; Handle state 0111
+
+BMRState7
+		BSR.S	Gen1InvPoint
+		ADDQ.W	#3,D4
+		BRA.S	TogStateDone
+
+; Gen1InvPoint bumps x by one and then generates a horizontal inversion point
+
+Gen1InvPoint
+		ADDQ.W	#1,D4							;bump by 1, first
+		MOVE.W	D4,(A5)+						;add x value (ip) to region
+		RTS
+
+; Handle State 1000
+
+BMRState8
+		MOVE.W	D4,(A5)+
+		BSR.S	Gen1InvPoint
+		ADDQ.W	#3,D4
+		RTS
+
+; Handle State 1001
+
+BMRState9
+		MOVE.W	D4,(A5)+
+		BSR.S	Gen1InvPoint
+		ADDQ.W	#2,D4
+		BRA.S	State1Common
+
+; Handle State 1010 (most complicated case)
+
+BMRState10
+		MOVE.W	D4,(A5)+
+		BSR.S	Gen1InvPoint
+		BSR.S	Gen1InvPoint
+		BRA.S	Gen1BumpBy1
+
+; Handle State 1011
+
+BMRState11
+		MOVE.W	D4,(A5)+
+		BSR.S	Gen1InvPoint
+		BSR.S	Gen1InvPoint
+		ADDQ.W	#2,D4
+		BRA.S	TogStateDone
+
+; Handle State 1100
+
+BMRState12
+		MOVE.W	D4,(A5)+
+		ADDQ.W	#2,D4
+		MOVE.W	D4,(A5)+
+		BRA.S	BumpBy2
+
+; Handle State 1101
+
+BMRState13
+		BSR.S	BMRState12
+		SUBQ	#1,D4
+		BRA.S	State1Common
+
+; Handle State 1110
+
+BMRState14
+		MOVE.W	D4,(A5)+
+		ADDQ.W	#3,D4
+		MOVE.W	D4,(A5)+
+		BRA.S	BumpBy1
+
+; State table
+
+BMRHandler
+		BRA.S	BMRState0
+		BRA.S	BMRState1
+		BRA.S	BMRState2
+		BRA.S	BMRState3
+
+		BRA.S	BMRState4
+		BRA.S	BMRState5
+		BRA.S	BMRState6
+		BRA.S	BMRState7
+
+		BRA.S	BMRState8
+		BRA.S	BMRState9
+		BRA.S	BMRState10
+		BRA.S	BMRState11
+
+		BRA.S	BMRState12
+		BRA.S	BMRState13
+		BRA.S	BMRState14
+
+; Handle State 15 or 1111
+
+BMRState15
+		MOVE.W	D4,(A5)+						;generate one now
+		NOT.B	D6								;toggle the state
+
+; Handle State 0 or 0000
+
+BMRState0
+		ADDQ.W	#4,D4
+		RTS
+
+; End of the State Guys
+
+;----------------------------------------------------------------------------------------
+
+BMRDiff
+		MOVE.L	D0,(A3)+						;fix up scanline buffer for next time
+
+; this long is different from the last one, so output a bunch
+; of inversion points by pumping it through the state machine, a nibble
+; at a time.
+
+		MOVEQ	#3,D7							;4 bytes to process (D7 high word clear)
+		MOVEQ	#0,D0							;prevent need to mask for first nibble
+
+; here is the loop where we feed it through a nibble at a time.
+; it's worth it to special case a whole byte of 0
+
+BMRByteLoop
+		ROL.L	#8,D1							;get next (topmost) byte
+		TST.B	D1								;is it zero?
+		BNE.S	BMRNibble						;if not, 4 bits at a time
+
+		TST.B	D6
+		BNE.S	BMRNibble						;if beam on, must pass through
+
+;the top 8 are zero, so we can save some time
+
+		ADDQ.W	#8,D4							;bump x
+		BRA.S	BMRNextByte
+
+;take care of the rightmost long for a line
+
+BMRLastLong
+		MOVE.L	(A1),D0							;fetch the long from the bitmap
+		AND.L	rightMask(A6),D0				;mask off right bits that aren't in map
+		BRA		BMRLastLEntry					;go process this long
+
+; handle the first nibble
+
+BMRNibble
+		MOVE.B	D1,D0							;get byte
+		EOR.B	D6,D0							;invert nibble when beam is on
+		LSR.B	#4,D0							;get 1st nibble
+		ADD.W	D0,D0							;double for word index
+
+		JSR		BMRHandler(D0.W)				;invoke the handler
+
+; handle the second nibble
+
+		MOVE.B	D1,D0							;get byte again
+		EOR.B	D6,D0							;invert nibble when beam is on
+		AND.W	#%1111,D0						;mask to it
+		ADD.W	D0,D0							;double for word index
+
+		JSR		BMRHandler(D0.W)				;invoke the handler
+
+BMRNextByte
+		DBRA	D7,BMRByteLoop					;loop for all 8 nibbles
+
+; bump to the next long
+
+NextBMRLong
+		SUBQ.W	#1,D5							;decrement longword index
+		BGT		BMRLongLoop						;not at end, loop for whole line
+		BEQ.S	BMRLastLong						;process last long for this line
+
+; we've reached the end of the (this) line
+BMREOL
+		MOVE.W	A5,D7							;current region pointer
+		SUB.W	A2,D7							;figga region size
+		CMP.W	startSize(A6),D7				;did we add inv. pts to this line?
+		BEQ.S	BMRNoLine						;br = no, so back up
+		BLT		BMR32KErr						;if the size decreased, we overflowed
+
+; if the state is on, generate one last inversion point
+
+		TST.B	D6
+		BEQ.S	@1
+
+		MOVE.W	D4,(A5)+						;generate a last one
+		ADDQ.W	#2,D7							;keep sizable advantage
+@1
+
+; end the scan line with the traditional $7FFF
+
+		BSR.S	OutputLastRgnWord
+
+BMREOL2
+		ADDQ.W	#1,D3							;bump y position
+		MOVE.W	D2,D4							;start x at left again
+		ADD.W	rowNumBytes(A6),A4				;bump to next row in map
+		SUBQ.W	#1,numLines(A6)
+		BGT		BMRLineLoop						;if we're not done then do next line
+		BLT.S	BMRFinis						;br if really done
+
+; as the last line process an imaginary line of zeroes to end the regionÉ
+		MOVE.L	rowLongs(A6),D0
+		ASL.L	#2,D0							;longs => bytes
+		_NewHandle clear						;get a full line of zero bits
+		BNE 	BMRBadEmpty						;if we failed then return a NIL handle <SM2> CSS
+		MOVE.L	A0,lastLineH(A6)				;save handle
+		MOVE.L	(A0),A4							;start of current line
+		BRA		BMRHScramLine					;do this last one (and rederef handle)
+
+BMRNoLine
+		SUBQ.L	#2,A5							;back up pointer
+		SUBQ.W	#2,D7							;back down size
+		BRA.S	BMREOL2							;go for next line
+
+; Append the "end of line" token to the region
+
+OutputLastRgnWord
+		MOVE.W	#$7FFF,D0
+
+; OutputRgnWord takes the word in D0, appends it to the region,
+; and leaves the condition codes set for ADDQ.W D7 (which contains the length)
+
+OutputRgnWord
+		MOVE.W	D0,(A5)+						;put a word to the region
+		ADDQ.W	#2,D7							;ink the size
+		RTS
+
+
+; all done so clean up, output the final $7FFF
+BMRFinis
+		MOVE.L	lastLineH(A6),A0
+		SafeDisposeHandle						;get rid of that last line of zeroes
+
+		CMP.W	#10,D7							;is region empty of inversion points?
+		BEQ.S	BMREmptyOut						;skip if so (it's an empty region)
+
+		BSR.S	OutputLastRgnWord				;put End-O-Region ($7FFF) word
+		BMI.S	BMR32KErr						;if we went negative, we overflowed!
+
+; find the smallest rectangle that encompasses all the inversion points
+; A0 will point to the current region word, A1 to the start of the line
+; D1 will have the smallest x, D2 the largest x, D4 will contain $7FFF
+; D3 gets the smallest y value (which we know at the start)
+
+		LEA		rgnData(A2),A0					;point A0 past the rgnBBox
+		MOVE.W	#$7FFF,D4
+		MOVE.W	D4,D1							;smallest x so far = $7FFF
+		MOVE.W	#$8000,D2						;largest x so far = -32768
+		MOVE.W	(A0),D3							;smallest y there is
+		BRA.S	BMRPackStart					;enter loop
+
+BMRPackY
+		MOVE.L	A0,A1							;remember where the y value is (sort of)
+
+		CMP.W	(A0)+,D1						;less than smallest x so far?
+		BLE.S	@1								;skip if not
+		MOVE.W	-2(A0),D1						;new smallest x
+
+@1		CMP.W	(A0)+,D4						;end of line?
+		BNE.S	@1								;if not then keep looking
+
+		CMP.W	-4(A0),D2						;last x greater than largest x so far?
+		BGE.S	BMRPackStart					;skip if not
+		MOVE.W	-4(A0),D2						;new largest x
+
+BMRPackStart
+		MOVE.W	(A0)+,D0						;get next word (y value or $7FFF)
+		CMP.W	D4,D0							;if $7FFF then we're done
+		BNE.S	BMRPackY						;otherwise loop
+
+		SWAP	D3								;top into top word
+		MOVE.W	D1,D3							;left into bottom word
+		MOVE.W	-2(A1),D4						;bottom (from last y at start of line)
+		SWAP	D4								;move bottom to high word
+		MOVE.W	D2,D4							;get right
+
+		CMP.W	#28,D7							;size = 28? (do we have a rect. region?)
+		BEQ.S	BMRRect							;skip if so
+
+		BRA.S	BMROut							;return complex region
+
+;the region would exceed 32K, so we have to error out, man
+BMR32KErr
+		MOVE.W	#rgnTooBigErr,D0				;if >32K needed return error
+
+;we come here after failing a SetHandleSize (or NewHandle)
+BMRBadEmpty
+		MOVE.W	D0,result(A6)					;OSErr function result
+
+; emptify the region on errors (or when it should be empty with no error)
+BMREmptyOut
+		MOVE.L	regionH(A6),A0					;handle to region
+		MOVE.L	(A0),A2							;point to it
+		CLR.L	D3								;(0, 0) to topLeft
+		CLR.L	D4								;(0, 0) to botRight
+
+BMRRect
+		MOVEQ	#10,D7							;the size of the region = 10
+
+;output the region with size (longword, high word clear) in D7
+;D3 comes in with topLeft, D4 with botRight
+BMROut
+		MOVE.W	D7,(A2)+						;the size of the region
+		MOVE.L	D3,(A2)+						;topLeft to rgnBBox
+		MOVE.L	D4,(A2)							;botRight to rgnBBox
+		MOVE.L	D7,D0							;size
+		MOVE.L	regionH(A6),A0					;handle to region
+		_SetHandleSize
+
+BMRDspSL
+		MOVE.L	slHandle(A6),A0
+		SafeDisposeHandle						;get rid of the scanline buffer (even if NIL)
+
+BMRDone
+		MOVEM.L	(SP)+,A2-A5/D3-D7				;restore work registers
+		UNLK	A6
+		MOVE.L	(SP)+,A0						;pop return address
+		ADD 	#paramSize,SP					;pop params
+		JMP 	(A0)
+		ENDWITH
+
+
+		END

@@ -1,0 +1,2346 @@
+;———————————————————————————————————————————————————————————————————————————————————————
+;
+;	File:		CrsrDev.a
+;
+;	Contains:	This file holds the new cursor device implementation, including new mouse
+;				/trackball handler and the new acceleration routines for jCrsrTask.
+;
+;	Written by:	Gary Rensberger (based on Dan Venolia's Cursory API)	[11/20/91]
+;
+;	Copyright:	© 1991-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM7>	 5/28/93	IH		Add comment about Display Mgr usage of CrsrNew.
+;	   <SM6>	12/01/92	HY		Fix a bug with uncoupled cursors(fixes MS Flight Simulator v4.0).
+;									Fixed a cursor flicker problem on slower machines like LC930. The
+;									cursor is drawn prior to calculating new positions of devices. The
+;									calculations were using up all the available VBL time, causing the
+;									flicker (cursor is drawn every other VBL, and calculations performed
+;									every other VBL).
+;	   <SM5>	 8/26/92	kc		Roll in Horror changes.
+;	   <H18>	 7/24/92	GMR		Fixed comaptibility problem with Hypercard/MacPaint Grid drawing
+;									mode (Atkinsons MouseMask secret).
+;	   <H17>	 7/17/92	GMR		Changed the double-click translation table to match the Mouse
+;									CDEVs double-click times.
+;	   <H16>	 7/14/92	GMR		Reset MBState to button up in CrsrDevReInit code.
+;	   <H15>	 7/13/92	djw		<GED> Added code in InitCrsrDev to initialize vectors for:
+;									DrawCursor, EraseCursor, the @drawCursor section of the new VBL,
+;									and a hook for SetCrsrData. Also added default vector code for
+;									the above.
+;	   <H14>	 7/13/92	GMR		Re-arranged the initialization routine so that our expandmem
+;									globals are created before InitADB, then InitADB is called.
+;									Update MBTicks when a button goes down, since Andy looks at it
+;									(shame on you!).
+;	   <H13>	  7/6/92	GMR		Update doubleTime lowmem when creating a new device.
+;	   <H12>	 6/29/92	BG		Changed AERROR message in the overpatching check at the bottom
+;									of the file to refer to the correct file being too big (you're
+;									welcome, Steve).
+;	   <H11>	 6/26/92	GMR		<SKH> Modified CrsrDevHandleADB to handle extended device data,
+;									ie: more than 2 buttons and up to 16bit resolution. Changed
+;									CrsrNewDevice to properly init cntButtons (it was moving a word
+;									into cntButtons). Changed CrsrDevSetAccel to enter the debugger
+;									if no 'accl' resources do not exist.
+;	   <H10>	 6/10/92	GMR		Fixed bug with buttonCount not being reset after waking up from
+;									sleep.
+;		<H9>	  6/5/92	GMR		Changed the movem's in the trap selector dispatcher to be
+;									movem.l.
+;		<H8>	  6/1/92	GMR		Removed the extra 'default' device created for address 3, since
+;									testers complained. Now, if a second mouse (or 1st mouse on
+;									portables) is added while the machine is running, it's
+;									acceleration won't be correct. Tough shit).
+;		<H7>	 5/12/92	JC		Fixed problem with CrsrDevHandleVBL trashing registers.
+;		<H6>	  4/3/92	SWC		Added overpatch padding at the end of the file.
+;		<H5>	 3/11/92	SWC		<GMR> Setup so second trackball button will behave just like the first
+;									one. Exported CrsrDevDispatch now that we have a trap for it.
+;		<H4>	  3/9/92	SWC		<GMR> Fixed bug in CrsrDevSetAccel where the acceleration to set
+;	   <SM4>	 7/30/92	fau		Made the MOVEM instructions in CrsrDevDispatch and StdExit be a
+;									MOVEM.L.  This fixes a bug in the Mouse cdev in Cyclone where
+;									the MOVEM was assembled to a MOVEM.W which sign-extends to 32
+;									bits when writing back to a register!.
+;	   <SM3>	  7/7/92	CSS		Change name of include from ApplDeskBusPriv.a to
+;									AppleDeskBusPriv.a to bring in line with Reality.
+;									The file "ApplDeskBusPriv.a" was inadvertently 
+;									brought in from Horror.
+;	   <SM2>	 5/29/92	KW		(JC,H7) Fixed problem with CrsrDevHandleVBL trashing registers.
+;	   <SM1>	  5/2/92	kc		Roll in Horror. Comments follow:
+;		<H6>	  4/3/92	SWC		Added overpatch padding at the end of the file.
+;		<H5>	 3/11/92	SWC		Setup so second trackball button will behave just like the first
+;									one. Exported CrsrDevDispatch now that we have a trap for it.
+;		<H4>	  3/9/92	SWC		GMR/Fixed bug in CrsrDevSetAccel where the acceleration to set
+;									is 0. Added more compatiblity code to jCrsrTask so the VU test
+;									tool will work. Setup address 3 to be a default device with 100
+;									dpi resolution, so if a user unplugs then plugs in a mouse, it
+;									will work.
+;		<H3>	 2/17/92	SWC		Used different registers in FindResource since the _GetResource
+;									call can trash D0-D2. Changed references to CrsrDevRec.resolution
+;									to a long since it's a fixed point number.
+;		<H2>	 2/14/92	SWC		Added a RomMapInsert before all resource calls so we make sure
+;									we at least find our resources in the ROM.
+;		<H1>	 2/12/92	GMR		First checked in.
+;———————————————————————————————————————————————————————————————————————————————————————
+
+
+			PRINT	OFF
+			LOAD	'StandardEqu.d'
+			INCLUDE	'EgretEqu.a'
+			INCLUDE	'IOPEqu.a'
+			INCLUDE	'AppleDeskBusPriv.a'
+			INCLUDE	'CrsrDevEqu.a'
+			PRINT	ON
+	
+			MACHINE	MC68020
+
+
+_FixDiv		OPWORD  $A84D
+
+			
+			
+
+CrsrDev		PROC
+
+			EXPORT	InitCrsrDev,CrsrDevDispatch
+			IMPORT	CrsrVBLTask
+
+			WITH	CrsrDevGlobals, CrsrDevRec, CrsrDevSegment, CrsrDataRec
+			WITH	ADBDeviceEntry, ADBVars, ExpandMemRec
+
+
+_______________________________________________________________________
+;			
+;	Routine:	CrsrDevDispatch (trap # $AADB)
+;
+;	Inputs:		d0.w 	- 	selector
+;				4(sp)	-	last parameter
+;				8(sp)	-	2nd to last parameter
+;
+;	Outputs:	d0		-	result code
+;				
+;	Destroys:	a0
+;
+;	Function:	This routine is our selector based dispatcher for the exported
+;				CrsrDev routines.  It follows toolbox conventions (e.g. parameters
+;				are passed in on the stack, with the function selector in D0).
+;_______________________________________________________________________
+
+CrsrDevDispatch
+			link	a6,#0						; parameters referenced off a6
+			movem.l	a1-a3/d1-d3,-(sp)			; save a bunch of registers
+			add.w	d0,d0						; (shift so we work on 68000's)
+			lea		@jmpTable,a0				; point to our jump table
+			adda.w	(a0,d0.w),a0				; add offset to routine
+			jmp		(a0)						; jump to selected routine
+
+;-------------------------------
+
+
+@jmpTable	dc.w	CrsrDevMoveTrap-			@jmpTable	; Selector 	 0
+			dc.w	CrsrDevMoveToTrap-			@jmpTable	;			 1
+			dc.w	CrsrDevFlushTrap-			@jmpTable	;			 2
+			
+			dc.w	CrsrDevButtonsTrap-			@jmpTable	;			 3
+			dc.w	CrsrDevButtonDownTrap-		@jmpTable	;			 4
+			dc.w	CrsrDevButtonUpTrap-		@jmpTable	;			 5
+			dc.w	CrsrDevButtonOpTrap-		@jmpTable	;			 6
+			dc.w	CrsrDevSetButtonsTrap-		@jmpTable	;			 7
+			
+			dc.w	CrsrDevSetAccelTrap-		@jmpTable	;			 8
+			dc.w	CrsrDevDoubleTimeTrap-		@jmpTable	;			 9
+			dc.w	CrsrDevSetUnitsPerInchTrap-	@jmpTable	;			10
+			
+			dc.w	CrsrDevNextDeviceTrap-		@jmpTable	;			11
+			dc.w	CrsrDevNewDeviceTrap-		@jmpTable	;			12
+			dc.w	CrsrDevDisposeDevTrap-		@jmpTable	;			13
+		
+
+
+;-------------------------------
+stdExit		movem.l	(sp)+,a1-a3/d1-d3			; restore registers
+			unlk	a6
+			move.l	(sp)+,a0
+			add.w	d0,sp						; dump parameters
+			jmp		(a0)
+
+
+
+
+
+userFrame	RECORD	0,increment
+saveA6			ds.l	1
+returnAddr		ds.l	1
+paramBase		equ		*				; ptr to base of parameters
+			ENDR
+
+
+		WITH	userFrame
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevMoveTrap
+;
+;	Inputs:		 8(a6).l	- 	delta Y
+;				12(a6).l	-	delta X
+;				16(a6).l	- 	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0			-	OSErr
+;				
+;	Destroys:	d1-d2,a1-a2
+;
+;	Function:	This routine accumulates given deltas for crsrDev, and 
+;				flags that is has new data.  The next time the cursor position 
+;				is computed, dh and dv will be run through the acceleration 
+;				algorithm and will contribute to the cursor movement.
+;====================================================================
+
+CrsrDevMoveTrap
+		
+			move.l	paramBase(a6),d1			; ∆y in d1
+			move.l	paramBase+4(a6),d0			; ∆x in d0
+			move.l	paramBase+8(a6),a2			; crsrDevRec in a2
+			bsr		CrsrDevMove					; accumulate the deltas
+			move.w	d0,paramBase+12(a6)			; result code
+			moveq	#12,d0						; dump three parameters on exit
+			jmp		stdExit						; 
+			
+		
+
+;====================================================================
+;			
+;	Routine:	CrsrDevMoveToTrap
+;
+;	Inputs:		 8(a6).l	-  	V
+;				12(a6).l	- 	H
+;				16(a6).l	- 	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0			-	OSErr
+;				
+;	Destroys:	d1,a1-a2
+;
+;	Function:	This routine transforms the coordinates (h,v) to screen
+;				space so that the next time the cursor position is computed
+;				it jumps to that point and any relative movement will be ignored.
+;====================================================================
+
+CrsrDevMoveToTrap
+		
+			move.l	paramBase+8(a6),a2			; crsrDevRec in a2
+			move.l	whichCursor(a2),a1			; a1 pts to cursor globals
+			
+			moveq	#0,d0
+			move.l	paramBase(a6),d0			; get V coord
+			swap	d0							; convert to fixed
+			move.l	d0,whereY(a1)				; = whereY
+			
+			moveq	#0,d0
+			move.l	paramBase+4(a6),d0			; get H coord
+			swap	d0							; convert to fixed
+			move.l	d0,whereX(a1)				; = whereX
+			
+			st.b	isAbs(a1)					; absolute mode
+			
+			clr.w	paramBase+12(a6)			; result code
+			moveq	#12,d0						; dump three parameters on exit
+			jmp		stdExit						; 
+			
+
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevFlushTrap
+;
+;	Inputs:		8(a6).l	- 	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0		-	OSErr
+;				
+;	Destroys:	a2
+;
+;	Function:	This routine explicitly ends the relative device move, 
+;				flushing out the error accumulators.
+;====================================================================
+
+CrsrDevFlushTrap
+		
+			move.l	paramBase(a6),a2			; crsrDevRec in a2
+
+			move.l	errorX(a2),d0				; accumulate previous errors into
+			add.l	d0,deltaX(a2)				; our deltas
+			move.l	errorY(a2),d0
+			add.l	d0,deltaY(a2)
+			
+			clr.l	errorX(a2)					; then flush the errors
+			clr.l	errorY(a2)
+			move.w	#-108,denom(a2)				; ???
+
+			clr.w	paramBase+4(a6)				; result code
+			moveq	#4,d0						; dump one parameter on exit
+			jmp		stdExit						; 
+
+	
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevButtonsTrap
+;
+;	Inputs:		 8(a6).w	- 	new button states (1 = down, 0 = up)
+;				10(a6).l	-	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0			-	OSErr
+;				
+;	Destroys:	a0-a2,d1-d3
+;
+;	Function:	This routine handles button debounce and event posting.  If the 
+;				mouse button bounces, we don't want it to look like a double click, 
+;				so if we see a mouse down less than 2 VBLs after a mouse up, we will 
+;				ignore it, and consider the mouse to still be up.  We will never 
+;				ignore a mouse up event, which could lead to menus hanging and 
+;				continuous scrolling.
+;====================================================================
+
+CrsrDevButtonsTrap
+		
+			move.w	paramBase(a6),d0			; button states in d0
+			move.l	paramBase+2(a6),a2			; crsrDevRec in a2
+			bsr		CrsrDevButtons				; handle button debounce/actions
+			move.w	d0,paramBase+6(a6)			; result code
+			moveq	#6,d0						; dump two parameters on exit
+			jmp		stdExit						; 
+			
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevButtonDownTrap
+;
+;	Inputs:		8(a6).l	-	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0		-	OSErr
+;				
+;	Destroys:	a0-a2,d1
+;
+;	Function:	Posts a button down event if this is the 1st button to go down
+;====================================================================
+
+CrsrDevButtonDownTrap
+		
+			move.l	paramBase(a6),a2			; crsrDevRec in a2
+			bsr		CrsrDevButtonDown			; handle button down actions
+			move.w	d0,paramBase+4(a6)			; result code
+			moveq	#4,d0						; dump one parameter on exit
+			jmp		stdExit						; 
+			
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevButtonUpTrap
+;
+;	Inputs:		8(a6).l	-	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0		-	OSErr
+;				
+;	Destroys:	a0-a2,d1
+;
+;	Function:	Posts a button up event if this is the last button to go up.
+;====================================================================
+
+CrsrDevButtonUpTrap
+		
+			move.l	paramBase(a6),a2			; crsrDevRec in a2
+			bsr		CrsrDevButtonUp				; handle button up actions
+			move.w	d0,paramBase+4(a6)			; result code
+			moveq	#4,d0						; dump one parameter on exit
+			jmp		stdExit						; 
+			
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevButtonOpTrap
+;
+;	Inputs:		8(a6).l		-	Operation specific data
+;				12(a6).w	-	Operation code
+;				14(a6).w	-	Button #
+;				16(a6).l	-	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0		-	OSErr
+;				
+;	Destroys:	a2,d1-d2
+;
+;	Function:	This routine sets a new operation to be associated with the
+;				given button.  The optional data field is set as well.
+;====================================================================
+
+CrsrDevButtonOpTrap
+		
+			move.w	paramBase+6(a6),d0					; button # in d0
+			move.l	paramBase+8(a6),a2					; crsrDevRec in a2
+			move.b	paramBase+5(a6),buttonOp(a2,d0.w)	; stuff the new operation code
+			lsl.w	#2,d0
+			move.l	paramBase(a6),buttonData(a2,d0.w)	; and the new data (if any)
+			clr.w	paramBase+12(a6)					; result code
+			moveq	#12,d0								; dump four parameters on exit
+			jmp		stdExit								; 
+
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevSetButtonsTrap
+;
+;	Inputs:		8(a6).w		-	# buttons for this device
+;				10(a6).l	-	pointer to CrsrDevRec for this device
+;				
+;	Outputs:	d0		-	OSErr
+;				
+;	Destroys:	a2
+;
+;	Function:	This routine sets the total # of buttons for the given 
+;				device.
+;====================================================================
+
+CrsrDevSetButtonsTrap
+		
+			move.l	paramBase+2(a6),a2			; crsrDevRec in a2
+			move.b	paramBase+1(a6),cntButtons(a2)	; only use a byte of the word
+			clr.w	paramBase+6(a6)				; result code
+			moveq	#6,d0						; dump two parameters on exit
+			jmp		stdExit						; 
+
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevSetAccelTrap
+;
+;	Inputs:		8(a6).l		-	acceleration (Fixed)
+;				12(a6).l	-	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0		-	OSErr
+;				
+;	Destroys:	a2,d1-d2
+;
+;	Function:	This routine installs the proper acceleration table for
+;				the specified device, based on the passed in acceleration
+;				value.
+;====================================================================
+
+CrsrDevSetAccelTrap
+		
+			move.l	paramBase(a6),d0			; acceleration
+			move.l	paramBase+4(a6),a2			; crsrDevRec in a2
+			bsr		CrsrDevSetAccel				; generate acceleration table
+			move.w	d0,paramBase+8(a6)			; result code
+			moveq	#8,d0						; dump two parameters on exit
+			jmp		stdExit						; 
+
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevDoubleTimeTrap
+;
+;	Inputs:		8(a6).l		-	duration (ticks)
+;				12(a6).l	-	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0		-	OSErr
+;				
+;	Destroys:	a2
+;
+;	Function:	This routine changes the double-click time for crsrDev to 
+;				the indicated value.  When crsrDev is clicked, it's double-
+;				click time is stuffed into the low-memory global DoubleTime.
+;				An application responding to the mouse-down event can check
+;				DoubleTime to determine whether to interpret a double-click.
+;====================================================================
+
+CrsrDevDoubleTimeTrap
+				
+			move.l	paramBase+4(a6),a2					; crsrDevRec in a2
+			move.l	paramBase(a6),doubleClickTime(a2)	; stuff the new value
+			move.w	#0,paramBase+8(a6)					; result code
+			moveq	#8,d0								; dump two parameters on exit
+			jmp		stdExit								; 
+
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevSetUnitsPerInchTrap
+;
+;	Inputs:		8(a6).l		-	resolution (fixed)
+;				12(a6).l	-	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0		-	OSErr
+;				
+;	Destroys:	a2
+;
+;	Function:	May be called if the software knows more about the resolution
+;				of the device than can be found from the ADB bus, e.g. for a 
+;				serial device.  Calls CrsrDevSetAcceleration (with the current 
+;				accel value) to recompute the acceleration tables for the device, 
+;				so the resource file that contains the 'accl' resource should be 
+;				open.
+;====================================================================
+
+CrsrDevSetUnitsPerInchTrap
+				
+			move.l	paramBase+4(a6),a2					; crsrDevRec in a2
+			move.l	paramBase(a6),resolution(a2)		; set new resolution for this device
+
+			move.l	acceleration(a2),d0					; get current acceleration
+			bsr		CrsrDevSetAccel						; generate acceleration table, based on new resolution
+			
+			move.w	#0,paramBase+8(a6)					; result code
+			moveq	#8,d0								; dump two parameters on exit
+			jmp		stdExit								; 
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevNextDeviceTrap
+;
+;	Inputs:		8(a6).l	-	VAR ptr to CrsrDevRec
+;
+;	Outputs:	d0		-	OSErr
+;
+;	Destroys:	none
+;
+;	Function:	When given NIL, returns the head of the global device list.
+;				When given a pointer to a cursor device reocrd, returns a
+;				pointer to the next one in the global device list.
+;====================================================================
+
+CrsrDevNextDeviceTrap			
+				
+			move.l	paramBase(a6),a2					; address of crsrDevRec ptr in a2
+			move.l	(a2),a2								; crsrDevRec ptr in a2
+			move.l	a2,d0
+			beq.s	@nil								; if NIL, special case
+			
+			move.l	nextCrsrDev(a2),a2					; else, get next link
+			bra.s	@exit
+
+@nil		movea.l	ExpandMem,a2						; get ptr to expandmem rec
+			movea.l	emCursorGlobals(a2),a2				; get cursory global ptr
+			move.l	firstCrsrDev(a2),a2					; get ptr to 1st CrsrDevRec
+
+@exit		move.l	paramBase(a6),a0					; get address of where to store crsrDevRec
+			move.l	a2,(a0)								; return next crsrDevRec
+			
+			move.w	#0,paramBase+4(a6)					; result code
+			moveq	#4,d0								; dump one parameter on exit
+			jmp		stdExit								; 
+
+
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevNewDeviceTrap
+;
+;	Inputs:		8(a6).l	-	VAR pointer to CrsrDevRec
+;
+;	Outputs:	d0		-	OSErr
+;
+;	Destroys:	none
+;
+;	Function:	This routine creates a new CrsrDevRec, adds it to the 
+;				linked list of device records, and initializes it's fields.
+;				Note:  the caller must call CrsrDevSetAcceleration after
+;				calling this routine.
+;====================================================================
+
+CrsrDevNewDeviceTrap			
+		
+			bsr		CrsrDevNewDevice			; create a new cursor device
+			move.l	paramBase(a6),a0			; address of crsrDevRec ptr in a2
+			move.l	a2,(a0)						; return crsrDevRec pointer
+			move.w	d0,paramBase+4(a6)			; result code
+			moveq	#4,d0						; dump one parameter on exit
+			jmp		stdExit						; 
+
+
+
+;====================================================================
+;			
+;	Routine:	CrsrDevDisposeDevTrap
+;
+;	Inputs:		8(a6).l	-	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0		-	OSErr
+;
+;	Destroys:	d1-d2,a0-a1
+;
+;	Function:	This routine eliminates CrsrDevRec from the linked list
+;				of device records, and disposes of all storage related to
+;				it.
+;====================================================================
+
+CrsrDevDisposeDevTrap			
+		
+			move.l	paramBase(a6),a2			; crsrDevRec in a2
+			bsr		CrsrDevDisposeDev			; create a new cursor device
+			move.w	d0,paramBase+4(a6)			; result code
+			moveq	#4,d0						; dump one parameter on exit
+			jmp		stdExit						; 
+
+		ENDWITH
+
+
+
+
+;_______________________________________________________________________
+;			
+;	Routine:	CrsrDevHandleADB
+;
+;	Inputs:		a0 	- 	pointer to mouse data
+;				a2 	- 	pointer to CrsrDevRec for this device
+;				d0 	- 	command byte
+;
+;	Outputs:		-
+;				
+;	Destroys:	a0-a3/d0-d3
+;
+;	Function:	This routine is installed as the ADB service routine for all
+;				ADDR=03 relative devices.  It decodes the ADB packet and
+;				passes the information to CrsrDevMove and CrsrDevButtons.
+;				This routine now handles old or new style packets.
+;
+;				The packet has the following format:
+;				Byte#	bits:	7	6	5	4	3	2	1	0
+;				0				b0	y6	y5	y4	y3	y2	y1	y0
+;				1				b1	x6	x5	x4	x3	x2	x1	x0
+;				2				b2	y9	y8	y7	b3	x9	x8	x7		(optional)						<H11>
+;				3				b4	y12	y11	y10	b5	x12	x11	x10		(optional)						<H11>
+;				4				b6	y15	y14	y13	b7	x15	x14	x13		(optional)						<H11>
+;
+;				Where bn is button n (1 = not pressed, 0 = pressed)
+;				xn is bit n of the x delta information
+;				yn is bit n of the y delta information
+;
+;				NOTE: The current approach for extracting the extended
+;				resolution information is kinda ugly.  However, it is
+;				fast and I have been unable to construct an efficent, general,
+;				function for extracting the awkward 3bit fields in bytes 2 through
+;				n (currently n is 4). - SKH
+;
+;_______________________________________________________________________
+
+CrsrDevHandleADB
+			move.b	d0,d2					; save command in D2.
+			move.l	a2,d0					; do we have globals?
+			beq		@exit					; no, exit
+			
+			lea		1(a0),a3				; skip over length byte, free up A0
+
+@x0to6		moveq.l	#$7F,d0					; prepare to mask button off
+			and.b	1(a3),d0				; get 2nd data byte (∆ horiz)
+			
+@y0to6		moveq.l	#$7F,d1					; prepare to mask off button
+			and.b	(a3),d1					; get 1st data byte (∆ vert)
+
+@byte3		cmp.b	#3,(a0)					; check to see if we have 3rd byte						<H11>
+			bge.s	@x7to9					; if so, process it. else, extend sign					<H11>
+@byte3extx	btst	#6,d0					; check sign bit (bit 6)								<H11>
+			beq.s	@byte3exty				; 														<H11>
+			or.w	#$ff80,d0				; fake a negative, faster than ext						<H11>
+@byte3exty	btst	#6,d1					; check sign bit (bit 6)								<H11>
+			beq		@domove					;														<H11>
+			or.w	#$ff80,d1				; fake a negative for y									<H11>
+			bra.s	@domove					;														<H11>
+			
+@x7to9		moveq.l	#$7,d2					; move mask into workspace								<H11>
+			and.b	2(a3),d2				; get x bits 7-9										<H11>
+			lsl.w	#7,d2					; move them to add to running tally						<H11>
+			or.w	d2,d0					;														<H11>
+@y7to9		moveq.l	#$70,d2					; mask the bits											<H11>
+			and.b	2(a3),d2				; get y bits 7-9										<H11>
+			lsl.w	#3,d2					; move and add to tally									<H11>
+			or.w	d2,d1					;														<H11>
+			
+@byte4		cmp.b	#4,(a0)					; check to see if we have a 4th byte					<H11>
+			bge.s	@x10to12				;														<H11>
+@byte4extx	btst	#9,d0					; check sign bit (bit 9)								<H11>
+			beq.s	@byte4exty				;														<H11>
+			or.w	#$fc00,d0				; fake a negative for x									<H11>
+@byte4exty	btst	#9,d1					; check sign bit (bit 9)								<H11>
+			beq.s	@domove					;														<H11>
+			or.w	#$fc00,d1				; fake a negative for y									<H11>
+			bra.s	@domove					;														<H11>
+			
+@x10to12	moveq.l	#$7,d2					; move mask into workspace								<H11>
+			and.b	3(a3),d2				; get x bits 10-12										<H11>
+			lsl.w	#8,d2					; move them to add to running tally						<H11>
+			lsl.w	#2,d2					; do a 10 bit shift										<H11>
+			or.w	d2,d0					;														<H11>
+@y10to12	moveq.l	#$70,d2					; mask the bits											<H11>
+			and.b	3(a3),d2				; get y bits 10-12										<H11>
+			lsl.w	#6,d2					; move and add to tally									<H11>
+			or.w	d2,d1					;														<H11>
+			
+@byte5		cmp.b	#5,(a0)					; check to see if we have a 5th byte					<H11>
+			bge.s	@x13to15				;														<H11>
+@byte5extx	btst	#12,d0					; check sign bit (bit 12)								<H11>
+			beq.s	@byte5exty				;														<H11>
+			or.w	#$e000,d0				; fake a negative for x									<H11>
+@byte5exty	btst	#12,d1					; check sign bit (bit 12)								<H11>
+			beq.s	@domove					;														<H11>
+			or.w	#$e000,d1				; fake a negative for y									<H11>
+			bra.s	@domove					;
+			
+@x13to15	moveq.l	#$7,d2					; move mask into workspace								<H11>
+			and.b	4(a3),d2				; get x bits 13-15										<H11>
+			lsl.w	#8,d2					; move them to add to running tally						<H11>
+			lsl.w	#5,d2					; do a 13 bit shift										<H11>
+			or.w	d2,d0					;														<H11>
+@y13to15	moveq.l	#$70,d2					; mask the bits											<H11>
+			and.b	4(a3),d2				; get y bits 13-15										<H11>
+			lsl.w	#8,d2					; move and add to tally									<H11>
+			lsl.w	#1,d2					; do a 9 bit shift										<H11>
+			or.w	d2,d1					;														<H11>
+
+@domove		ext.l	d0						; convert our words into longs
+			ext.l	d1						;
+			bsr.s	CrsrDevMove				; accumulate movement
+			
+			clr.l	d0						; assume all buttons up									<H11>	
+@btn0		clr.l	d1						; start looking at button 0								<H11>
+			btst.b	#7,(a3)+				; is 1st button up?										<H11>
+			bne.s	@btn1					; yes, check 2nd button									<H11>
+			bset	d1,d0					; no, indicate button down								<H11>
+			
+@btn1		addq.b	#1,d1					; go to the next button (button 1)						<H11>
+			btst.b 	#7,(a3)+				; is 2nd button up?										<H11>
+			bne.s	@btnn					; yes, handle all button states							<H11>
+			bset	d1,d0					; no, indicate button down								<H11>
+			
+@btnn		
+			addq.b	#1,d1					; go to the next button									<H11>
+			cmp.b	cntButtons(a2),d1		; compare current button number to num buttons			<H11>
+			bge.s	@setBtns				; set the buttons if we are done						<H11>
+			
+			btst.b	#7,(a3)					; check the button for the high nibble					<H11>
+			bne.s	@btnn_high				; not pressed, check high nibble						<H11>
+			bset	d1,d0					; record the press										<H11>
+			
+@btnn_high	addq.b	#1,d1					; other button in low nibble							<H11>
+			btst.b	#3,(a3)+				; the button for this nibble							<H11>
+			bne.s	@btnn					; loop again											<H11>
+			bset	d1,d0					; record the press										<H11>
+			bra.s	@btnn					;														<H11>
+			
+@setBtns	bsr		CrsrDevButtons			; handle our buttons
+			
+@exit		
+			rts
+
+
+
+;_______________________________________________________________________
+;			
+;	Routine:	CrsrDevMove
+;
+;	Inputs:		d0.l	-	delta X
+;				d1.l	-	delta Y
+;				a2 		- 	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0		-	OSErr
+;				
+;	Destroys:	a0-a1,d0-d2
+;
+;	Function:	This routine accumulates given deltas for crsrDev, and 
+;				flags that is has new data.  The next time the cursor position 
+;				is computed, dh and dv will be run through the acceleration 
+;				algorithm and will contribute to the cursor movement.
+;_______________________________________________________________________
+
+tempParams	RECORD	0,decrement
+tempY		ds.l	1					; delta Y
+tempX		ds.l	1					; delta X
+tempSize	EQU		*					; size of our param block
+			ENDR
+
+CrsrDevMove
+		WITH 	tempParams
+
+			link	a6,#tempSize			; create temp area
+			
+			tst.l	d0						; and X movement?
+			bne.s	@cont					; yes, continue
+			tst.l	d1						; and Y movement?
+			beq		@exit					; no, just exit
+			
+@cont		move.l	d0,tempX(a6)			; save delta X
+			move.l	d1,tempY(a6)			; save delta Y
+			
+			swap	d0						; word2Fix
+			clr.w	d0
+			move.l	d0,-(sp)				; convert delta X to Fixed (push on stack)
+			
+			swap	d1						; word2Fix
+			clr.w	d1
+			move.l	d1,-(sp)				; convert delta Y to Fixed (push on stack)
+			
+			tst.b	newData(a2)				; was the previous poll after last VBL?
+			bne.s	@accum					; yes, handle separately
+			
+			move.l	(sp)+,deltaY(a2)		; else, save it away
+			move.l	(sp)+,deltaX(a2)		;
+
+			st.b	newData(a2)				; indicate we have new data
+			bra.s	@checkDir				; and see if direction changed
+
+				
+@accum		move.l	(sp)+,d0
+			add.l	d0,errorY(a2)			; accumulate error y
+			
+			move.l	(sp)+,d0
+			add.l	d0,errorX(a2)			; accumulate error x
+			
+			move.w	spread(a2),d0			; adjust the length of the double-sample time
+			sub.w	denom(a2),d0			; this spread = old spread - denom
+			cmpi.w	#30,d0
+			bge.s	@spread					; skip if new spread >= 30
+			
+			add.w	d0,spread(a2)			; if new spread < 30 then
+			addq.w	#1,spread(a2)
+			lsr.w	spread(a2)				; spread := (spread + old spread + 1) / 2
+			
+@spread		moveq	#8,d0					; else, spread out error over next several VBL's
+			move.w	spread(a2),denom(a2)
+			cmp.w	denom(a2),d0			; clip demon to 0-8
+			bge.s	@checkDir				; 
+			move.w	d0,denom(a2)
+			
+
+@checkDir	move.l	tempY(a6),d0			; any dy?
+			beq.s	@chkXchg				; no, check X
+			move.l	errorY(a2),d1
+			eor.l	d1,d0					; yes, did it's direction change?
+			bpl.s	@chkXchg				; no, check X
+
+			add.l	d1,deltaY(a2)			; direction changed, adjust delta
+			clr.l	errorY(a2)				; and stomp the error
+
+@chkXchg	move.l	tempX(a6),d0			; any dx?
+			beq.s	@exit					; no, exit
+			move.l	errorX(a2),d1
+			eor.l	d1,d0					; yes, did it's direction change?
+			bpl.s	@exit					; no, exit
+
+			add.l	d1,deltaX(a2)			; direction changed, adjust delta
+			clr.l	errorX(a2)				; and stomp the error
+
+@exit		unlk	a6
+			moveq	#0,d0					; result code
+			rts
+				
+		ENDWITH			
+			
+
+;_______________________________________________________________________
+;			
+;	Routine:	CrsrDevButtons
+;
+;	Inputs:		d0.b	- new button states (1 = down, 0 = up)
+;				a2 		- pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0		- OSErr
+;				
+;	Destroys:	a0-a1,d1-d3
+;
+;	Function:	This routine handles button debounce and event posting.  If the 
+;	mouse button bounces, we don't want it to look like a double click, so if we 
+;	see a mouse down less than 2 VBLs after a mouse up, we will ignore it, and 
+;	consider the mouse to still be up.  We will never ignore a mouse up event, 
+;	which could lead to menus hanging and continuous scrolling.
+;_______________________________________________________________________
+
+CrsrDevButtons
+			move.b	d0,d1					; get current button(s) state in d1
+			moveq	#8-1,d3					; init our button counter...
+			
+@loop		btst.l	d3,d1					; check next current button state
+			beq.s	@nowUp					; branch if up
+			
+@nowDwn		btst.b	d3,buttons(a2)			; down now, was it down before?
+			bne.s	@nextButton				; yes, do nothing, handle next button
+
+			move.l	Ticks,d0
+			move.w	d3,d2 					;
+			lsl.w	#2,d2 					;
+			sub.l	buttonTicks(a2,d2.w),d0 ;
+			add.l	d0,RndSeed				; randomize our seed
+			subq.l	#2,d0
+			bmi.s	@nextButton				; exit if went down too quickly (bounce)
+			bset.b	d3,buttons(a2)			; mark that we're really down...
+			bra.s	@dispatch				; and handle the down event
+			
+@nowUp		btst.b	d3,buttons(a2)			; was it up before?
+			beq.s	@nextButton				; yes, do nothing, handle next button
+			
+			move.w	d3,d2 					;
+			lsl.w	#2,d2 					;
+			move.l	Ticks,buttonTicks(a2,d2.w) ; time-stamp the button-up event
+			bclr.b	d3,buttons(a2)			; mark that we're up
+*			bra.s	@dispatch				; and handle the down event
+	
+@dispatch	move.b	buttonOp(a2,d3.w),d0	; get the button operation in d0
+			ext.w	d0
+			add.w	d0,d0					; button op * 2 (need to run on 68000)
+			lea		@jmpTable,a0
+			adda.w	(a0,d0.w),a0			; base + offset = rtn address
+			jsr		(a0)					; handle button (d3 = button#, a2 = CrsrDevRec)
+											; • routine must preserve d1 •
+@nextButton	dbra	d3,@loop
+
+			moveq	#0,d0					; result code
+			rts								; we're done
+			
+
+;---------------------------------------------------------			
+@jmpTable	dc.w	doNop			-	@jmpTable	;
+			dc.w	doSingle		-	@jmpTable	;
+			dc.w	doDouble		-	@jmpTable	;
+			dc.w	doClickLock		-	@jmpTable	;
+			dc.w	d0CharStroke	-	@jmpTable	;
+			dc.w	doAppleScript	-	@jmpTable	;
+			dc.w	doCustom		-	@jmpTable	;
+			
+doNop		rts
+			
+;---------------------------------------------------------			
+doSingle
+			btst.b	d3,buttons(a2)			; are we down?
+			beq.s	@up						; no, skip
+			bsr.s	CrsrDevButtonDown		; yes, handle button down
+			bra.s	@done
+@up			bsr		CrsrDevButtonUp			; yes, handle button up
+@done		rts
+
+;---------------------------------------------------------			
+doDouble
+			btst.b	d3,buttons(a2)			; are we down?
+			beq.s	@up						; no, skip
+			bsr.s	CrsrDevButtonDown		; yes, generate 2 clicks
+			bsr.s	CrsrDevButtonUp			; 
+			bsr.s	CrsrDevButtonDown		; 
+			bra.s	@done
+@up			bsr.s	CrsrDevButtonUp			; and finally button up
+@done		rts
+
+;---------------------------------------------------------			
+doClickLock
+			tst.b	buttonData(a2,d3.w)		; is this the 1st time?
+			bne.s	@secondHit				; no, skip
+			btst.b	d3,buttons(a2)			; are we down?
+			beq.s	@firstUp				; no, skip
+			bsr.s	CrsrDevButtonDown		; yes, generate button down event
+			bra.s	@done
+
+@firstUp	st.b	buttonData(a2,d3.w)		; first up, mark it
+			bra.s	@done			
+
+@secondHit	btst.b	d3,buttons(a2)			; are we up (2nd time)?
+			bne.s	@done					; no, do nothing...
+			bsr.s	CrsrDevButtonUp			; yes, post up event
+			clr.b	buttonData(a2,d3.w)		; mark that we're really up
+@done		rts
+
+
+;---------------------------------------------------------			
+d0CharStroke
+
+			rts
+
+;---------------------------------------------------------			
+doAppleScript
+
+			rts
+
+;---------------------------------------------------------			
+doCustom	
+			pea		buttonData(a2)			; push our custom routine address
+			rts								; and call it.
+			
+
+;_______________________________________________________________________
+;			
+;	Routine:	CrsrDevButtonDown
+;
+;	Inputs:		a2 	- 	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0	-	OSErr
+;				
+;	Destroys:	a0-a1,d0
+;
+;	Function:	Posts a button down event if this is the 1st button to go down
+;_______________________________________________________________________
+
+CrsrDevButtonDown
+			move.l	whichCursor(a2),a1		; get ptr to target cursor data
+			
+			movea.l	ExpandMem,a0			; get ptr to expandmem rec
+			movea.l	emCursorGlobals(a0),a0	; get cursory global ptr
+			move.l	firstCrsrData(a0),a0	; a0 points to main cursor data record
+			cmpa.l	a0,a1					; is this the main cursor?
+			bne.s	@count					; no, just count other cursor's button
+			
+			move.l	doubleClickTime(a2),doubleTime	; set our double-click time
+			
+			tst.b	buttonCount(a1)			; is this the first button to go down?
+			bne.s	@count					; no, no need to post another event…
+			tst.b	MBState					; yes, was mouse up before (should be)? 
+			bpl.s	@count					; no, just count the down event
+			
+			clr.b	MBState					; now say the button is down...
+			moveq	#0,d0					; no message for PostEvent
+			move.w	#mButDwnEvt,a0			; Get event number
+			_PostEvent						; post the mouse down event
+
+@count		move.l	Ticks,MBTicks			; update MBTicks for compatibility		<H14>
+			addq.b	#1,buttonCount(a1)		; count the button down
+			moveq	#0,d0					; result code
+			rts
+
+
+;_______________________________________________________________________
+;			
+;	Routine:	CrsrDevButtonUp
+;
+;	Inputs:		a2 	- 	pointer to CrsrDevRec for this device
+;
+;	Outputs:	d0	-	OSErr
+;				
+;	Destroys:	a0-a1,d0
+;
+;	Function:	Posts a button up event if this is the last button to go up.
+;_______________________________________________________________________
+
+CrsrDevButtonUp
+			move.l	whichCursor(a2),a1		; get ptr to target cursor data
+			
+			movea.l	ExpandMem,a0			; get ptr to expandmem rec
+			movea.l	emCursorGlobals(a0),a0	; get cursory global ptr
+			move.l	firstCrsrData(a0),a0	; a0 points to main cursor data record
+			
+			subq.b	#1,buttonCount(a1)		; count the button up
+			bpl.s	@chkMain				;
+			clr.b	buttonCount(a1)			; clip at 0 (no negatives allowed)
+
+@chkMain	cmpa.l	a0,a1					; is this the main cursor?
+			bne.s	@exit					; no, just exit
+			
+			tst.b	buttonCount(a1)			; is this the last button to go up?
+			bne.s	@exit					; no, no need to post another event…
+			tst.b	MBState					; yes, was mouse down before (should be)? 
+			bmi.s	@exit					; no, exit
+			
+			bset.b	#7,MBState				; now say the button is up...
+			moveq	#0,d0					; no message for PostEvent
+			move.w	#mButUpEvt,a0			; Get event number
+			_PostEvent						; post the mouse up event
+
+@exit		moveq	#0,d0					; result code
+			rts
+			
+		
+
+;_______________________________________________________________________
+;			
+;	Routine:	CrsrDevSetAccel
+;
+;	Inputs:		a2 	- 	pointer to CrsrDevRec for device we want to set
+;				d0	-	acceleration to set (0-1, fixed point)
+;
+;	Outputs:	d0	-	OSErr
+;				
+;	Destroys:	d0-d1,a0-a1
+;
+;	Function:	This routine installs the proper acceleration table for
+;				the specified device, based on the passed in acceleration
+;				value.
+;_______________________________________________________________________
+
+CrsrDevSetAccel			
+			move.l	d0,acceleration(a2)		; save new acceleration
+			movem.l	d2-d7/a3-a4,-(sp)		; save a bunch of registers
+			
+			move.l	accelPoints(a2),d0		; get ptr to old table
+			beq.s	@cont
+			move.l	d0,a0					; if one existed,
+			_DisposPtr						; get rid of it
+			
+@cont		move.w	#mapTrue,RomMapInsert	; map ROM into resource chain							<H2>
+			clr.w	-(sp)					; room for function result
+			move.l	#'accl',-(sp)			; we're looking for acceleration resources
+			_CountResources					; how many are there in the current resource file?
+			move.w	(sp)+,d3				; keep count in d3
+			beq.s	@noaccl					; can't find any accl resources!						<H11>
+
+			move.l	devID(a2),d4			; first try finding an 'accl' that matches our device ID<H3>
+			beq.s	@tryClass				; if field NULL, use devClass
+			bsr		FindResource			; did we find one?
+			beq.s	@foundIt				; yes, skip below
+			
+@tryClass	move.b	devClass(a2),d4			; try finding an 'accl' that matches our device class	<H3>
+			ext.w	d4						;														<H3>
+			ext.l	d4						;														<H3>
+			bsr		FindResource			; did we find one?
+			beq.s	@foundIt				; yes, skip below
+			
+			moveq	#0,d4					; otherwise, just load the flat ramp					<H3>
+			bsr		FindResource			; did we find one?
+			beq.s	@foundIt
+
+@noaccl		_debugger						; •• break if we didn't find one (we should never get here!)
+
+;----------------------------------------------
+; first find the two tables which enclose the desired acceleration
+;----------------------------------------------
+
+@foundIt	move.l	acceleration(a2),d3		; get new acceleration in d3
+			move.w	(a0)+,d2				; get # of  acceleration tables in resource
+			move.l	a0,a1					; keep ptr to 'low' accel table in a1
+			
+@searchHi	cmp.l	(a0),d3					; compare this acceleration to desired acceleration
+			ble.s	@foundHi				; we found a table that is higher than us, done...
+			
+@nextEntry	move.l	a0,a1					; update ptr to 'low' accel table in a1
+			addq.l	#4,a0					; skip past the acceleration
+			move.w	(a0)+,d0				; get # of points for this table
+			asl.w	#3,d0					; * 8 bytes for each entry
+			adda.w	d0,a0					; point to next table
+			bra.s	@searchHi				; and try next acceleration
+
+@foundHi	move.l	a0,a3					; a3 = ptr to 'high' entry
+			cmpa.l	a1,a3					; are both tables same (matched 1st table)				<H4>
+			bne.s	@calcScale				; no, compute scale factor
+			addq.w	#4,a1					; bump past acceleration
+			addq.w	#4,a3					; in both tables
+			moveq	#1,d7					; yes, scale factor = 1
+			swap	d7						;
+			bra.s	@scaleTable
+			
+@calcScale	clr.l	-(sp)					; room for function result
+			sub.l	(a1),d3	
+			move.l	d3,-(sp)				; push (desired accel - low accel)
+			move.l	(a3)+,d0
+			sub.l	(a1)+,d0
+			move.l	d0,-(sp)				; push (high accel - low accel)
+			_FixDiv							; divide to get our interpolation factor
+			move.l	(sp)+,d7				; d7 = scale factor
+
+;----------------------------------------------
+; now scale the lower resource table to the desired acceleration.
+; The resulting table is pushed on the stack as it is created.
+;		d7 = scale factor
+;
+;		uses d3,d4 to hold last dumped x1,y1
+;----------------------------------------------
+@scaleTable	move.l	sp,a4					; keep ptr to stack buffer top
+
+			moveq	#0,d3					; init our 'prev' point 1
+			moveq	#0,d4
+			
+			clr.l	-(sp)					; init x1					
+			clr.l	-(sp)					; init y1					
+
+			move.w	(a1)+,d5				; d5 = # of points in lower table
+			move.w	(a3)+,d6				; d6 = # of points in upper table
+			
+			cmpa.l	a1,a3					; did we find an exact match?								<H4>
+			bne.s	@scaleLoop				; yes, say no points left in one of the tables				<H4>
+			moveq	#0,d5					;															<H4>
+			
+@scaleLoop	tst.w	d5						; any points left on lower line?
+			beq.s	@lowLine				; no, then interpolate onto lower line
+			tst.w	d6						; any points left on upper line?
+			beq.s	@highLine				; no, then interpolate onto upper line
+			
+			move.l	(a1),d0					; see if next x point on lower accel table is
+			cmp.l	(a3),d0					; greater then next x point on higher accel table
+			bgt.s	@lowLine				; yes, then use 2 points from lower table
+			
+;-----------								
+@highLine	move.l	(a3),-(sp)				; push x2 from upper curve
+			move.l	4(a3),-(sp)				; push y2		"	"
+			move.l	(a1),-(sp)				; push x3 from lower curve
+			move.l	4(a1),-(sp)				; push y3		"	"
+			subq.w	#1,d5					; count the point
+			ble.s	@doneLow				; if no more, we need to keep re-using last point
+			addq.w	#8,a1					; else, more points, point to next one
+			bra.s	@int1
+@doneLow	moveq	#0,d5					; indicate no more points on lower line
+
+@int1		bset	#31,d7					; indicate y3 is on lower curve
+			bsr		Interpolate				; find new x' y'
+			bra.s	@setPoint1				; and set next point 1
+
+			
+;-----------								
+@lowLine	move.l	(a1),-(sp)				; push x2 from lower curve
+			move.l	4(a1),-(sp)				; push y2		"	"
+			move.l	(a3),-(sp)				; push x3 from upper curve
+			move.l	4(a3),-(sp)				; push y3		"	"
+			subq.w	#1,d6					; count the point
+			ble.s	@doneHigh				; if no more, we need to keep re-using last point
+			addq.w	#8,a3					; else, more points, point to next one
+			bra.s	@int2
+@doneHigh	moveq	#0,d6					; indicate no more points on upper line
+
+@int2		bsr		Interpolate				; find new x' y'
+			
+;-----------								
+@setPoint1	tst.w	d5						; are we at end?
+			beq.s	@restorePrevPt1			; yes, restore previous pt1
+						
+			tst.w	d6						; are we at end of upper line?
+			beq.s	@restorePrevPt1			; yes, restore previous pt1
+						
+			move.l	(a1),d0
+			cmp.l	(a3),d0					; is next point on upper curve before next point on low curve?
+			ble.s	@swapLines				; no, skip below
+			
+@sameLine	addq.w	#8,sp					; dump last x3,y3 point
+			move.l	12(sp),4(sp)			; yes,	old x1 becomes new x1
+			move.l	8(sp),(sp)				; 		old y1 becomes new y1
+			bra.s	@nextPoint
+			
+@restorePrevPt1
+			addq.w	#8,sp					; dump last x3,y3 point
+			move.l	d3,4(sp)				; yes,	previous x1 becomes new x1
+			move.l	d4,(sp)					; 		previous y1 becomes new y1
+			bra.s	@nextPoint
+			
+;-----------								
+
+			
+@swapLines	move.l	(sp)+,4(sp)				; old y3 becomes new y1 data point
+			move.l	(sp)+,4(sp)				; old x3 becomes new x1 data point
+
+@nextPoint	move.l	12(sp),d3				; save last x1,y1 in case needed later
+			move.l	8(sp),d4
+			move.l	d1,12(sp)				; set new x',y' data point on top of old x1,y1 point
+			move.l	d2,8(sp)				; 
+
+			move.w	d5,d0					; any more points in lower
+			or.w	d6,d0					; or upper table?
+			bne		@scaleLoop				; yes, ok to continue
+
+;------------------			
+
+			addq.w	#8,sp					; dump last x1,y1 point
+
+			move.l	a4,d0					; find out how big our computed buffer
+			sub.l	sp,d0					; is
+			lsr.l	#3,d0					; / 8 to find how many points
+			
+			mulu	#CrsrDevSegSize,d0		; * size of each point
+			_NewPtr	,Sys,Clear				; allocate space for new table
+			move.l	a0,accelPoints(a2)		; save ptr to table
+			
+;----------------------------------------------
+; finally compute the table of accelPoints, based on the scaled accel resource
+;----------------------------------------------
+
+			move.l	a0,a3					; keep working ptr to new table in a3
+			move.l	a4,a1					; ptr to top of table in a4 (grows toward low mem)
+			
+			moveq	#0,d1					; init x1					
+			moveq	#0,d2					; init y1
+			
+			clr.l	-(sp)					; first, calculate a couple of scaling constants
+			move.l	resolution(a2),-(sp)	; device res
+			move.l	#(frameRate<<16),-(sp)	; / frame rate
+			_FixDiv
+			move.l	(sp)+,d6				; = scale factor for device speed
+			
+			clr.l	-(sp)
+			move.l	whichCursor(a2),a0
+			move.l	CrsrDataRec.screenRes(a0),-(sp)	; screen res
+			move.l	#(frameRate<<16),-(sp)	; / frame rate
+			_FixDiv
+			move.l	(sp)+,d7				; = scale factor for cursor speed
+			
+@loop		clr.l	-(sp)					; room for fixMul result
+			move.l	-(a1),-(sp)				; get device speed for next point
+			move.l	d6,-(sp)				;
+			_FixMul							;	dev speed * [devRes / frameRate]
+			move.l	(sp)+,d3				; 	= x2
+			move.l	d3,devUnits(a3)			; •• set max device speed for this segment
+			
+			clr.l	-(sp)					; room for fixMul result
+			move.l	-(a1),-(sp)				; get cursor speed for next point
+			move.l	d7,-(sp)				; 
+			_FixMul							; y2 = cursor speed * [crsrRes / frameRate]
+			move.l	(sp)+,d4				;
+			
+			clr.l	-(sp)					; room for function result
+			move.l	d4,d0
+			sub.l	d2,d0					; y2-y1
+			move.l	d0,-(sp)
+			move.l	d3,d0
+			sub.l	d1,d0					; x2-x1
+			move.l	d0,-(sp)
+			_FixDiv							; calculate the slope
+			move.l	(sp)+,slope(a3)			; •• set slope in table
+			
+			clr.l	-(sp)
+			move.l	slope(a3),-(sp)
+			move.l	d3,-(sp)
+			_FixMul							; slope * X
+			move.l	d4,d0
+			sub.l	(sp)+,d0				; Y - slope * X = intercept
+			move.l	d0,intercept(a3)		; •• set intercept
+			adda.w	#CrsrDevSegSize,a3		; bump to next segment
+			
+			move.l	d3,d1					; old x2,y2 becomes new x1,y1
+			move.l	d4,d2
+
+			cmpa.l	a1,sp					; are we done?
+			blt.s	@loop					; no, continue
+			
+			move.l	a4,sp					; dump buffer from stack
+			
+			move.l	#$7FFFFFFF,-12(a3)		; set last 'highest device speed' to max
+			
+			movem.l	(sp)+,d2-d7/a3-a4		; restore registers
+			
+			moveq	#0,d0					; result code
+			rts
+
+
+;------------------------------------------------
+;			
+;	Routine:	FindResource
+;
+;	Inputs:		d3		-	# of 'accl' resources to search
+;				d4		-	'accl' resource tag we're looking for
+;
+;	Outputs:	a0		-	ptr to 'accl' resource (past tag) if we found it
+;				ccr.Z	-	set if we matched
+;				
+;	Destroys:	a0,d0,d1,d2,d5
+;
+;	Function:	This routine scans 'accl' resources, searching
+;				for one with a tag matching d1.
+;------------------------------------------------
+
+FindResource			
+			move.w	d3,d5					; init our index										<H3>
+@loop		move.w	#mapTrue,RomMapInsert	; map ROM into resource chain							<H2>
+			clr.l	-(sp)					; room for function result
+			move.l	#'accl',-(sp)			; we're looking for acceleration resources
+			move.w	d5,-(sp)				; push current index									<H3>
+			_GetIndResource					; get next 'accl' resource
+			move.l	(sp)+,d0				; did we get this one?									<H3>
+			beq.s	@NotFound				; -> no, try the next one								<H3>
+			move.l	d0,a0					; handle in a0											<H3>
+			move.l	(a0),a0					; ptr in a0
+			cmp.l	(a0)+,d4				; does tag match our selector?
+			beq.s	@exit					; yes, exit (with res ptr in a0)
+@NotFound	subq.w	#1,d5					; no, bump to next resource								<H3>
+			bne.s	@loop					; keep searching...										<H3>
+			moveq	#1,d0					; set BNE if not found									<H3>
+
+@exit		rts								; exit with Z-Flag set on match			
+			
+
+
+;------------------------------------------------
+;			
+;	Routine:	Interpolate
+;
+;	Inputs:		18(sp)	-	x1
+;				14(sp)	-	y1
+;				10(sp)	-	x2
+;				0C(sp)	-	y2
+;				08(sp)	-	x3
+;				04(sp)	-	y3
+;				d7		-	scale, bit 31 set if 3rd point on lower accel curve.
+;
+;	Outputs:	d1		-	x'
+;				d2		-	y'
+;				d7.31	-	reset
+;
+;	Destroys:	a0,d0-d1
+;
+;	Function:	This routine interpolates to find a point on the line [x1,y1] [x2,y2] which
+;				is intersected by the line [x3,y3] [x3,y"].  The resulting y' is calculated
+;				by interpolating between y3 and y", towards the higher acceleration curve.
+;------------------------------------------------
+
+stackFrame	RECORD	0,increment
+saveA6			ds.l	1
+retAddr			ds.l	1
+y3				ds.l	1
+x3				ds.l	1
+y2				ds.l	1
+x2				ds.l	1
+y1				ds.l	1
+x1				ds.l	1
+		ENDR
+
+
+Interpolate			
+		WITH	stackFrame
+			link	a6,#0					; set our frame ptr
+			
+			clr.l	-(sp)					; room for function result
+			move.l	y2(a6),d0				; get y2
+			sub.l	y1(a6),d0				; y2 - y1
+			move.l	d0,-(sp)
+			move.l	x2(a6),d0				; x2 - x1
+			sub.l	x1(a6),d0
+			move.l	d0,-(sp)
+			_FixDiv							; calculate slope, leave on stack
+			
+			clr.l	-(sp)					; room for function result
+			move.l	4(sp),-(sp)				; push copy of slope
+			move.l	x1(a6),-(sp)			; push x1
+			_FixMul							; slope * x1
+			move.l	y1(a6),d1
+			sub.l	(sp)+,d1				; d1 = intercept = y1 - (slope * x1)
+			
+			move.l	(sp),-(sp)				; push slope, leave room for function result
+			move.l	x3(a6),-(sp)			; push x3
+			_FixMul
+			add.l	(sp)+,d1				; y" = slope * x3 + intercept
+			
+			clr.l	-(sp)					; room for function result
+			move.l	y3(a6),d0
+			sub.l	d1,d0
+			move.l	d0,-(sp)				; push (y3 - y")
+			move.l	d7,-(sp)				; push scale
+			bclr.b	#7,(sp)					; make sure flag is off
+			_FixMul
+			bclr	#31,d7					; check if y3 is on lower curve
+			bne.s	@lower					; yes, branch
+			
+@upper		move.l	(sp)+,d2				; yes, interpolate upward
+			add.l	d1,d2					; 	y' = scale(y3-y") + y"
+			bra.s	@exit
+			
+@lower		move.l	y3(a6),d2				; interpolate downward,
+			sub.l	(sp)+,d2				;	y' = y3 - scale(y3-y")
+			
+@exit		move.l	x3(a6),d1				; return x'
+			unlk	a6
+			rts
+
+		ENDWITH
+
+
+;_______________________________________________________________________
+;			
+;	Routine:	CrsrDevHandleVBL
+;
+;	Inputs:		-
+;
+;	Outputs:	-
+;				
+;	Destroys:	d0																				<H7>
+;
+;	Function:	This routine moves the cursor on the screen.  It handles error
+;				distribution and delta acceleration for all the devices, then 
+;				redraws the cursor.
+;_______________________________________________________________________
+
+		EXPORT	CrsrDevHandleVBL
+CrsrDevHandleVBL
+			movem.l	a0-a4/d1-d5,-(sp)			; save a bunch of registers						<H7>
+		
+			movea.l	ExpandMem,a3				; get ptr to expandmem rec
+			movea.l	emCursorGlobals(a3),a3		; get cursory global ptr
+			move.l	firstCrsrDev(a3),d0			; get ptr to 1st CrsrDevRec
+			beq		@exit						; if not even 1 device, just exit
+			move.l	d0,a2						;     ptr in a2
+			
+			tst.b	CrsrNew						; has anyone touched the old cursor
+			beq.s	@drawCheck					; globals (compatibility - Display Mgr sets this <IH> ) ?						<SM6>
+			
+			clr.b	CrsrNew						; yes, ok, we're handling it now
+			move.l	firstCrsrData(a3),a4		; get ptr to only CrsrDataRec in a4
+			
+			tst.b	isAbs(a4)					; are we in relative mode?
+			bne.s	@drawCheck					; no, skip										<SM6>
+
+			move.l	MTemp,d0					; does RawMouse									<H4>
+			cmp.l	RawMouse,d0					; = MTemp?										<H4>
+			bne.s	@delta						; no, then they're doing deltas					<H4>
+			
+@abs		move.w	d0,whereX(a4)				; yes, then just set our whereXY global to theirs
+			clr.w	whereX+2(a4)
+			swap	d0
+			move.w	d0,whereY(a4)
+			clr.w	whereY+2(a4)
+			bra.s	@drawCheck					;												<SM6>
+			
+@delta		move.w	Mouse+h,d0					; add in their movement to ours
+			sub.w	where+h(a4),d0				;   Mouse.h - crsrData->where.h
+			add.w	MTemp+h,d0					;
+			sub.w	RawMouse+h,d0				; + MTemp.h - RawMouse.h
+			swap	d0							;	Word2fix
+			clr.w	d0							;
+			add.l	d0,whereX(a4)				; update our global x position
+			
+			move.w	Mouse+v,d0					; yes, add in their movement to ours
+			sub.w	where+v(a4),d0				;   Mouse.v - crsrData->where.v
+			add.w	MTemp+v,d0					;
+			sub.w	RawMouse+v,d0				; + MTemp.v - RawMouse.v
+			swap	d0							;	Word2fix
+			clr.w	d0							;
+			add.l	d0,whereY(a4)				; update our global y position
+;																											<SM6>begin
+;		See if it is time to draw the cursor.
+;
+@drawCheck										;																				
+		IF	LC930	THEN		
+			bclr.b	#SkipDraw,CrsrDevFlags(a3)	; if this is the first CRSR VBL don't draw, do the calculations only			
+			bne.s	@accumLoop					; will draw on the next VBL														
+			
+;==================================
+@flushCrsrs
+			movem.l	d0/a0-a4,-(sp)				; save registers used by CursorDraw Routines 									
+			move.l	firstCrsrData(a3),a4		; get ptr to first CrsrDataRec 
+@flushLoop	clr.b	isAbs(a4)
+			
+			move.w	whereX(a4),where+h(a4)		; update our h coordinate
+			move.w	whereY(a4),where+v(a4)		; update our h coordinate
+			
+			move.l	nextCrsrData(a4),a4
+			move.l	a4,d0
+			bne.s	@flushLoop					; and clear flush next cursor (if any)
+
+;-----------------
+@drawCursor	movea.l	DrawCrsrVBLVector(a3),a0	; call the DrawCursor vector			<H15>
+			jsr		(a0)						;										<H15>
+			movem.l	(sp)+,d0/a0-a4				; restore registers trashed by CursorDraw routine 								
+		ENDIF									;															<SM6>end
+
+;------------------------------------------------------	
+; Now add and accelerate deltas for all cursor devices 
+; and combine into our only cursor data record.			
+;------------------------------------------------------	
+
+@accumLoop	move.l	whichCursor(a2),a4			; get ptr to this devices CrsrDataRec in a4
+			
+			tst.b	isAbs(a4)					; are we in absolute mode?
+			beq.s	@relative					; no, skip
+
+			clr.l	deltaX(a2)					; yes, absolute cursor,
+			clr.l	deltaY(a2)					; flush relative info for this device
+			clr.l	errorX(a2)					;
+			clr.l	errorY(a2)					;
+			move.w	#-104,denom(a2)
+			clr.b	newData(a2)
+			bra		@nextDev					; and continue
+
+;----------------	
+@relative	tst.b	newData(a2)					; relative cursor, do we have new data?
+			beq.s	@noNewData					; no, skip
+
+			clr.b	newData(a2)					; we're handling the new stuff now…
+			tst.w	denom(a2)					; any errors?
+			ble.s	@noError					; no, skip
+
+			clr.l	-(sp)						; make room for fixDiv result
+			move.l	errorX(a2),-(sp)			; 1st param for fixDiv
+			moveq	#0,d0
+			move.w	denom(a2),d0
+			swap	d0							; Word2Fix
+			move.l	d0,-(sp)					; 2nd param for fixDiv
+			_FixDiv
+			move.l	(sp)+,d3					; dx = FixDiv(errorX,denom)
+			
+			clr.l	-(sp)						; make room for fixDiv result
+			move.l	errorY(a2),-(sp)			; 1st param for fixDiv
+			moveq	#0,d0
+			move.w	denom(a2),d0
+			swap	d0							; Word2Fix
+			move.l	d0,-(sp)					; 2nd param for fixDiv
+			_FixDiv
+			move.l	(sp)+,d4					; dy = FixDiv(errorY,denom)
+			
+			sub.l	d3,errorX(a2)
+			sub.l	d4,errorY(a2)
+			bra.s	@addDeltas
+
+@noError	clr.l	d3
+			clr.l	d4
+			
+@addDeltas	add.l	deltaX(a2),d3				; add in the deltas
+			add.l	deltaY(a2),d4
+			cmpi.w	#-100,denom(a2)				; setup for next time
+			ble.s	@findMag
+			subq.w	#1,denom(a2)
+			bra.s	@findMag	
+
+@noNewData	move.l	errorX(a2),d3				; no new samples since last VBL,
+			move.l	errorY(a2),d4				; take all the error
+			clr.l	errorX(a2)
+			clr.l	errorY(a2)
+			move.w	#-102,denom(a2)
+
+;-----------------
+@findMag	move.l	d3,d0						; get dx
+			bpl.s	@absDy						; ok if positive
+			neg.l	d0							; else, make positive
+@absDy		move.l	d4,d1						; get dy
+			bpl.s	@chkMag						; ok if positive
+			neg.l	d1							; else, make positive
+@chkMag		cmp.l	d1,d0
+			bgt.s	@doY
+			lsr.l	#1,d0
+			bra.s	@setMag
+@doY		lsr.l	#1,d1
+@setMag		add.l	d0,d1						; d1 = magnitude
+			beq.s	@nextDev					; no magnitude, check next device
+
+			move.l	accelPoints(a2),a1			; a1 points to acceleration table
+			clr.w	d0
+@search		cmp.l	devUnits(a1,d0.w),d1		; find entry in the table
+			ble.s	@foundIt					; that matches our magnitude
+			add.w	#CrsrDevSegSize,d0			; not close yet, bump to next one
+			bra.s	@search
+
+;-----------------
+@foundIt	move.l	intercept(a1,d0.w),-(sp)	; push intercept for later add
+			clr.l	-(sp)						; room for function result
+			move.l	slope(a1,d0.w),-(sp)		; push slope
+			move.l	d1,-(sp)					; push mag
+			_FixMul
+			move.l	(sp)+,d0
+			add.l	(sp)+,d0					; scale = intercept + slope*mag
+			
+			clr.l	-(sp)						; room for function result
+			move.l	d0,-(sp)					; push scale
+			move.l	d1,-(sp)					; magnitude
+			_FixDiv								; scale = scale / mag
+
+			clr.l	-(sp)						; room for function result
+			move.l	4(sp),-(sp)					; push a copy of scale
+			move.l	d3,-(sp)					; push dx
+			_FixMul
+			move.l	(sp)+,d0
+			add.l	d0,whereX(a4)				; accumulate the accelerated move
+			
+			move.l	(sp),-(sp)					; push scale, leave room for function result
+			move.l	d4,-(sp)					; push dy
+			_FixMul
+			move.l	(sp)+,d0
+			add.l	d0,whereY(a4)				; accumulate the accelerated move
+			
+
+@nextDev	move.l	nextCrsrDev(a2),a2			; get next device ptr
+			move.l	a2,d0						; done all devices?
+			bne		@accumLoop					; no, continue looping
+
+		IF	NOT LC930	THEN					;										<SM6>
+		
+;==================================
+@flushCrsrs	move.l	firstCrsrData(a3),a4		; get ptr to first CrsrDataRec
+@flushLoop	clr.b	isAbs(a4)
+			
+			move.w	whereX(a4),where+h(a4)		; update our h coordinate
+			move.w	whereY(a4),where+v(a4)		; update our h coordinate
+			
+			move.l	nextCrsrData(a4),a4
+			move.l	a4,d0
+			bne.s	@flushLoop					; and clear flush next cursor (if any)
+			
+;-----------------
+@drawCursor	movea.l	DrawCrsrVBLVector(a3),a0	; call the DrawCursor vector			<H15>
+			jsr		(a0)						;										<H15>
+
+		ENDIF									;										<SM6>
+		
+@exit		movem.l	(sp)+,a0-a4/d1-d5			; restore a bunch of registers			<H7>
+			rts
+			
+;_______________________________________________________________________				<H15>
+;			
+;	Routine:	DrawCursor
+;
+;	Inputs:		a3 	-	ptr to CrsrDevGlobals
+;
+;	Outputs:	
+;
+;	Destroys:	d0,a0,a4
+;
+;	Function:	This routine is the default ROM routine called through
+;				the DrawCrsrVBLVector. The vector is initialized by
+;				InitCrsrDev. (Pulled from the in-line VBL code).
+;_______________________________________________________________________		
+
+DrawCursor	movea.l	firstCrsrData(a3),a4		; get ptr to main CrsrDataRec			<H15>
+			move.l	where(a4),d0				; get new mouse coords
+			cmp.l	Mouse,d0					; has cursor moved?
+			beq.s	@exit						; no… exit
+			tst.b	CrsrCouple					; is cursor coupled to mouse?
+			bne.s	@coupled					; yes, continue							<SM6>
+
+			move.l	d0,MTemp					; no, just update lowmem MTemp			<SM6>
+			bra.s	@exit						; and exit without drawing cursor		<SM6>
+
+@coupled	tst.b	CrsrBusy					; is it locked?							<SM6>
+			bne.s	@exit						; yes… exit
+			
+			lea		CrsrPin,a0					; it's ok to update cursor, get bounding rect
+			BSR.L	CrsrVBLTask					; pin and draw the cursor
+			
+			move.l	Mouse,d0					; has cursor been pinned?
+			cmp.l	where(a4),d0				;
+			beq.s	@exit						; no… exit
+			move.l	d0,where(a4)				; reflect pinned location
+			
+			move.l	MouseMask,d1				;													<H18>
+			not.l	d1
+			tst.w	d1							; are we gridding in x direction?
+			beq.s	@updateX					; no, force update
+			
+			move.w	whereX(a4),d0				; yes, see if we clipped at screen bounds			<H18>
+			sub.w	Mouse+h,d0
+			bpl.s	@xok
+			neg.w	d0
+@xok		cmp.w	d1,d0						; compare our error to grid delta
+			ble.s	@chkGridv					; <, so don't update our running x position
+@updateX	move.w	RawMouse+h,whereX(a4)		; stamp our new running x position
+			clr.w	whereX+2(a4)
+			
+@chkGridv	swap	d1							;													<H18>
+			tst.w	d1							; are we gridding in y direction?
+			beq.s	@updateY					; no, force update
+
+			move.w	whereY(a4),d0				; yes, see if we clipped at screen bounds			<H18>
+			sub.w	Mouse+v,d0
+			bpl.s	@yok
+			neg.w	d0
+@yok		cmp.w	d1,d0						; compare our error to grid delta
+			ble.s	@exit						; <, so don't update our running y position
+@updateY	move.w	RawMouse+v,whereY(a4)		; stamp our new running x position
+			clr.w	whereY+2(a4)				; loose the fraction
+			
+@exit		rts
+		
+		
+;_______________________________________________________________________
+;			
+;	Routine:	CrsrDevNewDevice
+;
+;	Inputs:		...
+;
+;	Outputs:	a2 	- 	pointer to CrsrDevRec for device we initialized
+;				d0	-	OSErr
+;
+;	Destroys:	d1-d2,a0-a1
+;
+;	Function:	This routine creates a new CrsrDevRec, adds it to the 
+;				linked list of device records, and initializes it's fields.
+;				Note:  the caller must call CrsrDevSetAcceleration after
+;				calling this routine.
+;_______________________________________________________________________
+
+CrsrDevNewDevice
+			move.l	#CrsrDevSize,d0
+			_NewPtr	,Sys,Clear							; non-explicitly set fields will default to zeros
+			bne.s	@error								; no memory, error exit
+			
+			move.l	a0,a2								; keep ptr in a0
+
+			movea.l	ExpandMem,a0						; get ptr to expandmem rec
+			movea.l	emCursorGlobals(a0),a0				; get cursory global ptr
+			move.l	firstCrsrDev(a0),nextCrsrDev(a2)	; link into our chain
+			move.l	a2,firstCrsrDev(a0)					;	"		"
+			
+			move.l	firstCrsrData(a0),whichCursor(a2)	; init the cursor data ptr
+			move.b	#classMouse,devClass(a2)			; we're a mouse type device
+			move.b	#1,cntButtons(a2)					; and have 1 button								<H11>
+			move.b	#btnSingleClick,buttonOp+0(a2)		; standard single-click operation
+			move.l	#(72<<16),resolution(a2)			; standard screen resolution
+			
+			subq	#4,sp								
+			move.l	sp,a0
+			move.l	#$00020008,d0
+			_ReadXPram									; read mouse PRAM
+			move.l	(sp)+,d1 							; get PRAM setting for double-click time
+			move.l	d1,d0
+			rol.l	#5+2,d0
+			andi.w	#$1C,d0
+			lea		@accelToFixed,a0
+			move.l	(a0,d0.w),acceleration(a2)			; convert to fixed, and set our acceleration
+
+			moveq	#8+4,d0
+			rol.l	d0,d1								; get PRAM setting for double-click time
+			andi.w	#$0F,d1
+			lea		@clickToFixed,a0
+			moveq	#0,d0
+			move.b	(a0,d1.w),d0
+			move.l	d0,doubleClickTime(a2)				; set our double-click time
+			move.l	d0,doubleTime						; update lowmem as well...							<H13>
+
+			move.w	#-101,denom(a2)
+			move.w	#4,spread(a2)
+			
+			moveq	#0,d0								; result code
+			rts
+
+@error		moveq	#-1,d0								; error exit
+			rts
+			
+
+			
+@accelToFixed
+			dc.l	$00000000							;	0
+			dc.l	$00002000							;	1
+			dc.l	$00005000							;	2
+			dc.l	$00008000							;	3
+			dc.l	$0000B000							;	4
+			dc.l	$0000E000							;	5
+			dc.l	$00010000							;	6
+			dc.l	$00010000							;	7
+
+@clickToFixed
+			dc.b	$0C									;	0
+			dc.b	$0C									;	1
+			dc.b	$0C									;	2
+			dc.b	$0C									;	3
+			dc.b	$10									;	4
+			dc.b	$14									;	5	fast
+			dc.b	$17									;	6
+			dc.b	$1B									;	7
+			dc.b	$20									;	8	medium
+			dc.b	$23									;	9
+			dc.b	$26									;	a
+			dc.b	$2C									;	b
+			dc.b	$30									;	c	slow
+			dc.b	$34									;	d
+			dc.b	$38									;	e
+			dc.b	$3C									;	f
+
+
+
+
+;_______________________________________________________________________
+;			
+;	Routine:	CrsrDevDisposeDev
+;
+;	Inputs:		a2 	- 	pointer to CrsrDevRec for device we want to remove
+;
+;	Outputs:	d0	-	OSErr
+;				
+;	Destroys:	d0-d2,a0-a1
+;
+;	Function:	This routine eliminates CrsrDevRec from the linked list
+;				of device records, and disposes of all storage related to
+;				it.
+;_______________________________________________________________________
+
+CrsrDevDisposeDev
+			movea.l	ExpandMem,a0			; get ptr to expandmem rec
+			movea.l	emCursorGlobals(a0),a0	; get cursory global ptr
+			move.l	firstCrsrDev(a0),a1		; d1 points to main cursor data record
+			
+			moveq	#0,d1					; prev := NIL
+
+@loop		cmpa.l	a1,a2					; is this the linked list element we want?
+			beq.s	@gotIt					; yes, handle it
+			move.l	a1,d1					; no, prev := next
+			move.l	nextCrsrDev(a1),d0		; get next->nextCrsrDev
+			beq.s	@exit					; exit if NIL (we never found it)
+			move.l	d0,a1					; next := next->nextCrsrDev
+			bra.s	@loop
+			
+@gotIt		move.l	nextCrsrDev(a1),a1		; next := next->nextCrsrDev
+			tst.l	d1						; was it the first one?
+			beq.s	@firstOne				; yes, handle special case
+			
+			move.l	d1,a2
+			move.l	a1,nextCrsrDev(a2)		; else, delete our element from middle of list
+			bra.s	@dispose
+
+@firstOne	move.l	a1,firstCrsrDev(a0)
+			
+@dispose	move.l	accelPoints(a2),d0
+			beq.s	@ridRecord				; get rid of storage within CrsrDevRec
+			move.l	d0,a0
+			_DisposPtr	
+			
+@ridRecord	move.l	a2,a0
+			_DisposPtr						; get rid of CrsrDevRec itself
+			
+@exit		moveq	#0,d0					; result code
+			rts
+
+
+;_______________________________________________________________________
+;			
+;	Routine:	CrsrDevReInit
+;
+;	Inputs:		d0	-	0 = pre-init, 1=post-init
+;
+;	Outputs:	d0	-	0 = pre-init, 1=post-init
+;				
+;	Destroys:	a0-a3/d1-d3
+;
+;	Function:	This routine handles pre and post ADB ReInit processing.
+;				Before reinit, it trashes all the crsrDevRecs that are
+;				hanging off the ADB chain.  After the re-init, it restores
+;				all the devices.  Devices that can enter Handler XX, like PGE,
+;				are polled for information from register 01, which is used
+;				to fill in the CrsrDevRec.  Other devices are used in the
+;				appropriate defaults.
+;_______________________________________________________________________
+
+ADBParamBlk	RECORD	0,decrement
+iDataAddr	ds.l	1						; ADB device data ptr
+iCRAddr		ds.l	1						; ADB device completion rtn
+iOrigAddr	ds.b	1						; ADB original address
+iDeviceTy	ds.b	1						; ADB device type
+iPBlock		EQU		iDeviceTy				; the start of our GetInfo param block
+iSPBlock	EQU		iCRAddr					; the start of our SetInfo param block
+adbPBSize	EQU		*						; size of our param block
+			ENDR
+
+		EXPORT		CrsrDevReInit
+CrsrDevReInit								;													<H14>
+		WITH	ADBParamBlk
+	
+			movem.l	d0-d3/a0-a3,-(sp)
+			link	a6,#adbPBSize			; Make a stack frame for our param block
+			bne.s	@PostInit				; Skip if post-processing
+
+;---------------------
+; pre-init processing
+;---------------------
+			_CountADBs						; Get the number of ADB devices
+			move.w	d0,d2					; Save in D2
+			beq		@exit					; Skip if none
+			
+
+@killLoop	lea		iPBlock(a6),a0			; a0 is parameter block
+			move.w	d2,d0
+			_GetIndADB						; Get a device entry
+			bmi.s	@nextRec1				; Skip if not valid
+			cmpi.b	#mouseAddr,iOrigAddr(a6); mouse?
+			bne.s	@nextRec1				; Skip if not
+
+			move.l	iDataAddr(a6),a2		; Save the data address pointer
+			clr.l	iDataAddr(a6)			; Clear it out, so the keyboard won't trash memory
+			lea		iSPBlock(a6),a0			; a0 ptr to our short param block
+			_SetADBInfo						; d0 already contains the ADB Address
+
+			bsr.s	CrsrDevDisposeDev		; eliminate it from our globals also
+			
+@nextRec1	subq.w	#1,d2
+			bgt.s	@killLoop
+			
+			movea.l	ExpandMem,a0			; get ptr to expandmem rec
+			movea.l	emCursorGlobals(a0),a0	; get cursory global ptr
+			clr.l	firstCrsrDev(a0)		; clear out initial dev ptr
+			bra		@exit
+
+
+;---------------------
+; post-init processing
+;---------------------
+@PostInit	bset.b	#7,MBState				; set current mouse button state to UP			<H16>
+			clr.l	MBTicks 				; reset timestamp for mouse button				<H16>
+
+			_CountADBs						; Get the number of ADB devices
+			move.w	d0,d2					; Save in D2
+			sub.w	#10,sp					; allocate ADBOp reply buffer on stack for later
+			beq		@postCheck				; Skip if no devices
+
+
+@instLoop	
+			lea		iPBlock(a6),a0			; a0 is parameter block
+			move.w	d2,d0
+			_GetIndADB						; Get a device entry
+			move.w	d0,d3					; save ADB address
+			bmi		@nextRec2				; Skip if not valid
+			cmpi.b	#mouseAddr,iOrigAddr(a6); mouse?
+			bne		@nextRec2				; Skip if not
+
+			bsr		CrsrDevNewDevice		; create and chain in a new cursor record
+											; a2 points to crsrDevRec
+			move.b	d3,d0					; address in d0
+			lsl.b	#4,d0					; upper 4 bits
+			ori.b	#%1111,d0				; talk R3 command
+			move.l	sp,a0					; reply buffer ptr in a0
+			bsr		syncADBTalk				; send command synchronously, reply in a0.
+			tst.b	(a0)					; any data?
+			beq		@nextRec2				; no, skip (should not happen)
+
+			move.b	#extDevHand,2(a0)		; yes, try to set to allow mouse extension
+			move.b	d3,d0					; address in d0
+			lsl.b	#4,d0					; upper 4 bits
+			ori.b	#%1011,d0				; Listen R3 command
+			bsr		syncADBListen			; send command synchronously.
+
+			move.b	d3,d0					; now see if we switched be doing a talk R3 again
+			lsl.b	#4,d0					; addr in upper 4 bits
+			ori.b	#%1111,d0				; talk R3 command
+			move.l	sp,a0					; reply buffer ptr in a0
+			bsr		syncADBTalk				; send command synchronously, reply in a0.
+			tst.b	(a0)					; any data?
+			beq		@nextRec2				; no, skip (should not happen)		
+
+			cmpi.b	#extDevHand,2(a0)		; did we switch?
+			bne.s	@preExisting			; no, doesn't 
+
+;--------------------------------			
+; We got an extended type device...
+;--------------------------------			
+			move.b	d3,d0					; now get the extended data from R1
+			lsl.b	#4,d0					; addr in upper 4 bits
+			ori.b	#%1101,d0				; talk R1 command
+			bsr		syncADBTalk				; send command synchronously, reply in a0.
+			cmpi.b	#8,(a0)					; did we get 8 bytes back?
+			bne.s	@preExisting			; no, try handler 2 (maybe 1)
+			
+			move.b	1(a0),devID+0(a2)		; copy the device ID (optimize later)				
+			move.b	2(a0),devID+1(a2)		;  "			
+			move.b	3(a0),devID+2(a2)		;  "			
+			move.b	4(a0),devID+3(a2)		;  "			
+
+			move.b	5(a0),resolution+0(a2)	; Copy the resolution			
+			move.b	6(a0),resolution+1(a2)	;  "			
+			clr.w	resolution+2(a2)		;  clear out the fraction part
+			
+			move.b	7(a0),devClass(a2)		; Copy the device class		
+			move.b	8(a0),cntButtons(a2)	; Copy the number of buttons
+			move.b	#btnSingleClick,buttonOp+1(a2)	; single-click operation for 2nd button			<H5>
+			bra.s	@setInfo				; and setup globals/completion rtn for this device
+			
+;--------------------------------			
+; We got a pre-existing type device...
+;--------------------------------			
+@preExisting
+			move.b	#2,2(a0)				; yes, try to set to handler 2
+			move.b	d3,d0					; address in d0
+			lsl.b	#4,d0					; upper 4 bits
+			ori.b	#%1011,d0				; Listen R3 command
+			bsr		syncADBListen			; send command synchronously.
+
+			move.b	d3,d0					; now see if we switched be doing a talk R3 again
+			lsl.b	#4,d0					; addr in upper 4 bits
+			ori.b	#%1111,d0				; talk R3 command
+			move.l	sp,a0					; reply buffer ptr in a0
+			bsr		syncADBTalk				; send command synchronously, reply in a0.
+			tst.b	(a0)					; any data?
+			beq.s	@nextRec2				; no, skip (should not happen)		
+
+			cmpi.b	#2,2(a0)				; did we switch to 2?
+			bne.s	@brainDead				; no, must be stupid 4th party device
+
+;-----------------------------------------			
+; We switched to 2, so adjust some paramters
+;-----------------------------------------			
+			move.l	#'@200',devID(a2)		; set the device ID				
+			move.w	#200,resolution(a2)		; set the resolution			
+			bra.s	@setInfo
+			
+;-----------------------------------------			
+; We didn't switch to 2, so set back to 1 (is this necessary Dan?)
+;-----------------------------------------			
+@brainDead	move.b	#1,2(a0)				; yes, try to set to handler 1
+			move.b	d3,d0					; address in d0
+			lsl.b	#4,d0					; upper 4 bits
+			ori.b	#%1011,d0				; Listen R3 command
+			bsr		syncADBListen			; send command synchronously.
+
+;--------------------------------			
+@setInfo	move.l	acceleration(a2),d0		; d0 = acceleration for this device
+			bsr		CrsrDevSetAccel			; set up the acceleration tables
+
+			lea		CrsrDevHandleADB,a0
+			move.l	a0,iCRAddr(a6)			; set our handler
+			move.l	a2,iDataAddr(a6)		; set up the data area
+			lea		iSPBlock(a6),a0			; a0 ptr to our short param block
+			move.w	d3,d0					; d0 = ADB address
+			_SetADBInfo						; install the new info
+			
+@nextRec2	subq.w	#1,d2
+			bgt		@instLoop				; continue looping though all devices
+			bmi.s	@postExit				; done when we've been through here twice (once to set default)
+
+;---------------------		
+@postCheck	move.b	#mouseAddr,d3
+			moveq	#numFDBAdr,d0			; Number of table entries
+			move.l	ADBBase,a3				; get ADB globals in a3
+			move.l	a3,a1					; copy in a1
+			bra.s	@chkMatch				; 
+
+@searchLoop	adda.w	#FRecSize,a1			; Get to next record
+@chkMatch	cmp.b	FDBAddr(a1),d3			; Is this the right one?
+			beq.s	@postExit				; If so, we're done
+			tst.b	FDBAddr(a1)				; Is it 0?
+			dbeq	d0,@searchLoop			; Loop until it is found or no more.
+
+			move.b	#1,FDBDevTy(a1)			; assume handler 1
+			move.b	d3,FDBOAddr(a1)			; set original address as 3
+			move.b	d3,FDBAddr(a1)			; set FDB address as 3
+			bset.b	d3,DevMap+1(a3)			; remember to poll it
+
+			bsr		CrsrDevNewDevice		; else, create and chain in a default cursor record
+			bra.s	@setInfo				; and set it it ADB unit table
+			
+@postExit	add.w	#10,sp					; • dump our ADBOp buffer
+			movea.l	ExpandMem,a0			; get ptr to expandmem rec								<H10>
+			movea.l	emCursorGlobals(a0),a0	; get cursory global ptr								<H10>
+			move.l	firstCrsrData(a0),a0	; get the cursor data ptr								<H10>
+			clr.b	buttonCount(a0)			; init button down count								<H10>
+
+;---------------------
+@exit		unlk	a6						; dump the adbInfo param block
+			movem.l	(sp)+,d0-d3/a0-a3
+			rts
+						
+
+
+
+;_______________________________________________________________________
+;			
+;	Routine:	syncADBTalk
+;
+;	Inputs:		d0	-	address/command byte
+;				a0	-	ptr to receive buffer
+;
+;	Outputs:	a0	-	pts to pascal talk string
+;				
+;	Destroys:	a1,d0
+;
+;	Function:	This routine makes a synchronous ADBOp call, and returns
+;				any data in the buffer pointed to by a0.
+;_______________________________________________________________________
+
+syncADBTalk	
+			move.l	a0,-(sp)				; save ptr to our buffer
+			clr.w	-(sp)					; our 'sync' flag
+
+			move.l	sp,a1					; keep pointer to globals for later
+			move.l	sp,-(sp)				; push pointer to globals
+			pea		syncComp				; push pointer to our completion routine
+			move.l	a0,-(sp)				; push pointer to our reply buffer
+			move.l	sp,a0
+			_ADBOp
+			
+@spin		tst.b	(a1)					; have we completed?
+			beq.s	@spin					; no, keep waiting
+			
+			lea		14(sp),sp				; dump locals
+			move.l	(sp)+,a0				; restore a0
+			rts
+
+
+;_______________________________________________________________________
+;			
+;	Routine:	syncADBListen
+;
+;	Inputs:		d0	-	address/command byte
+;				a0	-	ptr to transmit buffer
+;
+;	Outputs:	a0	-	pts to pascal talk string
+;				
+;	Destroys:	a0-a1,d0
+;
+;	Function:	This routine makes a synchronous ADBOp call, and returns
+;				any data in the buffer pointed to by a0.
+;_______________________________________________________________________
+
+syncADBListen	
+			clr.w	-(sp)					; our 'sync' flag
+			move.l	sp,a1					; keep pointer to data area for later
+			move.l	sp,-(sp)				; push pointer to data area
+			pea		syncComp				; push our completion address
+			move.l	a0,-(sp)				; push ptr to data to send
+			move.l	sp,a0
+			_ADBOp
+			
+@spin		tst.b	(a1)					; have we completed?
+			beq.s	@spin					; no, keep waiting
+			
+			lea		14(sp),sp				; dump locals
+			rts
+			
+			
+;_______________________________________________________________________
+;			
+;	Routine:	syncComp
+;
+;	Inputs:		d0	-	ADB command byte
+;				a0	-	ptr to data (pascal string)
+;				a2	-	ptr to data area
+;
+;	Outputs:	-
+;				
+;	Destroys:	a0-a3,d0-d3
+;
+;	Function:	This is our ADB completion routine.  It simply copies any
+;				data to our receive buffer in our data area, then sets our
+;				complete flag.
+;_______________________________________________________________________
+
+syncComp	st.b	(a2)					; set our complete flag			
+			rts
+
+			
+;_______________________________________________________________________
+;			
+;	Routine:	InitCrsrDev
+;
+;	Inputs:		-
+;
+;	Outputs:	-
+;				
+;	Destroys:	a0-a1/d0
+;
+;	Function:	This routine allocates and initializes globals for the 
+;				CursorDevice routines, keeping a pointer to them in ExpandMem.
+;_______________________________________________________________________
+
+InitCrsrDev
+
+			moveq	#CrsrGlobSize,d0
+			_NewPtr	,Sys,Clear				; allocate storage for our globals 
+
+			movea.l	ExpandMem,a1			; get ptr to expandmem rec
+			exg		a0,a1
+			move.l	a1,emCursorGlobals(a0)	; set cursory global ptr
+					
+			lea		SetCrsrDelCore,a0		; addr of default ROM handler 					<H15>
+			move.l	a0,SetCrsrDelayVector(a1) ;	install into vector							<H15>
+			lea		DrawCursor,a0			; addr of default ROM handler					<H15>
+			move.l	a0,DrawCrsrVBLVector(a1)  ; install into vector							<H15>
+					
+			moveq	#CrsrDataSize,d0		; size of our (only) cursor data record
+			_NewPtr	,Sys,Clear				; allocate it's globals
+			move.l	a0,firstCrsrData(a1)	; set ptr to main cursor data in our globals
+
+			moveq	#$10,d0
+			swap	d0
+			move.l	d0,whereX(a0)			; init cursor position
+			move.l	d0,whereY(a0)
+			
+			moveq	#72,d0					; init default screen resolution to 72 dpi
+			swap	d0						; word2Fix
+			move.l	d0,screenRes(a0)
+
+			lea		vDrawCursor,a0			; vector low level drawing routines
+			move.l	a0,DrawCrsrVector
+			lea		vEraseCursor,a0
+			move.l	a0,EraseCrsrVector
+
+		IF	LC930	THEN
+		
+			bset.b	#SkipDraw,CrsrDevFlags(a1)	; Do not draw the fisrt VBL just do the position calculations <SM6>
+		
+		ENDIF
+			
+			rts								;												<H14>
+
+;______________________________________________________________________________ 			<H15>
+;			
+;	Routine:	SetCrsrDelay
+;
+;	Inputs:		a1 contains the ptr to the cursor gDevice being setup
+;
+;	Outputs:	-
+;				
+;	Destroys:	a0,d0	
+;
+;	Function:	This routine sets the screenDelay value in the CrsrDataRec
+;				to an appropriate delay value based on the screen type.
+;				This delay value is used by the cursor VBL as a minimum
+;				delay between subsequent cursor blits.
+;______________________________________________________________________________
+			EXPORT	SetCrsrDelay					; 										<H15>
+SetCrsrDelay
+			movea.l	ExpandMem,a0
+			cmpa.l	#-1,a0							;has ExpandMem been initialized?
+			beq.s	@skipIt							; if not, then don't call b/c vector is not there
+			movea.l	emCursorGlobals(a0),a0
+			move.l	SetCrsrDelayVector(a0),d0		;vector to the code that does the real work
+			beq.s	@skipIt							;make sure the value has been initialized
+			movea.l	d0,a0
+			jsr		(a0)							; must preserve a1
+@skipIt
+		IF padForOverpatch THEN
+			move.l	CRSRPTR,A0						;get handle to cursor data [padding]
+			MOVE.L	(A0),A0							;get pointer to cursor data
+		ENDIF
+			rts
+
+;______________________________________________________________________________ 			<H15>
+;
+;	Routine:	SetCrsrDelCore
+;
+;	Inputs:		a1 contains the ptr to the cursor gDevice being setup
+;
+;	Outputs:	-
+;				
+;	Destroys:	a0,d0	
+;
+;	Function:	This routine sets the screenDelay value in the CrsrDataRec
+;				to an appropriate delay value based on the screen type.
+;				This delay value is used by the cursor VBL as a minimum
+;				delay between subsequent cursor blits.
+;______________________________________________________________________________
+
+SetCrsrDelCore
+			rts											; just a hook for now
+
+
+;_____________________________________________________________________________________________	<H15>
+;	VDrawCursor  -  default DrawCursor routine
+;
+;	The low level cursor routine DrawCursor, is now called through the expandmem vector
+;	emDrawCursorVector.  This is the default routine which is set into the vector by
+;	the routine InitCrsrVects.
+;
+
+			EXPORT	VDrawCursor
+			IMPORT	BLITCURSOR						;from ccrsrcore.a
+VDrawCursor
+			MOVE.B	#1,CRSRBUSY 					;MARK CHANGE IN PROGRESS
+		
+			TST		CRSRSTATE
+			BMI.S	DoneSho							;QUIT IF STILL HIDDEN
+			CLR 	CRSRSTATE						;DON'T LET CRSRSTATE GET > 0
+			TST.B	CRSRVIS 						;IS CURSOR ALREADY VISIBLE?
+			BNE.S	DoneSho							;YES, DON'T TRY TO REDRAW
+			TST.B	CrsrObscure						;Skip if obscured
+			BNE.S	DoneSho
+
+			BSR.L	BLITCURSOR						;Do the real work: put pixels up
+
+DoneSho		CLR.B	CRSRBUSY						;CHANGE COMPLETE
+			RTS
+
+
+;______________________________________________________________________________________________	<H15>
+;	VEraseCursor  -  default EraseCursor routine
+;
+;	The low level cursor routine EraseCursor, is now called through the expandmem vector
+;	emEraseCursorVector.  This is the default routine which is set into the vector by
+;	the routine InitCrsrVects.
+;
+
+			EXPORT	VEraseCursor
+			IMPORT	UNBLITCURSOR					;from ccrsrcore.a
+VEraseCursor
+			MOVE.B	#1,CRSRBUSY 					;MARK CHANGE IN PROGRESS
+			TST.B	CRSRVIS 						;IS CURSOR VISIBLE?
+			BEQ.S	DoneHid							;NO, DON'T TRY TO REMOVE IT
+			
+			BSR.L	UNBLITCURSOR					;Zap Pixels
+
+DoneHid		CLR.B	CRSRBUSY						;CHANGE COMPLETE
+			RTS
+
+		END

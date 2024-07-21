@@ -1,0 +1,113 @@
+;
+;	File:		LaterFileMgrPatches.a
+;
+;	Contains:	File Manager patches which must load after the main
+;				bunch in FileMgrPatches.a
+;
+;	Written by: Dave Feldman and Jeff Miller
+;
+;	Copyright:	© 1990 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <1>	12/14/90	dnf 	move patches in from old-style patchxxxROM files
+;
+;	To Do:
+;		Move the rest of the old-style patches in here.
+
+;——————————————————————————————————————————————————————————————————————————————————————————
+;								Includes…
+;——————————————————————————————————————————————————————————————————————————————————————————
+	print		push
+	print		off
+	load		'StandardEqu.d'
+	include		'LinkedPatchMacros.a'
+	print		pop
+
+;_______________________________________________________________________________________
+; Patch for MountVol
+;
+; Patched using ExtFSHook.
+;
+; The MountVol patch fixes a problem in the recognition of already mounted, but offline, volumes:
+; the recognition loop stops checking VCBs when the first one matching name and creation date is
+; found.  If the LEOF check subsequently fails, no other VCBs are even considered.
+;
+; We check for this condition and jump back into the File System to fix it, or we jump on
+; down the ExtFSHook chain.
+;
+; <1> dnf & jsm 	Converted to linked patch from old Patch #17 in PatchPlusRom.a
+;
+;_______________________________________________________________________________________
+
+ROMVCBLoop	RomBind 	(Plus, $3010)
+
+MountVolPatch	PatchProc	ExtFSHook, (Plus)
+			
+			MOVE.L	FSQHead,A0			; A0 -> current request 				<25Sep87>
+			MOVE.W	IOTrap(A0),D2		; get trap
+			AND.W	#$F0FF,D2			; make it generic
+
+			CMP.W	#$A00F,D2			; mountVol call?
+			bneOld						; Nope - try something else
+
+; MountVol only checks the LEOFs of open files for the first VCB that matches the newly mounted
+; volume in name and creation date.  It is possible, however, that additional VCBs exist that WOULD
+; match the new volume, even when the first one happens to fail, in which case a new mount should
+; really have been a remount:
+
+			TST.W	D0					; Error on call?
+			bneOld						; If so, don't make things any worse
+			TST.B	NewMount			; Was this actually a new mount?
+			bneOld						; Br if not (already a remount)
+
+			MOVE.L	QLink(A4),D0		; If any other volumes exist, A4 must point to one
+			bneOld						; Br if no more volumes
+
+; We're now sure that we need to take a look at this volume, so blow away
+; the return address to CmdDone and jump back into the right spot in MountVol
+
+			addq.w	#4, sp				; get rid of the return address into CmdDone
+			jmpROM	ROMVCBLoop			; Go check this one as well
+			endproc
+	
+			
+;_______________________________________________________________________________________
+; Patch for MFS Rename
+;
+; Patched using ExtFSHook.
+;
+; The rename patch fixes a problem encountered when renaming MFS volumes: D0 used to index the length
+; of the new name, and isn't cleared on exit, which prompts CmdDone to generate a TFS internal error code
+; message in D0's place.
+;
+; We check for this condition, fix it and jump on down the ExtFSHook chain.
+;
+; <1> dnf & jsm 	Converted to linked patch from old Patch #17 in PatchPlusRom.a
+;_______________________________________________________________________________________
+
+MFSRenamePatch	PatchProc	ExtFSHook, (Plus)
+
+			move.l	FSQHead,A0			; A0 -> current request 				<25Sep87>
+			move.w	IOTrap(A0),D2		; get trap
+			and.w	#$f0ff,D2			; make it generic
+			cmp.w	#$a00b,D2			; Rename call?
+			bneOld						; If not, just give up.
+
+; Rename contains a bug in the volume rename logic: SetVolName is called to fill in the new volume
+; name, which leaves D0 with the length of the new name.  Rename fails to clear D0 on its subsequent
+; (successful) exit, and so leaves D0 with some small, positive, integer at CmdDone.  CmdDone considers
+; D0 an internal error message code, and promptly converts it to an FSDSIntErr code (-127).  At the
+; point where this hook is called, CmdDone should have converted the error, but ioResult is still 1.
+
+			cmp.w	#FSDSIntErr,d0		; If so, internal error generated?
+			bneOld						; Nope - it's OK or a real error.
+			cmp.w	#SigWord,VCBSigWord(a2) ; Just renamed (a file on or an) MFS volume?
+			bneOld						; No - it's a real internal error
+
+			moveq.l	#0,d0				; Yes - Clear D0 (new result code - will go into
+										;	 ioResult(A0) later...)
+			jmpOld
+			
+			endProc
+			end

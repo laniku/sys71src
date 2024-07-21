@@ -1,0 +1,770 @@
+;
+;	File:		BTreeQueue.a
+;
+;	Contains:	This file separates Btree manager from HFS one layer above.
+;				Support async call for BTree Manager using its own cache buffers and
+;				param block queue.
+;
+;	Written by:	Kenny SC. Tung
+;
+;	Copyright:	© 1989-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM1>	 4/1/92		kc		Changed the name prefex used to distinguish
+;									 routines used by the external B-Tree manager
+;									from the versions used by the File System.
+;									Removed forRom conditional.
+;									• Pre-SuperMario comments follow •
+;		<20>	 9/13/91	JSM		Cleanup header.
+;		<19>	 6/12/91	LN		Removed #includes for private interfaces from public interfaces.
+;									Changed #include 'HardwareEqu.a' to 'HardwarePrivateEqu.a'
+;		<18>	 3/17/91	dnf		ppd, #dnf-0013: Use the result code from ioResult(a0) instead of
+;									from d0 to be extra-clean on async calls.
+;		<17>	 3/17/91	dnf		dba, dty, #84977: use CallWithRegistersPreserved in dispatching;
+;									save D0 across calls to completion routines.
+;		<16>	12/18/90	KST		With Bill B. Adding DoAlloc back.
+;		<15>	12/11/90	KST		With Bill B. Change _Allocate. to _SetEOF because some foreign
+;									FS doesn't handle _Allocate call.
+;		<14>	 9/10/90	KST		Took out debugger labels.
+;		<13>	  8/3/90	KST		Adding FlushFile call in ExtDoAOCRWF.
+;		<12>	 7/30/90	dnf		Make some changes so BTree manager can work as a linked patch.
+;		<11>	 7/18/90	KST		btRsvAccess will not return error if the file has already been
+;									reserved, instead the request will be queued.
+;		<10>	 7/11/90	gbm		add END
+;		 <9>	 4/17/90	KST		Adding btDebugSYS conditional in "ExtBTQueue".
+;		 <8>	 3/30/90	KST		Save registers across ASYNC call.
+;		 <7>	 3/20/90	KST		Fixing a bug in handling B*Tree request queue, removing <1.9>
+;									registers saving redundant code, and other documentation
+;									changes.
+;		 <6>	 3/13/90	KST		documentation change and code cleanup.
+;		 <5>	 2/20/90	KST		map node was written before "RelMap" was called, now we only
+;									mark it dirty and write it back in "ExtRelBlock" !				
+;		 <4>	  2/4/90	DNF		Add include of FileMgrPrivate.a
+;		 <3>	 1/22/90	KST		Changed queue dispatcher to support access control. -- KST
+;				 1/16/90	KST		added code to support AppleShare's access control.
+;	   <1.9>	11/10/89	dnf		Fix register trashing in ExtDoAOCRWF
+;	   <1.8>	 10/2/89	KST		Code cleanup.
+;	   <1.7>	 9/25/89	KST		Took out the Debugger call. BTFlush now will flush RamCAche.
+;	   <1.6>	 9/17/89	KST		New buffer scheme. No more B*Tree cache buffers.
+;	   <1.5>	  9/8/89	KST		Fixed a bug in ExtWriteBlock. We need to save the RefNum because 
+;									the param is being reused.
+;	   <1.4>	  8/7/89	KST		Code cleanup.
+;				 7/27/89	KST		Use jump table for dispatching calls; Get rid of macro calls
+;				 7/27/89	KST		Save async trap bit in BTVQflag of BTVar for all operations in
+;									ExtBTQueue (BTDispatch)
+;	   <1.3>	 7/13/89	KST		Take out debug code for write error.
+;	   <1.2>	  7/6/89	KST		Cleaned up the code.
+;	   <1.1>	 6/27/89	KST		Fixed a bug in DoACORW routine that trashes A1.
+;				 6/27/89	KST		Preserve A1 across ExtDoAOCRWF call.
+;	   <1.0>	 6/14/89	KST		New file for the new implementation of BTreeMgr.
+;				 5/15/89	KST		Check A6 stack overflow across ExtDoAOCRWF call.
+;				 4/24/89	KST		New today.
+;
+
+
+	LOAD		'StandardEqu.d'
+	INCLUDE		'BTreeEqu.a'		; BTManager
+	Include		'BTreePrivate.a'
+	Include		'FileMgrPrivate.a'
+	Include		'HardwarePrivateEqu.a'
+
+  			IF  	(&TYPE('btDebug') = 'UNDEFINED') THEN
+btDebug   	EQU 	0
+  			ENDIF
+
+			IF &trim(&type('btDebugSYS')) = 'UNDEFINED' THEN	;		<16Apr90>
+btDebugSYS	EQU		0											;		<16Apr90>
+			ENDIF												;		<16Apr90>
+
+;__________________________________________________________________________
+; Function: ExtBTQueue.
+;			All B*Tree requests branch to here to get queued and serviced in the
+;			order they enter the queue (but not necessarily serviced in FCFS because
+;			that file's access might have been reserved).
+; Input:	D0 = dispatch selector, A0 = ioParam, D1.W = trapword (A08E)
+;__________________________________________________________________________
+ExtBTQueue		PROC	EXPORT
+			export	ExtBTDispatchRequest
+			IMPORT	ExtIsBtree
+
+			MOVE.W	#1,IOResult(A0) 	; set IOResult to "in process"
+			MOVE.W	D1,IOTrap(A0)		; save the trap number
+			MOVE.B	D0,ioTrap+1(A0) 	; Store trap index in low byte
+			MOVE.L	(SP)+,IOCmdAddr(A0) ; save address to go to when ready
+			MOVE.W	#btQType,IOType(A0) ; say its a Btree queueing element
+			BTST	#btAsyncBit,D1 		; async bit on?
+			BNE		BTAsync 			; yes
+	;; else, it's a sync call:
+			CLR.L	IOCompletion(A0)	; no completion routines for sync calls
+			MOVE.L	A0,-(SP)			; save parameter block ptr
+			BSR.S	BTAsync 			; queue it up (and maybe call it)
+			MOVE.L	(SP)+,A0			; restore ioParam
+
+WaitLoop	MOVE.W	IOResult(A0),D0 	; get the result code into D0
+
+	IF btDEBUG THEN						; debug ... see if we can continue ?
+			CMPI	#btADAndWait,D0		; waiting for a RelAccess call?
+			BNE.S	@3					; no, never mind
+			;; if it is, then we need a RelAccess call. How?
+			MOVE.L	A0,-(SP)			; save parameter block ptr
+			BSR.S	InstallVBL			; install a VBL task
+			MOVE.L	(SP)+,A0			; restore ioParam
+			MOVE.W	#1,IOResult(A0)		; but do this only once
+			BRA.S	WaitLoop
+@3			TST		D0
+	ENDIF								;...... end of debug
+
+			BGT.S	WaitLoop			; done when result is zero or negative
+
+			EXT.L	D0					; ALWAYS return a long error code
+			RTS 						; return to caller
+
+	IF btDEBUG THEN
+			DC.B	$80, 'ExtBTQueue'
+			ALIGN
+			DC.W	0
+
+InstallVBL	;; ask VBL to issue the release access BTcall
+			;; Test program issues a synchronous request and the access is denied.
+
+			MOVEQ	#vblPhase+2,D0			; 14 bytes
+	    	_NewPtr	,SYS ,Clear
+			BNE.S	@nomem					; exit if no room
+			MOVE	#vType,vblType(A0)		; VBL queue
+			MOVE.L	@vblRelBT,vblAddr(A0)	; pointer to task (this will move the contents)
+			LEA		@vblRelBT,A1
+			MOVE.L	A1,vblAddr(A0)			; pointer to task (this will move the pointer)
+			MOVE	#30,vblCount(A0)		; frequency count
+			_VInstall
+
+@nomem		RTS
+
+@vblRelBT	;; this VBL task will release the file
+			MOVEa.L	FSVarsPtr,A1
+			MOVEA.L	fsVars.btMgr(A1),A1				; A1 = btVars
+			MOVEA.L	btVParam(A1),A0					; A0 = private Param
+			MOVEA.L	btVQhead(A1),A1					; A1 = current btioParam
+			MOVE	ioRefNum(A1),ioRefNum(A0)		; release this file
+			MOVE.L	ioBTRsrvUID(A1),D0				; test program's UID
+			ADDQ	#1,D0							; it uses UID - 1
+			MOVE.L	D0,ioBTRsrvUID(A0)				; use this ID to release
+			CLR.L	ioCompletion(A0)				; no completion routine
+			_BTRelAccess	,Async					; call B*TreeMgr
+			RTS
+
+	ENDIF
+
+
+BTAsync 	MOVEa.L	FSVarsPtr,A1
+			MOVEA.L	fsVars.btMgr(A1),A1	; A1 is also the q header
+			MOVE	SR,-(SP)			; only allow
+			ORI 	#HiIntMask,SR		; interrupt for debugging
+			_ENQUEUE																		;
+
+ToBTDispatch		; dispatch the next request (also called by ExtBTCmdDone)
+					; interrupt disabled.		; Is a request already executing?
+			BSET	#btQBusyBit,btVQFlag(A1)	; A1=btVar, B*Tree busy?
+			BEQ.S	BTDispatch					; if not, just call it
+
+; The B*tree Manager is busy (and we've queued the request), so we're done for now.  
+; We'll  get to it when ExtBTCmdDone is called.
+			MOVEQ	#0,D0				; no errors (yet)
+			MOVE.W	(SP)+,SR			; re-enable interrupts and return
+			RTS
+
+BTDispatch	;; A1 = ptr(BTvars)
+			MOVE	(SP)+,SR			; re-enable interrupts
+
+			MOVEM.L D3-D7/A2-A6,-(SP)	; observe Pascal regsave conventions					<17>
+			bsr.s	ExtBTDispatchRequest
+			MOVEM.L (SP)+,D3-D7/A2-A6	; restore registers										<17>
+			rts
+
+ExtBTDispatchRequest:
+		;; Added code to support AppleShare's access control:		-- 12/14/89
+		;; We may not service the request in FCFS order. If the request we're servicing
+		;; is not in the front of the queue, then we move it to the front.
+		;; If we cannot service any of the requests, we clear the BUSY flag and leave.
+
+			LEA		btVQHead(A1),A0		; A1=btVar, A0=ioParam
+@scanLoop	MOVE.L  qLink(A0),D0        ; Pick up the next element on the queue
+            BEQ	    @ad_ret		        ; If EQ, there are no requests pending
+@loop2		MOVEA.L	D0,A0				; A0 -> BT Parameter block
+
+		;; Loop through the queue, looking for an element that can be started:
+			MOVEQ	#0,D0
+			MOVE.B	ioTrap+1(A0),D0		; which operation
+			CMP.W	#btRsrvAccessN,D0	; reserveAccess will be queued now	<17Jul90>
+			BEQ.S	@controlled			; yes, this is RsrvAccess call		<17Jul90>
+			CMP.W	#btOpenN,D0			; INIT, OPEN are free to go
+			BLE.S	@moveQueue			; no access control
+			CMP.W	#btDeleteN,D0
+			BHI.S	@moveQueue			; no access control
+@controlled
+		;; we are in the range of operations that will change the contents of B*Tree.
+		;; check if the file is locked by other process; if not then move the request
+		;; to the front if it isn't already at the front.		
+			BSR		btFileUid			; get this B*tree file's Uid in D1
+			BNE.S	@moveQueue			; not btree error, but let B*TreeMgr handles it
+			TST.L	D1					; Check: B*-Tree access reserved?
+			BEQ.S	@moveQueue			; If 0,   it's a free-for-all
+			CMP.L	ioBTRsrvUID(A0),D1	; If not, is this call for the right user?
+			BEQ.S	@moveQueue			; yes, we have the access
+		;; If we don't have the access permission and this is a SYNCHRONOUS call, 
+		;; then we set a special value in ioResult.
+			BTST	#btAsyncBit,ioTrap(A0)	; SYNC call?
+			BNE.S	@scanLoop			; No, it's not - check next one in queue
+			MOVE	#btADAndWait,IOResult(A0) 	; access denied on a SYNC call, mark we're waiting
+			BRA.S	@scanLoop
+
+@moveQueue	CMP.L	btVQHead(A1),A0		; is this head?
+			BEQ.S	@doit				; yes
+		;; If not, then we need to move it to the front
+			MOVE	SR,-(SP)			; only allow level 3
+			ORI 	#HiIntMask,SR		; interrupts for debugging
+			MOVE.L	A1,-(SP)			; save btVars
+			LEA		btVQHdr(A1),A1		; A1 = theQueue, A0 = qEntry
+			_dequeue					; remove it from BT queue
+			MOVEA.L	(SP),A1				; A1 = btVars
+			MOVEA.L	btVQHead(A1),A1		; A1 = head
+			MOVE.L	A1,qLink(A0)		; add it in the front
+			MOVEA.L	(SP)+,A1			; restore A1(btVars)
+			MOVE.L	A0,btVQHead(A1)		; A0 = QHead
+			TST.L	btVQTail(A1)		; tail = NULL?
+			BNE.S	@1					; no
+			MOVE.L	A0,btVQTail(A1)		; A0 = QTail too
+@1			MOVE.W	(SP)+,SR			; re-enable interrupts
+
+@doit	;;Really gonna execute it. Here, make sure A1=btVar.
+			MOVEA.L	btVSTop(A1),A6		; Set up A6 for use as stack pointer
+		;; Before servicing the call, save async bit in BTVars because B*Tree Manager
+		;; shares its private param block doing I/O, not user param.
+			BCLR	#btAsyncBit,btVQFlag(A1)	; sync is default
+			BTST	#btAsyncBit,ioTrap(A0)		; Async only?
+			BEQ.S	@2							; sync call
+			BSET	#btAsyncBit,btVQFlag(A1)	; set async bit
+@2			MOVEA.L	IOCmdAddr(A0),A1	; get address to call
+			JMP 	(A1)				; execute Btree command and return						<17>
+										; (all commands finish by jumping to ExtBTCmdDone)
+
+;; Access has been denied, clear busy flag and return,
+;; (the request(s) will finally be serviced when a RelAccess call comes in).
+@ad_ret		BCLR	#btQBusyBit,btVQFlag(A1)	; Btree not servicing
+		;; because this test and clear is not atomic, I need to do this:
+			MOVE.L  qLink(A0),D0        ; A0 was tail
+			BEQ.S	@qexit				; and it still is
+			BSET	#btQBusyBit,btVQFlag(A1)	; is B*Tree busy?
+            BEQ	    @Loop2		        ; no, go service the new request
+@qexit		RTS							; D0 = 0
+
+;; _____________________________________________________________________
+;; Function:verify if this file is B*Tree, if it is, get the UID in D1
+;; Input:	A0 = user param
+;; Output:	D0=0 if it's Btree; D1 = UID. All other registers preserved.
+;; _____________________________________________________________________
+btFileUid	MOVEM.L	D2/A1-A4,-(SP)
+			BSR		ExtIsBtree			; BTree?
+			BNE.S	@3					; no,  not btree
+			MOVE.L	BTCRsrvUID(A4),D1	; yes, get UID
+
+		IF btDebugSYS THEN				; if debugging				<16Apr90>
+			MOVEQ	#0,D1				; .. system btree file		<16Apr90>
+		ENDIF							; .. don't use UID			<16Apr90>
+
+@3			MOVEM.L	(SP)+,D2/A1-A4
+			TST		D0
+			RTS
+	IF btDEBUG THEN
+			DC.B	$80, 'BTDispatch'
+			ALIGN
+			DC.W	0
+	ENDIF
+			ENDPROC
+
+; _____________________________________________________________________________
+; Function:	ExtBTCmdDone. All BTcommands jump to here when finished
+;			ioCompletion routine is called for ASYNC call. The current request 
+;			is removed from the queue, and the next one is serviced if there is one.
+; Input:	D0.W = error code
+; _____________________________________________________________________________
+ExtBTCmdDone	PROC	EXPORT
+			IMPORT	ExtBTDispatchRequest, CallWithRegistersPreserved
+
+		IF btDebug THEN
+			BSR		bufDebug			; debugging
+		ENDIF
+
+			EXT.L	D0					; Make a long of it
+			jsr		btQerrorp			; get current ioParam in A0
+			MOVE	SR,-(SP)			; save interrupt state
+			ORI 	#HiIntMask,SR		; only debug interrupts allowed
+			BCLR	#btQBusyBit,btVQFlag(A1)	; clear Btree busy flag
+
+; delete the current request from the queue and post any completion routines
+			MOVE.L	QLink(A0),btVQHead(A1)	; get next request, if any
+			BNE.S	bt_CallComp 		; branch if queue not empty
+			CLR.L	btVQTail(A1)		; clear tail ptr, too
+bt_CallComp
+			MOVE	(SP)+,SR			; restore interrupt state
+			MOVE.W	D0,IOResult(A0) 	; post error code
+			MOVE.L	IOCompletion(A0),D1 ; is there a completion routine?
+			BEQ.S	bt_DispNext 		; skip if there's not
+			MOVE.L	D1,A1				; get the completion routine address
+			JSR 	(A1)				; call it with A0=param
+
+bt_DispNext	;; check if there's anything else for us to do
+			MOVE	SR,-(SP)			; save interrupt state
+			ORI 	#HiIntMask,SR		; only debug interrupts allowed
+			MOVEa.L	FSVarsPtr,A1
+			MOVEA.L	fsVars.btMgr(A1),A1	; get BT vars
+			TST.L	btVQHead(A1)		; any req pending?
+			beq		@noRequirements		; <dnf> change for linked patch
+
+			BSET	#btQBusyBit,btVQFlag(A1)	; A1=btVar, B*Tree busy?						<17>
+			bne.s	@noRequirements		; if it was already busy, we can return asynchronously	<17>
+			move.w	(sp)+,sr			; restore interrupt state								<17>
+	
+			lea.l	ExtBTDispatchRequest,a0		; our dispatcher’s entry point					<17>
+			jmp		CallWithRegistersPreserved	; call it 										<17>
+
+@noRequirements:
+			MOVE.W	(SP)+,SR			; re-enable interrupts and return
+			RTS
+
+@doDispatch:
+
+;; _______________________________________________________________
+;; Function:	get current ioParam in A0 and validate it
+;; Output:		A0=current request, A1=BTVar ptr
+;; _______________________________________________________________
+btQerrorp	;; if error just die
+			MOVEa.L	FSVarsPtr,A1
+			MOVEA.L	fsVars.btMgr(A1),A1
+			MOVEA.L	btVQHead(A1),A0		; A0 = first ioParam
+			CMP 	#btQType,IOType(A0) ; it better be an Btree queue element
+			BNE.S 	@2					; or else die
+			RTS
+
+@2			MOVEQ	#DSFSErr,D0
+			_SysError
+
+		IF btDebug THEN					; Debugging ........................
+bufDebug	MOVEM.L	D0/D2/A3-A5,-(A7)
+			MOVEa.L	FSVarsPtr,A5
+			MOVEA.L	fsVars.btMgr(A5),A5
+			MOVEA.L	btBufQHdr(A5),A5	; A5 = ptr(buffer Qheader)
+			MOVEQ	#0,D2				; start from 0				<9/15/89>
+			LEA		btQBStart(A5),A3	; A3=first buffer			<9/15/89>
+
+@2			BTST   #CBHinuse,btBHFlags(A3) ; buffer in use?			<9/15/89>
+			BNE.S	@4					; yes, error				<9/15/89>
+			
+			ADDQ	#1,D2				; next index				<9/15/89>
+			CMPI	#btBufferN,D2		; all done?					<9/15/89>
+			BEQ.S	@6					; Yes,						<9/15/89>
+			ADDA	#$200,A3			; next buffer				<9/15/89>
+			ADDA	#lenBTBH,A3			;  ... and skip header		<9/15/89>
+			BRA.S	@2					; test next					<9/15/89>
+
+@4			_debugger					; this shouldn't happen		<9/15/89>
+										; A3 buffer still in use	<3/09/90>
+@6			MOVEM.L	(SP)+,D0/D2/A3-A5
+		ENDIF
+
+			RTS
+	IF btDEBUG THEN
+			DC.B	$80, 'ExtBTCmdDone'
+			ALIGN
+			DC.W	0
+	ENDIF
+			ENDPROC						; ExtBTCmdDone
+
+;; ___________________________________________________________________________
+;; Function:	This is the routine that handles async HFS calls
+;; Input:		D1 = option word (ALLOCATE/OPEN/CLOSE/READ/WRITE/Flush). 
+;;				A0 = BT private param, assume A1 is free
+;; Output:		D0=error code
+;; 28Jul89		KST		Disable system cache for B*Tree when doing R/W
+;; 24Aug89		KST		Undo previous change, we depend on RamCache
+;; 02Aug90		KST		Adding flushfile call for BTFlush.
+;; ___________________________________________________________________________
+asyncRegs	REG		d2-d7/A2-A5
+
+ExtDoAOCRWF	PROC	EXPORT
+			MOVEQ	#paramErr,D0		; preset error code
+			CMPI	#DoMaxNum,D1		; legal (0~5) ?
+			BHI.S	syncRet				; bad
+			MOVEa.L	FSVarsPtr,A1
+			MOVEA.L	fsVars.btMgr(A1),A1
+
+	IF btDebug THEN	;; debugging, check for stack overflow <6/12/89>
+			MOVE.L	btVSTop(A1),D0		; stack base
+			SUB.L	A6,D0				; how far does it go
+			CMPI.L	#(btStkLen-24),D0	; overflow? (reserve 24 bytes for AsyncOC)
+			BLO.S	@1					; no, 
+			MOVEQ	#dsStkNHeap,D0		; stack overflow
+			_SysError					; bumb !
+	ENDIF
+
+@1			LSL		#2,D1						; use jump table
+			BTST	#btAsyncBit,btVQFlag(A1)	; Async call?
+			BNE.S	AsyncOC						; yes
+@2	;; A0/A1 are saved by the system dispatcher
+			LEA		syncTable,A1
+			JMP		(A1,D1)						; service the call
+
+syncTable	
+			_Allocate						; put this back				 <18Dec90 #16>
+			BRA.S	syncRet
+			_HOpen
+			BRA.S	syncRet
+			_Close
+			BRA.S	syncRet
+			_Read
+			BRA.S	syncRet
+			_Write
+			BRA.S	syncRet
+			_FlushFile
+			BRA.S	syncRet
+			_SetEOF							; adding this				<18Dec90 #16>
+syncRet		RTS
+
+AsyncOC		;; A0 = BTParam to do async open/close...., D1 is the selector
+			;; A1 = ptr(BTVars)
+			MOVE.L		(SP)+,-(A6)			; save return address
+			MOVEM.L		asyncRegs,-(A6)		; save all regs across async
+			MOVE.L		A6,btVSPtr(A1)		; save BT stack top
+			BCLR		#btAsyncRetd,btVQFlag(A1)	; clear 'premature-return' flag
+			LEA			btIOComp,A1			; load btIOcomp routine
+			MOVE.L		A1,IOCompletion(A0)
+
+			LEA			asyncTable,A1
+			JMP			(A1,D1)				; service the call
+
+asyncTable
+			_Allocate ,Async				; put this back				 <18Dec90 #16>
+			BRA.S		@4
+			_HOpen ,Async
+			BRA.S		@4
+			_Close ,Async
+			BRA.S		@4
+			_READ  ,Async
+			BRA.S		@4
+			_WRITE ,Async
+			BRA.S		@4
+			_FlushFile ,Async
+			BRA.S		@4
+			_SetEOF ,Async					; adding this				<18Dec90 #16>
+@4			BEQ.S		@6					; branch if no error
+			TST			IOResult(A0)		; really error?
+			BLE.S		btACont				; yes
+@6			; say we returned from B*Tree async call
+			MOVEa.L		FSVarsPtr,A1
+			MOVEA.L		fsVars.btMgr(A1),A1
+			BSET		#btAsyncRetd,btVQFlag(A1)	; set asyncReturn flag
+			BNE.S		btACont1			; if we already returned, do ioComp now
+											; do the completion routine not caused by interrupt
+btAsyncRTS	RTS								; else, return to App. We'll be back
+
+
+btIOcomp	;; B*Tree ioCompletion routine
+			MOVEa.L		FSVarsPtr,A1
+			MOVEA.L		fsVars.btMgr(A1),A1			; say we're returning now
+			BSET		#btAsyncRetd,btVQFlag(A1)	; set asyncReturn flag
+			BEQ.S		btAsyncRTS			; if trap didn't really return ASYNC
+											; then RTS now, we'll be back (from @6)
+			;; SYNC case in an ASYNC call, it will eventually return to @6
+btACont		MOVEM.L D4-D7/A4-A6,-(SP)		; preserve non-interrupt registers
+			PEA 	btACont2 				; return to here to restore regs
+btACont1
+			MOVEa.L		FSVarsPtr,A1		; restore B*TreeMgr stack
+			MOVEA.L		fsVars.btMgr(A1),A1
+			MOVEa.L		btVSPtr(A1),A6	; A6 = BT stack
+			MOVEM.L		(A6)+,asyncRegs		; restore regs across async
+			MOVE.L		(A6)+,-(SP)
+			MOVE.W		ioResult(a0),D0		; any error?									<18>
+			RTS								; return to B*tree manager
+
+btACont2 	MOVEM.L 	(SP)+,D4-D7/A4-A6	; restore the non-int registers
+			RTS 			;; we're done with it! (return to interrupt handler)
+			ENDPROC			;; exit ExtDoAOCRWF
+
+;_________________________________________________________________________________
+; Routine:		ExtGetBlock															
+; Function: 	Gets a specified btree node (data fork of a B*Tree file).
+;				The desired block must be specified by file refnum;
+;				Unless GBnoRead option is specified, a FS read is performed.
+; Input:		D0.W  -  file refnum only
+;				A1.L  -  pointer to BTree cache queue header
+;				D1.B  -  option flags (default = read from disk if not found):
+;							 GBRead   - read from disk (forced read)
+;							 GBnoRead - don't read from disk if not found
+;							 GBexist  - get existing cache block
+;				D2.L  -  btree node number
+; Output:		A0.L  -  addr(buffer) containing desired block
+;				D0.W  -  result code, 0 = ok, other = error
+; 08Aug89	KSCT	Need a inuse flag for the new buffer scheme.
+; 15Aug89	KSCT	Clear inuse flag if read error!
+;_________________________________________________________________________________
+ExtGetBlock	PROC	EXPORT				;											
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1-D6/A1-A5,-(A6)	; save regs
+			MOVE.B	D1,D3				; D3 = option flags
+			MOVEA.L A1,A3				; A3 = ptr(Buf QHdr)
+			MOVE.W	D0,D1				; D1 = volume or file refnum?
+			BLT 	GBErrExit			; volume -> unsupported
+		
+			MOVEA.L FCBSPtr,A1			; A1 = ptr(FCB)
+			MOVEA.L FCBVPtr(A1,D1.W),A2 ; A2 = ptr(VCB)
+			MOVEA.L	FCBBTCBptr(A1,D1),A4; A4 = ptr(BTCB)
+			MOVEQ	#0,D6				; D6.L=request count
+			MOVE.W	btcNodeSize(A4),D6	; D6=B*Tree nodesize
+			BNE.S	@1					; B*tree opened
+		;; BTOpen wants to read the header but we don't know the NodeSize, assume 
+		;; Header Nodesize is a constant, or at least Header info is in the first 512 bytes.
+			MOVE.W	#btHdrNSize,D6
+
+;; new buffer scheme: not cache (can't get an existing block)		 <8/21/89>
+@1			BTST	#GBexist,D3 		; request for an existing block?
+			BEQ.S	@2					; no ->
+
+		IF btDebug THEN
+			_debugger					; should not happen
+		ENDIF
+
+			MOVEQ	#Chnotfound,D0		; result = 'not found'
+			BRA 	GBExit1 			; exit ->
+
+@2			MOVE	btQCIndex(A3),D0	; current index
+			MOVE	D0,D5				; save current index for error recovery
+			MOVEA.L A3,A5				; A3 = A5 = buffer QHdr
+			CMPI	#(btBufferN-1),D0	; need to wrap around?
+			BEQ.S	@3					; yes
+			ADDQ	#1,btQCIndex(A3)	; else, bump the index
+			BRA.S	@4
+@3			CLR		btQCIndex(A3)		; wrap around
+@4			MOVE	btQBSize(A3),D4		; D4=INIT buffer size
+	;; In future release, we need to make sure that D4>=D6, err otherwise.
+	;; get the buffer based on the index in D0
+			LEA		btQBStart(A3),A3	; A3=first buffer
+			BRA.S	@6
+@5			ADDA	D4,A3				; next buffer
+			ADDA	#lenBTBH,A3			;  ... and skip header
+@6			DBRA	D0,@5
+
+	;; A3=buffer header pointer, check if the buffer is inuse		<9/8/89>
+	;; can't just use the next one sequentially						<9/8/89>
+			BTST   #CBHinuse,btBHFlags(A3) ; buffer in use?			<9/8/89>
+			BEQ.S	@8					; No, OK =>					<9/8/89>
+			BSR		gNextbuf			; Yes, get next one			<9/11/89>
+			BNE.S	@gbNoBuf			; no buffer					<9/11/89>
+	;; convert block number into byte position, A3 = buffer header address to use.
+@8			MOVEQ	#0,D0
+			MOVE.B	btcL2NSize(A4),D0	; D0=shift bit count
+			LSL.L	D0,D2				; file block number x size = file position
+	;; assign buffer to new node, but keep status info				<9/8/89>
+			BSET   #CBHinuse,btBHFlags(A3) ; set in use				<9/8/89>
+
+			MOVE	D1,btBHRefNum(A3)	; save refnum
+			MOVE	D6,btBHNSize(A3)	; save node size
+			MOVE.L	D2,btBHFilePos(A3)	; save file position
+			LEA		btBHData(A3),A3		; A3=ptr(buffer)
+			BTST	#GBnoRead,D3		; no-read requested ?
+			BNE.S	NoReadBlk			; ...yes, skip read ->
+	;; FileRead here: D0/A0 are free, (A1,D1)=FCB, A4=BTCB, D2=file pos,D6=nodesize
+			MOVEa.L	FSVarsPtr,A1
+			MOVEA.L	fsVars.btMgr(A1),A1
+			MOVEA.L	btVParam(A1),A0		; A0 = BT Param
+			MOVE.W	D1,ioRefNum(A0)		; file refnum
+			MOVE.L	A3,IOBuffer(A0)		; buffer to read in
+			MOVE.W	#fsFromStart,IOPosMode(A0)	; position mode(from BOF)
+			MOVE.L	D6,IOByteCount(A0)	; r/w node size
+			MOVE.L	D2,IOPosOffset(A0)	; ... gives position offset
+			MOVEQ	#DoRead,D1			; indicate this is READ
+			BSR		ExtDoAOCRWF
+			BEQ.S	NoReadBlk			; read OK =>
+	;; some read error, clean up and exit (clear flag). A3=ptr(buffer)
+			LEA		-btBHData(A3),A1	; A1=ptr(bufHdr)			<9/15/89>
+			BCLR   #CBHinuse,btBHFlags(A1) ; not in use				<9/15/89>
+@gbNoBuf	MOVE	D5,btQCIndex(A5)	; restore old index as nothing has happened
+			BRA.S	GBExit1 			; D0=read error ->
+
+NoReadBlk	MOVEQ	#0,D0				; all OK
+GBExit1		MOVEA.L	A3,A0				; return buffer address in A0 (even error in read)
+			MOVEM.L (A6)+,D1-D6/A1-A5
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set up condition codes
+			RTS 						; exit ExtGetBlock			
+
+GBErrExit	MOVEQ	#paramErr,D0
+			BRA.S	GBExit1
+
+;_________________________________________________________________________________
+; Routine:		gNextbuf (internal function)
+; Function: 	Current buffer is inuse, try next one. This function is SYNC.
+; Input:		D4.W=Btree private buffer size, D5.W=index of current buffer, 
+;				A3=ptr(buffer inuse), A5=ptr(buffer QHdr)
+; Output:		if D0=0, then A3=new buffer ptr, everything else unchanged,
+;				btQCIndex(A5) updated to reflect the change.
+;				if D0<>0 (all inuse), everything unchanged, including A3.
+;_________________________________________________________________________________
+gNextbuf	MOVE.L	D2,-(SP)
+			MOVE	D5,D2				; D2=D5=index				<9/11/89>
+
+@gnbLoop	ADDQ	#1,D2				; next index				<9/11/89>
+			CMPI	#btBufferN,D2		; need to wrap around?		<9/11/89>
+			BNE.S	@1					; No						<9/11/89>
+			MOVEQ	#0,D2				; Yes, wrap around			<9/11/89>
+			LEA		btQBStart(A5),A3	; A3=first buffer			<9/11/89>
+			BRA.S	@2					;							<9/11/89>
+
+@1			ADDA	D4,A3				; A3 points to next buffer	<9/11/89>
+			ADDA	#lenBTBH,A3			;  ... and skip header		<9/11/89>
+
+@2		;; we knew D5 is inuse, so don't bother testing it. A3 = ptr(D5 buffer)
+			CMP		D2,D5				; all done?					<9/11/89>
+			BEQ.S	@gnbNobuf			; yes, all inuse. punt->	<9/11/89>
+
+			BTST   #CBHinuse,btBHFlags(A3) ; buffer in use?			<9/11/89>
+			BNE.S	@gnbLoop			; yes, try next one			<9/11/89>
+		;; found the free buffer, D2 is the index, update the btQCIndex field
+			ADDQ	#1,D2				; next index				<9/11/89>
+			CMPI	#btBufferN,D2		; need to wrap around?		<9/11/89>
+			BNE.S	@3					; No						<9/11/89>
+			MOVEQ	#0,D2				; Yes, wrap around			<9/11/89>
+@3			MOVE	D2,btQCIndex(A5)	; and save it in qHeader	<9/11/89>
+			MOVEQ	#0,D0				; perfect					<9/11/89>
+@gnbExit	MOVE.L	(SP)+,D2
+			TST		D0
+			RTS
+
+@gnbNobuf
+		IF btDebug THEN
+			_debugger					; this shouldn't happen		<9/11/89>
+		ENDIF
+			MOVEQ	#ChNoBuf,D0 		; result=all buffers in use	<9/11/89>
+			BRA.S	@gnbExit			;							<9/11/89>
+
+			ENDPROC
+
+
+;_________________________________________________________________________________
+;
+; Routine:		ExtRelBlock (Release Block)											
+;
+; Function: 	Releases use of a specified disk block; optionally marks block dirty,
+;				trashes block, and/or writes block to disk. Note: this routine may be
+;				called for an already released block to mark it dirty, trashed, or to
+;				write it.
+;
+; Input:		D1.B  -  option flags:
+;							RBdirty - mark buffer dirty
+;							RBtrash - trash buffer contents (set empty)
+;							RBwrite - force write buffer to disk
+;				A0.L  -  addr(cache buffer) containing disk block
+;				A1.L  -  pointer to buffer header (not used)
+; Output:		D0.W  -  result code
+;							0 = ok
+;							other = error (can only occur if RBwrite option specified)
+;_________________________________________________________________________________
+
+ExtRelBlock	PROC	EXPORT				;											
+			IMPORT	ExtWriteBlock		;											
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1/A0/A4,-(A6) 		; save registers
+			LEA 	-lenbtBH(A0),A4		; A4 = ptr to CBH
+			BTST	#CBHdirty,btBHFlags(A4) ; buffer dirty?			<2/20/90>
+			BEQ.S	@1					; no						<2/20/90>
+			CLR.B	btBHFlags(A4) 		; clear dirty/in-use		<2/20/90>
+			BRA.S	@4					; write dirty mapnode		<2/20/90>
+
+@1			CLR.B	btBHFlags(A4) 		; clear in-use				<9/8/89>
+
+			BTST	#RBdirty,D1 		; buffer dirty?
+			BNE.S	@4					; Yes ->
+@2			BTST	#RBwrite,D1 		; force write requested ?
+			BEQ.S	RBExit				; no ->
+@4			JSR 	ExtWriteBlock		; write block to disk						
+			BRA.S	RBExit1 			; all done -> D0 set
+RBExit
+			CLR.W	D0					; indicate no error
+RBExit1
+			MOVEM.L (A6)+,D1/A0/A4		; restore registers
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set up condition codes
+			RTS 						; exit ExtRelBlock							
+			ENDPROC
+
+;_________________________________________________________________________________
+; Function: 	write a B*Tree buffer to disk.
+; Input:		A4.L - buffer header to write
+; Output:		D0 = error code, set buffer not dirty!
+; Modification History:
+;	07Aug89		KSCT	Get node size shift count from BTCB
+;	08Sep89		KSCT	Save the RefNum we are servicing because the param is reused.
+;________________________________________________________________________________
+ExtWriteBlock	PROC	EXPORT					;									
+				IMPORT	ExtDoAOCRWF
+
+			MOVE.L	(SP)+,-(A6)
+			MOVEM.L	D1/A1,-(A6)					; save regs over _write call
+		;; We don't do flush now, Do a filewrite here:
+			MOVEa.L		FSVarsPtr,A1
+			MOVEA.L		fsVars.btMgr(A1),A1
+			MOVEA.L		btVParam(A1),A0			; A0 = BT Param
+		IF BTDEBUG THEN
+		;; A0 is reused. stash info on stack.										<9/8/89>
+			MOVE	ioRefNum(A0),-(A6)			; save the RefNum we're servicing	<9/8/89>
+		ENDIF
+			MOVE.W	btBHRefnum(A4),D0			; D0=refnum
+			MOVE.W	D0,ioRefNum(A0)				; file refnum
+			LEA		btBHdata(A4),A1
+			MOVE.L	A1,IOBuffer(A0)				; buffer to write
+			MOVE.W	#fsFromStart,IOPosMode(A0)	; position mode(from BOF)
+			MOVEQ	#0,D0
+			MOVE.W	btBHNSize(A4),D0			; D0=node size
+			MOVE.L	D0,IOByteCount(A0) 			; r/w node size
+			MOVE.L	btBHFilePos(A4),D0			; file pos
+			MOVE.L	D0,IOPosOffset(A0)			; ... gives position offset
+			MOVEQ	#DoWrite,D1					; indicate this is WRITE
+			BSR		ExtDoAOCRWF					; 
+
+		IF BTDEBUG THEN
+			MOVE	(A6),D1						; old refnum					<9/8/89>
+			CMP		ioRefNum(A0),D1				; same refnum?					<9/8/89>
+			BEQ.S	@2							; yes							<9/8/89>
+			_debugger							; should not happen				<9/8/89>
+
+@2			MOVE	(A6)+,ioRefNum(A0)			; restore RefNum				<9/8/89>
+		ENDIF
+
+			MOVEM.L (A6)+,D1/A1					; restore registers
+			MOVE.L	(A6)+,-(SP) 				; put return address back on stack
+			TST.W	D0							; set up condition codes
+			RTS
+			ENDPROC								; ExtWriteBlock					
+
+
+;_________________________________________________________________________________
+; Function:	mark the block dirty			
+;			Now we just write it but don't clear inuse flag			<9/11/89>
+; Input:	A0=ptr(buffer)
+; Output:	D0 = 0 if no error
+;_________________________________________________________________________________
+ExtMarkBlock	PROC	EXPORT					  ;								
+	;		BSET	#CBHdirty,CBHFlags-lenCBH(A0) ; mark it dirty
+			MOVE.L	(SP)+,-(A6)
+			MOVE.L	A4,-(A6)	
+			LEA 	-lenbtBH(A0),A4		; A4 = ptr to CBH
+
+			JSR		ExtWriteBlock		;										
+			MOVEa.L (A6)+,A4			; restore registers
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set up condition codes
+			RTS
+			ENDPROC
+
+			END

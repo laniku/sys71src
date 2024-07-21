@@ -1,0 +1,1363 @@
+;
+;	File:		USTPram.a
+;
+;	Contains:	This file contains the ROM based board burnin manager (RBIMgr).  The
+;				RBI manager first tests RAM, then lights an LED on the burnin chamber,
+;				reads its data structure out of PRAM and executes selected tests for a
+;				specified number of times.  If all tests pass, the RBI manager
+;				flashes an LED on the burnin chamber.  Otherwise, it turns the LED
+;				off and jumps to the test manager.
+;
+;	Written by:	KC Chin.  Adapted for use on Ericson and later machines by Scott Smyers
+;
+;	Copyright:	© 1983-1990, 1992-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 9/13/93	SAM		Added a flag to USTInit to tell it not to call SizeMem (again!).
+;	   <SM2>	  5/2/92	kc		Roll in Horror. Comments follow:
+;		<H3>	  3/6/92	AL		Moved the PRAM routines RdXByte, WrXByte and ClkWpOff over
+;									to this file (from USTTestMgr.a) because they were accessed
+;									mainly from files included in USTStartTest.a. This saved a lot
+;									of work by not making me go through all the occurrences and
+;									changing them from BSR6 to BigBSR6,a0. The few access to them
+;									from files in USTStartTest1.a can be taken care of.
+;		<H2>	01/27/92	jmp		Conditionalized the PROC parts of this file for use in lining up
+;									the UST part of HORROR with that of TERROR/Zydeco.
+;		<T5>	  4/2/91	CCH		Rolled in Scott Smyers' changes: Added support for 32 tests
+;									(instead of only 16). Added support for test ID and new word
+;									sized subtest ID. Made the use of PRAM during ROM burnin more
+;									logical. Modularized the code which copies data between PRAM and
+;									RAM to increase re-usability.
+;		<T4>	 3/13/91	CCH		Rolled in RBI changes from Scott Smyers.
+;		<T3>	 1/14/91	CCH		Rolled in Scott Smyers' changes.
+;		<T2>	12/14/90	HJR		Added Elsie V8 support.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;	  Pre-TERROR ROM comments begin here.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;		<10>	 6/18/90	CV		Rolling in changes from mainproj. Original comments below.
+;		{12}	 6/18/90	SS		Changed the error reporting for RAM tests so that the bank
+;									failure number goes into the high nibble of the subtest number.
+;		 <9>	  6/7/90	CV		Rolling in changes from mainproj. Original comments below.
+;		{11}	  6/5/90	SS		Changed the error reporting so that all tests now report all of
+;									D6 instead of just a byte, word or long.  This makes test result
+;									interpretation much easier.  Also added the RBV test to the test
+;									table.
+;		 <8>	 5/18/90	CV		Rolling in changes from mainproj. Original comments below.
+;		{10}	 5/10/90	SS		Fixed the initialization for the sound interrupt test.  I now
+;									set up the HW info regs before calling the test.
+;		 <7>	 4/27/90	CV		Rolling in changes from mainproj. Original comments below.
+;		 {9}	 4/20/90	SS		Changed to use SCSI equates from the HWPrivateEqu file.  Also am
+;									now using a VIA access for my flashing light time constant.
+;		 <6>	 4/10/90	JJ		Rolling in changes from mainproj. Original comments below.
+;		 {8}	  4/9/90	SS		Corrected the test numbering for status reporting.  Added the
+;									Reverse mod3test to the suite of RAM tests.  Removed the EASE
+;									header.
+;		 <5>	  4/2/90	CV		Rolling in changes from mainproj. Original comments below.
+;		 {7}	 3/27/90	SS		Added a power-on counter which increments every time ROM burn-in
+;									is entered.  Also added a post burn signature and fixed a small
+;									inconsistancy (changed a move.b to move.w).
+;		 <4>	 3/12/90	CV		Rolling in changes from mainproj. Original comments below.
+;		 {6}	  3/9/90	SS		Changed the calling convention for RBI tests while in the RBI
+;									manager.  Changed the name of the RBI manager to RBIMgr.  Added
+;									power fail recovery.  made the tests' access to the RBI data
+;									structure more robust.  Added a test of memory before beginning
+;									RBI.
+;		 <5>	 2/27/90	SS		Made the RBI signature bytes more universal.
+;		 <4>	 2/16/90	SS		Added flags to statements which were changed to support Ericson.
+;		 <3>	 2/13/90	MA		Fixed register usage when logging BIparameters
+;		 <2>	 2/12/90	MA		'MovePram' cleaned up and changed register usage.  Fixed
+;									numerous bugs.  Now preserves A1 in PRAM Logger.
+;	   <1.2>	 8/22/89	GMR		Setup VBR and preped a0,d0,d2 before launching BITests.
+;	   <1.1>	 6/11/89	GMR		Removed INCLUDES, now in header file which includes all others.
+;	   <1.0>	 6/11/89	GMR		Added new universal StartTest files for first time to EASE.
+;	   <1.3>	 5/16/89	rle		don't use startup code for size memory anymore
+;	   <1.2>	 3/28/89	rle		now uses (some) equates from "STEqu.a"
+;	   <1.1>	 2/10/89	RLE		incorporated K.C. Chin's changes to add data bus test and use
+;									stack-based routines
+;	   <1.0>	  2/2/89	RLE		new file
+;
+;
+;------------------------------------------------------------------------------
+
+PRLog		PROC
+
+			IMPORT	SetupForExecuteDTM
+			IMPORT	JGetHardwareInfo
+			IMPORT	RomTest
+			IMPORT	StartUpRomTest
+			IMPORT	Mod3Test
+			IMPORT	RevMod3Test
+			IMPORT	ExtRamTest
+			IMPORT	AddrLineTest
+			IMPORT	DataBusTest
+			IMPORT 	SCCRegTest
+			IMPORT	SCCTimerTest
+			IMPORT	SCCLoopTest
+			IMPORT	Viatest
+			IMPORT	TestScsi
+			IMPORT	TestAsc
+			IMPORT	PramTest			;
+			IMPORT	SizeMemory
+			IMPORT	RdXByte
+			IMPORT	WrXByte
+			IMPORT	ClkWpOff
+			IMPORT	Error1Handler
+			IMPORT	BaseOfROM			;		 
+			IMPORT	TestSndInts			;											<11>
+			IMPORT	TestRBV				;											<11>
+			IMPORT	TestCLUT			;											<13>
+			IMPORT	TestVRAM			;											<13>
+			IMPORT	ReadPramSig			;											<T4>
+			IMPORT	USTInit				;											<T4>
+
+			EXPORT	RBIMgr				;<6>
+
+			EXPORT	RdXByte	
+			EXPORT	WrXByte
+			EXPORT	ClkWpOff
+
+
+;---------------		to next <T4> below
+
+MaxCTESubTests	equ		29		;maximum number of subtests supported by the RBI manager	<T5>
+TotalRBITests	equ		32		;total number of tests supported by the RBI manager (crit and non crit)<T5>
+
+bROMTest		equ		31		;<T5>
+bRAMTest		equ		30		;<T5>
+bMovInvRAMTest	equ		29		;<T5>
+
+CritTestMask	equ		(1<<bROMTest) | \	;mask of bits used for critical tests
+						(1<<bRAMTest) | \
+						(1<<bMovInvRAMTest)
+
+RBIInfo		RECORD	USTGlobals.sizeofUSTGlobals,increment	;start at end of USTGlobals
+
+startofRBIInfo	equ		*	;start of RBI info
+
+TempScratch		ds.l	1	;temporary scratch area, if needed			<6>
+CurTest			ds.l	1	;current test										<T5>
+BIFailFlag		ds.w	1	;Burn-In fail flag
+
+TestLoopCount	ds.b	TotalRBITests	;number of times to execute each test per cycle<T5>
+RBITestList		ds.l	2*MaxCTESubTests	;test ID/subtest ID list for RBI tests	<T5>
+RBINumInst		ds.w	1				;number of installed tests					<T5>
+
+BINumCycles		ds.w	1	;# of cycles to run									<T5>
+BIRunMask		ds.l	1	;Mask of tests to run								<T5>
+BIFailMask		ds.l	1	;Mask of tests that fail							<T5>
+BICounter		ds.w	1	;# of cycles completed
+BIPasses		ds.w	1	;# of pass cycles
+BIFirstF		ds.w	1	;First failure cycle #
+BILastF			ds.w	1	;Last failure cycle #
+BITest			ds.l	1	;burnin test number									<T5>
+BISubTest		ds.l	1	;burnin subtest number								<T5>
+BITestResult	ds.l	1	;test result
+HWInfo			ds.l	3	;information returned from GetHardwareInfo (6 registers)
+
+sizeofRBIInfo	equ		*-startofRBIInfo	;size of the RBI information
+
+			ENDR
+
+pLowerCopy	EQU		$0				;start of lower copy of PRAM information
+pUpperCopy	EQU		$80				;start address of upper copy of PRAM information
+pPRAMLength	EQU		$80				;length of each copy of PRAM information
+
+PBSig		EQU		'DONE'			;Post burn signature						<T5>
+
+RBIPRAMMap	RECORD	pUpperCopy,increment
+
+pTstIterCnt	ds.b	TotalRBITests	;test iteration per cycle count				<T5>
+pBlank1		ds.b	$30				;undefined area number 1					<T5>
+
+pFailMask	ds.l	1				;tests failed mask							<T5>
+pTestNum	ds.l	1				;last failing test number					<T5>
+pSubTestNum	ds.l	1				;last failing subtest number				<T5>
+pTestResult	ds.l	1				;result of last failed test					<T5>
+
+pFrstFail	ds.w	1				;cycle at first failure						<T5>
+pLastFail	ds.w	1				;cycle at last failure						<T5>
+
+pBlank2		ds.b	2				;undefined area number 2					<T5>
+
+pPOCntr		ds.w	1				;number of power cycles during testing		<T5>
+pCyclesDone	ds.w	1				;number of cycles completed					<T5>
+pCyclesPass	ds.w	1				;number of cycles which passed				<T5>
+
+pPBSigAddr	ds.l	1				;RBI complete signature						<T5>
+
+pSTMJump	ds.b	1				;Jump to STM flag							<T5>
+pBlank3		ds.b	1				;another blank area							<T5>
+pCycleCnt	ds.w	1				;number of cycles to run					<T5>
+
+pTestMask	ds.l	1				;tests to run mask							<T5>
+
+			ENDR					;											<T5>
+
+savedregs	reg		a0-a2			;registers to save (MUST be reflected in HWInfo length)
+tstloopregs	reg		d0-d1/a0/a5		;registers used during test looping
+
+
+;---------------		to next <T4> above
+
+;-------------------------------------------------------------------------------
+;  Routine:	RBIMgr		Manages ROM Based Burnin.									<6>
+;																					<4>
+;  Inputs: 	none
+;																					<4>
+;  Destroys:	d0-d7, a0-a7														<4>
+;-------------------------------------------------------------------------------
+
+RBIMgr									;<6>
+	WITH	RBIInfo, RBIPRAMMap			;<T5>
+
+		
+		BSR6	disableMMU				;disable the MMU and require serialized access	<T4>
+										;to IO space									<T4>
+
+
+	; OK, everything is ready to go. Start the actual testing stuff by doing the memory
+	; sizing and preparation for CTE:
+
+		BSR6	SizeMemory				;First, size memory
+		bne		@RBIFailure				;Bomb out if this fails
+
+; Then next step is to test RAM to make sure we're justified in using RAM for our scratch.
+
+		move.w	#ErrRAMA,d7				;Init error to Bank A error code
+		movea.l	(sp),sp					;Set stack contiguous with the chunk table
+		movea.l sp,a4					;get ptr to chunk table
+
+		IF forRomulator THEN			;										<T4>
+			TestInRAM	a1				;are we running in RAM?					<T4>
+			bne.s	@RamPassed			;don't test RAM or move vector table if so!	<T4>
+		ENDIF							;										<T4>
+
+@memLoop
+		movea.l	(a4)+,a0				;get start of bank
+		cmpa.l	#-1,a0					;at end of table?
+		beq.s	@RamPassed				;(-1) means end of table
+		move.l	(a4)+,a1				;get length
+		adda.l	a0,a1					;calculate end of bank
+
+		cmpa.l	a1,sp					;above memory chunk table?							<1.9>
+		bhi.s	@testChunk				;no, test complete chunk
+		movea.l	sp,a1					;yes, set top to base of chunk table				<1.9>
+
+@testChunk
+		BSR6	Mod3Test				;test this bank										<1.7>
+		tst.l	d6
+		bne		@RBIFailure				;failed, go to test manager
+		addq.w	#1,d7					;bump to next bank code
+		bra.s	@memLoop				;passed, test next bank
+
+;---------------		to next <T4> below
+
+@RamPassed
+;---------------------------------------------------------------------------
+;
+; OK, if we got here, then all the RAM tests passed.  Now we stoke up the RBI
+; manager data structures in RAM, init CTE and start testing.
+;
+;---------------------------------------------------------------------------
+
+	WITH	USTGlobals
+		clr.w	d7						;zero out low word of d7 during initialization
+		
+		moveq	#0,D2					;tell USTInit to call SizeMem							<SM3>
+		BSR6	USTInit					;size memory and initialize the universal global area
+										;next, move it to just below the chunk table
+		movea.l	ChunkTable(a5),a1		;set the destination for the new global area
+		suba.l	#sizeofRBIInfo,a1		;make room for the RBI globals (to be initialized
+										;	later in this routine)
+										
+		bsr		RelocateGlobals			;then do it - relocate the actual USTGlobals
+
+		movea.l	DcdrInfPtr(a5),a0		;get the pointer to the decoder info
+		movea.l	PrdctInfPtr(a5),a1		;and the product info
+
+		movea.l	DecoderInfo.VIA1Addr(a0),a2		;then get the VIA1 pointer
+
+		movem.l	savedregs,HWInfo(a5)	;Save this info (a0-a2) for general use
+;
+; Next, init CTE interface and install all appropriate ROM based tests and subtests (note
+;	that the "installation" of the tests is NOT analagous to the InstallTest and
+;	InstallSubtest routines of the old CTE). I will continue to use the list of test & subtest
+;	IDs, and fill in the USTGlobals structure (using information gleaned from the test and
+;	subtest tables in the file USTSubtests.a) before calling GIM_ExecuteDTM.
+;
+		bsr		CTEInit					;just do it
+		movem.l	HWInfo(a5),savedregs	;then restore our state!
+
+;
+; Finally, turn on the burnin light to let everyone know that all is well, so far.
+;
+		bsr		IndicatorOn				;turn on the RBI indicator
+		
+;
+;Now we must decide which half of PRAM is valid.  Make a copy of the valid half to the
+;other half.
+;
+		move.l	a5,-(sp)				;save our global pointer
+
+		bsr6	ClkWpOff				;first, turn write protect off for good
+		move.l	#SigLocs,d3				;Get the locations of the signature bytes
+		bsr6	ReadPramSig				;read the signature out of PRAM
+
+		move.l	(sp)+,a5				;restore the global pointer
+
+		cmp.l	#SigBytes,d4			;Compare result with the signature
+		beq.s	@uppertolower			;if upper half is valid, copy it to lower half
+;
+;OK, its the lower half of PRAM that's valid.  Now we have to copy this lower
+;half to the upper half before we can continue
+;
+		move.w	#pLowerCopy,-(sp)		;Source PRAM address
+		move.w	#pUpperCopy,-(sp)		;Destination PRAM address
+		bra.s	@copy					;go copy
+
+@uppertolower
+		move.l	#SigLocs,d1				;First, invalidate the signature in the lower half of PRAM
+		swap	d1						;Get the address of the lower signature bytes
+		moveq.l	#0,d2					;Write a zero to one of the sig bytes locations
+
+		move.l	a5,-(sp)				;save the global pointer
+		BSR6	WRXBYTE
+		move.l	(sp)+,a5				;get the global pointer back
+
+		move.w	#pUpperCopy,-(sp)		;source PRAM address is upper half
+		move.w	#pLowerCopy,-(sp)		;destination PRAM address is lower half
+
+@copy
+		move.w	#pPRAMLength,-(sp)		;Length of copy
+		bsr		RelocatePRAM			;do it.
+		lea		6(sp),sp				;Clean up stack
+;
+;	Increment the power on counter every time we get to this point
+;
+		bsr		InvalidUpper	;Before updating PRAM, we need to invalidate the signature<7>
+
+		_CopyPRAMToRAM	#pPOCntr,TempScratch(a5),#2		;read the power on counter				<T5>
+		addq.w			#1,TempScratch(a5)				;increment the power on counter			<T5>
+		_CopyRAMToPRAM	TempScratch(a5),#pPOCntr,#2		;and write the PO counter back to PRAM	<T5>
+
+		bsr		UpperToLower	;Copy the upper half of PRAM to the lower half<7>
+
+;
+;	Now, make a copy of the PRAM burn-in information into memory
+;
+		_CopyPRAMToRAM	#pCycleCnt,BINumCycles(a5),#2	;get the number of cycles to run		<T5>
+		_CopyPRAMToRAM	#pTestMask,BIRunMask(a5),#4		;get the tests to run mask				<T5>
+		_CopyPRAMToRAM	#pFailMask,BIFailMask(a5),#4	;and get the current tests failed mask	<T5>
+		_CopyPRAMToRAM	#pCyclesDone,BICounter(a5),#2	;get the number of cycles completed		<T5>
+		_CopyPRAMToRAM	#pCyclesPass,BIPasses(a5),#2	;and the number of cycles passed		<T5>
+		_CopyPRAMToRAM	#pFrstFail,BIFirstF(a5),#2		;get the cycle # of first failure		<T5>
+		_CopyPRAMToRAM	#pLastFail,BILastF(a5),#2		;and the cycle # of last failure		<T5>
+
+		_CopyPRAMToRAM	#pTstIterCnt,TestLoopCount(a5),#TotalRBITests		;	<T5>
+
+		move.w	BICounter(a5),d1
+		sub.w	d1,BINumCycles(a5)		;Subtract the cycles we've already run
+;
+;	After each BI Cycle, this is the place to return
+;
+
+@NewBICycle
+		clr.w	BIFailFlag(a5)			;initialize BIFailFlag
+		subq.w	#1,BINumCycles(a5)		;decrement BINumCycles
+		bmi		@BIDone					;if we're finished then log BICounter and go to
+										; Test Manager
+
+		addq.w	#1,BICounter(a5)		;increment the cycle counter
+;
+;	First run the selected critical tests
+;
+		move.l	BIRunMask(a5),d0		;get the test mask						<T5>
+		move.l	#TotalRBITests-1,d1		;init test number						<T5>
+
+@TestLoop								;loop here to run the selected critical tests
+		tst.l	d0						;are we done yet?						<T5>
+		beq.w	@CycleDone				;exit if so
+
+		asl.l	#1,d0					;otherwise, see if we want to run the next test<T5>
+		bcc.w	@NextTest				;keep looping if not
+
+		move.w	d1,d7					;remember which test we're running in case we end up in STM
+		ori.w	#$C0,d7					;this indicates the test # is an RBI #	<T5>
+
+
+;
+;	Kludge Alert! Kludge Alert!
+;
+; This is really ugly, but I don't have another way to take care of it at the moment. The problem is
+;	this: The USTGlobals structure is >128 bytes long, and declaring the RBIGobals immediately after
+;	it makes the total globals I'm using for RBI way more than 128 bytes. However, the addressing mode
+;	we're using to access two of the fields in the RBI globals (TestLoopCount and RBITestList) is address
+;	indirect with index and displacement. This mode only allows the displacement (which are TestLoopCount
+;	and RBITestList) to be 8 bits (max 128 value). The problem is, these two fields are so numerically high
+;	in the records that they require more than +128 to reach them. The reason that this problem arises is
+;	due to the fact the the RBIInfo structure needs to be declared AFTER the USTGlobals, because I will
+;	always need the USTGlobals (and hence want the offsets to start at 0), but I only need the RBIInfo
+;	record for RBI stuff. For a picture of what we're talking about, here is a diagram of what the routine
+;	RelocateGlobals does:
+;
+;						top of RAM --->	|-------------|
+;										|	Chunk	  |
+;										|	Table	  |
+;										|-------------|		
+;										|	RBI	 	  |		
+;										|	Info	  |	
+;		This distance is{				|-------------|
+;		> +128 bytes so	{				|	UST	  	  |		}	This structure was extended for the new
+;		the two fields	{				|	Globals	  |		}	CTE kernel v2.1
+;		TestLoopCount	{				|			  |		}
+;		and RBITestList	{				|	   	  	  |
+;		can't be reached{				|	    	  |
+;		with the "old"	{		A5 --->	|-------------|
+;		addressing mode.				|	VBR	  	  |
+;										|	register  |
+;										|-------------|
+;										|	CTE	  	  |
+;										|	Workspace |
+;								SP --->	|-------------|
+;
+;
+;	Here is an example of the offending command that the assembler doesn't like:
+;
+;				move.b	TestLoopCount(a5,d1.w),d2
+;
+;	The rules say that TestLoopCount is a signed 8 bit number, but it don't work with the way things are
+;	set up because the value of TestLoopCount as declared in the RBIInfo record will be much
+;	greater than 128 (the max signed value of a byte). Any ideas?
+;
+;	I need a way to fake out the assembler, but I don't think this will work correctly. Stay
+; 	tuned for a fix:
+
+		move.b	#TestLoopCount,d3			; it takes these four statements
+		and.w	#$0f,d3		; #$0F OR #$00FF??????				; to do the same job as
+		add.w	d3,d1						; that one little statement below
+		move.b	(a5,d1.w),d2				;
+
+;;;		move.b	TestLoopCount(a5,d1.w),d2	; get the loop count for this test
+
+
+		and.w	#$FF,d2						;make the low word valid
+
+		moveq.l	#0,d5
+		bset.l	d1,d5
+		move.l	d5,CurTest(a5)			;set the current test bit mask			<T5>
+		
+		and.l	#CritTestMask,d5		;is this a critical test?				<T5>
+		bne.s	@CritTest				;branch if so
+;
+; This is a non critical test (i.e., a CTE test)
+;
+		cmp.w	RBINumInst(a5),d1		;compare our test number with the number of installed tests
+		bge.w	@NextTest				;don't do it if we don't have that many installed	<T5>
+
+
+; Fill in the RBIInfo fields BITest and BISubTest (this data is recorded into PRAM in case of
+;	failure). I have the same problem here as I did above for the TestLoopCount field, but the solution
+;	is a little different. Notice that the original command was this:
+;
+;		move.l	RBITestList(a5,d1.w*8),BITest(a5)
+;
+;	The d1.w*8 needs to be taken care of first (calculated), then I can add the RBITestList value to
+;	it. Finally, I can use the resulting d1.w as an index to a5:
+;
+;		NOTE: Remember to save d1.w and restore it to what it was prior to all this fooling around:
+;
+		move.w	d1,TempScratch(a5)								; save d1.w in the RBI scratch area
+		asl.w	#3,d1											; this has the same effect as d1.w*8
+		add.l	#RBITestList,d1									; fake out the assembler
+		move.l	(a5,d1.w),BITest(a5)							; see if this works
+		move.l	4(a5,d1.w),BISubTest(a5)
+;;;;		move.l	RBITestList(a5,d1.w*8),BITest(a5)			;place the test number in here	<T5>
+;;;;		move.l	RBITestList+4(a5,d1.w*8),BISubTest(a5)		;and put the subtest here		<T5>
+		move.w	TempScratch(a5),d1								; restore my original d1.w
+		
+
+; Do the necessary setup before calling GIM_ExecuteDTM:
+
+		movem.l	tstloopregs,-(sp)		; save our local registers (d0-d1/a0/a5)
+
+		BigBSR6	SetupForExecuteDTM,a0
+
+		movem.l	(sp),tstloopregs		; restore our registers (but leave them on the stack)
+		movea.l	CTEGlobals(a5),a3		; load up the CTE globals for the GIM_ExecuteDTM call
+
+@CTETestLoop
+		movem.l	d1-d2/a3,-(sp)			; save the loop counter, test number and globals pointer
+		CASE ON
+			GIM_ExecuteDTM	(a3), EXOPUSERINFO(a5), TINFOUSERINFO(a5), SINFOUSERINFO(a5), EXRESERR(a5)
+		CASE OFF
+		movem.l	(sp)+,d1-d2/a3			; restore this stuff
+		
+		move.l	d0,d6					; get the result into our result register
+		dbne.w	d2,@CTETestLoop			; and loop until error, or done
+		bra.s	@EndTestLoop			; go clean up
+;
+; This is a critical test (i.e., not CTE) with special considerations - don't wipe out the
+;	upper part of RAM, which contains all of the RBI and CTE data structures currently in
+;	use (yes, that means that the upper part of RAM doesn't get tested in ROM Burnin...unless
+;	we get around to modifying the routine to move the globals down to the lower part after
+;	testing there, then testing the upper part, then moving the globals back up to the top).
+;	See the description of the RelocateGlobals routine for a diagram of what memory looks
+;	like after the setup for RBI is complete, so you can get an idea of what is and is not
+;	being tested in the RAM tests for RBI:
+;
+@CritTest
+		move.l	d1,BITest(a5)			;place the test number in here			<T5>
+		move.l	#1,BISubTest(a5)		;and always start with a subtest of 1	<T5>
+
+		lea		RBICritTests,a0			;get the base address of the critical test table
+		move.w	#TotalRBITests-1,d5
+		sub.w	d1,d5
+		move.l	(a0,d5.w*4),d5			;get the offset of the test to run
+		lea		(a0,d5.l),a0			;and get the address of the actual test
+
+		movem.l	tstloopregs,-(sp)		;save our working registers
+
+@CritTestLoop
+		movem.l	d2/a0,-(sp)				;save our working registers
+		jsr		(a0)					;execute the test
+		movem.l	(sp)+,d2/a0				;restore the working registers
+		
+		tst.l	d6						;was there an error?
+		dbne.w	d2,@CritTestLoop		;keep going until we're used up
+
+@EndTestLoop
+;
+;	The test failed. Log info into Pram
+;
+		movem.l	(sp),tstloopregs		;restore our registers (but leave them on the stack)
+		movem.l	HWInfo(a5),savedregs	;restore other necessary information
+		bsr		IndicatorOn				;go turn on the RBI indicator again
+		
+		move.l	d6,BITestResult(a5)		;store the error code in RAM
+		beq.s	@CleanUp				;keep going if no error
+
+		bsr		LogFailure				;else, log the failure to PRAM
+
+@CleanUp
+		movem.l	(sp)+,tstloopregs		;restore registers again
+
+@NextTest
+		subq.w	#1,d1					;decrement the test number
+		bra.s	@TestLoop				;and keep going
+
+@CycleDone
+;---------------------------------------------------------------------------
+;	ChkFailFlag: if BIFailFlag = 0, inc BIPasses
+;				 If inc BIPasses, log BIPasses and BICounter
+;---------------------------------------------------------------------------
+
+		bsr		InvalidUpper				;Before updating PRAM, we need to invalidate the signature<T5>
+		_CopyRAMToPRAM		BICounter(a5), #pCyclesDone, #2	;update burnin cycle counter<T5>
+
+		tst.w	BIFailFlag(a5)				;Any failures on that last pass?
+		bne.w	@CycleFailed				;Don't increment the cycles passed count if so
+
+		addq.w	#1,BIPasses(a5)				;else, increase BIPasses				<T5>
+		_CopyRAMToPRAM		BIPasses(a5), #pCyclesPass, #2	;update cycles passed counter<T5>
+
+@CycleFailed
+		bsr		UpperToLower				;Copy upper half of PRAM to lower half
+
+		bra.w	@NewBICycle					;
+
+
+;---------------------------------------------------------------------------
+;	Log BICounter and go to Test Manager 
+;---------------------------------------------------------------------------
+
+@BIDone
+		clr.w	d7					;indicate we're not testing anymore				<T5>
+
+		bsr		InvalidUpper		;Before updating PRAM, we need to invalidate the signature<T5>
+		_CopyRAMToPRAM		#PBSig, #pPBSigAddr, #4		;log the DONE signature		<T5>
+		bsr		UpperToLower		;Copy the upper half of PRAM to the lower half	<T5>
+
+		tst.l	BIFailMask(a5)		;Now, look to see if there were any failures	<T5>
+		bne.s	@RBIFailure			;If so, tell the board test people about it.
+;
+; See if they want to go to the serial test manager when we're done regardless
+;
+		_CopyPRAMToRAM		#pSTMJump, TempScratch(a5), #1						;<T5>
+		
+		tst.b	TempScratch(a5)		;is our flag ­ 0?
+		bne.s	@JumpToSTM			;go directly to STM if so É
+;
+; Now, turn the burn-in light off
+;
+		bsr		IndicatorOff		;Turn off the RBI indicator
+		moveq.l	#0,d2				;remember that we're off
+		
+;-------------								to next <T4> above
+
+;
+; next, we need to decide if there were any failures.  If there were not, flash the LED,
+; otherwise, just turn it off and leave it off.
+;
+
+@flash	move.w	#500,d0				;Delay for 500 mS							<9>
+
+@delay0	move.w	#delay1mS,d1		;Get the 1mS time constant					<9>
+@delay	tst.b	vBufB(a2)			;touch the VIA register						<9>
+		dbra.w	d1,@delay			;and delay									<9>
+		dbra.w	d0,@delay0			;outer delay								<9>
+
+		eor.b	#1,d2				;toggle the state of the indicator			<T4>
+		beq.s	@Turnitoff			;branch if it's on to turn it off			<T4>
+
+		bsr		IndicatorOn			;else turn it on							<T4>
+		bra.s	@flash				;and continue								<T4>
+
+@Turnitoff
+		bsr		IndicatorOff		;turn indicator off							<T4>
+		bra.s	@flash				;and keep going!							<9>
+
+@RBIFailure
+@JumpToSTM
+;
+; Failure in RBI!  Turn off the burnin light and go the TM in case someone has a
+; mac connected for diagnostics.
+;
+		bsr		IndicatorOff		;Turn off the RBI indicator					<T4>
+;
+		bra		Error1Handler		;For now, go to TM when there are errors
+
+	ENDWITH
+
+;and new test table
+;-------------------------------------------------------------------------------
+;
+; This routine simply invalidates the signature in the upper half of PRAM.  This
+; must be done before updating the contents of PRAM.
+;
+;-------------------------------------------------------------------------------
+
+InvalidUpper
+		move.l	a5,-(sp)		;save a5
+
+		move.l	#SigLocs,d1		;then invalidate the signature byte
+		moveq.l	#0,d2			;Write a zero to one of the sig byte locations
+		BSR6	WRXBYTE
+
+		move.l	(sp)+,a5		;restore a5
+		rts
+
+;-------------------------------------------------------------------------------
+;
+; This routine first validates the signature in the upper half of PRAM, then
+; invalidates the low PRAM signature, and copies the upper
+; half of PRAM to the lower half.
+;
+;-------------------------------------------------------------------------------
+
+UpperToLower
+		move.l	a5,-(sp)		;save a5
+
+		move.l	#SigLocs,d1		;First, restore the signature byte in the upper half of PRAM
+		move.l	#SigBytes,d2
+		rol.l	#8,d2
+		BSR6	WRXBYTE
+
+		move.l	#SigLocs,d1		;first, invalidate the signature in the lower half of PRAM
+		swap	d1
+		moveq.l	#0,d2			;Write a zero to one of the sig byte locations
+		BSR6	WRXBYTE
+
+		move.w	#pUpperCopy,-(sp)	;then copy upper half of PRAM to lower half		<T4>
+		move.w	#pLowerCopy,-(sp)	;destination PRAM address is lower half			<T4>
+		move.w	#pPRAMLength,-(sp)	;Length of copy									<T4>
+
+		bsr		RelocatePRAM	;do it.
+		lea		6(sp),sp		;Clean up stack
+
+		move.l	(sp)+,a5		;restore a5
+		rts
+
+;-----------------------						to next <T4> below
+
+RelocatePRAM
+;-------------------------------------------------------------------------------
+;
+; This routine moves a block of PRAM from one location to another.  When called,
+; the stack must be set up as follows:
+;
+StackFrame1		RECORD	0, Increment	;Starts at offset 0 into the stack
+
+@SavedA5		ds.l	1				;save space for the saved global pointer
+
+@return			ds.l	1				;Return address
+@byteCnt		ds.w	1				;number of bytes to move
+@PRAMDest		ds.w	1				;destination PRAM address
+@PRAMSource		ds.w	1				;source PRAM address
+
+				ENDR
+;
+;-------------------------------------------------------------------------------
+
+	move.l	a5,-(sp)				;save the global pointer
+
+	WITH	StackFrame1
+@Copy
+		move.w	@PRAMSource(sp),d1		;Get the source PRAM address
+		BSR6	RDXBYTE					;read a byte from there
+		move.b	d1,d2					;prepare to write it out
+		move.w	@PRAMDest(sp),d1		;get the destination PRAM address
+		BSR6	WRXBYTE					;write out the byte
+		addq.w	#1,@PRAMSource(sp)		;increment the source
+		addq.w	#1,@PRAMDest(sp)		;increment the destination
+		subq.w	#1,@byteCnt(sp)			;decrement the byte count
+		bne.s	@Copy					;Continue if not zero yet
+	ENDWITH
+
+	move.l	(sp)+,a5				;restore the global pointer
+	rts								;Else, return
+
+;-------------------------------------------------------------------------------
+;
+;	IndicatorOn; Indicator Off
+;		These routines turn on and off the SCSI indicator.  In the case of 53C80
+;		machines this indicator is the SCSI BSY signal, and in the case of C96
+;		machines, this indicator is the ATN signal.  The indicator is on when the
+;		corresponding SCSI signal is asserted.
+;
+;	Inputs:
+;		d0 - bases valid flags
+;		a0 - pointer to the decoder info record
+;
+;	Destroys:
+;		a3
+;
+;-------------------------------------------------------------------------------
+
+IndicatorOn
+		WITH	DecoderInfo, USTGlobals
+			move.l	BasesValidFlags(a5),d0	;get the bases valid flags
+
+			btst.l	#SCSIExists,d0		;do we have a C80?
+			beq.s	@hasC96				;branch if not
+			movea.l	SCSIAddr(a0),a3		;Get the address of the SCSI register
+			bset.b	#3,sICR(a3)			;Turn the busy light on
+			rts							;and return
+		ENDWITH
+
+@hasC96
+		bsr		FindC96Base				;get the SCSI (1 or 2) base address in a3
+;;;		move.b	#cSetAtn,rCMD(a3)		;assert ATN
+
+		move.b	#$22,rCMD(a3)			;send data
+
+		rts
+
+;-------------------------------------------------------------------------------
+
+IndicatorOff
+		WITH	DecoderInfo, USTGlobals
+			move.l	BasesValidFlags(a5),d0	;get the bases valid flags
+
+			btst.l	#SCSIExists,d0		;do we have a C80?
+			beq.s	@hasC96				;branch if not
+			movea.l	SCSIAddr(a0),a3		;Get the address of the SCSI register
+			bclr.b	#3,sICR(a3)			;Turn the busy light off
+			rts							;and return
+		ENDWITH
+
+@hasC96
+		bsr		FindC96Base			;get the SCSI (1 or 2) base address in a3
+		move.b	#cRstAtn,rCMD(a3)	;negate ATN
+		rts
+
+;-------------------------------------------------------------------------------
+;
+;	FindC96Base
+;		This routine retrieves the SCSI base address of the external SCSI chip.
+;		This routine assumes that the SCSI chip is a 53C96.
+;
+;	Inputs:
+;		d0 - bases valid flags
+;		a0 - pointer to the decoder info record
+;
+;	Outputs:
+;		a3 - pointer to the base address of the external 53C96
+;
+;-------------------------------------------------------------------------------
+
+FindC96Base
+		WITH	DecoderInfo
+			movea.l	SCSI96Addr1(a0),a3	;assume SCSI1 is the external bus
+			btst.l	#SCSI96_2Exists,d0	;do we have a SCSI2 bus?
+			beq.s	@SCSI1Only			;branch if so (means SCSI1 is only bus)
+			movea.l	SCSI96Addr2(a0),a3	;else, SCSI bus 2 is the external bus
+		ENDWITH
+
+@SCSI1Only
+;;;		btst.b	#3,rCF1(a3)				;are we in test mode already?
+;;;		bne.s	@inTestMode				;branch if so
+
+		move.b	#cRstSChp,rCMD(a3)			;else, reset the chip,
+		move.b	#cNOP,rCMD(a3)				;perform the obligatory NOP,
+		move.b	#EnableChpTstMd,rCF1(a3)	;enable chip test mode,
+;;;		move.b	#2,rTST(a3)					;and put the chip into initiator mode
+		move.b	#1,rTST(a3)					;and put the chip into target mode (for now)
+
+@inTestMode
+		rts							;we're OK, return
+
+
+	EXPORT	CopyRAMToPRAM
+CopyRAMToPRAM
+;-------------------------------------------------------------------------------
+;
+; CopyRAMToPRAM - copies some information out of memory into PRAM
+;
+;		input:
+StackFrame2		RECORD	0, Increment
+
+@return			ds.l	1				;Return address
+@byteCnt		ds.w	1				;number of bytes to move
+@PRAMDest		ds.w	1				;destination PRAM address
+@RAMSource		ds.l	1				;source RAM address
+
+				ENDR
+
+@regsUsed	reg		d1/d3/a3/a5
+;
+;-------------------------------------------------------------------------------
+		WITH	StackFrame2
+
+			move.w	@PRAMDest(sp),d1	;get the PRAM destination address
+			movea.l	@RAMSource(sp),a3	;get the source RAM address
+			move.w	@byteCnt(sp),d3		;get the number of bytes to move
+			moveq.l	#0,d2				;zero out the value register
+
+			subq.w	#1,d3				;adjust for dbra
+			blt.s	@done				;quit if the number was zero
+
+@copy		move.b	(a3)+,d2			;get the next byte to write
+			movem.l	@regsUsed,-(sp)		;save our local registers
+			bsr6	WrXByte				;go write the information
+			movem.l	(sp)+,@regsUsed		;restore our local registers
+			addq.w	#1,d1				;increment the PRAM address
+			dbra.w	d3,@copy			;keep copying
+@done
+		ENDWITH
+		rts
+
+	EXPORT	CopyPRAMToRAM
+CopyPRAMToRAM
+;-------------------------------------------------------------------------------
+;
+; CopyPRAMToRAM - copies some information out of PRAM into memory
+;
+;		input:
+StackFrame3		RECORD	0, Increment
+
+@return			ds.l	1				;Return address
+@byteCnt		ds.w	1				;number of bytes to move
+@RAMDest		ds.l	1				;destination RAM address
+@PRAMSource		ds.w	1				;source PRAM address
+
+				ENDR
+
+@regsUsed	reg		d2/d3/a3/a5
+;
+;-------------------------------------------------------------------------------
+		WITH	StackFrame3
+
+			move.w	@PRAMSource(sp),d2	;get the PRAM destination address
+			movea.l	@RAMDest(sp),a3		;get the source RAM address
+			move.w	@byteCnt(sp),d3		;get the number of bytes to move
+
+			subq.w	#1,d3				;adjust for dbra
+			blt.s	@done				;quit if the number was zero
+
+@copy		move.w	d2,d1				;put the PRAM address in the right register
+			movem.l	@regsUsed,-(sp)		;save our local registers
+			bsr6	RdXByte				;go read the information
+			movem.l	(sp)+,@regsUsed		;restore our local registers
+			move.b	d1,(a3)+			;put the data into RAM
+			addq.w	#1,d2				;increment the PRAM address
+			dbra.w	d3,@copy			;keep copying
+@done
+		ENDWITH
+		rts
+
+;-------------------------------------------------------------------------------
+;
+; RelocateGlobals - This routine relocates the global data structure created by
+;					The USTInit routine, and the RBIInfo globals also.  If something
+;					changes about how the USTInit routine generates it's globals,
+;					then this routine may have to change.
+;
+;					When this routine is finished, memory looks like this (note that
+;					this diagram is not to scale):
+;
+;	top of RAM --->	|-------------|
+;					|	Chunk	  |
+;					|	Table	  |
+;					|-------------|		
+;					|	RBI	 	  |		
+;					|	Info	  |	
+;					|-------------|
+;					|	UST	  	  |		}	This structure was extended for the new
+;					|	Globals	  |		}	CTE kernel v2.1
+;					|			  |		}
+;					|	   	  	  |
+;					|	    	  |
+;			A5 --->	|-------------|
+;					|	VBR	  	  |
+;					|	register  |
+;					|-------------|
+;					|	CTE	  	  |
+;					|	Workspace |
+;			SP --->	|-------------|
+;
+;
+;
+;	Input:
+;		a1 - destination for new globals
+;
+;	Destroys:
+;		d0, d1, a0, a1, a2
+;
+;-------------------------------------------------------------------------------
+RelocateGlobals
+	WITH	USTGlobals
+
+		lea		sizeofUSTGlobals(a5),a0	;get a ptr past the last element in globals
+		move.l	a0,d0					;next calculate the size of the move
+		sub.l	sp,d0					;(i.e., distance from  stack to  end of  globals)
+		move.l	d0,d1					;save the actual size for later
+		movea.l	a1,a2					;and save the destination address
+
+		lsr.l	#2,d0					;adjust for long moves (slop is OK)
+		addq.l	#1,d0					;be sure to move the return address
+
+@Relocate
+		move.l	-(a0),-(a1)				;move a long word
+		dbra.w	d0,@Relocate			;and continue until done
+
+		movea.l	a2,a0					;recall the original destination address
+		suba.l	d1,a0					;calculate the address of the new stack
+		movea.l	a0,sp					;and reposition the stack
+
+		addq.l	#4,a0					;point to where the vbr should be
+		movec	a0,vbr					;and put the vbr there
+
+		lea		-sizeofUSTGlobals(a2),a5	;put the globals in the same relative place
+
+	ENDWITH
+
+	rts
+
+;--------------------------------------------------------------------------
+;
+; This disables the MMU translation, disables the program and data caches and
+; requires serialized access to IO space
+;
+;--------------------------------------------------------------------------
+
+nuBusTTxlat		EQU		$00FFC040			; require serialized writes 
+ioNuBusTTxlat	EQU		$00FFC040			; for all I/O space
+
+disableMMU
+	
+	IF forRomulator THEN
+		TestInRAM	a0						;are we in ROM?
+		beq.s	@reallyDisableMMU			;really disable MMU if we're in ROM
+		RTS6								;else return immediately
+		
+@reallyDisableMMU
+	ENDIF
+
+	sub.l	d0,d0					; D0 = 0
+	bset	#31,d0					; set Data Cache Enable bit on 040s
+	movec	d0,CACR					; attempt to enable data cache (temporarily)
+	movec	CACR,d0					; check and see if it's still there
+	btst	#31,d0					; see if the bit exists in CACR
+	beq.s	@not040					; IF we're on a 68040 THEN
+	MACHINE	MC68040					;	need this for the MOVEC D0,TC below
+		cinva	bc					;	make sure caches are invalidated
+		sub.l	d0,d0				;	clear d0
+		movec	d0,CACR				;	disable both instruction and data caches
+		movec	d0,TC				;	make sure that the MMU is disabled
+		move.l	#nuBusTTxlat,D0		;	get value to translate upper nuBus space
+		movec	d0,DTT0				;	use serialized writes on this space
+		move.l	#ioNuBusTTxlat,D0	;	get value to translate i/o and nuBus space
+		movec	d0,DTT1				;	use serialized writes on this space
+		bra.s	@not030				;	step around the rest of the 020/030 cache/tc stuff
+	MACHINE	MC68030					;	set it back to what works for 020/030
+@not040										; ELSE
+	move.l	#$2000,d0				;	CACR value w/WA bit for 030
+	movec	d0,cacr					;	disable both instruction & data caches
+	movec	cacr,d0					;	hmmm, maybe we are an 030
+	tst.l	d0						;	see if WA bit is still on
+	beq.s	@not030					;	IF we are an 030 processor
+	lea		@TCOff,a0				;     point to TC value that disabled the MMU
+	pmove	(a0),tc					;     turn off MMU
+									;	ENDIF
+@not030										; ENDIF
+	RTS6							; return through a6
+
+@TCOff		dc.l	0						; a TC value to disable the MMU
+
+CTEInit
+;---------------------------------------------------------------------------
+;
+; CTEInit - initialize CTE in the RBI environment
+;
+;---------------------------------------------------------------------------
+
+		WITH	CPUTestList, USTGlobals			;									<T5>
+			movea.l	(sp)+,a1					;save the return address
+			suba.l	#SizeOfCTEGlobals,sp		;make room on the stack for the CTE workspace
+			move.l	sp,CTEGlobals(a5)			;remember where the workspace is
+			movea.l	sp,a0						;put the pointer into a predictable location
+			move.l	a1,-(sp)					;replace the return address onto the stack
+
+			move.w	#RunBits.RBI,RunMode(a5)	;init our environment - set the run mode flag
+												;	to reflect that this is the RBI environment
+
+			CASE ON
+				GIM_InitInterface	(a0),#SIZEOFCTEGLOBALS	;Init CTE
+			CASE OFF
+;
+; Next, install all the ROM based tests for this machine. The new CTE kernel does not rely
+;	on the linked lists of tests and subtests; rather, it leaves the implementation up to
+;	the shell that is in control (in this case, the Horror ROM). The Terror implementation
+;	used a list of Test/Subtest IDs in the RBIInfo structure to gain the various pieces of
+;	info about them from the test lists (in the file USTSubtests.a), and used the InstallTest
+;	and InstallSubtest routines of the old CTE to install them. I will keep the list of IDs
+;	around, but will not use the InstallTest method (mainly because it no longer exists).
+;	Rather, I have enhanced the USTGlobals to represent a structure that is formatted as the
+;	paramters to the ExecuteDTM call (ExecutionOptions, testInfo, subtestInfo and executionResults
+;	structures). This structure is allocated on the stack at the end of the UST globals (see the
+;	diagram in the description of the RelocateGlobals routine). Before jumping into a DTM, I will
+;	fill in the necessary fields of the parameters. The initialization stuff will be done in the
+;	routine SetupForExecuteDTM, in the source file USTEnvirons.a (it's there because two of the
+;	ROM diagnostic environments - STM and IHT - are there, and the majority rules).
+;
+
+			movea.l	GlobCPUTestList(a5),a0	;get the CPU specific test list
+			lea		RBITestList(a5),a1		;a pointer to our local list of test IDs<T5>
+			move.w	#0,RBINumInst(a5)		;clear the number of installed tests counter
+
+@InstallDTMIDs
+			moveq.l	#0,d0					;zero out the subtest ID register		<T5>
+			move.w	TLSubTest_ID(a0),d0		;get the subtest ID number (word)		<T5>
+			cmpi.w	#-1,d0					;is this the end?						<T5>
+			beq.s	@QuitCTEInit			;finished with subtests if not
+
+			move.w	TLrunflags(a0),d1		;get the run flags for this test		<T5>
+			and.w	RunMode(a5),d1			;is this OK for RBI?
+			beq.s	@nextTest				;go to next test if not
+
+			moveq.l	#0,d1					;prepare to get the test ID				<T5>
+			move.w	TLTest_ID(a0),d1		;get the test ID						<T5>
+			move.l	d1,(a1)+				;and put that in our test list			<T5>
+			move.l	d0,(a1)+				;then put the subtest in our local list	<T5>
+			addq.w	#1,RBINumInst(a5)		;increment the number of installed subtests<T5>
+			cmp.w	#MaxCTESubTests,RBINumInst(a5)	;are we at our max?
+			beq.s	@QuitCTEInit					;quit if so
+
+@nextTest
+			adda.w	#sizeofCPUTestList,a0	;go to next
+			bra.s	@InstallDTMIDs
+
+
+		ENDWITH
+		
+		
+@QuitCTEInit
+		rts
+;-----------------------------------------------------------------------------------
+
+
+
+LogFailure
+;-----------------------------------------------------------------------------------
+;
+; LogFailure - log a test failure to PRAM
+;
+; This routine assumes that registers a0-a2 are already set up
+;
+;-----------------------------------------------------------------------------------
+	WITH	RBIInfo, RBIPRAMMap													;<T5>
+		bsr		InvalidUpper				;Before updating PRAM, we need to invalidate the signature
+
+		addq.w	#1,BIFailFlag(a5)			;increase BIFailFlag;failure occured
+		move.w	BICounter(a5),BILastF(a5)	;BILastF = BICounter
+
+		_CopyRAMToPRAM	BILastF(a5),#pLastFail,#2								;<T5>
+		_CopyRAMToPRAM	BITest(a5),#pTestNum,#4									;<T5>
+		_CopyRAMToPRAM	BISubTest(a5),#pSubTestNum,#4							;<T5>
+		_CopyRAMToPRAM	BITestResult(a5),#pTestResult,#4						;<T5>
+
+		tst.w	BIFirstF(a5)				;is it first failure?				<T5>
+		bne.s	@LogDone					;no, do not log BIFirstF			<T5>
+
+		move.w	BICounter(a5),BIFirstF(a5)	;initialize where first failure occured<T5>
+		_CopyRAMToPRAM	BIFirstF(a5),#pFrstFail,#2								;<T5>
+
+@LogDone
+		move.l	CurTest(a5),d2				;modify the tests failed mask		<T5>
+		or.l	d2,BIFailMask(a5)			;with the current failing test		<T5>
+
+		_CopyRAMToPRAM	BIFailMask(a5),#pFailmask,#4	;go log failure mask	;<T5>
+
+		bsr		UpperToLower			;Copy the upper half of PRAM to the lower half
+	ENDWITH
+	rts
+
+;---------------------------------------------------------------------------
+;
+; RBI critical tests
+;
+;---------------------------------------------------------------------------
+
+RBICritTests
+		dc.l	BIRomTest-RBICritTests		;ROM critical test
+		dc.l	BIRamTest-RBICritTests		;RAM Critical test
+		dc.l	BILongRAMTest-RBICritTests	;moving inversions critical RAM test
+		dc.l	0
+
+
+;---------------------------------------------------------------------------
+;		BIRomTest
+;---------------------------------------------------------------------------
+
+BIRomTest
+		moveq	#0,d6					;clear the result register
+		move.l	#1,BISubtest(a5)		;this is subtest 1 - byte lane ROM checksum	<T5>
+
+		move.l	a5,-(sp)				;save the globals pointer
+		BSR6	RomTest					;execute the test
+		move.l	(sp)+,a5				;and restore the globals pointer
+
+		tst.l	d6						;any error?
+		bne.s	@SumError				;exit if so
+
+		move.l	#2,BISubtest(a5)		;this is subtest 2 - startup ROM checksum	<T5>
+
+		move.l	a5,-(sp)				;save the globals pointer
+		BSR6	StartUpRomTest			;execute the test
+		move.l	(sp)+,a5				;restore the globals pointer
+
+		tst.l	d6						;check for errors
+		bne.s	@Test2Failure			;go report it if so
+
+		clr.l	BITestResult(a5)		;else, clear BIStatus
+		bra.s	@SumError				;and exit
+
+@Test2Failure
+		move.l	d1,d6					;for StartUpRomTest, eor result is in d1
+
+@SumError								;clear BIStatus
+		move.l	d6,BITestResult(a5)		;CCDDDEEFF error code if any		<6>
+		rts								;									<6>
+
+;-----------------------						to next <T4> above
+
+;---------------------------------------------------------------------------
+;		BIRamTest
+;	For Mod3Test and ExtRamTest, must setup
+;	a0 = pointer to bottom test area
+;	a1 = pointer to top test area+1
+;
+;	For DataBusTest,
+;	a0 = address pointer to test the data bus
+;---------------------------------------------------------------------------
+; From here to the next <6> label above was changed for new test numbers
+;and new calling conventions and new RBI tests
+
+	WITH	USTGlobals
+
+BIRamTest
+		moveq	#0,d6					;clear d6
+
+		movea.l	ChunkTable(a5),a3		;get the chunk table						<T4>
+
+@cont	movea.l	(a3)+,a0				;Get the base addr of next bank to test
+		cmpa.l	#-1,a0					;is it -1?
+		beq.s	@testspassed			;all done if so
+
+		movea.l	(a3)+,a1				;Get the size of this bank
+		adda.l	a0,a1					;calculate the end address
+
+		cmpa.l	a1,sp					;make sure we don't destroy our stack, etc	<T4>
+		bhi.s	@test					;continue if OK								<T4>
+
+		move.l	sp,d0					;else, stop here
+		andi.b	#$FC,d0					;Make sure we're long word aligned
+		movea.l	d0,a1
+
+@test	move.l	#1,BISubtest(a5)		;this is subtest 1 - mod 3 test				<T4><T5>
+		BSR6	Mod3Test				;run the test								<T4>
+		tst.l	d6						;any error?									<T4>
+		bne.s	RAMError				;exit if so									<T4>
+
+		move.l	#2,BISubtest(a5)		;this is subtest 2 - reverse mod 3 test		<T4><T5>
+		BSR6	RevMod3Test				;run the test								<T4>
+		tst.l	d6						;any error?									<T4>
+		bne.s	RAMError				;exit if so									<T4>
+
+		move.l	#3,BISubtest(a5)		;this is subtest 3 - extended RAM test		<T4><T5>
+		BSR6	ExtRamTest				;run the test								<T4>
+		tst.l	d6						;any error?									<T4>
+		bne.s	RAMError				;exit if so									<T4>
+		bra.s	@cont					;otherwise, keep working your way through the chunk table
+
+
+;-------------------------------------												<T4>
+@testspassed
+		movea.l	ChunkTable(a5),a0		;Get pointer to first bank					<T4>
+		movea.l	(a0),a0					;											<T4>
+		
+		lea		$100(a0),a0				;point into memory, just in case.			<T4>
+		move.l	#4,BISubtest(a5)		;this is subtest 4 - data bus test			<T4><T5>
+		BSR6	DataBusTest				;											<T4>
+		move.l	d6,BITestResult(a5)		;CCDDEEFF error code if any					<T4>
+		rts								;											<T4>
+
+RAMError
+		movea.l	ChunkTable(a5),a1		;Point to the memory info area				<T4>
+		suba.l	a1,a3					;Calculate where we are in the map			<T4>
+		move.l	a3,d0					;Get it into a data reg						<T4><T5>
+		lsl.l	#1,d0					;Mult by 2 ($10=bankA, $20=bankB)			<T4><T5>
+		or.l	d0,BISubtest(a5)		;Put it in the high nibble of subtest #		<T4><T5>
+		move.l	d6,BITestResult(a5)		;CCDDEEFF error code						<T4>
+		rts								;											<T4>
+
+;---------------------------------------------------------------------------
+;		BILongRAMTest - Performs the moving inversions RAM test.
+;						Note that this test takes a very long time!
+;
+;	For MovInvTest, must setup
+;		a0 = pointer to bottom test area
+;		a1 = pointer to top test area+1
+;
+;---------------------------------------------------------------------------
+
+BILongRAMTest							;
+		move.l	a5,-(sp)				;save a5
+
+		moveq.l	#0,d6					;clear d6
+		move.l	#1,BISubtest(a5)		;this is subtest 1 - moving inversions RAM test<T4><T5>
+
+		movea.l	ChunkTable(a5),a3		;get the chunk table				<T4>
+
+@cont	movea.l	(a3)+,a0				;Get the base addr of next bank to test
+		cmpa.l	#-1,a0					;is it -1?
+		beq.s	@endtest				;all done if so
+
+		movea.l	(a3)+,a1				;Get the size of this bank
+
+		move.l	a3,-(sp)				;save a3
+
+		adda.l	a0,a1					;calculate the end address
+
+		cmpa.l	a1,sp					;make sure we don't destroy our stack, etc
+		bhi.s	@test					;continue if OK
+		move.l	sp,d0					;else, stop here
+		andi.b	#$FC,d0					;Make sure we're long word aligned
+		movea.l	d0,a1
+
+@test	BSR6	MovInvTest				;Execute the test
+
+		move.l	(sp)+,a3				;restore a3
+
+		tst.l	d6						;any error?
+		beq.s	@cont					;Continue if not
+		move.l	(sp)+,a5				;Get the saved a5						<12>
+		bra.s	RAMError				;And error out							<12>
+
+;-------------------------------------
+
+@endtest
+		move.l	(sp)+,a5				;restore a5
+		move.l	d6,BITestResult(a5)		;No errors								<T4>
+		rts								;
+
+	ENDWITH
+
+
+;________________________________________________________________________________________
+;
+; Routine:	WrXByte
+;
+; Inputs:	A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A6	-	caller's return address (BSR6)
+;			D1	-	address of PRAM byte to read
+;			D2	-	byte to write to PRAM
+;
+; Outputs:	none
+;
+; Trashes:	A0,A3,A4,A5,A6,D0,D1,D2
+;
+; Function:	writes a byte of extended PRAM at the specified address
+;________________________________________________________________________________________
+
+WrXByte		MOVEA.L	A1,A3					; point to this machine's product info					<H3>
+			ADDA.L	ProductInfo.ClockPRAMPtr(A3),A3	;  and get the address of its clock/PRAM table	<H3>
+			MOVE.L	4*cpWrXByte(A3),D0		; get the offset to the routine							<H3>
+			BEQ.S	@NoEntry				; -> this function is not supported						<H3>
+			ADDA.L	D0,A3					; calculate the routine's address						<H3>
+			EXG		A6,A3					; save return address in A3, put routine's address in A6<H3>
+@NoEntry	JMP		(A6)					;  and either call the routine or just return			<H3>
+
+		
+;________________________________________________________________________________________
+;
+; Routine:	RdXByte
+;
+; Inputs:	A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A6	-	return address (BSR6)
+;			D1	-	address of PRAM byte to read
+;
+; Outputs:	D1	-	byte read from PRAM
+;
+; Trashes:	A0,A3,A4,A5,A6,D0,D2
+;
+; Function:	reads a byte of extended PRAM at the specified address
+;________________________________________________________________________________________
+
+RdXByte		MOVEA.L	A1,A3					; point to this machine's product info					<H3>
+			ADDA.L	ProductInfo.ClockPRAMPtr(A3),A3	;  and get the address of its clock/PRAM table	<H3>
+			MOVE.L	4*cpRdXByte(A3),D0		; get the offset to the routine							<H3>
+			BEQ.S	@NoEntry				; -> this function is not supported						<H3>
+			ADDA.L	D0,A3					; calculate the routine's address						<H3>
+			EXG		A6,A3					; save return address in A3, put routine's address in A6<H3>
+@NoEntry	JMP		(A6)					;  and either call the routine or just return			<H3>
+
+		
+;________________________________________________________________________________________
+;
+; Routine:	ClkWPOff
+;
+; Inputs:	A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A6	-	return address (BSR6)
+;
+; Outputs:	none
+;
+; Trashes:	D0,D1,D2,A0,A5,A6
+;
+; Function:	write-enables the clock chip if supported by the clock implementation
+;________________________________________________________________________________________
+
+ClkWPOff	MOVEA.L	A1,A5					; point to this machine's product info					<H3>
+			ADDA.L	ProductInfo.ClockPRAMPtr(A5),A5	;  and get the address of its clock/PRAM table	<H3>
+			MOVE.L	4*cpWrProtOff(A5),D0	; get the offset to the routine							<H3>
+			BEQ.S	@NoEntry				; -> this function is not supported						<H3>
+			ADDA.L	D0,A5					; calculate the routine's address						<H3>
+			EXG		A6,A5					; save return address in A5, put routine's address in A6<H3>
+@NoEntry	JMP		(A6)					;  and either call the routine or just return			<H3>
+
+
+	ENDPROC							;											<T4>

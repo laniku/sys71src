@@ -1,0 +1,333 @@
+;__________________________________________________________________________________________________
+;
+;	File:		ATBoot.a
+;
+;	Contains:	a boot protocol driver for AppleTalk
+;
+;				This is the driver that is called by the boot management driver to run a
+;				boot protocol. This involves finding a server, and later getting some sort
+;				of boot blocks to return.
+;
+;				We accept:
+;					control	- "getBootBlocks"
+;							- getSysVol
+;							- mountSysVol
+;					open,
+;					close	- our init and ending routines
+;
+;	Written by:	Patrick Dyson
+;
+;	Copyright © 1989-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 6/14/93	kc		Roll in Ludwig.
+;	   <LW2>	  4/8/93	fau		Rolled in the changes from Horror that were causing us from
+;									NetBooting.  Also, in the ATOpen routine, moved the saving of
+;									registers to the beginning/end of the file and moved the
+;									fetching of the RefNum from the open to happen before it's
+;									storage is released!
+;		<H2>	 4/28/92	dns		Corrected a couple of outstanding problems relating to opening
+;									the LAP Manager for net booting.
+;		 <4>	 6/17/90	CV		Preflight .MPP _Open by checking SPConfig byte - if the port
+;									isn't configured .MPP will crash cleaning up in it's exit code.
+;		 <3>	 6/15/90	CV		Handle error on Lap open.
+;		 <2>	 5/30/90	CV		Changed Close to close the AppleTalk drivers as well.
+;	   <SM2>	 11/5/92	SWC		Changed INCLUDEs to a LOAD of StandardEqu.d.
+;		 <6>	 2/20/90	PWD		Recover and detach our handle so that we         don't go away
+;									if we are ram based and the         system file is closed
+;									(switch launch). Only do this if the ForRam flag is set
+;		 <5>	  2/1/90	PWD		Recover and detach our handle so that we don't go away if we are
+;									ram based and the system file is closed (switch launch).
+;		 <4>	12/28/89	SWC		Fixed header and set tabs to 4.
+;		 <3>	12/19/89	PWD		Adding to bbs.
+;	   <1.2>	12/12/89	PWD		Added support for self-authenticating images
+;	   <1.1>	 11/1/89	PWD		Fixed bug on Elsie with old AppleTalk.
+;	   <1.0>	10/29/89	PWD		Adding to EASE
+;__________________________________________________________________________________________________
+
+;Include files
+
+			PRINT	OFF
+			LOAD	'StandardEqu.d'
+			INCLUDE	'Slots.a'				; Slot equates
+			INCLUDE	'ROMEqu.a'				; Slot ROM equates
+			INCLUDE	'AppleTalk.a'			; AppleTalk equates
+			INCLUDE	'NetBootEqu.a'			; Net Boot equates
+			PRINT	NOGEN,NOMDIR
+			PRINT	ON
+			INCLUDE	'ATBootEqu.a'			; protocol equates
+
+;
+; New equates for the lmgr resource
+;
+	IF &TYPE('lmgrCall') = 'UNDEFINED' THEN
+lmgrCall		EQU		2					; Offset into lmgr of function dispatcher
+lmgrROMBooting	EQU		2					; Tells lmgr we're doing ROM boot
+	ENDIF
+
+;_________________________________________________
+ATBOOT		PROC	EXPORT
+			STRING	PASCAL
+			MACHINE	MC68000
+
+; *****************************************
+; *                                       *
+; *       Start of Boot driver            *
+; *                                       *
+; *****************************************
+
+;
+;	Driver header
+;
+			DC.W	$4000+$0400				; control,locked
+			DC.W	0,0						; No time, no events
+			DC.W	0						; No menu
+
+;
+;	Entry points offset table
+;
+			DC.W	ATOpen-ATBOOT			; open offset
+			DC.W	ATAnRTS-ATBOOT			; prime (read,write)
+			DC.W	ATControl-ATBOOT		; control
+			DC.W	ATAnRTS-ATBOOT			; status
+			DC.W	ATClose-ATBOOT			; close
+
+			DC.W	'.ATBOOT'				; Driver name
+
+			DC.B	1						; Sub version number
+			DC.B	0						; No main version number
+
+
+;________________________________________________________________________
+;
+; Open - initialize the BOOT driver
+;
+;    Called:
+;	D0 = 0
+;	A0 -> queue element
+;         A1 -> DCE
+;
+;________________________________________________________________________
+ATOpen
+			IMPORT	DoOpenLap, mySysEnvirons
+; Go get some storage
+			MOVEM.L	D2-D7/A0-A6, -(SP)		; save regs in a paranoid fashion
+			MOVE.L		dCtlStorage(A1), D3	; are we running yet?
+			MOVE.L		D3, A3				; pick up globals
+			BGT.S		GotMem				; skip the allocate
+		
+		IF	&ForRam	THEN
+			LEA			ATBOOT, A0			; pick up our pointer
+			_RecoverHandle	,SYS			; make it a handle
+			move.l		a1, a2				; save a1
+			move.l		a0, -(SP)			; push handle
+			_DetachResource
+			move.l		a2, a1				; pop saved a1
+		ENDIF
+		
+			MOVE.L		#ATGlobalsSize, D0	; size of our globals
+			_NewPtr		,SYS,CLEAR
+			MOVE.L		A0, D3				; did we get?
+			BEQ			ATErrXit
+			MOVE.L		D3, dCtlStorage(A1)	; save globals pointer
+
+; pick up the .netBoot driver refnum
+
+GotMem		SUB			#IOQElSize,SP		;Allocate parameter block for device manager calls
+			MOVE.L		SP,A0
+			CLR.B		IOPermssn(A0)		;r/w permissions
+
+			LEA			BootDiskName, A1
+			MOVE.L		A1,IOFileName(A0)
+			_Open							; OPEN net boot disk driver
+			MOVE		IORefNum(A0),d4		; save refnum
+
+			TST			IOResult(A0)		; any problems?
+			ADD.L		#IOQElSize, SP		; nuke param block
+
+			BGT			ATErrXit
+
+			MOVE		d4,netBootRefNum(A3)	; get refnum
+; Open up AppleTalk
+controlBit	EQU		3						; Bit for control key down
+controlByte	EQU		7						; Byte for control keys
+
+			BTST	#controlBit,KeyMap+controlByte ; Control key skips boot
+			BNE		ATErrXit				; Branch if down
+
+			MOVEQ   	#PortNotCf,d1   	;<4> Assume a port-not-configured error
+			MOVE.B  	SPConfig,d0     	;<4> D1 = port configuration byte
+			AND.B   	#$0F,d0     		;<4> Clear all but port use bits
+			SUBQ.B  	#UseATalk,d0    	;<4> Must be unconfig'ed, or config'd for ATalk
+			BGT			@NoPatchee       	;<4> Return error if not
+
+			MOVE.W	#mapTrue,RomMapInsert	; map ROM into Resource Chain
+			SUBQ	#4,SP					; Make room for handle
+			MOVE.L	#'lmgr',-(SP)			; Push resource type
+			CLR.W	-(SP)					; Push resource ID
+			_GetResource					; get lmgr from ROM
+			MOVE.L	(SP)+,D5				; D5 -> lmgr master pointer
+			BEQ.S	@OldAppleTalk			; shouldn't happen, but ...
+	;
+	; We got the lmgr from ROM. So call it at its function dispatcher entry point.
+	; The function code is passed on the stack. We need to tell the lmgr that we're
+	; booting from ROM. This code only works with AppleTalk 57.0.4 or higher.
+	;
+			move.l	d5,a0					; move handle to A0
+			move.l	(a0),a0					; get ptr to lmgr code
+			move.l	#lmgrROMBooting,-(sp)	; tell lmgr what do to. (function selector)
+			jsr		lmgrCall(a0)			; Call the 'lmgr' to do its thing
+			addq	#4,sp					; remove parameter (C-Calling conventions)
+			tst.w	d0						; check result
+			beq.s	@lapOK					;<3> no error, continue
+			move	d0, d1					;<3> exit handler wants error in d1
+			bra.s	@NoPatchee				;<3> branch to exit code
+
+;
+; .MPPOpen is a bad boy and calls SysEnvirons. We patch it so it doesn't crash
+;
+@lapOK		MOVE.W	#$A090, D0				; SysEnvirons
+			_GetTrapAddress ,newOS
+			MOVE.L	A0, A5					; save address
+
+			MOVE.W	#$A090, D0				; SysEnvirons
+			LEA	mySysEnvirons, A0			; pick up our patch
+			_SetTrapAddress ,newOS			; patch that pup
+
+@OldAppleTalk
+			SUB		#ioQElSize,SP			; Allocate a queue element
+			MOVE.L	SP,A0					; A0 -> queue element
+			CLR.B	ioPermssn(A0)			; Any permission
+			LEA		MPPName,A1				; A1 -> name of MPP
+			MOVE.L	A1,ioFileName(A0)		; Set in queue element
+			_Open							; Open it
+			MOVE.W	ioResult(A0), D1		; pick up result of open
+			ADD		#ioQElSize,SP			; Get rid of qEl
+
+			TST.L	D5						; Old AppleTalk?
+			BEQ.S	@NoPatchee				; didn't patch iff so
+
+			MOVE.L	A5, A0					; pick up old SysEnvirons trap
+			MOVE.W	#$A090, D0				; and number
+			_SetTrapAddress ,newOS
+
+@NoPatchee
+
+			TST.W	D1						; check open result
+			BNE.S	ATErrXit				; Error if couldn't open
+
+ATXit		
+			MOVEM.L	(SP)+, D2-D7/A0-A6		; restorem
+			MOVEQ	#0,D0					; Indicate no error
+Go			RTS								; And return
+
+ATErrXit	
+			MOVEM.L	(SP)+, D2-D7/A0-A6		; restorem
+			MOVE.W	#openErr,D0
+			RTS
+
+	STRING	PASCAL
+MPPName		DC.W	'.MPP'
+BootDiskName
+			DC.W	'.netBOOT'
+
+OpenStr		DC.W	'ATBoot Open'
+			ALIGN	4
+;________________________________________________________________________
+;
+; Close - close the ATBOOT driver.
+;
+;	We just do housekeeping
+;	and return.
+;
+;	A1 -> DCE
+;________________________________________________________________________
+
+ATClose		MOVE.L	dCtlStorage(A1), D3		; do we have storage
+			BEQ.S	ATCloseExit				; skip the deallocate
+
+			MOVE.L	D3, A3					; address register
+			move.l	netpram(a3), d0			; <7>do we have a pram buffer?
+			beq.s	@nopram					; <7>no buffer, no dispose
+			move.l	d0,a0					; <7>set up for dispos
+			_DisposPtr						; <7>
+			
+@nopram		MOVE.L	netimageBuffer(A3), D0	; test
+			BEQ.S	@noBuffer
+			MOVE.L	D0,A0
+			_DisposPtr
+@noBuffer
+			MOVE.L	A3, A0					; globals pointer
+			_DisposPtr
+			CLR.L	dCtlStorage(A3)			; don't point at old storage
+
+ATCloseExit
+			sub	#ioQElSize,sp				; <7>Allocate a queue element
+			move.l	sp,a0					; <7>A0 -> queue element
+			move	#-10,ioRefNum(a0)		; <7>Set in queue element
+			_Close							; <7>Close .MPP driver
+			add	#ioQElSize,sp				; <7>Get rid of qEl
+		
+			moveq.l	#0, d0					; <7>no error
+ATAnRTS		RTS								; And return
+CloseStr	DC.W	'ATBoot Close'
+;________________________________________________________________________
+;
+; Read - never called
+;
+;	A0 -> queue element
+;	A1 -> DCE
+;________________________________________________________________________
+
+ATRead
+	RTS
+
+;________________________________________________________________________
+;
+; Control - control requests to driver
+;
+;	The "guts" of the driver, this is called to get the boot blocks,
+;	mount a system volume, etc.
+;
+;    Call:     A0 -> I/O queue element
+;              A1 -> device control entry
+;________________________________________________________________________
+			IMPORT	PLOTMYICON				; from ATBoot.c
+			IMPORT	DOATCONTROL				; from ATBoot.c
+
+ATControl
+;			PEA	ControlStr
+;			_DebugStr
+			MOVE.L	A1, -(SP)				; save DCE pointer for jIoDone
+			MOVE.L	A0,-(SP)				; save that param block pointer
+			MOVEQ	#-1, D0					; assume error return
+;
+; Go do the real work
+;
+			MOVE.L	dCtlStorage(A1), -(SP)	; push globals pointer
+			BEQ	NoGo						; paranoia check
+			MOVE.L	A0, -(SP)				; push param block
+
+			JSR	DOATCONTROL					; get boot blocks, image, etc.
+NoGo		ADDQ.L	#8, SP					; clean up stack
+
+ErrExit
+Exit		MOVE.L	(SP)+,A0				; restore iopb
+			MOVE.L	#1024,IOActCount(A0)	; fake good read
+			MOVE.W	D0, ioResult(A0)		; return code in D0.W
+			MOVE.L	(SP)+, A1				; MUST BE VALID FOR JIODONE!!!
+			MOVE.L  	JIODone,A3			; This is how we exit (Prime, Control, Status)
+			JMP	(A3)
+
+ControlStr	DC.W	'ATBoot Control'
+
+			ENDP
+
+mySysEnvirons	PROC	EXPORT
+
+			MOVE.W	#$0605, SysEnvRec.systemVersion(A0)	; fake good sys version
+			MOVEQ.L	#0, D0					; and return no error
+			RTS
+			ENDP
+			END

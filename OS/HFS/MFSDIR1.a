@@ -1,0 +1,255 @@
+;
+;	File:		MFSDIR1.a
+;
+;	Contains:	This file contains mostly MFS-specific volume-level routines.
+;
+;	Copyright:	© 1983-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <2>	 9/12/91	JSM		Add a header.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				 1/14/86	LAK		Removed CVFlags call in MFSCreate (now checked in TFS code).
+;				10/21/85	PWD		Changed to save file-locked state in FCB flags [FCBFilLck bit]
+;				10/21/85	PWD		Changed MFSOpen to save file-locked state in FCB flags
+;									[FCBFilLck bit]
+;				10/20/85	LAK		Flush control cache on exit of MFSCreate. Added routine
+;									MFSCtlFlush to do it.
+;				10/17/85	PWD		Changed MFSCreate to check for ':' in file name
+;				 10/1/85	LAK		Adjusted for new use of cache . . . removed OwnBuf support.
+;				 2/27/85	PWD		Moved FndFilSpc in from TFSDir1.
+;				 2/27/85	PWD		Split off from TFSDir1 FileOpen code.
+;				 2/25/85	GJC		Created from FSDir1.
+;
+
+;_______________________________________________________________________
+;
+; External Routines:	None
+;
+; Internal Routines:	FndFilSpc
+;
+;_______________________________________________________________________
+
+;_______________________________________________________________________
+;
+; Routine:		MFSOpen
+;
+; (c) 1983 Apple Computer, Inc.
+;
+; Arguments:	  A0.L (input)	-- pointer to I/O parameter block: uses IODrvNum,
+;									IOFileType,IOFileName,IOPermssn
+;				  D0.W (output) -- 0 if file successfully opened, errcode otherwise
+;				  Note that open does not use equates when transferring data from
+;				   the directory entry to the FCB (to save code).
+; Calls:		Gt1stFCB,GtNxtFCB,FndFilNam,CmdDone
+; Function: 	Open a file on an MFS volume.
+;
+;
+; Modification History:
+;	27-Feb-85  PWD	Split off from TFSDir1 FileOpen code.
+;	<21Oct85>  PWD	Changed to save file-locked state in FCB flags [FCBFilLck bit]
+;
+;_______________________________________________________________________
+
+
+			BLANKS		ON
+			STRING		ASIS
+
+MFSOpen 	MOVE.L	D1,A3				; get file's FCB ptr
+
+; now get all the info we need for the FCB into regs
+
+			MOVE.W	CurDB,D7			; blk num the file was found in 		<01Oct85>
+
+			MOVE.W	(A5),D3 			; set up for FCB flags
+			AND.W	#$01FF,D3			; clear rsrc, dirty bits
+			BTST	#8,D3				; File locked?									<PWD 21Oct85>
+			BEQ.S	@1					; If cleared, it's not.                         <PWD 21Oct85>
+			BSET	#FCBFlgPBit,D3		; Otherwise, duplicate the bit for later use.	<PWD 21Oct85>
+										; [bit 0 is also write-allowed bit] 			<PWD 21Oct85>
+
+@1			MOVE.L	VCBClpSiz(A2),FCBClmpSize(A3) ; use volume's default clump size
+
+			LEA 	FlFlNum(A5),A5		; get past user-defined words in directory
+			MOVE.L	(A5)+,D2			; file number
+			MOVE.W	(A5)+,D4			; file start block (regular fork)
+			MOVE.L	(A5)+,D5			; file logical length (regular fork)
+			MOVE.L	(A5)+,D6			; file physical len (regular fork)
+
+; now check whether we are opening resource or regular part of the file
+
+			TST.B	RegRsrc 			; regular part open?
+			BNE.S	@2					; br for regular part
+			BSET	#FCBFlgRBit,D3		; mark this FCB a resource FCB
+
+			MOVE.W	(A5)+,D4			; file start block (resource fork)
+			MOVE.L	(A5)+,D5			; file logical length (resource fork)
+			MOVE.L	(A5)+,D6			; file physical len (resource fork)
+@2			BSR 	PermssnChk			; Check file access permission
+			BNE.S	MFSOpnExit			; Stop if something's uncool
+			BRA 	SetUpFCB			; Re-join common code to set up FCB
+
+MFSOpnErr	CLR.W	IORefNum(A0)		; Invalidate the RefNum on errors
+MFSOpnExit	BRA 	CmdDone 			; Give up.
+
+;_______________________________________________________________________
+;
+; Routine:		MFSCreate
+; Arguments:	  A0.L (input)	-- pointer to I/O parameter block: uses
+;									IOFileName
+;				  D0 (output) -- error code
+;				  This call may be executed asynchronously.
+; Calls:		FndFilNam,CVFlgs,FndFilSpc,CmdDone
+; Function: 	Create a new file on an MFS volume. . .
+;
+; Modification History:
+;
+;	30-Nov-82  LAK	removed file type determination; gets time from lomem var
+;	01-Dec-82  LAK	changed Scn4Spc call to start from beginning of directory,
+;					  instead of where FndFil left off; included this proc in-line
+;	08 Dec 82  LAK	changed for new file system data structures.
+;	29 Aug 83  LAK	changed to specifically disallow file names of 0 length.
+;	25 Feb 85  GJC	modified slightly to continue MFS support in light of TFS
+;	17 Oct 85  PWD	Changed to check for ':' in file name.
+;_______________________________________________________________________
+
+;
+;  file did not already exist.	See FndFil to see what regs hold now. Basically:
+;	A2=ptr to correct VCB, A4=ptr to name, D2=name len
+
+MFSCreate	TST.W	D2					; zero-length name?
+			BEQ.S	MFSCrBdNm			; If so, punt								 <PWD 17Oct85>
+
+			MOVE.W	D2,D0				; Pick up name length						 <PWD 17Oct85>
+@1			SUBQ.W	#1,D0				; Count down characters 					 <PWD 17Oct85>
+			BLT.S	MFSCrSt 			; If count goes negative, we're all set.     <PWD 17Oct85>
+			CMP.B	#':',0(A4,D0)		; Check for a colon in the file name		 <PWD 17Oct85>
+			BNE.S	@1					; If it's not one, try the next character    <PWD 17Oct85>
+
+MFSCrBdNm	MOVEQ	#BdNamErr,D0		; This is bad news
+MFSCrExit	BRA 	CmdDone 			; that's all folks.
+
+MFSCrSt 	;LAK<14Jan86>;BSR	  CVFlgs			  ; check the volume flags for writability
+			;LAK<14Jan86>;BNE.S   MFSCrExit 		  ;  (requires A2=VCB ptr) - br if an error
+
+			BSR.S	FndFilSpc			; find space in the directory
+			BNE.S	MFSCrExit			; exit if directory full or disk error
+
+; first make sure the entire entry is zeroed
+
+			MOVE.W	D5,D0				; entry length
+			MOVE.L	A5,A1				; pointer to entry
+@1			CLR.W	(A1)+				; entry lengths are always even
+			SUBQ.W	#2,D0
+			BHI.S	@1
+
+			BSET	#7,FlFlags(A5)		; in-use bit set
+			MOVE.B	IOFileType(A0),FlTyp(A5) ; file type field
+			MOVE.L	VCBNxtFNum(A2),FlFlNum(A5) ; use next file number
+			ADDQ.L	#1,VCBNxtFNum(A2)	; increment next file number field
+
+			LEA 	FlCrDat(A5),A5
+			MOVE.L	Time,(A5)			; created now
+			MOVE.L	(A5)+,(A5)+ 		; also mod date
+
+; now move in file name: D2 is name length, A4 points to name, (A5)
+; points to destination for name . . .
+
+			MOVE.B	D2,(A5)+
+			BEQ.S	@3					; br if 0 (just in case)
+@2			MOVE.B	(A4)+,(A5)+ 		; move byte by byte
+			SUBQ.B	#1,D2
+			BHI.S	@2
+
+; now update VCB and we're done.
+
+@3			BSR 	MarkVCB 			; mark volume info changed
+			ADDQ.W	#1,VCBNmFls(A2) 	; incr VCB file count
+			BSR.S	MFSCtlFlush 		; flush control cache for MFS			<20Oct85>
+			MOVEQ	#0,D0				; flawless
+			BRA.S	MFSCrExit			; all done folks.
+
+MFSCtlFlush 							; A2=VCB ptr on entry - D0/A1/D1 wiped	<20Oct85>
+			MOVE.W	VCBVRefNum(A2),D0	; pass volume refnum					<20Oct85>
+			MOVE.L	SysCtlCPtr,A1		; catalog blk read: MFS catalog blks	<01Oct85>
+			MOVEQ	#0,D1				; regular flush options
+			JMP 	FlushCache			; only flushes if there are too many
+										;	dirty blocks
+;_______________________________________________________________________
+;
+; Routine:		FndFilSpc
+; Arguments:	  A2.L (input)	-- VCB pointer
+;				  D2.W (input)	-- new directory entry name length
+;				  D5.W (output) -- entry length
+;				  A5.L (output) -- pointer to directory space
+;				  D0.W (output) -- error code (directory full)
+;				  Preserves: A0,A2,D2,A4
+;				  Clobbers: other regs
+;				  Also marks this buffer dirty (anticipation) and invalidates the
+;					volume index,blk num fields
+;				  This routine may return to one level above caller.
+; Calls:		Rd1stDB,RdNxtDB
+; Called By:	Create,Rename(via GetSpace)
+; Function: 	Find space in the directory for a new file entry. This routine
+;				first checks for a directory block in the volume buffer and
+;				searches it first.	If space enough is not found, the directory
+;				is scanned from the first block.  A pointer to the space is
+;				returned and the next entry is marked empty (directory space
+;				is always at the end of a block).
+;
+; Modification History:
+;	09 Dec 82  LAK	New today.
+;	16 Jan 82  LAK	Modified for latest changes (no directory entry length byte).
+;
+; Note that FlNTLen+2 is the minimum size of a directory entry (an entry for
+;  a file with a 1-byte name).
+;
+;_______________________________________________________________________
+
+FndFilSpc
+			MOVE.L	(SP)+,A3			; preserve caller's address
+
+			MOVEQ	#FlNTLen+2,D5		; entry len, no name + length byte +1
+			ADD.W	D2,D5				; add name length (excluding length byte)
+			BCLR	#0,D5				; make it an even value
+
+			BSR 	MFSRd1stDB			; special case first read				<01Oct85>
+			BRA.S	scnNxB1
+
+scnNxB		BSR 	MFSRdNxtDB			; get next dir blk						<01Oct85>
+scnNxB1 	BNE.S	fndFSExit			; exit on bad reads or dir full
+
+scnSp2		MOVEQ	#0,D0				; init the index
+
+@1			TST.B	FlFlags(A5,D0)		; free space?
+			BEQ.S	blkOpnng			; br if so
+			BSR.S	GtNxEntry			; point (A5,D0) to next entry
+			BCS.S	@1
+
+blkOpnng	MOVE.W	D0,D4				; now see if new entry will fit this block
+			ADD.W	D5,D4				; compute new end of entries in the block
+			CMP.W	#BufSiz,D4			; did it fit?
+			BCC.S	ScnNxB				; if not, go scan the next block
+
+			JSR 	MarkA5Block 		; mark this block dirty (will soon be)			  <01Oct85>
+
+			LEA 	0(A5,D0.W),A5		; point right to the entry
+			CLR.L	VCBDirIndex(A2) 	; invalidate our index,blk num pair
+			MOVEQ	#0,D0				; success
+
+fndFSExit	JMP 	(A3)				; return to caller
+
+; routine shared by FndFilSpc, FndFilNam, GetFileInfo, and FClose
+; trashes D6, (A5,D0) point to next entry, BCS works if there is more room
+
+GtNxEntry	MOVEQ	#0,D6
+			MOVE.B	FlNam(A5,D0),D6 	; get name length
+			ADD.W	D6,D0				; update to point at next entry
+			ADD.W	#FlNTLen+2,D0		; full entry length including name
+			BCLR	#0,D0				; make sure have an even value
+			CMP.W	#(BufSiz-FlNTLen-2),D0 ; only scan thru the block
+			RTS 						; BCS branches if not at end
+
+

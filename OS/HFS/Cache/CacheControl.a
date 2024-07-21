@@ -1,0 +1,235 @@
+;
+;	File:		CacheControl.a
+;
+;	Contains:	This code adds a new trap to programatically control
+;				parameters of the RAMCache.
+;
+;	Written by:	Joe Buczek
+;
+;	Copyright:	© 1987-1991, 1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 4/29/93	chp		Removed ioMisc equate, now in SysEqu.a.
+;		 <2>	 9/13/91	JSM		Add a header.
+;	   <1.0>	 3/20/89	MSH		Ported from system disk to ROM.
+;				  3/7/89	JB		Made ROM-able
+;				 12/2/87	JB		Changed for ioParamblock interface
+;				11/25/87	JB		Added get/set cache status
+;				11/20/87	JB		New today.
+;
+
+				TITLE		'HFS Cache Control Trap'
+;____________________________________________________________________________________
+;
+;	Function:	These traps provide an interface to the file system
+;				caching mechanism.
+;
+;	Cache Trap
+;	  Routines:    
+;				GetCSize		Get cache size
+;				SetCSize		Set cache size
+;				GetApZnSiz		Get minimum application zone size
+;				SetApZnSiz		Set minimum application zone size
+;				GetMaxCXfr		Get maximum cached transfer size
+;				SetMaxCXfr		Set maximum cached transfer size
+;				GetCStatus		Get cache status
+;				SetCStatus		Set cache status
+;
+;	Internal
+;	  Routines:
+;				GetCacSize		Get current size of cache
+;
+;	To do:
+;		- Need to completely redefine way cache uses memory. Should be
+;			a trap here to feed memory to the cache (called by MultiFinder
+;			or memory manager), also a way to ask for those blocks back
+;			if they are needed.
+;		- Need some reasonableness checks for parameters.
+;
+;	Build notes:
+;
+;		This file should be assembled as follows:
+;
+;							asm -d FSPNonPortable CacheTrap.a
+;
+;_____________________________________________________________________________
+
+			PRINT	OFF
+			include	'SysEqu.a'
+			include	'SysErr.a'
+			include	'FSPrivate.a'
+			include	'DiskCachePriv.a'
+			PRINT	ON
+
+;_____________________________________________________________________________
+;	Cache trap dispatcher
+;
+;	Supplied:
+;				D0.W	Service selector index
+;				A0.L	New cache parameter value if call is a 'set' call
+;
+;	Returned:
+;				D0.L	Result code
+;						'ParamErr' is returned if either the selector
+;							is invalid or if the value supplied on a 'set'
+;							call is unreasonable
+;				A0.L	Requested cache parameter value if the
+;						call was a 'get' call
+;_____________________________________________________________________________
+CacheProc	PROC	EXPORT
+
+			IMPORT	FSQueueSync, CmdDone
+
+;
+;  Cache trap dispatch table:
+;
+CTrapTbl	dc.w	GetCSize-CTrapTbl	; 0 - get cache size
+			dc.w	SetCSize-CTrapTbl	; 1 - set cache size
+			dc.w	GetApZnSiz-CTrapTbl	; 2 - get min application zone size
+			dc.w	SetApZnSiz-CTrapTbl	; 3 - set min application zone size
+			dc.w	GetMaxCXfr-CTrapTbl	; 4 - get max cached transfer size
+			dc.w	SetMaxCXfr-CTrapTbl	; 5 - set max cached transfer size
+			dc.w	GetCStatus-CTrapTbl	; 6 - get cache status
+			dc.w	SetCStatus-CTrapTbl	; 7 - set cache status
+
+maxCacheTrap equ	(*-CTrapTbl)/2		; Number of traps defined
+
+;_____________________________________________________________________________
+;	Cache control trap entrypoint
+;_____________________________________________________________________________
+			EXPORT	CacheTrap
+CacheTrap	cmp.w	#maxCacheTrap,d0	; Valid trap index?
+			blo.s	@1					; Xfer if so...
+			moveq	#ParamErr,d0		; Else, indicate parameter error
+			rts
+@1
+			lea		CTrapTbl,a1			; Base of dispatch table
+			add.w	d0,d0				; Trap index into WORD index
+			add.w	(a1,d0),a1			; Routine to invoke
+			jmp		(a1)				; Go to requested routine...
+CTExit
+			jmp		CmdDone				; Exit via the file system...
+
+;_____________________________________________________________________________
+;	0 -- Get cache size
+;_____________________________________________________________________________
+GetCSize
+			jsr		FSQueueSync			; Synchronize with the file manager
+			move.l	CacheVars,a1		; Cache vars address
+			move.l	OldBufPtr(a1),d0	; Pre-cache BufPtr
+			sub.l	NewBufPtr(a1),d0	; Size of cache = (Pre-cache BufPtr)-current
+			move.l	d0,ioMisc(a0)		; Return in param block
+			moveq	#0,d0				; Result = SUCCESS
+			bra.s	CTExit
+
+;_____________________________________________________________________________
+;	1 -- Set cache size
+;_____________________________________________________________________________
+SetCSize
+			jsr		FSQueueSync			; Synchronize with the file manager
+			move.l	ioMisc(a0),d0		; Get desired cache size
+			moveq	#15,d1				; Divide by 32K
+			lsr.l	d1,d0				; ...
+			move.b	d0,CacheConfig		; Set mem config for next launch
+			moveq	#0,d0				; Result = SUCCESS
+			bra.s	CTExit
+
+;_____________________________________________________________________________
+;	2 -- Get minimum application zone size
+;_____________________________________________________________________________
+GetApZnSiz
+			jsr		FSQueueSync			; Synchronize with the file manager
+			move.l	CacheVars,a1		; Cache vars address
+			move.l	CacheMinZn(a1),ioMisc(a0)
+			moveq	#0,d0				; Result = SUCCESS
+			bra.s	CTExit
+
+;_____________________________________________________________________________
+;	3 -- Set minimum application zone size
+;
+;		This value is examined whenever the cache is grown.  Cache size will
+;		not be allowed to exceed this amount. The default value is enough
+;		space to load and run an application.  The value may be set to a
+;		smaller value to enable use of memory for cacheing when it is known
+;		that other applications will not be present (MultiFinder).
+;_____________________________________________________________________________
+SetApZnSiz
+			jsr		FSQueueSync			; Synchronize with the file manager
+			move.l	CacheVars,a1		; Cache vars address
+			move.l	ioMisc(a0),CacheMinZn(a1)	; Set new ApplZone size minimum
+			moveq	#0,d0				; Result = SUCCESS
+			bra.s	CTExit
+
+;_____________________________________________________________________________
+;	4 -- Get maximum cached transfer size
+;_____________________________________________________________________________
+GetMaxCXfr
+			jsr		FSQueueSync			; Synchronize with the file manager
+			move.l	CacheVars,a1		; Cache vars address
+			move.l	CacheByteLim(a1),ioMisc(a0)
+			moveq	#0,d0				; Result = SUCCESS
+			bra.s	CTExit
+
+;_____________________________________________________________________________
+;	5 -- Set maximum cached transfer size
+;
+;		This value is examined on each "read/write in place" call. These cache
+;		calls are used by file system to transfer integral blocks from the
+;		caller's buffer to/from the disk (possibly) without caching. Setting
+;		this value to a smaller value will tend to keep reading/writing large
+;		files from effectively causing a flush of the cache.  This might 
+;		make an environment where multiple files are typically open behave
+;		better (i.e., one application won't tend to cause the cache to be
+;		flushed).
+;_____________________________________________________________________________
+SetMaxCXfr
+			jsr		FSQueueSync			; Synchronize with the file manager
+			move.l	CacheVars,a1		; Cache vars address
+			move.l	OldBufPtr(a1),d0	; Pre-cache BufPtr
+			sub.l	NewBufPtr(a1),d0	; Size of cache = (Pre-cache BufPtr)-current
+			move.l	ioMisc(a0),d1		; Get caller's parameter
+			cmp.l	d1,d0				; Cache size >= requested max xfer size?
+			bhs.s	@1					; Xfer if so...
+			moveq	#ParamErr,d0		; Else, indicate parameter error
+			bra		CTExit
+@1
+			move.l	d1,CacheByteLim(a1) ; Set new max transfer size
+			moveq	#0,d0				; Result = SUCCESS
+			bra		CTExit
+
+;_____________________________________________________________________________
+;	6 -- Get cache status
+;_____________________________________________________________________________
+GetCStatus
+			jsr		FSQueueSync			; Synchronize with the file manager
+			move.l	CacheVars,a1		; Cache vars address
+			moveq	#0,d0				; Assume cache disabled
+			tst.b	CurEnable(a1)		; Cache currently enabled?
+			beq.s	@1					; Xfer if currently disabled (error?)
+			btst    #5,CacheEnable      ; test enable bit
+			beq.s	@1					; Xfer if disabled
+			moveq	#1,d0				; Else, indicate "enabled"
+@1
+			move.l	d0,ioMisc(a0)		; Set returned cache status to caller
+			moveq	#0,d0				; Result = SUCCESS
+			bra		CTExit
+
+;_____________________________________________________________________________
+;	7 -- Set cache status
+;_____________________________________________________________________________
+SetCStatus
+			jsr		FSQueueSync			; Synchronize with the file manager
+			tst.l	ioMisc(a0)			; Enable or disable?
+			beq.s	@1					; Xfer if disable...
+			bset	#5,CacheEnable		; Else, ask for enable on next launch
+			bra.s	@2
+@1
+			bclr	#5,CacheEnable		; Ask for disable on next launch
+@2
+			moveq	#0,d0				; Result = SUCCESS
+			bra		CTExit
+
+			ENDPROC
+
+			END

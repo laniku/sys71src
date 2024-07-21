@@ -1,0 +1,340 @@
+;
+;	File:		XSNAN.a
+;
+;	Contains:	Routines for handling the SNAN exception
+;
+;	Originally Written by:	Motorola Inc.
+;	Adapted to Apple/MPW:	Jon Okada
+;
+;	Copyright:	© 1990, 1991 by Apple Computer, Inc., all rights reserved.
+;
+;   This file is used in these builds:   Mac32
+;
+;	Change History (most recent first):
+;
+;		<2+>	 6/24/91	BG		Changed snanwrt_dn: for opclass 0/2 enabled case,
+;							sign of destination NaN has priority.
+;		 <2>	 3/30/91	BG		Rolling in Jon Okada's latest changes.
+;		 <1>	12/14/90	BG		First checked into TERROR/BBS.
+
+;  xsnan.a
+
+;  Based upon Motorola file 'x_snan.sa'.
+
+;  CHANGE LOG:
+;  09 Jan 91	JPO	Inserted label "snan" at beginning of code.
+;			  Deleted unreferenced labels "ck_inex", "take_inex",
+;			  "wrt_word", and "dst_nan".  Renamed labels "loop1",
+;			  "loop2", and "wrt_dn" to "snanloop1", "snanloop2",
+;			  and "snanwrt_dn", respectively.  Modified branching
+;			  to user SNAN and INEX handlers.  Modified code to
+;			  read DST register number in "snanwrt_dn".  Modified
+;			  subroutine 'move_out' to avoid calling 'mem_write'.
+;			  Changed "bra fpsp_done" to "rte".
+;  27 May 91	JPO	For opclass 0/2 enabled case, sign of destination NaN
+;			  has priority.
+;
+
+*
+*	x_snan.sa 3.1 12/10/90
+*
+* fpsp_snan --- FPSP handler for signalling NAN exception
+*
+* SNAN for float -> integer conversions (integer conversion of
+* an SNAN) is a non-maskable run-time exception.
+*
+* For trap disabled the 040 does the following:
+* If the dest data format is s, d, or x, then the SNAN bit in the NAN
+* is set to one and the resulting non-signaling NAN (truncated if
+* necessary) is transferred to the dest.  If the dest format is b, w,
+* or l, then garbage is written to the dest (actually the upper 32 bits
+* of the mantissa are sent to the integer unit).
+*
+* For trap enabled the 040 does the following:
+* If the inst is move_out, then the results are the same as for trap 
+* disabled with the exception posted.  If the instruction is not move_
+* out, the dest. is not modified, and the exception is posted.
+*
+
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* X_SNAN	IDNT    2,1 Motorola 040 Floating Point Software Package
+
+
+snan:				; label inserted <1/9/91, JPO>
+fpsp_snan:
+	link	a6,#-LOCAL_SIZE
+	fsave	-(a7)
+	movem.l	d0-d1/a0-a1,USER_DA(a6)
+	fmovem.x fp0-fp3,USER_FP0(a6)
+	fmovem.l fpcr/fpsr/fpiar,USER_FPCR(a6)
+
+*
+* Check if trap enabled
+*
+	btst.b	#snan_bit,FPCR_ENABLE(a6)
+	bne.b	ena		;If enabled, then branch
+
+	bsr	move_out	;else SNAN disabled
+*
+* It is possible to have an inex1 exception with the
+* snan.  If the inex enable bit is set in the FPCR, and either
+* inex2 or inex1 occured, we must clean up and branch to the
+* real inex handler.
+*
+;ck_inex:				; label DELETED <1/9/91, JPO>
+	move.b	FPCR_ENABLE(a6),d0
+	and.b	FPSR_EXCEPT(a6),d0
+	andi.b	#$3,d0
+	beq.b	end_snan
+*
+* Inexact enabled and reported, and we must take an inexact exception.
+*
+;take_inex:				; label DELETED <1/9/91, JPO>
+	move.b	#INEX_VEC,EXC_VEC+1(a6)
+	movem.l	USER_DA(a6),d0-d1/a0-a1
+	fmovem.x USER_FP0(a6),fp0-fp3
+	fmovem.l USER_FPCR(a6),fpcr/fpsr/fpiar
+	frestore (a7)+
+	unlk	a6
+
+;	bra.l	real_inex		; DELETED <1/9/91, JPO>
+
+	move.l	($00C4).W,-(sp)		; push vector to user INEX handler <1/9/91, JPO>
+	rts				; execute user's handler <1/9/91, JPO>
+
+*
+* SNAN is enabled.  Check if inst is move_out.
+* Make any corrections to the 040 output as necessary.
+*
+ena:
+	btst.b	#5,CMDREG1B(a6) 	;if set, inst is move out
+	beq.w	not_out
+
+	bsr	move_out
+
+report_snan:
+	move.b	(a7),VER_TMP(a6)
+	cmpi.b	#VER_40,(a7)		;test for orig unimp frame
+	bne.b	ck_rev
+	moveq.l	#13,d0			;need to zero 14 lwords
+	bra.b	rep_con
+ck_rev:
+	moveq.l	#11,d0			;need to zero 12 lwords
+rep_con:
+	clr.l	(a7)
+snanloop1:				; label renamed <1/9/91, JPO>
+	clr.l	-(a7)			;clear and dec a7
+	dbra.w	d0,snanloop1		; label renamed <1/9/91, JPO>
+
+	move.b	VER_TMP(a6),(a7)	;format a busy frame
+	move.b	#BUSY_SIZE-4,1(a7)
+	move.l	USER_FPSR(a6),FPSR_SHADOW(a6)
+	or.l	#sx_mask,E_BYTE(a6)
+	movem.l	USER_DA(a6),d0-d1/a0-a1
+	fmovem.x USER_FP0(a6),fp0-fp3
+	fmovem.l USER_FPCR(a6),fpcr/fpsr/fpiar
+	frestore (a7)+
+	unlk	a6
+
+;	bra.l	real_snan		; DELETED <1/9/91, JPO>
+
+	move.l	(FPSNAN_VEC040).W,-(sp)	; push vector to user handler <1/9/91, JPO>
+	rts				; execute user handler <1/9/91, JPO>
+
+*
+* Exit snan handler by expanding the unimp frame into a busy frame
+*
+end_snan:
+	bclr.b	#E1,E_BYTE(a6)
+
+	move.b	(a7),VER_TMP(a6)
+	cmpi.b	#VER_40,(a7)		;test for orig unimp frame
+	bne.b	ck_rev2
+	moveq.l	#13,d0			;need to zero 14 lwords
+	bra.b	rep_con2
+ck_rev2:
+	moveq.l	#11,d0			;need to zero 12 lwords
+rep_con2:
+	clr.l	(a7)
+snanloop2:					; label renamed <1/9/91, JPO>
+	clr.l	-(a7)				;clear and dec a7
+	dbra.w	d0,snanloop2			; label renamed <1/9/91, JPO>
+
+	move.b	VER_TMP(a6),(a7)		;format a busy frame
+	move.b	#BUSY_SIZE-4,1(a7)		;write busy size
+	move.l	USER_FPSR(a6),FPSR_SHADOW(a6)
+	or.l	#sx_mask,E_BYTE(a6)
+	movem.l	USER_DA(a6),d0-d1/a0-a1
+	fmovem.x USER_FP0(a6),fp0-fp3
+	fmovem.l USER_FPCR(a6),fpcr/fpsr/fpiar
+	frestore (a7)+
+	unlk	a6
+
+;	bra.l	fpsp_done		; deleted <1/9/91, JPO>
+
+	rte				; <1/9/91, JPO>
+
+*
+* Move_out 
+*
+move_out:
+	move.l	EXC_EA(a6),a0		;get <ea> from exc frame
+
+	bfextu	CMDREG1B(a6){3:3},d0	;move rx field to d0{2:0}
+	cmpi.l	#0,d0			;check for long
+	beq.b	sto_long		;branch if move_out long
+	
+	cmpi.l	#4,d0			;check for word
+	beq.b	sto_word		;branch if move_out word
+	
+	cmpi.l	#6,d0			;check for byte
+	beq.b	sto_byte		;branch if move_out byte
+	
+*
+* Not byte, word or long
+*
+	rts
+*	
+* Get the 32 most significant bits of etemp mantissa
+*
+sto_long:
+	move.l	ETEMP_HI(a6),d1
+	move.l	#4,d0		;load byte count
+*
+* Set signalling nan bit
+*
+	bset.l	#30,d1			
+*
+* Store to the users destination address
+*
+	tst.l	a0		;check if <ea> is 0
+	beq.b	snanwrt_dn	;destination is a data register - label renamed <1/9/91, JPO>
+	
+;	move.l	d1,-(a7)	;move the snan onto the stack - DELETED <1/9/91, JPO>
+;	move.l	a0,a1		;load dest addr into a1 - DELETED <1/9/91, JPO>
+;	move.l	a7,a0		;load src addr of snan into a0 - DELETED <1/9/91, JPO>
+;	bsr	mem_write	;write snan to user memory - DELETED <1/9/91, JPO>
+;	move.l	(a7)+,d1	;clear off stack - DELETED <1/9/91, JPO>
+
+	move.l	d1,(a0)		; write snan to <ea> <1/9/91, JPO>
+
+	rts
+*
+* Get the 16 most significant bits of etemp mantissa
+*
+sto_word:
+	move.l	ETEMP_HI(a6),d1
+	move.l	#2,d0		;load byte count
+*
+* Set signalling nan bit
+*
+	bset.l	#30,d1			
+*
+* Store to the users destination address
+*
+	tst.l	a0		;check if <ea> is 0
+	beq.b	snanwrt_dn	;destination is a data register - label renamed <1/9/91, JPO>
+
+;	move.l	d1,-(a7)	;move the snan onto the stack - DELETED <1/9/91, JPO>
+;	move.l	a0,a1		;load dest addr into a1 - DELETED <1/9/91, JPO>
+;	move.l	a7,a0		;point to low word - DELETED <1/9/91, JPO>
+;	bsr	mem_write	;write snan to user memory - DELETED <1/9/91, JPO>
+;	move.l	(a7)+,d1	;clear off stack - DELETED <1/9/91, JPO>
+
+	swap	d1		; write high word of d1 to <ea>  <1/9/91, JPO>
+	move.w	d1,(a0)
+	swap	d1		; restore d1 <1/9/91, JPO>
+
+	rts
+*
+* Get the 8 most significant bits of etemp mantissa
+*
+sto_byte:
+	move.l	ETEMP_HI(a6),d1
+	move.l	#1,d0		;load byte count
+*
+* Set signalling nan bit
+*
+	bset.l	#30,d1			
+*
+* Store to the users destination address
+*
+	tst.l	a0		;check if <ea> is 0
+	beq.b	snanwrt_dn	;destination is a data register - label renamed <1/9/91, JPO>
+
+;	move.l	d1,-(a7)	;move the snan onto the stack - DELETED <1/9/91, JPO>
+;	move.l	a0,a1		;load dest addr into a1 - DELETED <1/9/91, JPO>
+;	move.l	a7,a0		;point to source byte - DELETED <1/9/91, JPO>
+;	bsr	mem_write	;write snan to user memory - DELETED <1/9/91, JPO>
+;	move.l	(a7)+,d1	;clear off stack - DELETED <1/9/91, JPO>
+
+	rol.l	#8,d1		; write high byte of d1 to <ea>  <1/9/91, JPO>
+	move.b	d1,(a0)
+	ror.l	#8,d1		; restore d1 <1/9/91, JPO>
+
+	rts
+
+*
+*	snanwrt_dn --- write to a data register - label renamed <1/9/91, JPO>
+*
+*	We get here with D1 containing the data to write and D0 the
+*	number of bytes to write: 1=byte,2=word,4=long.
+*
+snanwrt_dn:			; label renamed <1/9/91, JPO>
+	move.l	d1,L_SCR1(a6)	;data
+
+;	move.l	d0,-(a7)	;size - DELETED <1/9/91, JPO>
+;	bsr.l	get_fline	;returns fline word in d0 - DELETED <1/9/91, JPO>
+;	move.l	d0,d1		; DELETED <1/9/91, JPO>
+;	andi.l	#$7,d1		;d1 now holds register number - DELETED <1/9/91, JPO>
+;	move.l	(sp)+,d0	;get original size - DELETED <1/9/91, JPO>
+
+	movea.l	USER_FPIAR(a6),a0	; return fline word in d1.w <1/9/91, JPO>
+	move.w	(a0),d1			; <1/9/91, JPO>
+	andi.l	#7,d1			; get register number <1/9/91, JPO>
+
+	cmpi.l	#4,d0
+	beq.b	wrt_long
+	cmpi.l	#2,d0
+	bne.b	wrt_byte
+;wrt_word:			; label DELETED <1/9/91, JPO>
+	or.l	#$8,d1
+	bra	reg_dest
+wrt_long:
+	or.l	#$10,d1
+	bra	reg_dest
+wrt_byte:
+	bra	reg_dest
+*
+* Check if it is a src nan or dst nan
+*
+not_out:
+	move.l	DTAG(a6),d0	
+	bfextu	d0{0:3},d0	;isolate dtag in lsbs
+
+	cmpi.b	#3,d0		;check for nan in destination
+	bne.b	issrc		;destination nan has priority
+;dst_nan:			; label DELETED <1/9/91, JPO>
+;	btst.b	#6,FPTEMP_HI(a6) ;check if dest nan is an snan - DELETED <5/27/91>		<T3>
+;	bne.b	issrc		;no, so check source for snan - DELETED <5/27/91>		<T3>
+	move.w	FPTEMP_EX(a6),d0
+	bra.b	cont
+issrc:
+	move.w	ETEMP_EX(a6),d0
+cont:
+	btst.l	#15,d0		;test for sign of snan
+	beq.b	clr_neg
+	bset.b	#neg_bit,FPSR_CC(a6)
+	bra.w	report_snan
+clr_neg:
+	bclr.b	#neg_bit,FPSR_CC(a6)
+	bra.w	report_snan
+
+
+

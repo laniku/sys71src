@@ -1,0 +1,273 @@
+;---------------------------------------------------------------------------
+;	File:		ExceptionSupport.a
+;
+;	Contains:	This file contains routines which are used to install, de-install
+;				exception handlers and set interrupt levels.
+;
+;	Written by:	Test Engineering and CPU diagnostics
+;
+;	Copyright:	© 1990, 1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 5/16/92	kc		Roll in Horror changes. Comments follow:
+;		 <2>	 1/24/91	CCH		Rolled in changes from Scott Smyers.
+;		 <1>	 8/31/90	SS		first checked in
+;
+;
+;---------------------------------------------------------------------------
+
+		include		'STDMacros.a'
+		include		'USTMacros.a'
+
+		IF		&TYPE('LUCY')='UNDEFINED' THEN
+LUCY	EQU 	0
+		ENDIF
+		IF		&TYPE('LINUS')='UNDEFINED' THEN
+LINUS	EQU 	0
+		ENDIF
+		IF LUCY OR LINUS THEN
+CPU 	EQU 	00
+		ENDIF
+		IF		&TYPE('CPU')='UNDEFINED' THEN
+CPU 	EQU 	20
+		ENDIF
+		
+		IF		CPU = 20 THEN
+		MACHINE MC68020
+		ELSE
+		MACHINE MC68000
+		ENDIF
+		CASE	ON
+
+;
+;		ExceptionSupport.a
+;
+
+; When stub is called, address on stack will point to globs field of Exception Info
+ExceptionInfo	RECORD	0		;typedef struct ExceptionInfo
+								;{
+; instruction	ds.w 1			;		UWORD instruction ; 			// JSR instruction
+; stubAddress	ds.l 1			;		void *stubAddress ; 			// stub address
+globs			ds.l 1			;		struct CTEGlobals *globs ;		// pointer to globals.
+handler 		ds.l 1			;		void (*handler)(void *info) ;	// pointer to exception handler.
+argPtr			ds.l 1			;		void *argPtr ;					// pointer to SubtestInfo structure.
+oldVector		ds.l 1			;		void *oldVector ;				// vector from Exception Vector Table which
+								;										//				was replaced when this handler was installed.
+oldInfoPtr		ds.l 1			;		ExceptionInfo *oldInfoPtr ; 	// pointer from the ExceptionInfoPtrTable which
+								;										//				was replaced when this handler was installed.
+vectorNumber	ds.w 1			;		unsigned short vectorNumber ;									//
+				ENDR			;} ExceptionInfo ;
+
+frameFormat68K0 EQU 	$10000
+frameFormat68K1 EQU 	$10001
+
+Cpu68000		EQU 	$00000000		;Vanilla 68000
+CpuLucy 		EQU 	$00000002		;Woodstock NT
+CpuLinus		EQU 	$00000003		;Woodstock SC
+CpuWoodstockBit EQU 	$01 			;Bit 1 set for woodstock
+Cpu68020		EQU 	$00002000		;Vanilla 68020
+
+;
+; int SetInterruptLevel(int newLevel) ;
+;
+SetInterruptLevel		PROC	EXPORT
+		IMPORT	GetInterruptLevel
+		jsr 	GetInterruptLevel
+		move.l	4(sp),d1
+		lsl.w	#8,d1
+		move	sr,d2
+		and.w	#$f8ff,d2
+		or.w	d1,d2
+		move	d2,sr
+		rts
+		ENDPROC
+
+;
+; int GetInterruptLevel(void) ;
+;
+GetInterruptLevel		PROC	EXPORT
+		move	sr,d0
+		lsr.w	#8,d0
+		and.w	#$00000007,d0
+		rts
+		ENDPROC
+
+;
+; void *InstallExceptionVector(void *newHandler, int vecNumber) ;
+;
+InstallExceptionVector	PROC	EXPORT
+		IMPORT	FindVectorEntry
+
+		move.l	8(sp),d0						; push new vector.
+		jsr 	FindVectorEntry 				; go find correct entry
+
+		move.l	(a0),d0 						; get current vector.
+		move.l	4(sp),(a0)						; install new vector.
+		rts
+
+		ENDPROC
+
+		
+
+;
+;		interrupt void ExceptionHandlerStub(void) ;
+;
+ExceptionHandlerStub	PROC	EXPORT
+		movem.l d0-d3/a0-a1,-(sp)				;save scratch registers.
+		
+		WITH	ExceptionInfo
+		move.l	24(sp),a1						;get exceptionInfo ptr
+
+		IF CPU <> 00 THEN
+@Exception68020
+		move.w	34(sp),d3						;get vector/format from exception stack frame
+		rol.w	#4,d3							;get format nibble
+		and.l	#$000f,d3
+
+		ELSE
+
+		IF NOT (LUCY OR LINUS) THEN
+@Exception68000
+		move.w	vectorNumber(a1),d3 			;have to use vector number from exception info
+		cmp.w	#2,d3							;If this is bus error or address error,
+		beq.s	@68000Format1
+		cmp.w	#3,d3
+		bne.s	@68000Format0
+@68000Format1
+		move.l	#frameFormat68K1,d3 			;  use frame format 1
+		bra.s	@CallTheHandler
+		ENDIF
+		
+@ExceptionWoodstock
+@68000Format0
+		move.l	#frameFormat68K0,d3 			;Otherwise, frame format 0
+
+		ENDIF			;else CPU = 00
+
+@CallTheHandler
+		move.l	argPtr(a1),-(sp)				;push the interrupt argument onto the stack.
+		IF LUCY OR LINUS THEN
+		pea 	52(sp)							;For Woodstock, have to dig deeper for exception stack frame onto the stack.
+		ELSE
+		pea 	32(sp)							;push the address of the exception stack frame onto the stack.
+		ENDIF
+		move.l	d3,-(sp)						;push frame format
+		move.l	globs(a1),-(sp) 				;push globals ptr
+		move.l	handler(a1),a0
+		jsr 	(a0)							;call the interrupt handler.
+		add 	#16,sp							;clean up the stack.
+
+		ENDWITH
+
+		IF CPU = 00 AND NOT (LUCY OR LINUS) THEN
+		cmp.l	#frameFormat68K1,d3 			;If this is 68000 type 1,
+		bne.s	@ExceptionRte
+		movem.l (sp)+,d0-d3/a0-a1				;  we have to pop extra stuff before rte
+		add.l	#12,sp							;  pop exceptionInfo & Bus/Addr err info
+		rte 									;  now we're out of here
+		ENDIF
+		
+@ExceptionRte	
+		movem.l (sp)+,d0-d3/a0-a1				;restore registers
+		add.l	#4,sp							;pop exceptionInfo pointer
+		IF NOT (LUCY OR LINUS) THEN
+		rte 									;return from exception.
+		ELSE
+		rts 									;Woodstock, back to ROM-based ISR
+		ENDIF	
+		ENDP
+
+;
+;		FakeExceptionCall(int vectorNumber) ;
+;
+FakeExceptionCall		PROC	EXPORT
+		IMPORT FindVectorEntry,CalcVectorEntry
+
+		move.l	4(sp),d0						;get new vector
+		IF NOT (LUCY OR LINUS) THEN
+		jsr 	FindVectorEntry 				;go find correct entry
+		ELSE
+		moveq.l #0,a0							;Find real vector address for Woodstock, this time
+		jsr 	CalcVectorEntry
+		ENDIF
+		move.l	(a0),a0 						;Get Service Routine address
+
+		IF CPU <> 00 THEN
+		move.l	4(sp),d1						;  get vector number
+		asl.w	#2,d1							;  mult. by 4 to get vector offset.
+		move.w	d1,-(sp)						;  push the vector offset.
+		ENDIF
+
+		pea 	@1								;push the return program counter
+		move	sr,-(sp)						;push the status register.
+		jmp 	(a0)							;jump to exception handler.
+@1
+		rts
+
+		ENDP
+
+		IF LUCY THEN
+WoodstockLevel1 EQU 	$00700020				;Level 1 ISR addr goes here
+WoodstockLevel2 EQU 	$00700024				;Level 2 or above ISR addr goes here
+		ENDIF
+
+		IF LINUS THEN
+WoodstockLevel1 EQU 	$0098000C				;Level 1 ISR addr goes here
+WoodstockLevel2 EQU 	$00980010				;Level 2 or above ISR addr goes here
+		ENDIF
+		
+;
+; FindVectorEntry (d0 = vecNumber) ;
+;  return a0 = vector Address
+; CalcVectorEntry (d0 = vecNumber, a0 = vector base) ;
+;  return a0 = vector Address
+
+FindVectorEntry 		PROC	EXPORT
+		EXPORT	CalcVectorEntry
+
+		IF CPU <> 00 THEN
+		MACHINE 		MC68020
+@Get68020VBase									; 68020, use vbr
+		movec	vbr,a0							; get base of exception vector table.
+
+		ELSEIF NOT (LUCY OR LINUS) THEN
+@Get68000VBase									; 68000, assume 0 is ram
+		move.l	#0,a0							; get base of exception vector table.
+
+		ELSE
+@GetWoodstockVBase								; Woodstock has RAM-based vector pointers
+		cmp.w	#25,d0
+		bne.s	@10
+		move.l	#WoodstockLevel1,a0 			; Only have access to level 1 and 2 ints
+		rts
+@10 	move.l	#WoodstockLevel2,a0
+		rts
+		ENDIF
+
+CalcVectorEntry
+		lsl.w	#2,d0
+		lea 	(a0,d0.w),a0					; point to vector table entry.
+		rts
+
+
+		ENDP
+
+;----------------------------------------------------------------------
+;
+; This routine needs to return a pointer to the CTE globals in d0
+;
+;	Input:	a5 - pointer to the UST globals
+;
+;	Output:	d0 - pointer to the CTE globals
+;
+;----------------------------------------------------------------------
+
+	CASE ON
+
+GetCTEGlobals	PROC	EXPORT
+
+		move.l	USTGlobals.CTEGlobals(a5),d0	;Get the CTE globals pointer
+		rts										;and return
+
+		ENDPROC

@@ -1,0 +1,1179 @@
+;
+;	File:		ADBDriver.aii
+;
+;	Contains:	IOP code for IOP Based ADB driver
+;
+;	Written by:	Gary G. Davidian 10-Jul-88
+;
+;	Copyright:	� 1988-1990 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <2>	  1/2/90	GGD		NEEDED FOR ZONE-5: General source cleanup, no code changes.
+;	   <1.5>	11/19/89	GGD		NEEDED FOR ZONE-5 Added conditional assembly option
+;									'ForceWorstCase' to cause ADB to use more processor time, to
+;									stress test the worst case paths of the SWIM Driver. Added
+;									facility to control auto-polling on a device address basis so
+;									that the ADB Manager can select to only poll addresses that have
+;									device table entries.
+;	   <1.4>	 11/2/89	GGD		NEEDED FOR ZONE-5 Changed the ADB Polling rate from 13.5ms to
+;									11.0ms to be closer to a floppy disk sector time, and to be
+;									consistent with the Mac II ADB Micro poll rate.
+;	   <1.3>	 9/21/89	GGD		Added ADBActivity indicator so that the disk driver can give ADB
+;									more priority if there was recent activity. Corrected timing
+;									calculation in Attn pulse (off by 5탎).
+;	   <1.2>	  7/8/89	CCH		No changes. Testing in-file comments for ".aii" suffix files.
+;	   <1.1>	 6/15/89	GGD		Updated to use equates for the latest rev of the IOP chip,
+;									re-formated tab stops in source.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;				 7/10/88	GGD		Created today.
+;
+;	To Do:
+;
+				eject
+				title	'IOP ADB Driver'
+; File: ADBDriver.aii  -	IOP code for IOP Based ADB driver.
+;
+;_______________________________________________________________________
+;
+; Copyright � Apple Computer, Inc. 1988-1989
+;
+;	  written by Gary G. Davidian 10-Jul-88
+;
+;  This module implements the IOP side of the IOP based Apple Desktop Bus
+;  Driver.	It performs the low level ADB transactions as well as automatic
+;  polling of the last device, and automatic service request polling (in
+;  Most Recently Used order).  The Host CPU will only be interrupted, with
+;  a single interrupt per transaction, when there is some device input to
+;  be processed.
+;
+;  This driver co-exists on the IOP that also has the SWIM Driver, and the
+;  SWIM chip is used to drive and receive the ADB bus.
+;
+; NOTE: This code was optimized for space, and also contains many cycle
+;		counted timing dependent routines.	This may detract from its
+;		readability at times, but keep in mind that this code replaces a
+;		considerable amount of hardware and saves $$$ (profit sharing).
+;
+; MODIFICATION HISTORY:
+;
+;  <10Jul88>	GGD Created today.
+;
+;_______________________________________________________________________
+
+				machine m65C02
+				codechk off
+				datachk off
+				longa	off
+				longi	off
+				print	nomdir,nogen
+				print	off
+				include 'IOPDefs.aii'
+				include 'SWIMDefs.aii'
+				print	on
+
+hasAltADB		equ		1					; include alternate SWIM based ADB also
+ForceWorstCase	equ		0					; don't simulate worst case data length		<1.5>
+
+;		Polling rate definitions
+
+;  These two time constants are used to control auto polling,  and service request
+;  polling.  Explicit commands are serviced immediatly, which may mean that if they
+;  are issued at a very high frequency, they may utilize more than 50% of the bus
+;  bandwith, and may prevent the processors in the devices from having time to
+;  service their device  (this is the way that it is done on other machines).
+;  During normal AutoPolling, this situation will not occur.  But it can occur during
+;  Service Request polling.
+;
+;  AutoPollRate is the MINIMUM time from the START of a command to the START of
+;  the next command when auto polling.
+;
+;  SRQPollDelay is the MINIMUM time from the END of a command to the START of
+;  the next command.  This is used when polling for a device that issued a service
+;  request.
+
+AutoPollRate	equ 	(11000*TMPB1second)/1000000 	; 11.000 MS auto poll interval		<1.4>
+SRQPollDelay	equ 	(00500*TMPB1second)/1000000 	;  0.500 MS delay before SRQ polls
+
+
+;		ADB transaction related definitions
+
+NumADBAddrs 	equ 	16					; 16 addresses, 0..15
+
+ADBCmdMask		equ 	$0F 				; mask for command/reg portion of ADB command
+ADBAddrMask 	equ 	$F0 				; mask for address portion of ADB command
+
+ResetCmd		equ 	$00 				; ADB Bus Reset command
+TalkR0Cmd		equ 	$0C 				; ADB command Talk Reg 0
+
+MinDataLen		equ 	2					; Data length can be 0, 2..8 bytes
+MaxDataLen		equ 	8					; Data length can be 0, 2..8 bytes
+
+
+;		Message Format
+
+ADBMsg			record	0,increment 		; format CPU <-> IOP messages
+Flags			ds.b	1					; modifier/status flags (see below)
+DataCount		ds.b	1					; number of bytes of ADBData (0..8) (cmd not included)
+ADBCmd			ds.b	1					; ADB command to send / command that replied
+ADBData 		ds.b	MaxDataLen			; ADB Data to be sent with command, or data received
+				ds.b	1					; input data buffer (needs 1 extra byte)
+				endr
+
+;		ADBMsg.Flags bit definitions
+
+ExplicitCmd 	equ 	%10000000			; message contains an explicit commmand
+AutoPollEnable	equ 	%01000000			; auto polling and srq polling enabled
+SetPollEnables	equ		%00100000			; Update auto-enable bit mask from ADBData field
+ServiceRequest	equ 	%00000100			; service request detected
+TimedOut		equ 	%00000010			; addressed device did not return data
+
+
+;		Low level message passing state and data buffer assignments
+
+ADBXmtMsgState	equ 	XMTMsg3State
+ADBRcvMsgState	equ 	RCVMsg3State
+
+ADBXmtMsgData	equ 	XMTMsg3Data
+ADBRcvMsgData	equ 	RCVMsg3Data
+
+
+;		Page zero variables
+
+				seg 	'zdata'
+ADBVarsZ		record
+				export	ADBActivity			; export activity status for disk driver
+ADBActivity		ds.b	1					; status of last 8 transactions
+ADBFlags		ds.b	1					; status information
+ByteCount		ds.b	1					; number of bytes to send / bytes received
+PollingTMPB 	ds.b	1					; index of Polling Timer Param Block
+MRUAddr 		ds.b	1					; ADB address most recently received from
+LRUAddr 		ds.b	1					; ADB address least recently received from
+AutoPollAddr	ds.b	1					; ADB address to auto poll
+MsgPtr			ds.w	1					; pointer to xmt/rcv message buffer
+Temp			ds.b	1					; general purpose temporary
+SRQcount		ds.b	1					; number of devices searched during SRQ poll
+				endr
+
+
+;		Other Driver variables
+
+				seg 	'data'
+ADBVars 		record
+XmtCmdAndData	ds.b	1					; command byte (must precede SendBuffer)
+				ds.b	MaxDataLen			; output data buffer
+MRUList 		ds.b	NumADBAddrs 		; list of ADB addrs in MRU order
+DisableFlags	ds.b	NumADBAddrs 		; if <> 0 then don't auto-poll this address
+				endr
+ReceiveBuffer	equ 	ADBXmtMsgData+ADBMsg.ADBData	 ; rcv directly into msg buffer
+
+
+
+				seg 	'code'
+ADBDrvr 		proc	export
+
+				export	HandleRCVMsg3		; ADB driver requests use MSG 3
+				export	HandleXMTMsg3		; ADB driver requests use MSG 3
+				export	InitADBDrvr 		; ADB driver initialization
+				import	GetTMPB
+				import	CancelTMPBTimer
+				import	StartTMPBTimer
+				import	WaitTMPBDone
+				import	CheckTMPBdone
+				import	TMPBtimeH
+				import	TMPBtimeL
+
+				with	ADBVarsZ,ADBVars	; globals used throughout driver
+				title	'IOP ADB Driver - Initialization'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	InitADBDrvr
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, z, c
+;  Calls:		GetTMPB
+;  Called by:	SWIMIOP driver initialization
+;
+;  Function:	Initializes the IOP based ADB Driver variables.
+;
+;_______________________________________________________________________
+
+InitADBDrvr
+			if hasAltADB then
+				jsr		CheckForAltADB		; patch in SWIM based ADB if present
+			endif
+				jsr 	GetTMPB 			; get a timer parameter block pointer
+				sty 	<PollingTMPB		; save the TMPB pointer
+
+*				stz 	<ADBFlags			; initialize the status flags
+
+				assert	(ADBXmtMsgData**$FF)=(ADBRcvMsgData**$FF)
+				lda 	#<(ADBXmtMsgData\
+						+ADBMsg.ADBCmd)		; get low byte of msg pointer
+				sta 	<MsgPtr 			; init low byte of message pointer
+
+;		Initialize the MRU information
+
+*				stz 	<MRUAddr			; first entry is default MRU
+*				stz 	<AutoPollAddr		; first entry is default Poll device
+				ldx 	#NumADBAddrs-1		; index/counter
+				stx 	<LRUAddr			; last entry is default LRU
+@MRUInitLoop	txa 						; prepare to store	count
+				sta 	MRUList-1,x 		; MRUList[x] := x+1
+				dex 						; point to prev list
+				bne 	@MRUInitLoop		; init the entire list
+*				stz 	MRUList\
+						+NumADBAddrs-1		; last entry points to first
+				rts
+				title	'IOP ADB Driver - Host Message Request Handling'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	HandleRCVMsg3
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, v, z, c
+;  Calls:		CopyMsg, ADBAction (branched to)
+;  Called by:	IOPKernel.HandleHSTInt
+;
+;  Function:	Handles receiving new messages from the host, by copying
+;				the request information, and notifying the host that the
+;				message request has been accepted.	ADBAction is then
+;				called to actually process the command.
+;
+;_______________________________________________________________________
+
+HandleRCVMsg3	ldx 	#>ADBRcvMsgData		; get high byte of message pointer
+				ldy 	ADBRcvMsgData\
+						+ADBMsg.DataCount	; get the xmt byte count
+				lda 	ADBRcvMsgData\
+						+ADBMsg.Flags		; get the new flags
+				jsr 	CopyMsg 			; copy the message
+				lda 	#MessageCompleted	; message completed state
+				sta 	ADBRcvMsgState		; indicate that it is done
+				lda 	#MsgCompletedINT	; get the interrupt bit
+				sta 	HostControl 		; interrupt the main CPU
+				bra 	ADBAction			; go run a command
+
+
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	HandleXMTMsg3
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, v, z, c
+;  Calls:		CopyMsg, ADBAction (branched to)
+;  Called by:	IOPKernel.HandleHSTInt
+;
+;  Function:	Handles receiving messages replies from the host, by copying
+;				the request information, and updating the message state to
+;				indicate that the message reply has been accepted.
+;				ADBAction is then called to actually process the command.
+;
+;_______________________________________________________________________
+
+HandleXMTMsg3	ldx 	#>ADBXmtMsgData		; get high byte of message pointer
+				ldy 	ADBXmtMsgData\
+						+ADBMsg.DataCount	; get the xmt byte count
+				lda 	ADBXmtMsgData\
+						+ADBMsg.Flags		; get the new flags
+				jsr 	CopyMsg 			; copy the message
+				assert	Idle=0
+*				lda 	#Idle				; Indicate that response was received
+				stz 	ADBXmtMsgState		; set the new message state
+				bra 	ADBAction			; go run a command
+				title	'IOP ADB Driver - Polling Request Handling'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jmp 	StartSRQPoll
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	A, X, n, z, c
+;  Calls:		CancelPollTimer, StartPolling (branched to)
+;  Called by:	ADBAction
+;
+;  Function:	Handles service request polling, by setting up a Talk R0
+;				command for the next device in MRU (Most Recently Used) order.
+;				It will delay for a short time before issuing the request
+;				so that devices on the ADB bus, and the IOP itself will not be
+;				saturated by this polling.
+;
+;_______________________________________________________________________
+
+StartSRQPoll	ldx 	<AutoPollAddr		; get address of last device polled
+@disabled		lda 	MRUList,x			; get the next address to poll for service request
+				tax							; save the poll address
+				inc		<SRQcount			; update the SRQ poll count
+				lda		<SRQcount			; get the updated count
+				cpa		#NumADBAddrs		; see if one pass through table completed
+				bge		@updatePollAddr		; if all enabled addrs searched, search disabled ones
+				bit		DisableFlags,x		; see if this address is enabled
+				bmi		@disabled			; if disabled, skip it the first time
+@updatePollAddr	stx 	<AutoPollAddr		; change poll device to next most recently used
+				jsr 	CancelPollTimer 	; cancel the autopoll timer
+				lda 	#<SRQPollDelay		; get low byte of poll delay
+* (fall into)	bra 	StartPolling		; poll the next device after a short delay
+
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	StartPolling
+;  Inputs:		A - low byte of poll timer delay (high byte assumed zero)
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, v, z, c
+;  Calls:		ADBAction (falls into)
+;  Called by:	ADBAction, StartSRQPoll (branched to)
+;
+;  Function:	Starts running the polling timer, and returns.
+;
+;				When the timer goes off, ADBAction will be called.
+;
+;_______________________________________________________________________
+
+StartPolling	ldy 	<PollingTMPB		; get the TMPB index
+				sta 	TMPBtimeL,y 		; store low into the TMPB
+				assert	(SRQPollDelay>>8)=(AutoPollRate>>8)
+				lda 	#>AutoPollRate		; get high byte of poll rate
+				sta 	TMPBtimeH,y 		; store high into the TMPB
+				jsr 	StartTMPBTimer		; start the timer
+				ldy 	<PollingTMPB		; get the TMPB index
+				jsr 	WaitTMPBdone		; wait for it to time out, return to caller
+
+;				Timer interrupt resumes us here
+* (fall into)	bra 	ADBAction			; when timer goes off, perform some ADB Action
+				title	'IOP ADB Driver - Perform ADB Action'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jmp 	ADBAction
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, v, z, c
+;  Calls:		StartPolling, CheckTMPBdone, ADBRequest, StartSRQPoll (branched to)
+;  Called by:	HandleRCVMsg3, HandleXMTMsg3, StartPolling (falls into)
+;
+;  Function:	Handles ADB request processing, by deciding what if anything
+;				should be done.  While the IOP to Host transmit message is in
+;				use, no ADB action will be performed, since there is no way
+;				to notify the Host that it has completed.  If an Explicit
+;				request is pending, it will be sent, otherwise, auto/SRQ
+;				polling will be done if enabled.
+;
+;_______________________________________________________________________
+
+ADBAction		lda 	ADBXmtMsgState		; get the xmt message state
+				assert	Idle=0
+				bne 	@Done				; if xmt msg in use, wait until its free
+
+				ldy 	<PollingTMPB		; get the TMPB index
+				jsr 	CheckTMPBdone		; see if auto poll timer timed out
+				bne 	@Done				; if not, wait until auto poll interval
+				lda 	#<AutoPollRate		; get low byte of auto poll rate
+				jsr 	StartPolling		; setup timer to wake us up later
+
+;		Figure out what to do.
+
+				assert	ExplicitCmd=$80 	; n bit
+				assert	AutoPollEnable=$40	; v bit
+				bit 	<ADBFlags			; test explicit and auto-poll bits
+				bmi 	@SendIt 			; if explicit command, go send it
+				bvc 	@Done				; if implicit, and no auto polling, do nothing
+
+;		If implicit, and polling enabled, create the auto-poll command
+
+				lda 	<AutoPollAddr		; get the device address to auto poll
+				asl 	a					; shift left 4 bits to position device address
+				asl 	a
+				asl 	a
+				asl 	a
+				ora 	#TalkR0Cmd			; make it a talk R0 command
+				sta 	XmtCmdAndData		; update the command
+				stz 	<ByteCount			; no data to send, now send the command
+
+@SendIt 		jsr 	ADBRequest			; perform the ADB transaction
+
+;		Check the result of the transaction
+
+				lsr		<ADBActivity		; shift in zero, assume no activity
+
+				lda 	<ADBFlags			; get flags
+				sta 	ADBXmtMsgData\
+						+ADBMsg.Flags		; return the new flags
+				and 	#ExplicitCmd\
+						+AutoPollEnable\
+						+TimedOut			; isolate just the flags that we want to check
+
+				cpa 	#AutoPollEnable\
+						+TimedOut			; test for implicit, auto, no reply
+				beq 	@CheckSRQ			; if so, don't notify host, keep on polling
+
+;		If explicit command, or reply received, Send ADB transaction result back to host
+
+				lda		#$80				; mask to set activity indication
+				tsb		<ADBActivity		; indicate explicit or reply received activity
+
+				lda 	<ByteCount			; get the number of bytes received
+				sta 	ADBXmtMsgData\
+						+ADBMsg.DataCount	; get the xmt byte count
+				assert	(Idle+1)=NewMessageSent
+				inc 	ADBXmtMsgState		; change message state Idle -> NewMessageSent
+				lda 	#NewMsgSentINT		; prepare to interrupt the host
+				sta 	HostControl 		; interrupt the host
+
+				lda 	#ExplicitCmd		; prepare to clear explicit bit
+				trb 	<ADBFlags			; indicate no longer explicit
+				bne 	@Done				; if was explicit, don't check SRQ
+				stz		<SRQcount			; if reply received, reset the SRQ count
+
+;		Check for service request, and if so, start SRQ polling
+
+
+@CheckSRQ		lda 	#ServiceRequest		; prepare to test for service request
+				bit 	<ADBFlags			; see if service request was set
+				bne 	StartSRQPoll		; if so, start/continue SRQ polling, and return
+@Done			rts 						; otherwise, request is complete
+				title	'IOP ADB Driver - Utility Routines'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	CopyMsg
+;  Inputs:		A - new flags from ADBMsg.Flags
+;				X - page number of message buffer
+;				Y - data count from ADBMsg.DataCount
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, v, z, c
+;  Calls:		CancelPollTimer (falls into)
+;  Called by:	HandleRCVMsg3, HandleXMTMsg3
+;
+;  Function:	If an explicit command is not already accepted, it will
+;				copy the flags, byte count, command and data, from the
+;				message whose page number was passed in,  to prepare for
+;				starting an ADB transaction.  If the new command is an
+;				explicit command, the poll timer is canceled, so that
+;				the command can run immediatly.
+;
+;_______________________________________________________________________
+
+CopyMsg 		bit 	<ADBFlags			; see if already have an explicit cmd
+				assert	ExplicitCmd=$80		; n bit
+				bmi 	@CopyDone			; if explicit pending, don't overwrite it
+				stx 	<MsgPtr+1			; setup high byte of message pointer
+				sta 	<ADBFlags			; set new flags
+				stz 	<ByteCount			; send count is zero when implicit
+				and		#ExplicitCmd\
+						+SetPollEnables		; check for explicit / SetPollEnables
+				assert	ExplicitCmd=$80		; n bit
+				bmi 	@Explicit			; if explicit then copy cmd and data
+				beq		@CopyDone			; if not SetPollEnables, just return
+
+;	Process a SetPollEnables request (ignored if ExplicitCmd is also set)
+				trb 	<ADBFlags			; reset the SetPollEnables flag
+				ldy		#2					; 2 bytes of data (16 bit mask)
+				lda		(MsgPtr),y			; get low byte of mask
+				sta		<Temp				; save it
+				dey							; point to high byte
+				lda		(MsgPtr),y			; get high byte of mask
+				ldx		#NumADBAddrs-1		; loop counter, index into DisableFlags
+@EnablesLoop	rol		<Temp				; shift the low byte
+				rol		a					; shift the high byte (highest bit into carry)
+				stz		DisableFlags,x		; assume polling enabled
+				bcs		@NextEnable			; if enable bit set, DisableFlags := $00
+				dec		DisableFlags,x		; if enable bit clear, DisableFlags := $FF
+@NextEnable		dex							; update loop counter and index
+				bpl		@EnablesLoop		; loop through all device addresses
+
+@CopyDone		rts 						; all done
+
+@Explicit		cpy 	#MaxDataLen+1		; see if count is reasonable
+				blt 	@CopyStart			; if in range start copying
+				ldy 	#MaxDataLen 		; otherwise, peg it to the Max
+@CopyStart		sty 	<ByteCount			; init the send count
+@CopyLoop		lda 	(MsgPtr),y			; get a byte from the message
+				sta 	XmtCmdAndData,y 	; copy it into the send buffer
+				dey 						; dec index/count
+				bpl 	@CopyLoop			; copy the command and data
+* (fall into)	bra 	CancelPollTimer 	; cancel the poll timer and return
+
+
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	CancelPollTimer
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, v, z, c
+;  Calls:		CancelTMPBTimer
+;  Called by:	StartSRQPoll, CopyMsg (falls into)
+;
+;  Function:	Cancels to Auto Polling interval timer.
+;
+;_______________________________________________________________________
+
+CancelPollTimer ldy 	<PollingTMPB		; get the TMPB index
+				jmp 	CancelTMPBTimer		; cancel the timer and return
+				title	'IOP ADB Driver - Bus Timing'
+
+;_______________________________________________________________________
+;		Apple Desktop Bus timing definitions from ADB spec #062-0267 (Rev E)
+;		Clock counts based upon IOP Clock = 15.6672 MHZ / 8 = 1.9584 MHZ
+;_______________________________________________________________________
+
+;symbol 		clocks	 true clocks	time	meaning
+Tcyc	equ 	 196	;  195.840		100탎	bit cell time
+T0		equ 	 127	;  127.296		 65탎	"0" low time
+T1		equ 	  69	;	68.544		 35탎	"1" low time
+Tattn	equ 	1567	; 1566.720		800탎	attention signal
+Tsynch	equ 	 127	;  127.296		 65탎	synch pulse width
+Tlt 	equ 	 392	;  391.680		200탎	stop to start time
+Tstop	equ 	 137	;  137.088		 70탎	stop pulse width
+Tsrq	equ 	 588	;  587.520		300탎	service request
+*Tres	equ 	5875	; 5875.200		  3ms	reset signal (3ms min)
+
+;		Additionally we define the following
+Tres	equ 	7834	; 7833.600		  4ms	reset signal (40*Tcyc in Rev C)
+*TsrqMin equ	Tsrq-Tsrq*30/100 ;		210탎	Minimum SRQ width is Tsrq - 30%
+TsrqMin equ 	Tsrq-Tsrq*40/100 ;		180탎	Minimum SRQ width is Tsrq - 40% (mouse violates spec)
+TsrqMax equ 	Tsrq*130/100	 ;		390탎	Maximum SRQ width is Tsrq + 30%
+TltMax	equ 	Tlt*130/100 	 ;		260탎	Maximum stop to start time is Tlt + 30%
+T0Max	equ 	Tcyc*130/100*65/100*105/100 ;	88.725탎 Max time between data bit transitions
+Tlow	equ 	T1		;	68.544		 35탎	initial low phase of bit cell
+Tdata	equ 	T0-T1	;	58.752		 30탎	middle low or high phase of bit cell
+Thigh	equ 	Tcyc-T0 ;	68.544		 35탎	final high phase of bit cell
+
+		assert	Tcyc=(T0+T1)
+		assert	Tcyc=(Tlow+Tdata+Thigh)
+
+;		The ADB bus is normally high, a transaction is sent as follows.
+
+;		Attention signal starts the transaction
+;High			Bus is high when not in use
+;Low	Tattn	Attention signal
+;High	Tsynch	synch pulse
+
+;		The 8 bits of the command are sent, MSB first, LSB last.
+;Low	Tlow	low phase of data bit
+;L/H	Tdata	low if zero, high if one.  Data phase of bit
+;High	Thigh	high phase of data bit
+
+;		Stop bit follows command
+;Low	Tstop	command stop bit
+
+;		Service requests from other devices are indicated here by pulling bus low.
+;High	Tlt 	stop bit to start bit
+
+;		data if any is as follows (otherwise bus is left high)
+
+;Low	Tlow	beginning of start bit for data
+;High	Tdata	data phase of start bit
+;High	Thigh	high phase of start bit
+
+;		2..8 bytes are sent, MSB first, LSB last.
+;Low	Tlow	low phase of data bit
+;L/H	Tdata	low if zero, high if one.  Data phase of bit
+;High	Thigh	high phase of data bit
+
+;		Stop bit follows command
+;Low	Tstop	command stop bit
+;High			bus left high at end of transaction
+				title	'IOP ADB Driver - Bus Manipulation'
+
+;_______________________________________________________________________
+;  Macros and constants used to read and write the ADB Bus.  By using
+;  these definitions, this code can be easily modified if the polarity,
+;  bit position, or register addresss ever change.	This would allow easy
+;  migration to an IOP that had direct access to the ADB bus, instead of
+;  accessing it through the SWIM chip.
+;_______________________________________________________________________
+
+;		ADB output bit
+
+			if hasAltADB then
+rAltADBoutReg	equ 	rSetup				; SWIM register for ADB output state
+wAltADBoutReg	equ 	wSetup				; SWIM register for ADB output state
+AltADBoutMask	equ 	Select35			; bit mask for output bit
+			endif
+rADBoutReg		equ		TimerDPLLctl		; SWIM register for ADB output state
+wADBoutReg		equ		TimerDPLLctl		; SWIM register for ADB output state
+ADBoutMask		equ		GPOUT0				; bit mask for output bit
+
+;		macros for modifing state of ADBoutReg when it is the Accumulator
+
+				macro
+				ADBoutLow					; change state to cause bus to go Low
+				ora		#ADBoutMask			; output bit is active low
+				endm
+
+				macro
+				ADBoutHigh					; change state to cause bus to go High
+				and		#휕DBoutMask		; output bit is active low
+				endm
+
+;		ADB input bit
+
+			if hasAltADB then
+AltADBinReg		equ 	rHandshake			; SWIM register for ADB input state
+AltADBinMask	equ 	DriveSense			; bit mask for input bit
+			endif
+ADBinReg		equ		TimerDPLLctl		; SWIM register for ADB input state
+ADBinMask		equ		GPIN0				; bit mask for input bit
+
+;		macros for branching on the state of ADBinReg after a BIT instruction
+
+				macro
+				brADBlo &Target 			; branch if bus is low
+				beq 	&Target 			; input bit is active high
+				endm
+
+				macro
+				brADBhi &Target 			; branch if bus is high
+				bne 	&Target 			; input bit is active high
+				endm
+				title	'IOP ADB Driver - Set Bus / Set Bus After'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	SetBus
+;  Inputs:		c - Value to set the ADB bus to.
+;  Outputs: 	z - setup for brADBlo/brADBhi testing
+;  Destroys:	A, n, v, z
+;  Calls:		none
+;  Called by:	ADBRequest
+;
+;  Function:	Sets the ADB bus output to the state specified by the
+;				carry bit.	Carry reset means bus low, Carry set means
+;				bus high.  After setting the bus, the bus input is read,
+;				and tested, ready for branching with brADBlo/brADBhi.
+;				This routine returns to the caller 12 clocks after the
+;				bus is set.
+;
+;				The Macro SetBusAfter, is provided to allow an exact number
+;				of clocks to be counted before setting the bus.
+;				The acceptable clock counts are 27, 29..1301, 1303.
+;
+;_______________________________________________________________________
+
+
+				macro
+				SetBusAfter 	&Count		; set bus to carry after "count" clocks
+				CallWaiting 	&Count-22,SetBusPlus
+				endm
+
+				macro
+				CallWaiting 	&Count,&Routine
+				lcla	&q,&r
+&q				seta	&eval(&Count)/5
+&r				seta	&eval(&Count)//5
+				if		&r=1 then
+&q				seta	&q-1
+&r				seta	&r+5
+				endif
+				if		&q<1 then
+				aerror	'Wait value too small'
+				elseif	&q>255 then
+				aerror	'Wait value too large'
+				else
+				lda 	#&q
+				jsr 	&Routine&r
+				endif
+				endm
+
+			if hasAltADB then
+PatchBase
+			endif
+SetBusPlus6 	nop 						; add 6 clocks before loop
+SetBusPlus4 	nop 						; add 4 clocks before loop
+SetBusPlus2 	nop 						; add 2 clocks before loop
+*				lda 	#1					; ( 2)
+*				jsr 	SetBusHighPlus0		; ( 8)
+SetBusPlus0 	dea 						; (10) decrement loop counter
+SetBusPlus3 	bne 	SetBusPlus0 		; (12) loop until A=0
+
+SetBus			lda 	rADBoutReg			; (16) read output register
+				bcs 	@SetHigh			; (18) (19)
+				ADBoutLow					; (20) modify to set bus low
+				bra 	@SetBusOutput		; (23)
+
+@SetHigh		ADBoutHigh					; (21) modify to set bus high
+				nop 						; (23)
+
+@SetBusOutput	sta 	wADBoutReg			; (27) set the bus high or low
+				lda 	#ADBinMask			; ( 2) prepare check bus fighting
+				bit 	ADBinReg			; ( 6) test the bus
+				rts 						; (12) all done
+			if hasAltADB then
+
+				gbla	&FixrADBoutReg1,&FixOutLowOp1,&FixOutLowData1,&FixOutHighOp1
+				gbla	&FixOutHighData1,&FixwADBoutReg1,&FixADBinMask1,&FixADBinReg1
+&FixrADBoutReg1	seta	SetBus+1-PatchBase
+&FixOutLowOp1	seta	SetBus+5-PatchBase
+&FixOutLowData1	seta	SetBus+6-PatchBase
+&FixOutHighOp1	seta	@SetHigh+0-PatchBase
+&FixOutHighData1 seta	@SetHigh+1-PatchBase
+&FixwADBoutReg1	seta	@SetBusOutput+1-PatchBase
+&FixADBinMask1	seta	@SetBusOutput+4-PatchBase
+&FixADBinReg1	seta	@SetBusOutput+6-PatchBase
+			endif
+				title	'IOP ADB Driver - ADB Request Transaction'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	ADBrequest
+;  Inputs:		XmtCmdAndData - Command byte, followed by data, if any
+;				ByteCount - number of data bytes to send (0..8)
+;  Outputs: 	ReceiveBuffer - data received from device
+;				ByteCount - number of data bytes received (0..8)
+;				ADBFlags.ServiceRequest - set if SRQ detected, else 0
+;				ADBFlags.TimedOut - set if no reply data received, else 0
+;  Destroys:	A, X, Y, n, v, z. c
+;  Calls:		SetBus, SetBusAfter, SendBytes, @ReceiveReply (branched to)
+;  Called by:	ADBAction
+;
+;  Function:	Performs the low level ADB transmission, sending attention,
+;				sync, command byte, and stop bit.  Detects and records
+;				service requests after command byte's stop bit.  Data is
+;				sent if ByteCount is non-zero, preceded by a start bit,
+;				and followed by a stop bit.
+;
+;_______________________________________________________________________
+
+ADBrequest
+		if ForceWorstCase then				; simulate worst case data length	<1.5>
+				ldy		#10*8				; 10 byte times @ 8 bits per byte
+@delay			sec							; leave bus high
+				setbusafter	(Tcyc*130/100)	; worst case bit time
+				dey							; update bits remaining count
+				bne		@delay				; loop through all bits
+		endif								;									<1.5>
+				clc 						; prepare to set bus low for attention pulse
+				jsr 	SetBus				; (  12) attn is low for Tattn
+				lda 	<ADBFlags			; (  15) Setup default result flags
+				and 	#휯erviceRequest	; (  17) Assume no service request
+				ora 	#TimedOut			; (  19) Assume timeout (no receive data)
+				sta 	<ADBFlags			; (  22)
+
+;		initialize the receive buffer while attention is being sent.
+
+				ldx 	#MaxDataLen 		; (  24) buffer index
+				lda 	#$01				; (  26) initialize receive buffer to $01 for shift loop
+@RcvBufInitLoop sta 	ReceiveBuffer,x 	; (  31) ( 101)
+				dex 						; (  33) ( 103)
+				bne 	@RcvBufInitLoop 	; (  36) ( 105)
+				stz 	ReceiveBuffer		; ( 109) first byte is zero, to allow for start bit
+
+;		check for specially handled reset command
+
+				lda 	XmtCmdAndData		; ( 113) Get the command byte
+				sta 	ADBXmtMsgData\
+						+ADBMsg.ADBCmd 		; ( 117) return the command
+				and 	#ADBCmdMask 		; ( 119) isolate the command
+				assert	ResetCmd=$00
+*				eor 	#ResetCmd			;		 test for reset command
+				beq 	@SendReset			; ( 121) ( 122) if reset command, send it
+
+;		kill some extra time because Tattn is too long for SetBusAfter range.
+
+*				ldx 	#0					;		 X is still zero from above
+@AttnLowWait	dex 						; ( 123) (1398)
+				bne 	@AttnLowWait		; ( 126) (1400)
+
+;		Send Sync before command byte
+
+				ldy 	#1					; (1402) byte count is 1, index is 0. ADBcmd
+				assert	Tsynch=(Tcyc-T1)	; sync is same as high phase of a 1 bit (start bit)
+				SetBusAfter Tattn-Tlow-1402	; (Tattn-Tlow) (12) beginning of low phase of start bit
+				jsr 	SendBytes			; (Tlow) (18) send start bit, ADBcmd, and Stop bit
+				bcc 	@BusFite			; (20) report error if fighting (before stop bit)
+				brADBhi @NoSRQ				; (22) (23)  if no fight then no SRQ
+
+;		An SRQ is defined as TsrqMin .. TsrqMax of low from the beginning of the stop
+;		bit, which was Tstop ago. So the min would be TsrqMin - Tstop.
+;		And the max would be TsrqMax - Tstop.
+
+				lda 	#ADBinMask			; (24) prepare to read the bus
+				ldx 	#(TsrqMin\			; get min srq poll time
+						-Tstop\ 			; Tsrq is defined from start of stop bit
+						-26\				; which started its high phase 26 clocks ago
+						+10)/11 			; (26) Round up, Load min loop counter
+@ChkSRQmin		bit 	ADBinReg			; ( 4) test to see if SRQ went away
+				brADBhi @NoSRQ				; ( 6) Branch if SRQ too short
+				dex 						; ( 8) decrement timeout count
+				bne 	@ChkSRQmin			; (11) loop 
+
+;		if the SRQ was low long enough, make sure it goes back high soon enough
+
+				ldx 	#(TsrqMax\			; get remaining max srq poll time
+						-(TsrqMin+2)\		; adjust for min srq time already waited
+						+10)/11+1			; (TsrqMin+2) Load max loop counter (1 extra due to early dec)
+@ChkSRQmax		dex 						; ( 2) decrement timeout count
+				beq 	@BusFite			; ( 4) if timed out, SRQ too long
+				bit 	ADBinReg			; ( 8) test to see if SRQ is done
+				brADBlo @ChkSRQmax			; (11) loop until it goes high or times out
+
+				lda 	#ServiceRequest		; Flag valid SRQ detected
+				tsb 	<ADBFlags			; update status
+
+;		After the stop bit (and possibly SRQ) we wait 200탎 (391 clocks) before
+;		the start bit that indicates the beginning of the data bytes.
+
+@NoSRQ			ldx 	#1					; (25) initialize buffer index
+				ldy 	<ByteCount			; (28) get send byte count
+				beq 	@ReceiveReply		; (30) (31) if no data to send, look for a reply
+
+;		Send Start bit before data bytes
+				clc 						; (32) prepare to set bus low
+				SetBusAfter Tlt-32			; (Tlt) (12) begin start bit before sending data
+				jsr 	SendBytes			; send the transmit buffer
+* (fall into)	brADBhi @Done				; all done if no bus fight
+
+@BusFite
+@DataError
+@TimeOut
+@Done			stz 	<ByteCount			; indicate no bytes in reply
+				rts 						; Done
+			if hasAltADB then
+
+				gbla	&FixADBinMask2,&FixADBinReg2,&FixADBinReg3
+&FixADBinMask2	seta	@ChkSRQmin-3-PatchBase
+&FixADBinReg2	seta	@ChkSRQmin+1-PatchBase
+&FixADBinReg3	seta	@ChkSRQmax+4-PatchBase
+			endif
+
+
+;_______________________________________________________________________
+;
+;		Reset is a special case command, the command byte is not sent out
+;		on the bus, instead, the bus is held low for Tres.
+;
+;_______________________________________________________________________
+
+@ResetLoopCount equ 	(Tres-(132-15)+1299)/1300
+@ResetWait		equ 	(Tres-(132-15))/@ResetLoopCount-(4+15)
+
+@SendReset
+*				ldx 	#0					; X is still zero from above
+@ResetLoop		inx 						; ( 2) increment loop count
+				cpx 	#@ResetLoopCount	; ( 4) carry := 1 if limit reached, otherwise 0.
+				SetBusAfter @ResetWait		; (12) either leave the bus zero, or set it high
+				bcc 	@ResetLoop			; (15) loop until last time
+				rts 						; all done
+				title	'IOP ADB Driver - Receive Reply'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	@ReceiveReply
+;  Inputs:		ByteCount - initialized to zero
+;				ReceiveBuffer[0] - initialized to zero
+;				ReceiveBuffer[1..8] - initialized to $01
+;  Outputs: 	ReceiveBuffer - data received from device
+;				ByteCount - number of data bytes received (0..8)
+;				ADBFlags.TimedOut - set if no reply data received, else 0
+;  Destroys:	A, X, Y, n, v, z. c
+;  Calls:		@UpdateMRU (falls into)
+;  Called by:	ADBRequest
+;
+;  Function:	Performs the low level ADB data reception, sending attention,
+;				sync, command byte, and stop bit.  Detects and records
+;				service requests after command byte's stop bit.
+;
+;_______________________________________________________________________
+
+@ReceiveReply	lda 	#ADBinMask			; ( 33) get the bit mask for testing the bus
+;		start bit should happen by TltMax after stop bit
+				ldx 	#-((T0Max\			; ( 35) setup low counter/timeout
+						-0\ 				;		no extra time to reomve
+						+10)/11+1)			;		Round up, adjust for early inc
+				ldy 	#(TltMax\			;		setup start bit timeout
+						-(37-7)\			;		Adjust for time before/after
+						+10)/11 			; ( 37) round up
+@StartSearch	bit 	ADBinReg			; ( 4) sample the bus
+				brADBlo @LowLoop			; ( 6) loop until it goes low
+				dey 						; ( 8) check for timeout
+				bne 	@StartSearch		; (11) loop until start bit or timeout
+				rts 						;	   no reply data if start bit timeout
+
+
+@GetNextBit 	beq 	@DataError			; (20) if Shift Data is zero, start bit was zero
+				ldx 	#-((T0Max\			; (22) setup low counter/timeout
+						-22\				;		adjust for cycles already consumed
+						+10)/11+1)			;		Round up, adjust for early inc
+
+;		count number of samples when bus is low
+
+@LowLoop		inx 						; ( 2) update low count/timeout
+				beq 	@TimeOut			; ( 4) if low too long
+				bit 	ADBinReg			; ( 8) sample the bus
+				brADBlo @LowLoop			; (11) loop until it goes high
+
+;		count number of samples when bus is high
+
+				ldy 	#-((T0Max\			; ( 2) setup high counter/timeout
+						-2\ 				;		adjust for cycles already consumed
+						+10)/11+1)			;		Round up, adjust for early inc
+@HighLoop		iny 						; ( 2) update high count/timeout
+				beq 	@CheckEnd			; ( 4) if high too long (maybe end of data)
+				bit 	ADBinReg			; ( 8) sample the bus
+				brADBhi @HighLoop			; (11) loop until it goes low
+
+;		data bit is based on the higher counter
+
+				stx 	<Temp				; ( 3) setup for compare
+				cpy 	<Temp				; ( 6) carry := 1 if high >= low
+				ldx 	<ByteCount			; ( 9) get count/buffer index
+				rol 	ReceiveBuffer,x		; (15) shift the bit in
+				bcc 	@GetNextBit 		; (17) (18) loop until entire byte is received
+
+				cpx 	#MaxDataLen 		; (19) see if end of buffer reached
+				bge 	@DataError			; (21) report error if too many bytes received
+				inc 	<ByteCount			; (26) update count/buffer index
+				ldx 	#-((T0Max\			; (28) setup timeout counter
+						-31\				;		adjust for cycles already consumed
+						+10)/11+1)			;		Round up, adjust for early inc
+				bra 	@LowLoop			; (31) get next bit
+
+@CheckEnd		ldx 	<ByteCount			; get count/buffer index
+				dec 	ReceiveBuffer,x 	; test for Shift Data = $01 (no bits shifted in)
+				bne 	@TimeOut			; if partial byte received, then this is a timeout
+				cpx 	#MinDataLen 		; see if the 2 byte minimum was reached
+				blt 	@DataError			; if not, then the report the error
+
+				lda 	#TimedOut			; indicate that there is a valid reply
+				trb 	<ADBFlags			; update the flags
+* (fall into)	bra 	@UpdateMRU			; mark the device as most recent
+			if hasAltADB then
+
+				gbla	&FixADBinMask3,&FixADBinReg4,&FixADBinReg5,&FixADBinReg6
+&FixADBinMask3	seta	@ReceiveReply+1-PatchBase
+&FixADBinReg4	seta	@StartSearch+1-PatchBase
+&FixADBinReg5	seta	@LowLoop+4-PatchBase
+&FixADBinReg6	seta	@HighLoop+4-PatchBase
+			endif
+
+
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	@UpdateMRU
+;  Inputs:		XmtCmdAndData - command whose device is to be made MRU
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, v, z. c
+;  Calls:		none
+;  Called by:	@ReceiveReply (falls into)
+;
+;  Function:	Updates the MRU chain by making the specified device the
+;				most recently used, by removing it from the chain, and
+;				inserting it before the prior MRU entry, and marking it
+;				as the head of the MRU chain.
+;
+;				When a Service Request is pending, don't update the MRU,
+;				because it is about to change again, and we don't want
+;				the MRU list to change during SRQ polling because if more
+;				that two devices were sending constant data, only the first
+;				two would get serviced.
+;
+;_______________________________________________________________________
+
+
+@UpdateMRU		lda 	#ServiceRequest		; prepare to test service request
+				bit 	<ADBFlags			; see if it is set
+				bne 	@MRUok				; don't update MRU if SRQ pending
+
+				lda 	XmtCmdAndData		; get the last command sent
+				lsr 	a					; shift right 4 bits to get device address
+				lsr 	a
+				lsr 	a
+				lsr 	a
+				cpa 	<MRUAddr			; see if already MRU
+				beq 	@MRUok				; if so, no need to change anything
+
+				tax 						; load last address into index reg
+				bit		DisableFlags,x		; see if polling is disabled for this address
+				bmi		@MRUok				; if disabled, don't update the AutoPollAddr
+
+				ldy 	#-1 				; loop counter/index
+@MRUloop		iny 						; inc counter/index
+				cpa 	MRUList,y			; look for entry that points to new MRU
+				bne 	@MRUloop			; loop until it is found
+
+				cpa 	<LRUAddr			; see if LRU is becoming MRU
+				bne 	@DoUpdate			; if not, do normal stuff
+				sty 	<LRUAddr			; new LRU is pointer to old LRU
+				bra 	@MRUdone			; all done
+
+@DoUpdate		lda 	MRUList,x			; get successor of new MRU
+				sta 	MRUList,y			; remove new MRU entry from chain
+				ldy 	<LRUAddr			; get pointer to LRU entry
+				txa 						;
+				sta 	MRUList,y			; LRU entry points to new MRU entry
+				lda 	<MRUAddr			; get pointer to old MRU entry
+				sta 	MRUList,x			; new MRU entry points to old MRU entry
+@MRUdone		stx 	<MRUAddr			; mark new entry as MRU
+				stx 	<AutoPollAddr		; mark new entry as auto poll device
+
+@MRUok			rts 						; return, with valid reply
+				title	'IOP ADB Driver - Send Bytes'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	SendBytes
+;  Inputs:		X - index to first byte to send from XmtCmdAndData
+;				Y - number of bytes to send
+;  Outputs: 	c - 0 means send aborted due to bus fighting
+;					1 means send was successfull
+;				z - setup for brADBlo/brADBhi testing
+;  Destroys:	A, X, Y, n, v, z, c
+;  Calls:		SetBusAfter, brADBlo
+;  Called by:	ADBRequest
+;
+;  Function:	Sends a start bit, the requested number of bytes, and a
+;				stop bit.  The send will be aborted, and indicated in
+;				carry bit, if a bus fight occurs on any bit other than the
+;				stop bit.  The fight status of the stop bit is returned in
+;				the z bit.	It is assumed the SetBusAfter was called to
+;				set the bus low to begin the start bit right before calling
+;				SendBytes.
+;
+;				This routine returns to the caller 18 clocks after setting
+;				the stop bit high.
+;
+;_______________________________________________________________________
+
+SendBytes
+
+;		Send Start bit before data bytes
+
+				stz 	<Temp				; (21) setup shift data for 1 bit (start bit)
+				sec 						; (23) start bit is a one
+
+;		Send the data bytes
+
+@NextBit		SetBusAfter Tlow-23 		; (Tlow) (12) wait for end of low phase
+				bra 	@SendLoop			; (15) join common code (waste 3 clocks)
+
+@SendLoop		sec 						; (17)
+				SetBusAfter Tdata-17		; (Tdata) (12) set the bus high for Thigh
+				clc 						; (14) prepare to set bus low / flag fight error
+				brADBlo @Error				; (16) report error if fighting
+				SetBusAfter Thigh-16		; (Thigh) (12) set the bus low for Tlow
+				bit 	<Temp				; (15) just waste 3 clocks
+				asl 	<Temp				; (20) Shift the next bit into carry
+				bne 	@NextBit			; (22) (23) loop if not final bit
+
+;		drop 1 clock every byte to adjust for 195.84 vs 196.00
+;				missing clock				; (23)
+				lda 	XmtCmdAndData,x		; (27) get the next data byte
+				sec 						; (29) shift in a one, so non-zero until done
+				rol 	a					; (31) Shift first bit into carry, 1 into low bit
+				sta 	<Temp				; (34) setup shift data
+				inx 						; (36) update the buffer index
+				dey 						; (38) update byte count
+				bmi 	@SendStop			; (40) (41) send the entire buffer
+				SetBusAfter Tlow-40 		; (Tlow) (12) wait for end of low phase
+				bra 	@SendLoop			; (15) join common code
+
+;		Send Stop bit after data bytes
+@SendStop		sec 						; ( 43)
+				SetBusAfter Tstop-43		; (Tstop) (12) stop bit is low for Tstop
+@Error			rts 						; (18) then leave bus high
+			if hasAltADB then
+				title	'IOP ADB Driver - CheckForAltADB'
+
+;_______________________________________________________________________
+;
+;  Routine: 	jsr 	CheckForAltADB
+;  Inputs:		none
+;  Outputs: 	none
+;  Destroys:	A, X, Y, n, z, c
+;  Calls:		none
+;  Called by:	InitADBDrvr
+;
+;  Function:	If running on an old IOP chip, patch in the SWIM support.
+;
+;_______________________________________________________________________
+
+CheckForAltADB	ldx		#-1					; PatchTable index, pre-decremented
+				lda		#ADBoutMask			; get the output bit mask
+				tsb		wADBoutReg			; set the output bit
+				bit		rADBoutReg			; see if the bit got set
+				beq		@patchStart			; if clear, running on an old IOP chip
+				rts							; if set, new IOP, code is correct
+
+;	If this is an old IOP chip, we will patch our code to access the SWIM chip
+;	registers instead.
+
+@addrLoop		sta		PatchBase,y			; change the code to use the new byte
+@addrStart		inx							; advance to next entry in the PatchTable
+				ldy		PatchTable,x		; get the code offset to be changed
+				bne		@addrLoop			; loop until end of list
+
+@patchStart		inx							; advance to next entry in the PatchTable
+				lda		PatchTable,x		; get the new code byte to be used
+				bne		@addrStart			; loop until end of list
+				rts							; code now patched for old IOP
+
+
+FixrADBoutReg1	equ		&FixrADBoutReg1
+FixwADBoutReg1	equ		&FixwADBoutReg1
+FixOutLowOp1	equ		&FixOutLowOp1
+FixOutLowData1	equ		&FixOutLowData1
+FixOutHighOp1	equ		&FixOutHighOp1
+FixOutHighData1	equ		&FixOutHighData1
+FixADBinMask1	equ		&FixADBinMask1
+FixADBinMask2	equ		&FixADBinMask2
+FixADBinMask3	equ		&FixADBinMask3
+FixADBinReg1	equ		&FixADBinReg1
+FixADBinReg2	equ		&FixADBinReg2
+FixADBinReg3	equ		&FixADBinReg3
+FixADBinReg4	equ		&FixADBinReg4
+FixADBinReg5	equ		&FixADBinReg5
+FixADBinReg6	equ		&FixADBinReg6
+
+PatchTable
+				dc.b	rAltADBoutReg**$FF	; change reads to the ADBoutReg
+				dc.b	FixrADBoutReg1
+				dc.b	0
+
+				dc.b	wAltADBoutReg**$FF	; change writes to the ADBoutReg
+				dc.b	FixwADBoutReg1
+				dc.b	0
+
+				dc.b	$29					; change the 'ora' to an 'and'
+				dc.b	FixOutLowOp1
+				dc.b	0
+
+				dc.b	휕ltADBoutMask		; active high output data
+				dc.b	FixOutLowData1
+				dc.b	0
+
+				dc.b	$09					; change the 'and' to an 'ora'
+				dc.b	FixOutHighOp1
+				dc.b	0
+
+				dc.b	AltADBoutMask		; active high output data
+				dc.b	FixOutHighData1
+				dc.b	0
+
+				dc.b	AltADBinMask		; change loads of the ADBinMask
+				dc.b	FixADBinMask1
+				dc.b	FixADBinMask2
+				dc.b	FixADBinMask3
+				dc.b	0
+
+				dc.b	AltADBinReg**$FF	; change reads to the ADBinReg
+				dc.b	FixADBinReg1
+				dc.b	FixADBinReg2
+				dc.b	FixADBinReg3
+				dc.b	FixADBinReg4
+				dc.b	FixADBinReg5
+				dc.b	FixADBinReg6
+				dc.b	0
+
+				dc.b	0					; end of table
+			endif
+				endwith
+				endproc
+
+				end
+

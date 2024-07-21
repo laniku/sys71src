@@ -1,0 +1,465 @@
+;
+;	File:		ShowINIT.a
+;
+;	Contains:	xxx put contents here xxx
+;
+;	Written by:	xxx put writers here xxx
+;
+;	Copyright:	© 1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <1>	  1/4/93	ejb		first checked in
+;
+;
+
+; File: ShowINIT.a
+; Last Modified: Monday, December 21, 1992 1:17:00 PM
+;
+; # after any modification, please execute the following giberish to update the dates in this file
+; find ∞ "{active}"; replace \(([∂"∂'])®0Version of )®1≈\ "®1`date -d -s`®0" "{active}"
+; find • "{active}"; replace /(Last∂ Modified: )®0≈/ "®0`date`" "{active}"
+;————————————————————————————————————————————————————————————————————————————————————————————————
+;
+;  INIT notification routine
+;  by Paul Mercer, Darin Adler, Paul Snively, Frédéric Miserey, Alex Rosenberg,
+;  and François Grieu, from an idea by Steve Capps
+;
+;  The whole thing is for drawing an extension's icon during the boot process;
+;  this code has had a complicated life cycle: there are dozens of different
+;  versions around in the wilderness.
+;
+;  François Grieu, latest offender of this code, is on AppleLink  FRA0003
+;  the internet address is:   FRA0003@AppleLink.Apple.COM
+;
+;  This particular variation :
+;  - knows how to wrap around the screen, for thoose with many inits; this only
+;    works with cooperating ShowINITs
+;  - draw from  ICN#/icl4/icl8  combos, now the standard for icons; the best
+;    source is choosen according to main screen pixel depth and available resources
+;  - does NOT support the ‘old’ cicn  resources
+;  - displays a nice empty square if no valid ICN# is present (new feature)
+;  - has been rewritten for extreme compactness: shrinked from 964 to 500 bytes,
+;    while lot of error prevention and checking was added.
+;  - is heavily commented, hopefuly compensating much of the obfuscation introduced.
+;  
+;  as supplied, the programming interface is :
+;
+;	extern pascal void ShowINIT(short iconID, short moveX);
+;
+;	PROCEDURE ShowINIT(iconID: INTEGER, moveX: INTEGER); EXTERNAL
+;
+;	iconID:	resource ID of an ICN#, and (optionaly) of an icl4 and/or icl8
+;	moveX:	horizontal displacement for next icon; legitimate values are
+;		-1 or 40	standard 40 pixels displacement
+;		0		no displacement (for animation purproses)
+;
+;  a typical INIT with a small animation looks like :
+;
+;	ShowINIT(128,0);	/* draw first icon, don't move */
+;	doMyOwnjob();		/* do some usefull stuff */
+;	ShowINIT(129,-1);	/* draw second icon, advance for next */
+;
+;
+; (FRG: My first idea was to remove the moveX parameter entirely, since I never use it;
+;  later I realised it meant others could not just use my code as a drop-in replacement,
+;  and precluded animations; thus, I introduced an assembly option to control what moveX
+;  does, and if it exists; see below under  moveX_option)
+;
+;————————————————————————————————————————————————————————————————————————————————————————————————
+; Revision history
+;
+; 6/7/87     PM   - Created First version.
+; 6/15/87    PM   - Changed to standard (Pascal) calling conventions.
+; 6/20/87    PM   - Fixed color & Finder bug on Mac II.
+; 6/22/87    DBA  - Improved handling of QuickDraw.
+; 6/29/87    DBA  - Used scratch8 to avoid conflict with “Easy Access”.
+; 6/30/87    DBA  - Changed to a 4-byte scheme with “checksum”.
+; 6/30/87    PFS  - Separated into ShowINIT and InnerShowINIT.
+; 7/1/87     DBA  - Fixed stack bug and switched to CurApName.
+; 7/2/87     PM   - Added check for old signature in ApplScratch for backword compatibility
+;                   (TMON Startup).
+; 7/3/87     PM   - Removed _SysBeep in ErrorExit since it causes a crash.
+;                 - Also changed ICN# plotter to srcOr mode for Blinker.
+; 7/13/87    PM   - Fixed A3 trashing bug in InnerShowINIT - exit code left word on stack
+;                   (reported by D. Dunham).
+; 7/21/87    PM   - Due to popular demand, InitGraf is no longer being called.
+;                   This avoids the gamma correction problem with Startupscreens getting
+;                   “washed out” by ShowINIT, though someone else is still bound to call
+;                   InitGraf sooner or later (i.e. InitWindows).
+; 7/29/87    PM   - Put InitGraf back in; this is required (reported by C. Derossi at Apple
+;                   Tech Support).
+;                 - Took out GetPort/SetPort.
+; 10/6/87    PM   - Set CurrentA5 properly.  Rearranged myVars.
+; 12/28/87   PM   - Major revision to accomodate future INIT31 based ShowINIT.
+; 7/14/88    PM   - Major revision to get rid of above 'accomodations'.
+;                 - Added color icon 'cicn' support and fixed beep crash.
+;                 - Removed support for old signature.
+; 11/25/89   PM   - Added Y dimension support, icl4/8 support to get rid of 'obsolete' cicns.
+; 3/27/90    AMR  - 'cicn's were not being drawn in their native size
+; 11/30/91   FRG  - Started from source found on ‘Lord of the Files’, dev. CD Vol VII.
+;                 - Removed cicn support - these are obsolete and may cause palette problems
+;                 - Introduced a right margin (causes wraparound sooner on a few sreens).
+;                 - Simplified A5 world allocation; all variables now A5-based
+;                 - Initialized more fields in the PixMap.
+;                 - Added a check that ICN#/icl4/icl8 resources are at least the expected size;
+;                   blockmoved these into variables and disposed the Resource immediately;
+;                   default drawing if no ICN# can be loaded; many other sanity cheks.
+;                 - Rather than disposing the Color Map of the PixMap returned by _NewPixMap and
+;                   later manufacturing an empty Color Map before disposing the PixMap, we now
+;                   save the original Color Map, and restore it before disposing the PixMap.
+; 12/3/91    FRG  - Introduced  moveX_option  for backward link-level compatibility.
+;                 - Spread subroutines to use short branchs where possible.
+;                 - Firmly decided to stop shrinking the code - maybe it's too late.
+; 12/4/91    FRG  - Did extensive tests on many configurations and monitor stiings, including
+;                      - Plus and SE under 6.0.7 and 3.2
+;                      - II under System 6.0.7 and 3.2
+;                      - IIcx under System 7
+;                      - IIci under 6.0.7 and 7.0.1
+;                      - IIfx under 7.0 and two Apple 13" monitors
+;                      - IIfx under 6.0.7 and 32 bits color (RasterOps card & monitor)
+;                   not a single crash; the INIT adapts well to the environment and draws using
+;                   the right resource and colors; however, there are quite a few visual
+;                   glitches with old INITs, when drawing past the first line. Many keep drawing
+;                   on the bottom line; some will allow only two or three lines.
+;                   All in all, the method implemented seems to be the ‘official’ one, and
+;                   reasonably compatible with what's around.
+;                 - AppleLink relase.
+; 12/21/92	  - Call LoadResource after GetResource <rb>
+; 3/26/93    chp  - Change QuickEqu.a to QuickDraw.a for new AIncludes.
+;
+;————————————————————————————————————————————————————————————————————————————————————————————————
+;
+		INCLUDE	'Traps.a'
+		INCLUDE	'SysEqu.a'
+		INCLUDE	'QuickDraw.a'
+;
+;————————————————————————————————————————————————————————————————————————————————————————————————
+; 
+; Assembly-time option for moveX parameter treatment. Allowable values for  moveX_option are :
+;	0	; original : negative value -> 40, other taken as is
+;	1	; enforce standard : zero -> no move, others -> 40 pixels right
+;	2	; no moveX parameter - function name changed to ShowINIT_EZ
+;
+; if necessay, moveX_option can be set up from the command line, for example:
+;  ASM  -d moveX_option=2  ShowINIT.a
+;
+; with moveX_option=2, the programming interface becomes :
+;
+;	extern pascal void ShowINIT_EZ(short iconID);
+;
+;	PROCEDURE ShowINIT_EZ(iconID: INTEGER); EXTERNAL
+;
+;
+	IF &TYPE('moveX_option') = 'UNDEFINED' THEN
+moveX_option	SET	0			; default to old behaviour
+	ENDIF
+;
+;
+		PROC
+	IF moveX_option <> 2 THEN ; option 2 supresses the moveX parameter and change name
+		EXPORT	(ShowINIT):CODE		; keep standard name
+	ELSE
+		EXPORT	(ShowINIT_EZ):CODE	; name when no moveX parameter
+	ENDIF
+;
+; other constants
+iconSize	EQU	32		; X & Y size of icons (don't even think to change this…)
+iconSpacer	EQU	8		; X & Y spacing, and top/left/bottom/right sreen margin
+checksumConst	EQU	$1021		; constant used for computing checksum
+minColorDepth	EQU	4		; minimum bits/pixel for drawing color icons
+iconRowBytes	EQU	32/8		; 32/8 bits
+hasCQDBit	EQU	6		; this bit in ROM85 is cleared if Color QuickDraw is available
+;
+; remanent low mem variables; CurApName+32-8 is a GREAT place to store 8 bytes (it was Darin's idea)
+myVCheck	EQU	CurApName+32-8	; a simple checksum of myV to determine first-timeness
+myV		EQU	myVCheck+2	; current vertical position
+myH		EQU	myV+2		; current horizontal position
+myHCheck	EQU	myH+2		; a simple checksum of myH to determine first-timeness
+;
+; our register list: D7 and A6 are still for rent !!
+savedRegList	REG	D3-D6/A2-A5	; registers used - adjust savedRegCnt accordingly
+savedRegCnt	EQU	8		; count of saved registers
+
+; our variables and buffers; allocated on the stack, making an A5 world
+; insert new fields only as advertised; do not reorder
+stackFrame	RECORD	{A5Link},DECR	; build a stack frame record
+paramBegin	EQU	*		; start parameters after this point
+iconID		DS.W	1		; resource ID of the ICN#/icl4/icl8 combo
+	IF moveX_option <> 2 THEN ; option 2 supresses the moveX parameter
+moveX		DS.W	1		; horizontal move parameter
+	ENDIF
+; insert additionnal parameters here
+paramSize	EQU	paramBegin-*	; size of all the passed parameters
+	 	DS.L	1		; place holder for return address
+		DS.L	savedRegCnt	; place holder for saved registers
+A5Link		DS.L	1		; QuickDraw will stuff a pointer to his variables here
+; possible location for additionnal variables
+thePort   	DS.L	1		; QuickDraw globals
+		DS.B	grafSize-4	; other QuickDraw globals (except thePort)
+; prefered location for additionnal variables
+myPort		DS.B	portRec		; a private port
+myBitMap	DS.B	bitmapRec	; private bitMap record for our ICN# offscreen
+; possible location for additionnal variables
+buf_iclx	DS.B	1024		; room for an icl8 (also hold the icl4)
+; possible location for additionnal variables
+buf_mask	DS.B	128		; ICN# mask
+buf_icon	DS.B	128		; ICN# icon
+dstRect		DS.B	8		; the rectangle we draw to - must be last
+varsSize	EQU	*
+		ENDR
+		WITH	stackFrame	; cover our local stack frame
+;
+;————————————————————————————————————————————————————————————————————————————————————————————————
+; 
+; 
+; the entry point : this is to be kept on the first instruction of the module, for compatibility
+; only one of the two label is realy exported, depending on moveX_option
+ShowINIT:
+ShowINIT_EZ:
+;
+; first we build an A5 world on the stack. This why we save the registers before the LINK An,#
+		MOVEM.L	savedRegList,-(A7)			; save registers, including A5
+		LINK	A5,#varsSize				; allocate our variables & A5 world
+		MOVE.L	A7,A2					; points to dstRect - used later
+;
+; initialise QuickDraw gear
+; we open a new port to get fresh information, and isolate the screen port from our messing
+		PEA	thePort(A5)
+		_InitGraf					; fixes color bug as per DA@ICOM
+		LEA	myPort(A5),A4				; will later move into myBitMap
+		MOVE.L	A4,-(A7)				; _ClosePort parameter (done in cleanup)
+		MOVE.L	A4,-(A7)				; _OpenPort parameter
+		_OpenPort
+;
+; setup myBitMap to refer to the ICN# mask (not yet loaded)
+		MOVE.L	#(iconSize<<16)+iconSize,D6		; D6 constant from now on
+		MOVE.L	D6,-(A4)		;bounds.botRight
+		CLR.L	-(A4)			;bounds.topLeft	; 0-0-32-32 standard icon bounds
+		MOVE.W	#iconRowBytes,-(A4)	;rowBytes
+		LEA	buf_mask(A5),A0				; pointer to Mask
+		MOVE.L	A0,-(A4)		;baseAddr	; A4 is ptr to myBitMap from now on
+;
+; (11/30/91 FRG) build drawing coordinates and update the remanent variables
+; First we calculate the rightmost position allowable.
+; There is, purprosely, a small deviation from the original : we have a 7 pixels right margin.
+; Also note that the moveX parameter is always ignored for wraparound calculation, as in the original,
+; else it would ruin animation on the rightmost position
+		MOVEQ	#iconSize+iconSpacer,D2		; (horizontal spacing) added in valid_coord
+		MOVE.W	myPort+portBounds+right(A5),D1	; horizontal screen size
+		SUB.W	D2,D1				; maximum in valid_coord (right margin)
+	IF moveX_option = 0 THEN ; original 
+		MOVE.W	moveX(A5),D2			; prescribed horizontal spacing
+		BPL.S	more				; must be non-negative
+		MOVEQ	#iconSize+iconSpacer,D2		; default horizontal spacing
+	ELSEIF moveX_option = 1 THEN ; enforce regular icon spacing 
+		TST.W	moveX(A5)			; flag for horizontal spacing
+		BNE.S	more				; non-zero means default
+		MOVEQ	#0,D2				; zero means no move
+	ENDIF
+more		MOVEQ	#0,D3				; nothing yet to be substracted in valid_coord
+		MOVEQ	#iconSpacer,D4			; default (for valid_coord)
+		MOVE.L	myH,D0				; get myH & myHCheck
+		SWAP	D0				; myHCheck <-> myH (reversed for historical reasons)
+		BSR.S	valid_coord			; build left coordinate
+		SWAP	D0				; myH <-> myHCheck (reversed for historical reasons)
+		MOVE.L	D0,myH				; save updated myH & myHCheck
+		MOVEQ	#-(iconSize+iconSpacer),D4
+		ADD.W	myPort+portBounds+bottom(A5),D4	; vertical default
+		MOVEQ	#0,D2				; nothing to be added
+		MOVE.W	D4,D1				; maximum (same as default)
+		MOVE.L	myVCheck,D0			; get myVCheck/myV
+		BSR.S	valid_coord			; build top coordinate
+		MOVE.L	D0,myVCheck			; store myVCheck/myV
+;
+; result (topLeft of our location on the screen) is in D5. A2 points to dstRect
+		MOVE.L	D5,(A2)+	;topLeft	; save the resulting X/Y coordinate
+		ADD.L	D6,D5				; compute the botRight (no overflow can occur)
+		MOVE.L	D5,(A2)+	;botRight	; make an icon-sized rect
+;
+; load the ICN#
+		MOVEQ	#256/128,D3			; size for DATA+MASK
+		MOVE.L	#'ICN#',D4			; note that here A2 points to buf_icon
+		BSR.S	load_rsrc			; load the icon and mask
+		BEQ.S	got_mask			; ICN# loaded ok
+;
+; (11/30/91 FRG) no resource loaded; draw a simple light gray rect with black border
+		PEA	ltGray+thePort(A5)
+		_BackPat				; set background pattern to light gray
+		PEA	dstRect(A5)			; _FrameRect parameter
+		MOVE.L	(A7),-(A7)			; _EraseRect parameter
+		_EraseRect				; make the inside
+		_FrameRect				; and the border
+		BRA.W	cleanup
+;
+; (11/30/91 FRG) coordinate validator; called two times to process the H then V coordinates; trashes A0
+; reg	*** on entry ***				*** on exit ***
+; D0	lo:coordinate	hi:alleged checksum		lo: result coordinate	hi:updated checksum 
+; D1	maximum value					unchanged
+; D2	post-offset (added for horizontal shift)	unchanged
+; D3	pre-offset (substracted for vertical offset)	set to iconSize+iconSpacer if maximum exceeded
+; D4	default when invalid checksum or out of bound	unchanged
+; D5	lo:ignored	hi:previous result		lo: previous result	hi:result coordinate
+valid_coord	BSR.S	adj_chksum			; adjust high word of D0
+		CMP.L	A0,D0				; a copy of D0 was kept in A0
+		BEQ.S	useD0a				; D0's checksum was OK
+		MOVE.W	D4,D0				; revert to default
+useD0a		SUB.W	D3,D0				; on vertical pass : move up if previous overflow
+		CMP.W	#iconSpacer,D0			; check against minimum
+		BLO.S	useDefault			; too left/high, use default & no line change
+		CMP.W	D1,D0
+		BLS.S	useD0b				; check for overflow
+		MOVEQ	#iconSize+iconSpacer,D3		; (vertical spacing) remember the overflow
+useDefault	MOVE.W	D4,D0
+useD0b		MOVE.W	D0,D5				; store left / top
+		SWAP	D5				; build the top point
+		ADD.W	D2,D0				; add after
+adj_chksum	MOVE.L	D0,A0				; fix D0's high byte
+		ROL.W	#1,D0
+		EOR.W	#checksumConst,D0
+		SWAP	D0
+		MOVE.W	A0,D0
+		RTS
+;
+; (11/30/91 FRG) load an ICN#/icl4/icl8 resource
+; on entry :	A2 = destination; unchanged
+;		D4 = resource type; unchanged
+;		D3 = expected length/128 (either or 2,4,8). Is returned multiplied by 128
+; on exit	D0 = 0 if OK, and -1 if error; flags are set accordingly
+load_rsrc	ASL.W	#7,D3				; D3 *= 128
+		SUBQ.L	#4,A7				; _GetResource result
+		MOVE.L	D4,-(A7)			; type
+		MOVE.W	iconID(A5),-(A7)		; id
+		_GetResource
+		MOVE.L	(A7)+,D0
+		BEQ.S	baderr				; nil handle
+		MOVE.L	D0,A0
+		MOVE.L	A0,-(SP)
+		_LoadResource				; load resource
+		MOVE.L	(A0),D2
+		BEQ.S	baderr				; purged handle
+		MOVE.L	A0,-(A7)			; parameter for _ReleaseResource
+		_GetHandleSize
+		CMP.L	D3,D0
+		BLO.S	miderr				; not the expected size
+		MOVE.L	D3,D0				; len for _BlockMove
+		MOVE.L	D2,A0				; src for _BlockMove
+		MOVE.L	A2,A1				; dst for _BlockMove
+		_BlockMove
+		_ReleaseResource
+		MOVEQ	#0,D0				; mark OK
+		RTS
+miderr		_ReleaseResource
+baderr		MOVEQ	#-1,D0				; mark err
+		RTS
+;
+; try to draw in color; if anything fails, revert to ShowINIT1Bit 
+got_mask	BTST.B	#hasCQDBit,ROM85		; does CQD exists ?
+		BNE.S	ShowINIT1Bit			; no, we'll do it one bit
+		MOVE.L	MainDevice,D5			; get handle to main device
+		BSR.S	safe_deref_D5
+		MOVE.L	gdPMap(A3),D5			; get its pixmap handle
+		BSR.S	safe_deref_D5
+		MOVE.L	#'icl8',D4			; icl8 as first choice
+		CMPI.W	#minColorDepth,pmPixelSize(A3)	; test main screen depth
+		BLT.S	ShowINIT1Bit			; not deep enough for us to draw in color
+		BEQ.S	is_4bits			; screen is 4 bits deep, first use icl4
+		SUBQ.B	#4,D4				; icl8->icl4
+is_4bits	LEA	buf_iclx(A5),A2			; storage pointer for load_rsrc
+		MOVEQ	#1,D5				; try to load the appropriate iclx, else try the other
+two_times_max	MOVEQ	#$0C,D3				; note : high word of D3 is 0 from now on
+		EOR.W	D3,D4				; alternates icl4 and icl8
+		AND.W	D4,D3				; 4 or 8; after load_rsrc will become 512 or 1024
+		BSR.S	load_rsrc			; load eiter the icl4 or icl8 (D3 multiplied by 128)
+		DBEQ	D5,two_times_max
+		BEQ.S	ShowINITxBit			; found a resource, go draw in color
+;
+; draw the B&W ICN#
+ShowINIT1Bit	MOVEQ	#srcBic,D0			; mode for Mask
+		BSR.S	doCopyBits
+		MOVEQ	#-128,D0		
+		ADD.L	D0,baseAddr(A4)			; now move myBitMap to the ICON
+		MOVEQ	#srcOr,D0			; mode for the ICON
+		BSR.S	doCopyBits
+		BRA.S	cleanup				; all done
+;
+; (12/02/91 FRG) checks for handle just loaded in D5; if invalid, revert to ShowINIT1Bit
+; returns the handle in A0, the dereferenced handle in A3 and D0; destroys A1
+safe_deref_D5	MOVE.L	(A7)+,A1			; pop return address, keep flags
+		BEQ.S	ShowINIT1Bit			; error - nil handle (in D5)
+		MOVE.L	D5,A0
+		MOVE.L	(A0),D0
+		BEQ.S	ShowINIT1Bit			; error - purged handle
+		MOVE.L	D0,A3
+		JMP	(A1)
+;
+; (11/30/91 FRG) a subroutine to CopyBits myBitMap to the dstRect in said (D0) mode 
+doCopyBits	MOVE.L	A4,-(A7)			; source bitmap (is myBitMap)
+		PEA	myPort+portBits(A5)		; dst bitmap
+		PEA	myBitMap+bounds(A5)		; srcRect
+		PEA	dstRect(A5)			; dstRect
+		MOVE.W	D0,-(A7)			; mode
+		CLR.L	-(A7)				; no clip region
+		_CopyBits				; draw it
+		RTS
+
+; draw on icl4 or icl8; we need to manufacture an offsceen pixmap
+ShowINITxBit	SUBQ.L	#4,A7
+		_NewPixMap				; make a new PixMap
+		MOVE.L	(A7)+,D5			; D5 keeps the PixMap till we dispose it
+		BSR.S	safe_deref_D5
+		_HLock					; lock the new PixMap
+; while we point here, prepare the bitMaps/pixMaps for the _CopyMask
+		MOVE.L	A3,-(A7)			; srcBits (is the new PixMap)
+		MOVE.L	A4,-(A7)			; maskBits (is myBitMap)
+		PEA	myPort+portBits(A5)		; dst bitmap
+; now fill in the PixMap fields, in ascending order (so we save code, and won't forget anything)
+		MOVE.L	A2,(A3)+	;pmBaseAddr	; address where the icl4/icl8 was _BlockMoved
+		MOVE.B	#$80,(A3)+	;pmNewFlag	; mark as new style PixMap
+		LSR.W	#7-2,D3				; depth in bit (8 or 4) multiplyed by 4
+		MOVE.B	D3,(A3)+	;pmRowBytes+1	; set Row Width in bytes (either 32 or 16)
+; while we point here, prepare the Rect parameters for the _CopyMask
+		MOVE.L	A3,-(A7)			; srcRect is pmBounds
+		MOVE.L	A3,-(A7)			; maskRect is same
+		PEA	dstRect(A5)			; dstRect
+		CLR.L	(A3)+		;pmBounds.topLeft	; set the pmBounds
+		MOVE.L	D6,(A3)+	;pmBounds+botRight	; D6 = (iconSize<<16) + iconSize
+		CLR.L	(A3)+		;pmVersion/pmPackType	; standard
+		CLR.L	(A3)+		;pmPackSize		; standard
+		ADDQ.L	#pmPixelType-pmHRes,A3			; let pmHRes & pmVRes unchanged
+		LSR.W	#2,D3				; depth in bit (8 or 4)
+		MOVE.L	D3,(A3)+	;pmPixelType/pmPixelSize (pmPixelType zeroed=>chunky)
+		MOVE.W	#1,(A3)+	;pmCmpCount	; components in pixel, 1 for chunky
+		MOVE.W	D3,(A3)+	;pmCmpSize	; same as pmPixelSize
+		CLR.L	(A3)+		;pmPlaneBytes	; 0 for chunky
+		SUBQ.L	#4,A7				; get the clut appropriate for our depth
+		MOVE.L	#'clut',-(A7)
+		MOVE.W	D3,-(A7)			; resource id = either (8 or 4)
+		_RGetResource				; hopefully can't fail on a color machine
+		MOVE.L	(A3),D4		;pmTable	; keep the original color map around
+		MOVE.L	(A7)+,(A3)+	;pmTable	; stuff the ROM clut
+		CLR.L	(A3)		;pmReserved	; ‘must be set to 0 for future compatibility’
+; now do the much awaited drawing
+		_CopyMask				; do the drawing
+; cleanly dispose the PixMap
+		MOVE.L	D4,-(A3)	;pmTable	; restore the original color map
+		MOVE.L	D5,-(A7)			; original new PixMap Handle
+		_DisposPixMap
+
+; about all done
+cleanup		_ClosePort				; parameter for this one pushed long ago
+; *** (DBA) I think that QuickDraw leaves handles around. Too bad we can't get rid of them…
+		UNLK	A5				; de-allocate our variables - does NOT restore A5
+		MOVEM.L	(A7)+,savedRegList		; restore standard registers, including A5
+		MOVE.L	(A7)+,A0			; pop return address
+		ADDA	#paramSize,A7			; discard parameters (optimized into ADDQ.W)
+		JMP	(A0)				; all done
+;————————————————————————————————————————————————————————————————————————————————————————————————
+; ShowINITCredits
+		STRING  ASIS
+		DC.W	'ShowINIT by Paul Mercer'
+		DC.W	'Copyright 1987-1991'
+		DC.W	'Version of 12/21/92'
+;————————————————————————————————————————————————————————————————————————————————————————————————
+		ENDPROC
+		END

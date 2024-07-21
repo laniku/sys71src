@@ -1,0 +1,1347 @@
+;
+;	File:		BTreeSvcs.a
+;
+;	Contains:	These routines provide service functions used to access
+;				and maintain a BTree file.
+;
+;				Modified for Sys7.0 B*tree Manager by Kenny SC. Tung
+;
+;	Copyright:	© 1984-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM1>	 4/1/92		kc		Changed the name prefex used to distinguish
+;									 routines used by the external B-Tree manager
+;									from the versions used by the File System.									
+;									¥ Pre-SuperMario comments follow ¥
+;		<13>	 9/16/91	JSM		Cleanup header.
+;		<12>	 2/21/91	KST		dnf, #83596: Do not check for volume offline.
+;		<11>	11/12/90	dnf		include FileMgrPrivateEqu.a
+;		<10>	 9/27/90	KST		Documentation changes only.
+;		 <9>	  8/3/90	KST		ExtBTFlush should't call FlushCache directly. It will call FS's <SM1>
+;									flushfile only if D5 flag is set now.
+;		 <8>	 4/11/90	KST		Use ExtBTMaxDepth and related equates.							<SM1>
+;		 <7>	  4/5/90	KST		make btDebug symbol default to 0.
+;		 <6>	  4/4/90	KST		BTInsert didn't check for MaxDepth limit and returns no error.
+;		 <5>	 2/22/90	KST		Documentation change and cleanup.
+;		 <4>	 2/16/90	KST		Take out debugger code.
+;		 <3>	 2/16/90	KST		Adding ExtGetUpdateHdr, ExtUpdateHdr routines for "RelMap" change. 
+;		 <2>	 2/12/90	KST		Adding documentation for BTInsert using new buffer scheme.
+;				 9/27/89	KSCT	It used to use cache queue ptr from BTCCQptr(A4).now we pass
+;									SysCtlCPtr in BTFlush. The code will run on 7.0 without
+;									RamCAche.
+;				 8/31/89	KSCT	We can't mark block before Updating the leaf record because of
+;									the new buffer scheme, not cache
+;				 8/29/89	KSCT	Fixed 2 bugs in BTSearch. It branches to the wrong label
+;									(BSExit). This will causing a crash if the node hint is bad or
+;									the node is bad.
+;				  5/4/89	KSCT	Fixed a bug in BTDelete, MOVE should be a long, not word.
+;				 4/11/89	KSCT	Fixing a serious bug that B*Tree grows without checking the
+;									depth limit.
+;				 9/25/86	BB		Updated to use new MPW equate files.
+;				 1/20/86	BB		Fixed bug on CalBTVars, did not include space for a node pointer
+;									in the index record size calculation (not patched in ROm75).
+;				12/18/85	BB		BTInsert now checks for errors returned from ExtInitNode (not
+;									patched in ROm75).
+;				11/20/85	BB		Fixed update depth bug in BTDelete (ROM75 patch). Fixed ExtGetNode
+;									error return bug in BTDelete (ROM75 patch).
+;				10/25/85	BB		Added vectors for ROM versions.
+;				10/22/85	BB		Moved BTClose, BTFlush, and BTOpen to ExtBTSvcs from BtIntf.
+;				10/21/85	BB		Fixed bug in BTGetRecord which was trying to release a node it
+;									didn't have after getting an IO error.
+;				10/14/85	BB		Added use of new MOVEQ error equates.
+;				10/10/85	BB		Fixed BTDelete and BtInsert to use MarkBlock instead of always
+;									releasing nodes as "dirty". Added use of new MOVEQ equates for
+;									GetBlock,RelBlock, and FlushCache. Did some minor code clean up.
+;				 10/9/85	BB		Fixed bug in calulation of the size of BTree variables.
+;				 10/1/85	LAK		Changed to .Include TFSEqu for cache, BTree equates.
+;				 9/23/85	BB		Modified BTDelete to call ExtClrNode for nodes being freed.
+;				 9/23/85	BB		Modified BTInsert to not check for a null node pointer before
+;									calling ExtRelNode. ExtRelNode now checks for it.
+;				  9/3/85	BB		Fixed bug in Btdelete that was releasing parent nodes as dirty.
+;				 8/29/85	BB		Fixed bug in BTInsert that was releasing a node twice.
+;				  8/9/85	BB		Added code to maintain leaf record count and 1st and last node
+;									numbers.
+;				  8/6/85	BB		Updated to use equates for index and leaf node types.
+;				 7/10/85	BB		Removed calls to BTFlush. This is now done by CM and FXM.
+;				  7/8/85	BB		Modified BTInsert and BTDelete to maintain links for index nodes
+;									and to use the new ExtGetLtSib/ExtGetRtSib interface.
+;				 6/10/85	BB		Added BTSetUP and BTCleanup subroutines.
+;				  6/5/85	BB		Removed use of BTVars for temporary storage of data records.
+;				 5/30/85	BB		Modified BTGetRecord to set up default node and index markers
+;									for BTree underflow/overflow conditions.
+;				 5/24/85	BB		Added call to BTFlush after an insert or delete.
+;				 5/24/85	BB		Modified all routines to selectively clear BTCB flags.
+;				 4/21/85	BB		Modified BTGetRecord to update current node and record index
+;									marks after each successful call.
+;				 3/15/85	BB		Modified to use A6 stack.
+;				 3/11/85	BB		Added extend BTree file stuff.
+;				 2/26/85	BB		Finished adding hints.
+;				 2/21/85	BB		Added use of hints.
+;				 2/18/85	BB		Modified to support variable length keys in leaf nodes.
+;				 2/12/85	BB		Added save/restore for scratch registers
+;				 1/17/85	BB		Removed use of BTree Global area (BTG).
+;				  1/5/85	BB		Modified to return pointers to key and data record for BTSearch
+;									and BTGetRecord. BTDelete also modified to no longer return
+;									deleted record.
+;				  1/1/85	BB		Modified BTOpen to set up address of external key-compare
+;									routine (currently "KeyCompare") in BTCB.
+;				10/10/84	BB		Modified for BTree files.
+;				 9/27/84	BB		New today.
+;
+
+;__________________________________________________________________________________
+;
+; External
+;  Routines:	BTClose 	-  Closes a BTree file.
+;				BTDelete	-  Deletes a record from a BTree file given the key.
+;				BTFlush 	-  Flushes a BTree file.
+;				BTGetRecord -  Gets the next/previous record from a BTree file.
+;				BTInsert	-  Inserts a record into a BTree file given the key
+;							   and data record.
+;				BTOpen		-  Opens a BTree file.
+;				BTSearch	-  Searches a BTree file for a record given the key.
+;				ExtBTUpdate	-  Marks the cache buffer containing the specified
+;							   BTree node as updated (dirty).
+; Internal
+;  Subroutines: BTCleanUp	-  Cleans up after a BTree service call.
+;				BTSetUp 	-  Sets up for a BTree service call.
+;				CalBTVars	-  Calculates the size of the BTree Variable storage
+;							   area (BTVars).
+;
+;__________________________________________________________________________________
+
+			BLANKS		ON
+			STRING		ASIS
+
+			PRINT		OFF
+			LOAD		'StandardEqu.d'
+			INCLUDE		'BtreeEqu.a'
+			INCLUDE		'BtreePrivate.a'			; Use ExtBTMaxDepth 	<11Apr90><SM1>
+			include		'FileMgrPrivate.a'
+			PRINT		ON
+			PRINT		NOGEN
+
+		IF &trim(&type('btDebug')) = 'UNDEFINED' THEN
+btDebug		EQU		0
+		ENDIF
+
+ExtBTSvcs		PROC	EXPORT
+
+			EXPORT	ExtBTClose,ExtBTDelete,ExtBTFlush,ExtBTGetRecord,ExtBTInsert,ExtBTSearch ;<SM1>
+			EXPORT	ExtBTUpdate
+			Export	ExtGetUpdateHdr, ExtUpdateHdr			;	<16Feb90>
+
+			IMPORT	ExtAllocNode,ExtExtBTFile,ExtFreeNode
+			IMPORT	ExtBuildIRec,ExtDeleteRec,ExtGetLtSib,ExtGetMaxkey,ExtGetRecA,ExtGetRtSib
+			IMPORT	ExtInitNode,ExtInsertRec,ExtLocRec,ExtLocTPR,ExtSearchNode
+			IMPORT	ExtUpdDRec,ExtUpdIKey, ExtLocBTCB
+			IMPORT	ExtRotateLt,ExtSplitLT,ExtTreeSearch
+			IMPORT	ExtClrNode,ExtGetNode,ExtRelNode
+			IMPORT	ExtMarkBlock, ExtWriteBlock, ExtDoAOCRWF									;<SM1>
+
+
+;__________________________________________________________________________________
+;
+; Routine:		BTClose
+;
+; Function: 	Closes a BTree file. The BTree Header (BTH) is updated and the
+;				cache is flushed and trashed for the specified file.  The BTCB
+;				memory is also released.
+;				Note: ExtBTFlush only flushes buffers to FS DiskCache not to disk. <SM1>
+; Input:		D0.W  -  file refnum
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							-n = IO error
+; 25Sep89	KSCT	Don't call FlushCache, it is called in ExtBTFlush.
+;__________________________________________________________________________________
+ExtBTClose																				;<SM1>
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D1-D5/A0-A4,-(A6)	; save regs
+			MOVE.W	 D0,D3				; D3 = file refnum
+			MOVE.W	 D3,D0				; locate the BTCB
+			JSR 	 ExtLocBTCB			;
+;
+; flush the BTCB and cache buffers for the file
+			MOVEQ	#0,D5				; clear flag so that it will not flush fs cache
+			JSR 	 ExtBTFlush			; Flush everything first						<SM1>
+			BNE.S	 BCExit 			; error ->
+
+; release BTCB memory
+;
+@2			MOVEA.L  A4,A0				; release the BTCB
+			_DisposPtr					;
+			MOVEA.L FCBSPtr,A4			; clear BTCB ptr
+			CLR.L	FCBBTCBptr(A4,D3.W) ; ... in FCB
+
+			CLR.W	D0					; result = 'ok'
+BCExit
+			MOVEM.L (A6)+,D1-D5/A0-A4	; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set condition codes
+			RTS 						; exit BTClose
+
+
+
+
+;__________________________________________________________________________________
+;
+; Routine:		BTDelete
+;
+; Function: 	Deletes a record from a BTree file given the key.
+;
+; Input:		A0.L  -  address of key
+;				D0.W  -  file refnum
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 BTnotfound = record not found
+;							 other = error
+;__________________________________________________________________________________
+
+ExtBTDelete																					;<SM1>
+;			MOVE.L	jBTDelete,-(SP) 	; jumptable entry for vBTDelete 		 <25Oct85>
+;			RTS 						; go there								 <25Oct85>
+;vBTDelete								; 'vectored' BTDelete routine			 <25Oct85>
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D1-D5/A0-A4,-(A6)	; save regs
+;
+; initialize some things
+;
+			BSR 	 BTSetUp			; set up common stuff
+
+			CLR.L	 BTCNodeM(A4)		; invalidate current node mark
+
+			SUBA.L	 A2,A2				; ...no left node buffer
+			SUBA.L	 A3,A3				; ...no right node buffer
+;
+; search tree for key
+;
+			JSR 	 ExtTreeSearch 		; search for key
+			MOVEA.L  A1,A3				; A3 = ptr(node buffer)
+			BNE 	 BDExit1			; didn't find it ->
+			MOVE.W	 D1,D5				; D5 = record index
+;
+; delete record from node
+;
+BDDelete
+			MOVEA.L  A3,A1				; ptr(node buffer)
+			MOVE.W	 D5,D1				; record index
+			JSR 	 ExtDeleteRec		; delete it
+
+			MOVEA.L  A3,A0				; ptr(node buffer)			   <10Oct85>
+			JSR 	 ExtMarkBlock		; mark it dirty 			   <10Oct85>	<SM1>
+
+			TST.W	 D5 				; delete 1st record ?
+			BNE.S 	 @1 				; no ->
+			BSET	 #BTCKeyUpd,BTCFlags(A4) ; indicate key update required
+
+@1			CMPI.B	 #NDLeafNode,NDType(A3) ; at leaf level?
+			BNE.S	 BDRemove			; no ->
+			SUB.L	 #1,BTCNRecs(A4)	; decrement number of leaf records
+
+;
+; unlink the node if the last record was deleted
+;
+BDRemove
+			TST.W	 NDNRecs(A3)		; node empty ?
+			BGT.S 	 BDNxtLev			; no ->
+
+			MOVEA.L  A3,A0				; ptr(node buffer)
+			JSR 	 ExtGetLtSib		; get left sibling node
+			BNE 	 BDExit1			; error ->
+			TST.L	 D1 				; is there a left sibling ?
+			BEQ.S	 @1 				; no ->
+
+			MOVE.L	 NDFlink(A3),NDFlink(A1) ; update forward link
+			MOVEQ	 #kRBdirty,D1		; release					   <10Oct85>
+			MOVEA.L  A1,A0				;
+			JSR 	 ExtRelNode			; ...left node buffer
+
+@1			MOVEA.L  A3,A0				; ptr(node buffer)
+			JSR 	 ExtGetRtSib		; get right sibling node
+			BNE 	 BDExit1			; error ->
+			TST.L	 D1 				; is there a right sibling ?
+			BEQ.S	 BDUpdPtrs			; no ->
+
+			MOVE.L	 NDBlink(A3),NDBlink(A1) ; update backward link
+			MOVEQ	 #kRBdirty,D1		; release					   <10Oct85>
+			MOVEA.L  A1,A0				;
+			JSR 	 ExtRelNode			; ...right node buffer
+;
+; update 1st and last node pointers
+;
+BDUpdPtrs
+			CMPI.B	 #NDLeafNode,NDType(A3) ; at leaf level?
+			BNE.S	 BDFree 			; no ->
+
+			TST.L	 NDBLink(A3)		; backward link = 0?
+			BNE.S	 @1 				; no ->
+			MOVE.L	 NDFlink(A3),BTCFNode(A4) ; yes, update 1st node number
+
+@1			TST.L	 NDFLink(A3)		; forward link = 0?
+			BNE.S	 BDFree 			; no ->
+			MOVE.L	 NDBlink(A3),BTCLNode(A4) ; yes, update last node number
+;
+; free the empty node
+;
+BDFree
+			MOVEA.L  A3,A0				; clear the empty node		   <23Sep85>
+			JSR 	 ExtClrNode			;							   <23Sep85>
+
+			MOVEQ	 #kRBdirty,D1		; release					   <10Oct85>
+			JSR 	 ExtRelNode			; ...node buffer
+			SUBA.L	 A3,A3				; indicate no buffer
+
+			MOVE.W	 BTCLevel(A4),D0	; locate
+			JSR 	 ExtLocTPR 			; ...TPR
+
+			MOVE.L	 TPRNodeN(A0),D1	; free
+			MOVE.W	 BTCRefNum(A4),D0	;
+			JSR 	 ExtFreeNode		; ...the disk node
+
+			BSET	 #BTCDelIRec,BTCFlags(A4) ; indicate index record delete
+			BCLR	 #BTCKeyUpd,BTCFlags(A4)  ; ...and no key update
+;
+; move to next level
+;
+BDNxtLev
+			SUB.W	 #1,BTCLevel(A4)	; bump to next level up
+			BEQ.S 	 BDRoot 			; up to root level ->
+
+			BTST	 #BTCKeyUpd,BTCFlags(A4) ; key update required ?			<03Sep85>
+			BNE.S	 @1 				; yes ->								<03Sep85>
+			BTST	 #BTCDelIRec,BTCFlags(A4) ; index record delete required ?	<03Sep85>
+			BEQ 	 BDExit 			; no, all done ->						<03Sep85>
+
+@1			MOVE.W	 BTCLevel(A4),D0	; locate TPR
+			JSR 	 ExtLocTPR 			; for this level
+			MOVE.W	 TPRRIndx(A0),D5	; D5 = parent record index
+			MOVE.L	 TPRNodeN(A0),D2	; D2 = parent node number
+
+			MOVEQ	 #0,D1				; get parent node						<10Oct85>
+			JSR 	 ExtGetNode			;
+			BNE 	 BDExit1			; error ->								<20Nov85>
+			MOVEA.L  A0,A2				; A2 = ptr(parent node buffer)
+;
+; update parent key
+;
+BDUpdKey
+			BTST	 #BTCKeyUpd,BTCFlags(A4) ; key update required ?
+			BEQ.S	 @1 				; no ->
+
+			MOVE.W	 D5,D0				; locate
+			MOVEA.L  A2,A1			   ;
+			JSR 	 ExtGetRecA			; ...parent index record
+			MOVE.L	 A0,-(SP)			; ...and save it
+			MOVE.L	 A3,A1				; locate 1st key
+			CLR.W	 D0 				;
+			JSR 	 ExtGetRecA			; ...in node
+			MOVEA.L  (SP)+,A1			; ptr(parent index record)
+
+			JSR 	 ExtUpdIKey			; update the key
+
+			MOVEA.L  A2,A0				; ptr(parent node buffer)	   <10Oct85>
+			JSR 	 ExtMarkBlock		; write it back	 			   <20Feb90><SM1>
+
+			TST.W	 D5 				; update to 1st key in node ?
+			BEQ.S	 @1 				; yes, leave flag set ->
+			BCLR	 #BTCKeyUpd,BTCFlags(A4) ; don't need to update next level
+
+@1			MOVEQ	 #0,D1				; release child 			   <10Oct85>
+			MOVE.L	 A3,A0				;
+			JSR 	 ExtRelNode			; ...node buffer
+
+			MOVEA.L  A2,A3				; new child node = parent node
+			MOVE.L	 D2,D3				; should be a long, not word <5/4/89>
+;
+; check if done
+;
+			BCLR	 #BTCDelIRec,BTCFlags(A4) ; indx rec delete required ? <03Sep85>
+			BEQ.S	 @2 				; no ->
+			BRA 	 BDDelete			; delete parent index record ->
+
+@2			BTST	 #BTCKeyUpd,BTCFlags(A4) ; another key update required ?
+			BNE.S	 BDNxtLev			; yes ->
+			BRA.S	 BDExit 			; no, all done ->
+;
+; up to the root, check for an empty tree
+;
+BDRoot
+			MOVE.L	 A3,D0				; root node released?
+			BNE.S	 BDUpdDepth 		; no ->
+			CLR.W	 BTCDepth(A4)		; set tree to empty state
+			CLR.L	 BTCRoot(A4)		;
+			BRA.S	 BDExit 			; exit ->
+;
+; update tree depth
+;
+BDUpdDepth
+			CMPI.W	 #1,NDNRecs(A3) 	; check # of records left in root
+			BGT.S 	 BDExit 			; > 1, all done ->
+			TST.B	 NDType(A3) 		; index node ?
+			BNE.S 	 BDExit 			; no, all done ->
+
+			SUBQ.W	 #1,BTCDepth(A4)	; decrement tree depth
+
+			MOVEQ	 #0,D1				; locate key and data for 1st record <10Oct85>
+			MOVEA.L  A3,A1				;
+			JSR 	 ExtLocRec 			; ... in node				  <10Oct85>
+			MOVE.L	 (A1),BTCRoot(A4)	; new root = child node 	  <10Oct85>
+;
+; release the previous root node
+;
+			MOVEA.L  A3,A0				; clear the node buffer 	  <23Sep85>
+			JSR 	 ExtClrNode			;							  <23Sep85>
+
+			MOVEQ	 #kRBdirty,D1		; release the				  <10Oct85>
+			JSR 	 ExtRelNode			; ...node buffer
+			SUBA.L	 A3,A3				; indicate no buffer
+
+			MOVE.L	 D3,D1				; free
+			MOVE.W	 BTCRefNum(A4),D0	;
+			JSR 	 ExtFreeNode		; ...the node
+;																	  <20Nov85>
+; get new root node and check if depth can be reduced again 		  <20Nov85>
+;																	  <20Nov85>
+			MOVE.L	 BTCRoot(A4),D3 	; D3 = new root node #		  <20Nov85>
+			MOVE.L	 D3,D2				; get the new root node 	  <20Nov85>
+			MOVEQ	 #0,D1				;							  <20Nov85>
+			JSR 	 ExtGetNode			;							  <20Nov85>
+			BNE.S	 BDExit1			; error ->					  <20Nov85>
+
+			MOVEA.L  A0,A3				; A3 = ptr to node buffer	  <20Nov85>
+			BRA.S	 BDUpdDepth 		; check out new root -> 	  <20Nov85>
+
+;
+; release last node and exit
+;
+BDExit
+			BSET	 #BTCDirty,BTCFlags(A4) ; mark BTCB dirty
+			CLR.W	 D0 				; result = ok
+BDExit1
+			MOVE.W	 D0,-(A6)			; save result code
+
+			MOVEA.L  A3,A0				; ptr(node buffer)				<23Sep85>
+			MOVEQ	 #0,D1				;								<10Oct85>
+			JSR 	 ExtRelNode			; release it
+
+			MOVE.W	 (A6)+,D0			; restore result code
+
+			BSR 	 BTCleanUP			; clean up
+
+			MOVEM.L  (A6)+,D1-D5/A0-A4	; restore regs					<29Aug85>
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit BTDelete
+
+
+
+
+
+;__________________________________________________________________________________
+;
+; Routine:		BTFlush
+;
+; Function: 	Flushes a BTree file. The BTree Header (BTH) is updated and the
+;				cache is flushed for the specified file.
+;
+; Input:		D0.W  -  file refnum
+;				A4.L  -	 BTCB
+;				D5.B  -  Write flag, If set then flush file system cache.
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							-n = IO error
+; 30Jul90		KST		Flush B*Tree private cache buffers for the specific file.
+;						Only call FlushCache if D5 flag is set.
+;__________________________________________________________________________________
+
+ExtBTFlush								; 'vectored' BTFlush routine			<25Oct85><SM1>
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D1-D4/A0-A4,-(A6)	; save regs
+			MOVE.W	 D0,D3				; D3 = file refnum
+			MOVEA.L  FCBsPtr,A1 		; point into FCB array
+			MOVEA.L  FCBVPtr(A1,D3.W),A2; point to VCB
+
+	; we have the BTCB already
+	;		JSR 	 ExtLocBTCB			; locate the BTCB
+			BCLR	 #BTCdirty,BTCFlags(A4) ; is the BTCB dirty?
+			BEQ.S	 BFFlush			 ; no, just flush cache ->
+
+			BSR.S	ExtGetUpdateHdr		; get BTH from disk in A3 and update it
+			BNE.S	BFExit				; can't get it					<2/16/90>
+; release cache buffer
+			MOVEQ	 #kRBdirty,D1		; release 'dirty'				 <14Oct85>
+			MOVEA.L  A3,A0				; cache buffer ptr
+			JSR 	 ExtRelNode			; release it
+			BNE.S	 BFExit 			; error ->
+;
+; flush the private cache buffers for the B*Tree manager, don't call FlushCache.
+; Note: this is a delayed write if D5 is not set.								<01Aug90>
+BFFlush
+			MOVEA.L BTCCQptr(A4),A3		; ptr to cache queue					<30Jul90>
+			MOVE.W	btQBSize(A3),D4		; D4=INIT B*Tree buffer size			<30Jul90>
+			LEA		btQBStart(A3),A3	; A3=first buffer						<30Jul90>
+			MOVEQ	#btBufferN,D1		; number of private buffers				<30Jul90>
+			SUBQ	#1,D1				; for dbring							<30Jul90>
+@flushLoop
+			CMP.W	btBHRefNum(A3),D3	; same file?							<30Jul90>
+			BNE.S	@4					; no									<30Jul90>
+			BCLR	#CBHdirty,btBHFlags(A3) ; buffer dirty?						<30Jul90>
+			BEQ.S	@4					; no									<30Jul90>
+		;; buffer dirty, so write it to FS, A4 trashed here.					<30Jul90>
+			MOVEA.L	A3,A4				; A4 = ptr(buffer header)				<30Jul90>
+			JSR 	ExtWriteBlock		; write block to FS						<30Jul90>
+			
+@4			ADDA.W	D4,A3				; next buffer							<30Jul90>
+			ADDA.W	#lenBTBH,A3			;  ... and skip header					<30Jul90>
+			DBRA	D1,@flushLoop		; continue								<30Jul90>
+
+			TST.B	D5					; flush fs cache?						<01Aug90>
+			BEQ.S	@BFRet				; no, all done							<01Aug90>
+		;; here, call file system's flushcache									<01Aug90>
+			MOVEa.L	FSVarsPtr,A1		;										<01Aug90>
+			MOVEA.L	fsVars.btMgr(A1),A1	;										<01Aug90>
+			MOVEA.L	btVParam(A1),A0		; A0 = BT Param							<01Aug90>
+			MOVE.W	D3,ioRefNum(A0)		; file refnum							<01Aug90>
+			MOVEQ	#DoFlushFile,D1		; indicate this is FlushFile			<01Aug90>
+			BSR		ExtDoAOCRWF			; flush cache							<01Aug90>
+			BNE.S	BFExit				; error									<01Aug90>
+
+@BFRet		MOVEQ	 #0,D0				; no error								<01Aug90>
+; clean up and exit
+;
+BFExit
+			MOVEM.L  (A6)+,D1-D4/A0-A4	; restore regs
+			MOVE.L	 (A6)+,-(SP)		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit BTFlush
+
+; __________________________________________________________________________
+; Function:	get BTH from disk and update it from BTCB info
+; Input:	A4.L  -	 BTCB	<2/16/90>
+; Output:	D0=0 if read header and then A3.L = header buffer ptr
+; Trashes:	D0, D1, D2, A0, A1, A3
+; __________________________________________________________________________
+ExtGetUpdateHdr
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEQ	 #0,D1				; no options
+			MOVEQ	 #0,D2				; BTH is disk block 0
+			JSR 	 ExtGetNode			; get disk block
+			BNE.S	 @6		 			; couldn't get it ->
+			MOVEA.L  A0,A3				; A3 = cache buffer ptr
+			BSR.S	 ExtUpdateHdr
+
+@6			MOVE.L	 (A6)+,-(SP)		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit BTFlush
+; __________________________________________________________________________
+; Function:	 update BTH from BTCB info. This routine is SYNC.
+; Input:	A4.L = BTCB, A3.L = header buffer ptr.
+; Output:	D0=0			<2/16/90>
+; Trashes:	D0, A0, A1
+; __________________________________________________________________________
+ExtUpdateHdr
+			MOVE.W	 #LenMemBTH-1,D0	; loop index
+			LEA 	 BTCDepth(A4),A0	; ptr(source)
+			LEA 	 lenND(A3),A1		; ptr(destination)
+@4			MOVE.B	 (A0)+,(A1)+		; move it
+			DBRA	 D0,@4				; ...in
+
+			MOVEQ	 #0,D0
+			RTS
+
+;__________________________________________________________________________________
+;
+; Routine:		BTGetRecord
+;
+; Function: 	Gets a record from a BTree file.  Any previous, current,
+;				or next record relative to the last BTSearch or BTGetRecord
+;				operation may be obtained.
+ ;
+; Input:		D0.W  -  refnum
+;				D1.W  -  selection code
+;							 -n = previous record
+;							  0 = current record
+;							 +n = next record
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 BTnotfound = record not found
+;							 other = error
+;				A0.L  -  pointer to key
+;				A1.L  -  pointer to data record
+;				D1.W  -  size of data record
+;				D2.L  -  BTree hint
+;__________________________________________________________________________________
+
+ExtBTGetRecord																	;
+;			MOVE.L	jBTGetRecord,-(SP)	; jumptable entry for vBTGetRecord		<25Oct85>
+;			RTS 						; go there								<25Oct85>
+;vBTGetRecord							; 'vectored' BTGetRecord routine		<25Oct85>
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D3-D5/A2-A4,-(A6)	; save regs
+;
+; initialize some things
+;
+			BSR 	 BTSetUp			; set up common stuff
+
+			MOVE.W	 D1,D5				; D5 = selection code
+			SUBA.L	 A3,A3				; indicate no node buffer
+;
+; set up starting position in BTree
+;
+			MOVE.W	 BTCIndexM(A4),D4	; current index mark
+			MOVE.L	 BTCNodeM(A4),D3	; current node mark
+			BNE.S	 @1 				; valid node number ->
+			MOVEQ	 #BTnotfound,D0 	; set return code		  <14Oct85>
+			BRA.S	 GRExit1			; exit ->
+@1			ADD.W	 D5,D4				; adjust index
+;
+; locate the record relative to the starting position
+;
+GRLocate
+			BSR.S 	 GRGetNode			; get the node
+			BNE.S	 GRExit1			; error ->
+
+@1			TST.W	 D4 				; check index bounds
+			BLT.S	 @3 				;	< 0, get previous node ->
+			MOVE.W	 NDNRecs(A3),D1 	;
+			CMP.W	 D1,D4				;
+			BLT.S	 GRGotIt			;	< #recs, got it ->
+
+			MOVE.L	 NDFlink(A3),D0 	; get next node number
+			BEQ.S	 @2 				; don't have one ->
+			MOVE.L	 D0,D3				; D3 = next node number
+			SUB.W	 D1,D4				; adjust index
+			BRA.S	 GRLocate			; try next node
+
+@2			MOVE.W	 D1,D4				; new index mark = index of last record
+			SUBQ.W	 #1,D4				;
+			BRA.S	 @5 				; use common exit ->
+
+@3			MOVE.L	 NDBlink(A3),D0 	; get previous node number
+			BEQ.S	   @4				; don't have one ->
+			MOVE.L	 D0,D3				; D3 = previous node number
+			BSR.S 	 GRGetNode			; get the previous node
+			BNE.S	 GRExit1			; error ->
+			ADD.W	 NDNRecs(A3),D4 	; adjust index
+			BRA.S	 @1 				; check bounds again ->
+
+@4			MOVEQ	 #0,D4				; new index mark = index of first record
+
+@5			MOVE.L	 D3,BTCNodeM(A4)	; new node mark
+			MOVE.W	 D4,BTCIndexM(A4)	; new index mark
+			MOVEQ	 #BTnotfound,D0 	; set return code							 <14Oct85>
+			BRA.S 	 GRExit1			; exit ->
+;
+; found the record, set up pointers to key and data
+;
+GRGotIt
+			MOVE.W	 D4,D1				; record index
+			MOVEA.L  A3,A1				; ptr(node buffer)
+			JSR 	 ExtLocRec 			; locate key and data record
+
+			MOVE.L	 D3,BTCNodeM(A4)	; update current node
+			MOVE.W	 D4,BTCIndexM(A4)	; ...and index markers
+;
+; release node buffer and exit
+;
+GRExit
+			CLR.W	 D0 				; result = ok
+GRExit1
+			MOVEM.L   D0-D1/A0-A1,-(A6) ; save return stuff
+			BSR.S 	 GRRelNode			; release node buffer
+			MOVEM.L   (A6)+,D0-D1/A0-A1 ; restore return stuff
+
+			MOVE.L	 D3,D2				; hint = node number
+
+			BSR 	 BTCleanUP			; clean up
+
+			MOVEM.L  (A6)+,D3-D5/A2-A4	; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit BTGetRecord
+
+;
+; GRGetNode subroutine - releases current node and gets the next node.
+;						 A3.L = ptr(current node buffer)
+;						 D3.L = next node number
+;
+GRGetNode
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			BSR.S 	 GRRelNode			; release current node
+			MOVEQ	 #0,D1				; no GetBlock options					 <10Oct85>
+			MOVE.L	 D3,D2				; node number
+			JSR 	 ExtGetNode			; get the node
+			BNE.S	 @1 				; error ->								 <21Oct85>
+			MOVEA.L  A0,A3				; A3 = ptr(next node buffer)
+@1			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit GRGetNode
+
+
+;
+; GRRelNode subroutine - releases current node buffer.
+;						 A3.L = ptr(current node buffer)
+;
+
+GRRelNode
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+
+			MOVEQ	 #0,D1				; no RelBlock options					<10Oct85>
+			MOVEA.L  A3,A0				; ptr(node buffer)						<23Sep85>
+			JSR 	 ExtRelNode			; release the node
+			SUBA.L	 A3,A3				; indicate no node buffer
+
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit GRRelNode
+
+
+
+
+
+;__________________________________________________________________________________
+;
+; Routine:		BTInsert
+;
+; Function: 	Inserts a record into a BTree file given the
+;				record key and data.
+;
+; Input:		A0.L  -  address of key
+;				A1.L  -  address of record data
+;				D0.W  -  file refnum
+;				D1.W  -  size of DATA record
+;				D2.L  -  actual data size (in number of nodes)				<23Feb90>
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 BTexists = key already exists
+;							 other = error
+;				D2.L  -  BTree hint
+;__________________________________________________________________________________
+
+ExtBTInsert																		;
+;			MOVE.L	jBTInsert,-(SP) 	; jumptable entry for vBTInsert 		<25Oct85>
+;			RTS 						; go there								<25Oct85>
+;vBTInsert								; 'vectored' BTInsert routine			<25Oct85>
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D1/D3-D7/A0-A4,-(A6) ; save registers
+
+			JSR 	 ExtLocBTCB			; locate BTCB
+
+			MOVE.L	 A1,D7				; D7 = ptr(record)
+			MOVE.W	 D1,D6				; D6 = size of record
+			MOVE.L	 A0,D5				; D5 = ptr(key)
+;
+; make sure there is enough file space for a worst case split
+; In supporting the new special data record, no code needs to be changed at this lower
+; level (the data record (A1) and size (D1) are representing the special record, not the
+; actual data), except in allocating more disk space for the data.				<23Feb90>
+
+			MOVEQ	 #1,D3				; required space (in nodes) =
+			ADD.W	 BTCDepth(A4),D3	;	 tree depth + 1
+			CMP.L	 BTCFree(A4),D3 	; enough space?
+			BLE.S	 BIInit 			; yes ->
+@1			JSR 	 ExtExtBTFile			; extend the file
+			BNE 	 BIExit2			; couldn't do it ->
+
+			CMP.L	 BTCFree(A4),D3 	; enough space now?
+			BGT.S	 @1 				; no ->
+;
+; initialize some things
+;
+BIInit
+			MOVE.W	 BTCRefNum(A4),D0	; set up common stuff
+			BSR 	 BTSetUp			;
+
+			MOVEM.L  D6/D7,-(A6)		;save input record size and ptr
+
+			MOVEQ	 #0,D4				; indicate no parent node buffer <29Aug85>
+			SUBA.L	 A2,A2				; ...no left node buffer
+			SUBA.L	 A3,A3				; ...no right node buffer
+
+			CLR.L	 BTCNodeM(A4)		; invalidate current node mark
+;
+; build BTree record consisting of input key with a junk data record
+;
+			MOVEA.L  BTCVarPtr(A4),A1	; dest = record buffer
+			LEA 	 ExtBTVRecord(A1),A1	; maxDepth changed			<11Apr90>
+			MOVEA.L  D5,A0				; source = input key
+			MOVEQ	 #0,D0				; get key length
+			MOVE.B	 (A0),D0			;
+			ADDQ.L	 #2,D0				; include length byte
+			LSR.L	 #1,D0				;
+			LSL.L	 #1,D0				; ...and adjust to word boundry
+			ADD.W	 D0,D6				; total size  = key size + data size
+			_BlockMove					; move in the key
+
+			ADDQ.W	 #1,D6				; adjust total size to word boundry
+			LSR.W	 #1,D6				;
+			LSL.W	 #1,D6				;
+			MOVE.L	 A1,D7				; D7 = ptr(Btree record)
+;
+; search tree for key
+;
+BISearch
+			JSR 	 ExtTreeSearch 		; search for key
+			MOVEA.L  A1,A3				; A3 = ptr(right node buffer)
+			BNE.S	 @1 				; key not found or error ->
+			MOVEQ	 #BTexists,D0		; error, it already exists		  <14Oct85>
+			BRA 	 BIExit1			; exit ->
+@1			CMP.W	 #BTnotfound,D0 	; key not found ?
+			BNE 	 BIExit1			; no, must be IO error ->
+			MOVE.L	 D2,D3				; D3 = right node number
+			MOVE.W	 D1,D5				; D5 = insert index
+;
+; if tree is empty, add 1st leaf node
+;
+			TST.W	 BTCLevel(A4)		; tree empty ?
+			BGT.S 	 BIInsert			; no ->
+
+			MOVE.W	 BTCRefNum(A4),D0	; file refnum
+			JSR 	 ExtAllocNode		; allocate the node
+			BNE 	 BIExit1			; error ->
+
+			MOVE.L	 D1,D3				; D3 = new node number
+
+			JSR 	 ExtInitNode		; get an initialized node
+			BNE 	 BIExit1			; error ->							<18Dec85>
+			MOVEA.L  A0,A3				; A3 = ptr(new root node)
+
+			MOVE.B	 #NDLeafNode,NDType(A3) ; type = leaf node
+			MOVEQ	 #1,D0				; node height = 1
+			MOVE.B	 D0,NDNHeight(A3)	;
+
+			MOVE.W	 D0,BTCDepth(A4)	; tree depth = 1
+			MOVE.L	 D3,BTCRoot(A4) 	; new root node number
+
+			MOVE.L	 D3,BTCFNode(A4)	; 1st and last node pointers
+			MOVE.L	 D3,BTCLNode(A4)	;
+
+			MOVE.W	 #1,BTCLevel(A4)	; current level = 1
+;
+; try a simple insert first
+;
+BIInsert
+			MOVEA.L  D7,A0				; ptr(record)
+			MOVE.W	 D6,D0				; record size
+			MOVEA.L  A3,A1				; ptr(node buffer)
+			MOVE.W	 D5,D1				; insert index
+			JSR 	 ExtInsertRec		; try to insert it
+			BNE.S	 BIRotate			; didn't make it ->
+
+			TST.W	 D5 				; insert a new 1st record ?
+			BNE.S	 BIInsDone			; no, insert complete ->
+			BSET	 #BTCKeyUpd,BTCFlags(A4) ; indicate key update required
+			BRA.S	 BIInsDone			; insert complete ->
+;
+; insert didn't work, try rotation into left sibling node
+;
+BIRotate
+			MOVEA.L  A3,A0				; ptr(node buffer)
+			JSR 	 ExtGetLtSib		; get left sibling node
+			BNE 	 BIExit1			; error ->
+			TST.L	 D1 				; is there a left sibling ?
+			BEQ.S	 BISplit			; no ->
+			MOVE.L	 D1,D2				; D2 = left node number
+			MOVEA.L  A1,A2				; A2 = ptr(left node buffer)
+
+			MOVEA.L  D7,A0				; ptr(record)
+			MOVE.W	 D6,D0				; record size
+			MOVE.W	 D5,D1				; insert index
+			JSR 	 ExtRotateLt		; try rotating left, and insert the record
+			BNE.S	 BISplit			; didn't make it ->
+			BRA.S	 BISplit1			; use common code ->				   <10Oct85>
+;
+; rotate didn't work, got to split
+;
+BISplit 	MOVEA.L  D7,A0				; ptr(record)
+			MOVE.W	 D6,D0				; record size
+			MOVE.W	 D5,D1				; insert index
+			JSR 	 ExtSplitLT			; split left
+			BEQ.S	 @1 				; ok ->
+			MOVEQ	 #BTnoFit,D0		; result = 'no fit' 				  <14Oct85>
+			BRA 	 BIExit1			; exit ->
+@1			BSET	 #BTCNewIRec,BTCFlags(A4) ; indicate new index record required <10Oct85>
+
+BISplit1								;									  <10Oct85>
+			BSET	 #BTCKeyUpd,BTCFlags(A4) ; indicate key update required   <10Oct85>
+			MOVE.W	 D1,D5				; D5 = new record index 			  <10Oct85>
+
+		;; another problem with the new buffer scheme using ExtMarkBlock;<9/6/89>
+		;; A1.L=ptr(node buffer) containing new record					;<9/6/89>
+			CMPA.L	A2,A1				; new record in left node?		;<9/6/89>
+			BNE.S	@4					; no							;<9/6/89>
+			CMPI.B	 #NDleafNode,NDType(A1) ; leaf level?				;<9/6/89>
+			BNE.S	 @4					; no, ->						;<9/6/89>
+		;; before we marking the leaf, update the data					;<9/6/89>
+			MOVEM.L  (A6),A0/D0 		; get input record ptr and size ;<9/6/89>
+			JSR 	 ExtUpdDRec			; replace the junk data record	;<9/6/89>
+@4			MOVEA.L  A2,A0				; mark the left node dirty			  <10Oct85>
+			JSR 	 ExtMarkBlock		; write it back	 			  	 <20Feb90>
+;
+; completed the record insert, clean up
+;
+BIInsDone
+;; We can't mark block before Updating the leaf record:					<8/31/89>
+;; (because ExtMarkBlock is now writing block to cache)					
+			CMPI.B	 #NDleafNode,NDType(A1) ; leaf level?				<8/31/89>
+			BEQ.S	 @0					; yes, ->						<8/31/89>
+			MOVEA.L  A3,A0				; no, not leaf					<8/31/89>
+			JSR 	 ExtMarkBlock		; write it back	 			    <20Feb90>
+			BRA.S	 BICkDone			; all done if not leaf			<8/31/89>
+
+@0			MOVEM.L  (A6),A0/D0 		; get input record ptr and size	<8/31/89>
+			JSR 	 ExtUpdDRec			; replace the junk data record	<8/31/89>
+			MOVEA.L  A3,A0				; update and then mark it		<8/31/89>
+			JSR 	 ExtMarkBlock		; write it back	 			    <20Feb90>
+
+			ADD.L	 #1,BTCNRecs(A4)	; bump leaf record count
+
+			MOVE.W	 D5,BTCIndexM(A4)	; save index marker
+			MOVE.L	 D3,D0				; assume right node number
+			CMPA.L	 A3,A1				; is new record in right node?
+			BEQ.S	 @1 				; yes ->
+			MOVE.L	 D2,D0				; no, use left node number
+@1			MOVE.L	 D0,BTCNodeM(A4)	; save node marker
+;
+; Check if all done
+;
+BICkDone
+			BTST	 #BTCKeyUpd,BTCFlags(A4) ; key update required ?
+			BNE.S	 BINxtLev			; yes, move to next level ->
+			BTST	 #BTCNewIRec,BTCFlags(A4) ; new index record required ?
+			BEQ 	 BIExit 			 ; no, all done ->
+;
+; move to next level
+;
+BINxtLev
+			SUB.W	 #1,BTCLevel(A4)	; bump to next level up
+			BEQ 	 BIRoot 			; up to root level ->
+
+			MOVE.W	 BTCLevel(A4),D0	; locate TPR
+			JSR 	 ExtLocTPR 			; for this level
+			MOVE.W	 TPRRIndx(A0),D5	; D5 = parent record index
+			MOVE.L	 TPRNodeN(A0),D3	; D3 = parent node number
+
+			MOVE.L	 D2,-(A6)			; save D2 (node hint)
+			MOVEQ	 #0,D1				; get parent node					  <10Oct85>
+			MOVE.L	 D3,D2				;
+			JSR 	 ExtGetNode			;
+
+			BNE 	 BIExit1			; error -> D2 on a6 ????? <KSCT>
+			MOVE.L	 A0,D4				; D4 = ptr(parent node buffer)
+			MOVE.L	 (A6)+,D2			; restore D2
+;
+; update parent key
+;
+BIUpdKey
+			BTST	 #BTCKeyUpd,BTCFlags(A4) ; key update required ?
+			BEQ.S	 @1 				; no ->
+
+			MOVE.W	 D5,D0				; locate
+			MOVEA.L  D4,A1				;
+			JSR 	 ExtGetRecA			; ...parent index record
+			MOVE.L	 A0,-(SP)			; ...and save it
+			MOVEA.L  A3,A1				; locate 1st key
+			CLR.W	 D0 				;
+			JSR 	 ExtGetRecA			; ...in right node
+			MOVEA.L  (SP)+,A1			; ptr(parent index record)
+
+			JSR 	 ExtUpdIKey			; update the key
+
+			MOVEA.L  D4,A0				; mark the parent node dirty		  <10Oct85>
+			JSR 	 ExtMarkBlock		; write it back	 			   		<20Feb90>
+
+			TST.W	 D5 				; update to 1st key in node ?
+			BEQ.S	 @1 				; yes, leave flag set ->
+			BCLR	 #BTCKeyUpd,BTCFlags(A4) ; don't need to update next level
+
+@1			MOVEQ	 #0,D1				; release							  <10Oct85>
+			MOVEA.L  A3,A0				;
+			JSR 	 ExtRelNode			; ... right node buffer
+
+			MOVEA.L  D4,A3				; parent is new right node
+			MOVEQ	 #0,D4				; indicate no parent node buffer	  <29Aug85>
+;
+; build new index record pointing at new left node
+;
+BINewRec
+			BTST	 #BTCNewIRec,BTCFlags(A4) ; new index record required ?
+			BEQ.S	 @1 				; no ->
+
+			MOVEA.L  A2,A1				; left node
+			MOVE.L	 D2,D0				; left node number
+			JSR 	 ExtBuildIRec		; build index record
+
+@1			MOVEQ	 #0,D1				; release							  <10Oct85>
+			MOVEA.L  A2,A0				;
+			JSR 	 ExtRelNode			; ... left node buffer
+			SUBA.L	 A2,A2				; indicate no left node
+;
+; set up for insert of new index record
+;
+			BTST	 #BTCNewIRec,BTCFlags(A4) ; new index record required ?
+			BEQ 	 BICkDone			; no, check if done ->
+
+			MOVEA.L  BTCVarPtr(A4),A0	; locate new index record
+			LEA 	 ExtBTVRecord(A0),A0	; maxDepth changed				<11Apr90>
+			MOVE.L	 A0,D7				; D7 = ptr to new record
+			JSR 	 ExtGetMaxkey		; max key length + 4				  <10Oct85>
+			ADDQ.W	 #4,D0				;	 = size of index record 		  <10Oct85>
+			MOVE.W	 D0,D6				; D6 = size of new record			  <10Oct85>
+			BCLR	 #BTCNewIRec,BTCFlags(A4) ; clear new index rec flag
+			BRA 	 BIInsert			; insert new index record ->
+;
+; we updated the root, must add a level if it was split
+;
+BIRoot
+			BTST	 #BTCNewIRec,BTCFlags(A4) ; was root node split ?
+			BEQ	 	 BIExit 			 ; no, all done ->
+;
+; set up a new root index node
+;
+
+			MOVE.W	BTCDepth(A4),D0		; check tree depth					<04Apr90>
+			CMPI	#ExtBTMaxDepth,D0	; is this the limit?				<11Apr90>
+			BNE.S	@0					; no								<04Apr90>
+		IF btDebug THEN
+			_debugger					; fatal error						<04Apr90>
+		ENDIF
+			MOVE.W	#btDepthErr,D0		; punt on							<04Apr90>
+			BRA.S 	 BIExit1			; error ->							<04Apr90>
+
+@0			MOVE.W	 BTCRefNum(A4),D0	; volume refnum
+			JSR 	 ExtAllocNode		; allocate the node
+			BNE.S 	 BIExit1			; error ->
+
+			MOVE.L	 D1,D3				; D3 = new root node number
+
+			MOVE.L	 D3,D1				; new node number
+			JSR 	 ExtInitNode		; get an initialized node
+			BNE.S 	 BIExit1			; error ->							<18Dec85>
+			MOVE.L	 A0,D4				; D4 = ptr(new root node buffer)
+
+			MOVE.B	 #NDIndxNode,NDType(A0) ; type = index node
+			MOVEQ	 #1,D0				; node height
+			ADD.W	 BTCDepth(A4),D0	;	= previous depth +1
+			MOVE.B	 D0,NDNHeight(A0)	;
+;
+; add index record for left node
+;
+			MOVEA.L  A2,A1				; build index record
+			MOVE.L	 D2,D0				;
+			JSR 	 ExtBuildIRec		; ...for left node
+
+			JSR 	 ExtGetMaxkey		; max key length + 4				  <10Oct85>
+			ADDQ.W	 #4,D0				;	 = size of index record 		  <10Oct85>
+			MOVEA.L  BTCVarPtr(A4),A0	; locate new index record
+			LEA 	 ExtBTVRecord(A0),A0	; maxDepth changed				<11Apr90>
+			MOVEA.L  D4,A1				; ptr(root node buffer)
+			CLR.W	 D1 				; insert index = 0
+			JSR 	 ExtInsertRec		; insert it
+;
+; add index record for right node (previous root)
+;
+			MOVE.W	 #1,D0				; get node number
+			JSR 	 ExtLocTPR 			;
+			MOVE.L	 TPRNodeN(A0),D0	; ...of previous root
+			MOVEA.L  A3,A1				; ptr(node buffer)
+			JSR 	 ExtBuildIRec		; build index record
+
+			JSR 	 ExtGetMaxkey		; max key length + 4				  <10Oct85>
+			ADDQ.W	 #4,D0				;	 = size of index record 		  <10Oct85>
+			MOVEA.L  BTCVarPtr(A4),A0	; locate new index record
+			LEA 	 ExtBTVRecord(A0),A0	; maxDepth changed				<11Apr90>
+			MOVEA.L  D4,A1				; ptr(root node buffer)
+			MOVE.W	 #1,D1				; insert index = 1
+			JSR 	 ExtInsertRec		; insert it
+
+			MOVEA.L  D4,A0				; mark the new root node dirty		  <10Oct85>
+			JSR 	 ExtMarkBlock		; write it back	 			  	 <20Feb90>
+;
+; update BTCB
+;
+			ADD.W	 #1,BTCDepth(A4)	; add a level
+			MOVE.L	 D3,BTCRoot(A4) 	; new root node number
+;
+; clean up and exit
+;
+BIExit
+			BSET	 #BTCDirty,BTCFlags(A4) ; mark BTCB dirty
+			CLR.W	 D0 				; result = ok
+BIExit1
+			MOVE.W	 D0,-(A6)			; save result code
+
+			MOVEA.L  A2,A0				; ptr(left node buffer) 			 <23Sep85>
+			MOVEQ	 #0,D1				; no RelBlock options				 <10Oct85>
+			JSR 	 ExtRelNode			; release it
+
+			MOVEA.L  A3,A0				; ptr(right node buffer)			 <23Sep85>
+			JSR 	 ExtRelNode			; release it
+
+			MOVEA.L  D4,A0				; ptr(parent node buffer)			 <23Sep85>
+			JSR 	 ExtRelNode			; release it
+
+			MOVE.W	 (A6)+,D0			; restore result code
+
+			MOVE.L	 BTCNodeM(A4),D2	; return hint (node number)
+			CLR.L	 BTCNodeM(A4)		; invalidate current record markers
+
+			BSR 	 BTCleanUP			; clean up
+
+			ADDQ.L	 #8,A6				; deallocate saved stuff
+BIExit2
+			MOVEM.L  (A6)+,D1/D3-D7/A0-A4 ; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit BTInsert
+
+
+;__________________________________________________________________________________
+;
+; Routine:		BTSearch
+;
+; Function: 	Searches a BTree file for a record given the key.  If a hint is
+;				given, the BTree node identified by that hint is obtained and
+;				searched first.  Then, if the record is not found, a normal tree
+;				search is performed.
+;
+; Input:		A0.L  -  pointer to key
+;				D0.W  -  file refnum
+;				D2.L  -  BTree hint
+;							0 = no hint
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 BTnotfound = record not found
+;							 other = error
+;				A0.L  -  pointer to key
+;				A1.L  -  pointer to data record
+;				D1.W  -  size of data record
+;				D2.L  -  new BTree hint
+;__________________________________________________________________________________
+
+ExtBTSearch								;											
+;			MOVE.L	jBTSearch,-(SP) 	; jumptable entry for vBTSearch 		  <25Oct85>
+;			RTS 						; go there								  <25Oct85>
+;vBTSearch								; 'vectored' BTSearch routine			  <25Oct85>
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D3-D7/A2-A4,-(A6)	; save regs
+;
+; initialize some things
+;
+			BSR 	 BTSetUp			; set up common stuff
+
+			MOVEA.L  A0,A3				; A3 = ptr to key
+			SUBA.L	 A2,A2				; indicate no node buffer
+;
+; go directly to the leaf node if hint is given
+;
+			TST.L	 D2 				; hint given?
+			BEQ.S	 BSTSrch			; no, do tree search ->
+
+			MOVEQ	 #0,D1				; get target node			   <10Oct85>
+			JSR 	 ExtGetNode			;
+			BNE.S	 BSExit1 			; error ->					   <07Sep89>
+										; this node has been released  <07Sep89>
+			MOVEA.L  A0,A2				; A2 = ptr(node buffer)
+
+			CMPI.B	 #NDLeafNode,NDType(A0) ; leaf node?
+			BNE.S	 @1 				; no ->
+			TST.W	 NDNRecs(A0)		; node empty?
+			BLE.S	 @1 				; yes ->
+
+			MOVEA.L  A3,A0				; search node for key
+			MOVEA.L  A2,A1				;
+			JSR 	 ExtSearchNode 		;
+			BEQ.S	 BSTSrch1			; found it ->
+
+@1			MOVEA.L  A2,A0				; release node buffer
+			MOVEQ	 #0,D1				; no RelBlock options		   <10Oct85>
+			JSR 	 ExtRelNode			;
+			BNE.S	 BSExit1 			; error ->					   <07Sep89>
+;
+; search tree for key
+;
+BSTSrch
+			MOVEA.L  A3,A0				; ptr to key
+			JSR 	 ExtTreeSearch 		; search tree for key
+			MOVEA.L  A1,A2				; A2 = ptr(node buffer)
+			BEQ.S	 BSTSrch1			; key found  ->
+			CMP.W	 #BTnotfound,D0 	; key not found error ?
+			BNE.S	 BSExit1			; no, must be IO error ->
+BSTSrch1	MOVE.W	 D1,D5				; D5 = record index
+			MOVE.W	 D0,-(A6)			; save search result
+;
+; update current markers in BTCB
+;
+			MOVE.L	 D2,BTCNodeM(A4)	; update current node mark
+			MOVE.W	 D5,BTCIndexM(A4)	; ... and record index mark
+;
+; set up pointers to key and data record
+;
+			TST.W	 (A6)				; record found?
+			BNE.S	 BSExit 			; no ->
+			MOVE.W	 D5,D0				; record index
+			MOVEA.L  A2,A1				; ptr(node buffer)
+			JSR 	 ExtLocRec 			; locate the record
+;
+; release node buffer and exit
+;
+BSExit
+			MOVEM.L  D1-D2/A0-A1,-(A6)	; save return stuff
+
+			MOVEA.L  A2,A0				; ptr(node buffer)			   <23Sep85>
+			MOVEQ	 #0,D1				; no RelBlock options		   <10Oct85>
+			JSR 	 ExtRelNode			; release it
+			MOVEM.L  (A6)+,D1-D2/A0-A1	; restore return stuff
+
+			MOVE.W	 (A6)+,D0			; restore search result
+BSExit1
+			BSR.S 	 BTCleanUP			; clean up
+
+			MOVEM.L  (A6)+,D3-D7/A2-A4	; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit BTSearch
+
+
+
+
+
+;__________________________________________________________________________________
+;
+; Routine:		ExtBTUpdate
+;
+; Function: 	Marks a buffer containing the specified BTree node as being
+;				updated (dirty).
+;
+; Input:		D0.L  -  file refnum
+;				D2.L  -  BTree hint (node number of dirty node)
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 BTnotfound = node not found
+;							 other = IO error
+;__________________________________________________________________________________
+
+ExtBTUpdate
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L  D1/A0-A1/A4,-(A6)	; save regs
+
+			JSR 	 ExtLocBTCB			; locate BTCB
+
+			MOVEQ	 #kGBexist,D1		; indicate existing cache block 	 <10Oct85>
+			JSR 	 ExtGetNode			; get the node
+			BNE.S	 BUExit 			; error ->
+
+			MOVEQ	 #kRBdirty,D1		; indicate dirty buffer
+			JSR 	 ExtRelNode			; release the node
+			BNE.S	 BUExit 			; error ->
+
+			CLR.W	 D0 				; indicate no error
+BUExit
+			MOVEM.L  (A6)+,D1/A0-A1/A4	; restore regs
+			MOVE.L	 (A6)+,-(SP)		; put return address back on stack
+			TST.W	 D0 				; set condition codes
+			RTS 						; exit ExtBTUpdate
+
+
+
+
+
+;__________________________________________________________________________________
+;
+; Internal Subroutines
+;__________________________________________________________________________________
+
+;__________________________________________________________________________________
+;
+; Subroutine:	BTCleanUp (BTree Clean Up)
+;
+; Function: 	Cleans up after a BTree service call.  Space for the BTree
+;				variable storage area (BTVars) is released and the pointer to
+;				BTVars in the BTCB is cleared.
+;
+; Input:		A4.L  -  pointer to BTCB
+;
+; Output:		none
+;__________________________________________________________________________________
+
+BTCleanUp
+			MOVE.L	 D0,-(SP)			; save registers
+
+			BSR.S	 CalBTVars			; calculate size of BTVars
+			ADDA.L	 D0,A6				; remove BTVars from A6 stack
+			CLR.L	 BTCVarPtr(A4)		; clear pointer in BTCB
+
+			MOVE.L	 (SP)+,D0			; restore registers
+			RTS 						; exit BTCleanUp
+
+
+
+
+
+;__________________________________________________________________________________
+;
+; Subroutine:	BTSetUp (BTree Set Up)
+;
+; Function: 	Sets up for a BTree service call.  The BTCB is located and space
+;				for the BTree variable storage area (BTVars) is allocated on the
+;				A6 stack.  A pointer to BTVars is saved in the BTCB.  All call-
+;				specific status flags in the BTCB are also cleared.
+;
+; Input:		D0.W  -  file refnum
+;
+; Output:		A4.L  -  pointer to BTCB
+;__________________________________________________________________________________
+
+BTSetUp
+			MOVE.L	 D0,-(SP)			; save registers
+
+			JSR 	 ExtLocBTCB			; locate the BTCB
+
+			BSR.S	 CalBTVars			; calculate size of BTVars
+			SUBA.L	 D0,A6				; allocate space on A6 stack
+			MOVE.L	 A6,BTCVarPtr(A4)	; save pointer in BTCB
+
+			BCLR	 #BTCNewIRec,BTCFlags(A4) ; clear status flags
+			BCLR	 #BTCDelIRec,BTCFlags(A4) ;
+			BCLR	 #BTCKeyUpd,BTCFlags(A4) ;
+
+			MOVE.L	 (SP)+,D0			; restore registers
+			RTS 						; exit BTSetUp
+
+
+
+
+
+;__________________________________________________________________________________
+;
+; Subroutine:	CalBTVars (Calculate size of BTVars)
+;
+; Function: 	Calculates the size of the BTree variable storage area (BTVars).
+;
+; Input:		A4.L  -  pointer to BTCB
+;
+; Output:		D0.L  -  size of BTVars
+;__________________________________________________________________________________
+
+CalBTVars
+			JSR 	 ExtGetMaxkey		; get max key size						<10Oct85>
+			ADDI.W	 #ExtlenTPT+4,D0	; size of BTVars = length of TPT		<11Apr90>
+
+			RTS 						; exit CalBTVars
+
+			END 
+
+

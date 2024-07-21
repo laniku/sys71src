@@ -1,0 +1,155 @@
+;
+;	File:		BTIntf.a
+;
+;	Copyright:	© 1990-1992 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 11/3/92	SWC		Changed INCLUDEs to a LOAD of StandardEqu.d.
+;		 <2>	 4/11/90	S		To make ioBTKCProc zeroed out as per Kenny Tung.
+;
+
+
+			BLANKS ON
+			STRING ASIS
+
+			PRINT OFF
+			LOAD			'StandardEqu.d'
+			INCLUDE	        'BTreeEqu.a'
+			PRINT ON
+			PRINT NOGEN 
+
+;________________________________________________________________________________
+;
+; Routine:     OpenUGBT
+;
+; Function:    Open a file for B*-Tree access.
+;
+;			   This function will also update the B*-Tree's key descriptor if the
+;			   B*-Tree doesn't have one yet.
+;
+; Pascal interface:
+;   Function OpenUGBT(VRefNum: Integer;
+;				    DirID: LongInt;
+;					fileName: Str255;
+;					OpenMode: Integer;
+;				    VAR BTRefNum: Integer): OSErr;
+;________________________________________________________________________________
+;
+OpenUGBT	PROC 	EXPORT
+			LINK    A6,#-BTParamSize    ; Allocate an HFS parameter block
+;
+; At this point the stack looks as follows:
+;
+;  -BTParamSize(A6) --> Start of I/O parameter block.
+;    (A6) --> Old A6
+;   4(A6) --> Return address
+;   8(A6) --> Address of BTRefNum (to be returned)
+;  12(A6) --> Open Mode
+;  14(A6) --> Filename string
+;  18(A6) --> DirID
+;  22(A6) --> Volume RefNum
+;  24(A6) --> Return value storage (2 bytes)
+;
+BTRefNum	EQU		8					; Address of BTRefNum (to be returned)
+BTOpenMode	EQU		12					; File open mode
+BTNamePtr	EQU		14					; Filename string
+BTDirID		EQU		18					; DirID
+BTVRefNum	EQU		22					; Volume RefNum
+Result		EQU		24					; Return value storage (2 bytes)
+ArgSize		EQU		Result-8			; Size of argument block on stack (28 bytes)
+
+			MOVE.L  BTRefNum(A6),A1		; Point to BTRefNum
+			CLR.W   (A1)	        	; Zero it out (in case of errors)
+
+@0			LEA		-BTParamSize(A6),A0		; Point to parameter block
+			MOVE.W	#(BTParamSize/2)-1,D0	; DBRA word loop index
+@1	    	CLR.W	(A0)+					; ...cleared.
+			DBRA    D0,@1
+
+			LEA		-BTParamSize(A6),A0		; Point to parameter block
+			MOVE.W  BTVRefNum(A6),ioVRefNum(A0)		; Set up VRefNum
+			MOVE.L  BTDirID(A6),ioDirID(A0)			; ... DirID,
+			MOVE.L  BTNamePtr(A6),ioFileName(A0)	; ... and Filename pointer
+										; [ioFileType and ioOwnBuf are clear ]
+			MOVE.B  BTOpenMode+1(A6),ioPermssn(A0) ; Request R/W permission
+			MOVE.L  #0, ioBTKCProc(A0)             ; Clear this field as per Kenny Tung Sangam 4/11/90
+			_BTOpen
+			BEQ.S	@50					; Continue if no error
+			CMP.W	#btNoKDErr,D0		; No key descriptor?
+			BNE.S	@50					; If other error, give up
+			LEA		UGKD,A1				; Point to key descriptor
+			MOVE.L	A1,ioBTKDPtr(A0)	; Set up pointer to KD
+			CLR.L	ioBTKDReqCount(A0)	; Clear top 3 bytes of KD length
+			MOVE.B	(A1),ioBTKDReqCount+3(A0) ; Copy length of KD record
+			_BTUpdateKD					; Try to update the key descriptor
+			BEQ.S	@0					; If successful, retry _BTOpen call
+			
+@50			MOVE.W  D0,Result(A6)		; Set up to pass error on to user
+			BNE.S   @95		        	; Punt if anything goes wrong
+
+			MOVEA.L BTRefNum(A6),A1		; Point to BTRefNum storage
+			MOVE.W  ioRefNum(A0),(A1)	; Return refNum for opened file.
+
+@95	    	UNLK    A6		       		; Release local storage
+			MOVE.L  (SP)+,A0	        ; Save return address
+			ADDA.W   #ArgSize,SP	    ; Remove arguments
+			JMP	    (A0)	        	; And return
+
+			DC.B    ($80+'O')       	; Indicate start of procedure name
+			DC.B    'PENUGBT'	        ; (for use by debugger)
+			DC.W    0
+
+UGKD:		DC.B	7					; Key descriptor length = 7
+			DC.B	$00, $01			; Skip 1 byte
+			DC.B	$06, $01			; 1 unsigned longword
+			DC.B	$03, $01, $00		; 1 Pascal string, not case sens, not diac. sens.
+			ENDP			
+;________________________________________________________________________________
+;
+; Routine:     BldFSKey
+;
+; Function:    Build a File-System B*-Tree key
+;
+; Pascal interface:
+;   Procedure BldFSKey(keyDirID: LongInt; keyCName: Str31; keyBufPtr: BTKeyPtr);
+;________________________________________________________________________________
+;
+BldFSKey	PROC 	EXPORT
+			LINK	A6,#0       ; LINK for debugging trail
+;
+; At this point the stack looks as follows:
+;
+;    (A6) --> Old A6
+;   4(A6) --> Return address
+;   8(A6) --> Key buffer pointer
+;  12(A6) --> CName pointer
+;  16(A6) --> DirID
+;
+			MOVEA.L 8(A6),A1	    ; Point to key to be built
+			MOVEA.L 12(A6),A0	    ; Point to CName string
+			MOVEQ   #0,D0	    ; Clear top 3 bytes
+			MOVE.B  (A0),D0	    ; Pick up CName length
+								; Add in: key filler (1)
+								;	      DirID (4)
+								;	      String length byte (1)
+								;	      ----------------------
+			ADDQ.L  #6,D0	    ;	      6 bytes
+			MOVE.B  D0,(A1)+	; ...which gives the total key length
+			CLR.B   (A1)+	    ; leave a filler
+			MOVE.L  16(A6),(A1)+; Move in DirID
+			SUBQ.L  #5,D0	    ; Get back length of actual CName string
+			_BlockMove		    ; Move in the CName string
+
+			UNLK    A6		    ; Pop off call frame
+			MOVE.L  (SP)+,A0	    ; Save return address
+			ADD.W   #12,SP	    ; Pop incoming arguments, leaving result
+			JMP	    (A0)	    ; And return to the caller
+
+			DC.B    ($80+'B')   ; Indicate start of procedure name
+			DC.B    'LDFSKEY'	    ; (for use by debugger)
+			DC.W    0
+			ENDP			
+
+			END
+

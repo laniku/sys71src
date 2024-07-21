@@ -1,0 +1,1014 @@
+;
+;	File:		CatSearch.a
+;
+;	Contains:	High speed catalog search
+;
+;	Written by: Dave N. Feldman
+;
+;	Copyright:	© 1988-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM1>	 4/15/92	kc		Removed the "ROM" prefix from the RomBind routines.
+;									• Pre-SuperMario comments follow •
+;		<19>	 9/13/91	JSM		Cleanup header.
+;		<18>	 2/25/91	dnf		dho, #83584: Change the name of maskNotFileNames to
+;									maskNotSearchInfo2, since that what it really does. Update the
+;									comment in the #paramErr rules section to note the new bits
+;									that count here.
+;		<17>	 2/12/91	dnf		gbm, #breaksTheAUXExternalFileSystem: Make sure CatSearch
+;									clears A3 (WDCB pointer) when exiting, since we never identify
+;									working directories.
+;		<16>	11/28/90	dnf		Put a comment in front of <14>
+;		<15>	11/28/90	dnf		Put a comment in front of <14>
+;		<14>	11/27/90	dnf		(with dba) Fix use of fsSBNegate when ioFlAttrib specifies only
+;									files or directories.
+;		<13>	 11/6/90	dnf		(with dba) Don't crush the timerInstalled flag. Make sure that
+;									long string target names (>31 characters) don't get searched.
+;		<12>	10/30/90	dnf		(with dba) Start the timer way early for more accurate timing.
+;									Fix early error exit cases where a3 wasn't set up.
+;		<11>	 8/28/90	dnf 	Rename ioSpecBits, ioSpec1 and ioSpec2 to ioSearchBits,
+;									ioSearchInfo1 and ioSearchInfo2
+;		<10>	 7/30/90	dnf 	Convert to linked patch; change rom reference names and use
+;									jsrRom macro.
+;		 <9>	  7/2/90	dnf 	Fix typo in branch from FlXFndrInfoIsDir case.
+;		 <8>	  6/2/90	dnf 	Use proper offsets for both file and directory search cases on
+;									finder info and dates
+;		 <7>	 4/17/90	dnf 	Fix register trashing bug in StartTimer
+;		 <6>	 3/16/90	dnf 	Return FSSpecs in ioMatchPtr instead of MBufEntries
+;		 <5>	 2/26/90	dnf 	Change ioQuant from a catalog record count to an amount of time
+;									to let the call run (and rename it ioSearchTime)
+;		 <4>	  2/8/90	dnf 	Test d0 before exiting CheckCriteria
+;		 <3>	  2/4/90	dnf 	Added negate bit; fixed ioFlAttrib bug; Changed to include
+;									StandardEqu.d
+;		 <2>	  1/9/90	dnf 	Add support for search on parent ID, implement CheckCSPB
+;									routine.
+;	   <1.5>	  9/7/89	dnf 	Added support for CatPosition
+;	   <1.4>	 8/26/89	dnf 	Get minimum buffer off of stack
+;	   <1.3>	 7/31/89	dnf 	Bug fixes, input from code review
+;	   <1.2>	  7/6/89	dnf 	Added read buffer support and offline check
+;	   <1.1>	  6/1/89	GGD 	Added include of HFS70Equ.a so that it would assemble.
+;	   <1.0>	 5/30/89	dnf 	Integrate CatSearch, FileID's and Desktop Database Mgr into one
+;									ptch
+;				 1/23/89	dnf 	Modified for new param block and search criteria
+;				12/20/88	dnf 	Broke off BTPScan into separate file
+;				 11/2/88	dnf 	New Today.
+;
+;	External
+;	 Routine:			CMCatSearch  -	Searches catalog for files according to search criteria
+;
+;	Internal			GetReadBuffer	- Allocates a read buffer
+;	 Subroutines:		MbufInsert		- Inserts a match record into match buffer
+;						UpperCaseIt 	- Convert a CName to its canonical form for comparison
+;						CompareMasked	- Masked bitwise comparison of a range of bytes
+;						CompareRange	- See if a value falls within a specified range
+;						CheckCriteria	- Checks current CNode against all specified search criteria
+;
+;						TimerRoutine	- timer task completion routine
+;						StartTimer		- installs a timer task
+;						StopTimer		- removes a timer task
+;
+
+
+	print	push
+	PRINT	OFF
+	LOAD		'StandardEqu.d'
+	INCLUDE 	'CatSrchPriv.a'
+	INCLUDE 	'BTScanPriv.a'			; for the NoMoreReads bit
+	include 	'LinkedPatchMacros.a'
+	include		'FileMgrPrivate.a'
+	PRINT	pop
+
+	import		BTIPScan, BTEndPScan, BTGetPhys
+
+;__________________________________________________________________________________
+;
+; Routine:		GetReadBuffer
+;
+; Function: 	Allocates a read buffer
+;
+; Input:		A3.L  -  CatSearch state record pointer
+;				A5.L  -  user pb pointer
+;
+; Output:		A1.L  -  address of buffer
+;				D3.L  -  length (in bytes) of buffer
+;
+; The deal - If the ioRBufPtr field in the param block points to a suitable buffer
+; that buffer will be used in the call.  If not, CatSearch will get a small (512-byte or so)
+; buffer off the A6 stack.	A buffer is suitable if it is bigger than the one CatSearch
+; would get off the stack.
+;__________________________________________________________________________________
+
+GetReadBuffer:	proc
+	import		bufAddr, bufLength
+	MOVE.L		ioOptBuffer(A5), D3 	; get the user's buffer address             <1.2>
+	BEQ.S		@getOurOwn				; nil? Use our own buffer then				<1.2>
+	MOVE.L		ioOptBufSize(A5), D3	; get the user's buffer length              <1.2>
+	CMP.L		#CSMinBufferSize, D3	; bigger than ours? 						<1.2>
+	BLE.S		@getOurOwn				; if not, we'll use ours                    <1.2>
+
+	; the user's buffer is cool; go ahead and use it                                <1.2>
+	MOVE.L		ioOptBuffer(A5), A1 	; move buffer address to output register	<1.2>
+	BRA.S		@GRBExit														;	<1.2>
+
+	; the user's buffer is uncool.  Get our own off the A6 stack.                   <1.4>
+@getOurOwn: 																	;	<1.2>
+	MOVE.L		#CSMinBufferSize, D3	; length of read buffer 					<1.4>
+	SUBA.L		D3, A6					; get memory off the stack					<1.4>
+	MOVEA.L 	A6, A1					; address of read buffer					<1.4>
+	BSET.B		#bufferOnStack, CSSR.flags(A3)	; remember so we can deallocate 	<1.4>
+@GRBExit:
+	RTS
+	_CSDebug	'GetReadBuffer', 0
+	endproc
+
+
+;
+; How the timer works here:
+;
+;	Before reading any data from the catalog, we start a timer running.
+;	When the timer expires the timer completion routine will set the timerFired bit
+;	in the CatSearch state record. This is passed along to the BTree scanner in the
+;	"noMoreReads" bit, telling the scanner to continue to deliver records until it
+;	needs to hit the disk again.
+;
+;	The effect is that CatSearch will process records until the timer goes off,
+;	at which point it will finish the records it's got in memory and exit
+;
+
+;__________________________________________________________________________________
+;
+; Routine:		TimerRoutine
+;
+; Function: 	Gets run when the timer goes off
+;				Sets the "noMoreReads" bit in the PScan flags
+;
+; Input:		A1		- csTimeTask record (a.k.a CatSearch state record pointer)
+;
+; Output:		A1		- trashed
+;
+; Note that since csTimeTask is first in the CSSR, a1 can be used like a pointer
+; to the CSSR.
+;__________________________________________________________________________________
+
+TimerRoutine:	proc
+	bset.b		#timerFired, CSSR.flags(a1) 		; boom!					<12>
+	rts
+	endproc
+
+;__________________________________________________________________________________
+;
+; Routine:		StartTimer
+;
+; Function: 	Checks to see if we need to run a timer during this search
+;				If so, starts the timer
+;
+; Input:		A3.L  -  CatSearch state record pointer
+;				D0.L  -  Time count (time manager form) or zero for no timer
+;
+; Output:		A3.L  -  CatSearch state record pointer
+;
+; If the time count is zero, no timer task is started.	If a timer task is started
+; the "timerWasInstalled" bit is set in CSSR.flags.
+;__________________________________________________________________________________
+
+StartTimerRegs	reg 		d0-d1/a0-a1
+
+StartTimer: 	proc
+	tst.l		d0						; do we need to start a timer?
+	beq.s		@StartTimerExit 		; if count = 0, no.
+
+	movem.l 	StartTimerRegs, -(sp)
+	move.l		d0, d1					; save time value around _InsTime
+	bset.b		#timerWasInstalled, CSSR.flags(a3)	; note that we're doing this
+	move.l		a3, a0					; a0 = ptr (our time task record)
+	lea.l		TimerRoutine, a1		; a1 = ptr(our timer completion routine)
+	move.l		a1, tmAddr(a0)			; point to our completion routine
+	_InsTime							; put our task in the queue
+	move.l		d1, d0					; restore time value
+	_PrimeTime							; start the timer ticking
+	movem.l 	(sp)+, StartTimerRegs
+
+@StartTimerExit:
+	rts
+	endproc
+
+;__________________________________________________________________________________
+;
+; Routine:		StopTimer
+;
+; Function: 	Checks to see if we installed a time manager task
+;				If so, removes it.
+;
+; Input:		A3.L  -  CatSearch state record pointer
+;
+; Output:		A3.L  -  CatSearch state record pointer
+;
+;__________________________________________________________________________________
+
+StopTimerRegs	reg 	d0/a0
+StopTimer:		proc
+
+	btst.b		#timerWasInstalled, CSSR.flags(a3)	; did we use a timer this search?
+	beq.s		@noTimerUsed
+
+	movem.l 	StopTimerRegs, -(sp)
+	move.l		a3, a0					; a0 = ptr (our time task record)
+	_RmvTime							; remove the task from the queue
+	movem.l 	(sp)+, StopTimerRegs
+
+@noTimerUsed:
+	rts
+	endproc
+
+;__________________________________________________________________________________
+;
+; Routine:		MBufInsert
+;
+; Function: 	Convert the current record into an FSSpec and insert it
+;				into the Match Buffer
+;				Increments nextMBuf pointer in CSSR
+;
+; Input:		A0.L  -  ptr(catalog key)
+;				A3.L  -  ptr(CatSearch state record)
+;
+; Output:
+;				A0.L  -  trash
+;				A1.L  -  trash
+;				D0.L  -  trash
+;__________________________________________________________________________________
+MBufInsert: 	proc
+	MOVE.L		CSSR.PSRPtr(A3), A1 		; A1 = ptr(Pscan state record)
+	MOVE.L		PSR.fcbptr(A1), A1			; A1 = ptr(fcb of btree file we're scanning)
+	MOVE.L		fcbVPtr(A1), A1 			; A1 = ptr(vcb of search volume)
+	MOVE.W		vcbVRefNum(A1), D0			; D0 = vRefNum of search volume
+	MOVE.L		CSSR.nextMBuf(A3), A1		; A1 = ptr(next empty MBuf entry)
+	MOVE.W		D0, (A1)+					; copy vRefNum into FSSpec
+	MOVE.L		ckrParID(A0), (A1)+ 		; copy ParID from key
+	MOVEQ.L 	#0, D0						; clear D0 to clear high bytes
+	LEA.L		ckrCName(A0), A0			; A0 = ptr(str31 containing CName)
+	MOVE.B		(A0), D0					; get length of CName
+	; don't add one for the length byte 'cause we're DBRAing                        <1.3>
+@MoveCName:
+	MOVE.B		(A0)+, (A1)+				; move the CName, byte by byte
+	DBRA		D0, @MoveCName				; (this is still faster than _BlockMove)
+	MOVE.L		CSSR.nextMBuf(A3), A1		; A1 = ptr(just filled MBuf entry)
+	ADDA.W		#FSSpec.size, A1			; A1 = ptr(MBuf entry after the one we just filled)
+	MOVE.L		A1, CSSR.nextMBuf(A3)		; remember position for next time
+	RTS
+	_CSDebug	'MBufInsert', 0
+
+;	_AssumeEQ	ckrParID+4, ckrCName		; put this in. ••
+	endproc
+
+;__________________________________________________________________________________
+;
+; UpperCaseIt
+;
+; Function: 	Convert the current cName (from the key to its catalog record)
+;				into a canonical form for comparison.  Store the result in the CatSearch
+;				state record. Zero flag up if current cName has length of zero.
+;
+; Register
+; Usage:		A0.L  -  ptr(key)
+;				A3.L  -  ptr(CatSearch state record)
+;				A4.L, A5.L - scratch
+;
+;				D5.L  - ioSearchBits
+;
+; Output:		zero flag high if current cName is empty
+;				D0.L - D4.L  are trashed
+;__________________________________________________________________________________
+UpperCaseIt:	proc
+	MOVE.L		A0, D2					; save address regs into trashable D regs
+	MOVE.L		A4, D3
+	MOVE.L		A5, D4
+	MOVEQ.L 	#0, D0					; clear D0 to clear byte 1 (for DBRA)
+	MOVE.B		ckrCName(A0), D0		; D0.W = len(current cName)
+	BEQ.S		@failUCI				; null cNames fail
+	MOVE.W		D0, D1					; keep another copy in D1
+
+	; Don't add one for the length byte, 'cause we're DBRAing
+	LEA.L		ckrCName(A0), A4		; A4 = ptr(current cName)
+	LEA.L		CSSR.copyCur(A3), A5	; A5 = ptr(copy of current cName)
+@block
+	MOVE.B		(A4)+, (A5)+			; move a byte
+	DBRA		D0, @block				; until we're done
+
+	MOVE.W		D1, D0					; D0.W = len(copy of current cName)
+	LEA.L		CSSR.copyCur+1(A3), A0	; A0 = ptr(1st char of copy of cName)
+	_FSUprString						; uppercase, strip diacriticals
+	MOVEQ.L 	#1, D0					; just something to clear the zero flag
+
+	; Zero flag is cool regardless of how we got here
+@failUCI
+	MOVEA.L 	D2, A0					; restore A regs from D regs
+	MOVEA.L 	D3, A4
+	MOVEA.L 	D4, A5
+	RTS
+	_CSDebug	'UpperCaseIt', 0
+	endproc
+
+;__________________________________________________________________________________
+;
+; CompareMasked
+;
+; Function: 	Do a bitwise comparison with mask.	The source and data are exclusive-or'ed
+;				together, yielding 1's where they differ.  That value is and'ed with the
+;				comparison mask, leaving a word with 1's where there are significant
+;				mismatches.  This technique allows the caller to set target bits only where
+;				the mask bits are 1, and leaving the rest undefined. If all long words
+;				pass, then the zero flag is set on return.
+;
+; Register
+; Usage:		A0.L  -  ptr(source data)  (what you're checking out)
+;				A4.L  -  ptr(target data)  (what you're looking for)
+;				A5.L  -  ptr(comparison mask) (what bits you care about)
+;
+;				D0.W  -  comparison count - 1 (note: we step by longwords)
+;				D1.L  -  trashed
+;				D2.L  -  trashed
+;
+; Output:		zero flag high if hit
+;
+; Note: This routine steps on the register usage of CheckCriteria by using A0 as an input.
+;__________________________________________________________________________________
+CompareMasked:	proc
+	MOVE.L		(A0)+, D1				; D1 = long word of source data
+	MOVE.L		(A4)+, D2				; D2 = long of target data
+	EOR.L		D2, D1					; D1 bits are on where source and data differ
+	AND.L		(A5)+, D1				; D1 bits are on where we cared about mismatches
+	DBNE		D0, CompareMasked		; keep going as long as the bytes match
+	RTS
+	_CSDebug	'CompareMasked', 0
+	endproc
+
+;__________________________________________________________________________________
+;
+; CompareRange
+;
+; Function: 	Compare to see if  ioSearchInfo1[D1].L <= D0.L <= ioSearchInfo2[D1].L
+;				Return carry clear if yes, carry set if not.
+;
+; Register
+; Usage:		A0.L  -  ptr(ioSearchInfo1)  (low end of range)
+;				A2.L  -  ptr(ioSearchInfo2)  (high end of range)
+;
+;				D0.L  -  current value
+;				D1.W  -  offset in CInfoPBRec to use for value
+;
+; Output:		zero flag high if D0 is in range, low if not
+;
+;__________________________________________________________________________________
+
+CompareRange:	proc
+	CMP.L		(A0, D1.W), D0			; is D0 >= low end of range?
+	BLO.S		@failRange				; if (D0 < value in ioSearchInfo1), fail
+	CMP.L		(A2, D1.W), D0			; is D0 <= high end of range?
+	BLS.S		@succeedRange			; if (D0 <= value in ioSearchInfo2), succeed
+@failRange:
+	MOVEQ.L 	#1, D0					; clear the zero flag
+	RTS
+@succeedRange:
+	MOVEQ.L 	#0, D0					; set the zero flag
+	RTS
+	_CSDebug	'CompareRange', 0
+	endproc
+
+;__________________________________________________________________________________
+;
+; Routine:		CheckCriteria
+;
+; Function: 	Checks current record against match criteria.
+;				Partial and full name matches are the optimized cases
+;
+; Input:		A0.L  -  ptr(key)
+;				A1.L  -  ptr(data record)
+;				A3.L  -  ptr(CatSearch state record)
+;				A5.L  -  ptr(user parameter block)
+;				D5.L  -  ioSearchBits
+;
+; Output:		A0.L				- ptr(key)
+;				A1.L, A2.L			- trash
+;				A3.L, A4.L, A5.L	- preserved
+;				D0, D1, D2, D3, D4	- trash
+;				D5, D6, D7			- preserved
+;				zero flag set if match, clear otherwise
+;__________________________________________________________________________________
+CheckCriteria:	proc
+	MOVE.L		A0, -(A6)
+	
+	CMP.B		#cmFilCN, cdrType(A1)		; is this a file record?					<14>
+	BEQ.S		@IsFile						;											<14>
+	CMP.B		#cmDirCN, cdrType(A1)		; is this a directory record?				<14>
+	BNE			@notSearchable				; we only consider files and directories	<14>
+	BCLR.B		#isFile, CSSR.flags(A3)		; indicate that current record is a dir		<14>
+	BTST.B		#inclDirs, CSSR.flags(A3)	; do criteria include directories?			<14>
+	BEQ			@failed						; if not, we're done already				<14>
+	BRA.S		@LookAtIt					; if so, continue with criteria				<14>
+	
+@IsFile:
+	BSET.B		#isFile, CSSR.flags(A3) 	; indicate that current record is a file
+	BTST.B		#inclFiles, CSSR.flags(A3)	; do criteria include files?
+	BEQ			@failed						; if not, we're done already
+
+@LookAtIt:
+	BTST.L		#fsSBPartialName, D5		; is name substring included?
+	BEQ.S		@FullName					; go check the next thing (Exact cName match)
+
+	; This is the 'name substring' match
+	BSR 		UpperCaseIt 				; make an uppercase copy of the current cName
+	BEQ 		@failed 					; zero flag indicates current cName is empty
+
+	;	Register use during substring compare
+	;	A0 - ptr(current cName) 			D1 - starting point limit in current cName
+	;	A1 - ptr(substring) 				D2 - length of substring
+	;	A2 - scratch for DBRA				D3 - next starting point in current cName
+	;	A3 - scratch for DBRA				D4 - scratch for DBNE
+
+	MOVEM.L 	A0/A1/A3, -(A6) 		; save regs around string compare loop
+	LEA.L		CSSR.copyCur(A3), A0	; A0 = ptr(current cName)
+	LEA.L		CSSR.copyTarg(A3), A1	; A1 = ptr(target substring)
+	MOVE.B		(A0), D1				; D1 = len(current cName)
+	MOVEQ.L 	#0, D2					; make D2 clean for DBRA
+	MOVE.B		(A1)+, D2				; D2 = len(target substring) (A1 = ptr(1st char))
+	SUB.B		D2, D1					; D1 = -1 + last possible starting point for a match
+	BMI.S		@failPartial			; if that's < 0, we couldn't possibly match
+
+	SUBQ.L		#1, D2					; adjust D2 for DBRA
+	ADDQ.B		#1, D1					; D1 = last possible starting point for a match
+	MOVEQ.L 	#1, D3					; initialize "next starting point" value (past length byte)
+
+@outer:
+	LEA.L		(A0, D3), A2			; A2 = ptr(place to look for match)
+	MOVEA.L 	A1, A3					; A3 = ptr(1st char in substring)
+	MOVE.W		D2, D4					; D4 counts the DBRA
+@loop:
+	CMPM.B		(A2)+, (A3)+			; compare char by char
+	DBNE		D4, @loop				; and keep going as long as they're the same
+	BEQ.S		@hitPartial 			; all the way without a miss = a hit
+
+@again:
+	ADDQ.B		#1, D3					; up the starting point
+	CMP.B		D1, D3					; is starting point beyond last possible start?
+	BLS.S		@outer					; as long as it's not, check another starting point
+
+	; if we fell through to here, we missed on all starting points
+@failPartial
+	MOVEM.L 	(A6)+, A0/A1/A3 		; restore regs saved around substring compare
+	BRA 		@failed
+
+@hitPartial
+	MOVEM.L 	(A6)+, A0/A1/A3 		; restore regs saved around substring compare
+	MOVEQ.L 	#maskPartialName, D0	; D0 = ioSearchBits long w/fsSBPartialName set
+	CMP.L		D0, D5					; was PartialName the only criteria?
+	BEQ 		@hit					; then leave now
+
+@FullName:								; This is the 'full cName' match
+	BTST.L		#fsSBFullName, D5		; is full name included?
+	BEQ.S		@FlParID				; go check the next thing (file parent)
+
+	BSR 		UpperCaseIt 			; make an uppercase copy of the current cName
+	MOVE.L		A4, D1					; save A4 around string compare
+	LEA.L		CSSR.copyCur(A3), A2	; A2 = ptr(current cName)
+	LEA.L		CSSR.copyTarg(A3), A4	; A4 = ptr(target string)
+	MOVE.B		(A2), D0				; D0 = length of current CName (+ length byte for DBRA)
+@FullNameLoop:
+	CMPM.B		(A2)+, (A4)+			; compare a byte
+	DBNE		D0, @FullNameLoop
+	BNE.S		@failedFull 			; did we end on a missed character?
+
+	; If we fell through to here, we hit
+	MOVEA.L 	D1, A4					; restore reg saved around string compare
+	MOVEQ.L 	#maskFullName, D0		; D0 = ioSearchBits long w/fsSBFullName set
+	CMP.L		D0, D5					; was Fullname the only criteria?
+	BEQ 		@hit					; then leave now
+	BRA.S		@FlParID				; or else keep going with the next criteria
+
+@failedFull:
+	MOVEA.L 	D1, A4					; restore reg saved around string compare
+	BRA 		@failed
+
+@FlParID:								; This is the parent ID check
+	MOVE.L		ckrParID(A0), D0		; D0 = parent ID of current cNode (grabbed before we change A0)
+
+	; from here down,
+	;	 A0 - points to ioSearchInfo1
+	;	 A2 - points to ioSearchInfo2
+	MOVEA.L 	ioSearchInfo1(A5), A0		; A0 = ptr(CInfoPBRec with values & low end of ranges)
+	MOVEA.L 	ioSearchInfo2(A5), A2		; A2 = ptr(CInfoPBRec with masks & high end of ranges)
+
+	BTST.L		#fsSBFlParID, D5		; is parent ID included?
+	BEQ.S		@FlAttrib				; go check the next thing (file attributes)
+	MOVEQ.L 	#ioFlParID, D1			; D1 = offset into CInfoPBRec to parent ID
+	BSR 		CompareRange
+	BNE 		@failed
+
+@FlAttrib:								; This is the file attributes check
+	BTST.L		#fsSBFlAttrib, D5		; are file attributes included?
+	BEQ.S		@DrNmFls				; go check the next thing (files/directory)
+	MOVE.B		filFlags(A1), D0		; D0 = file flags (bit 0 = locked is the only one)
+	MOVE.B		ioFlAttrib(A0), D1		; D1 = user's target for file attrib bits
+	EOR.B		D1, D0					; D0 bits on where source and target differ
+	AND.B		CSSR.attribMask(A3), D0 ; D0 bits on where we cared about mismatches
+	BNE 		@failed
+
+@DrNmFls:
+	BTST.L		#fsSBDrNmFls, D5		; is # files per directory included?
+	BEQ.S		@FlFndrInfo 			; go check the next thing (finder info)
+	MOVE.W		dirVal(A1), D0			; D0 = # files in current directory
+	CMP.W		ioDrNmFls(A0), D0		; is D0 >= low end of range?
+	BCS 		@failed 				; if (D0 < # files in this directory), fail
+	CMP.W		ioDrNmFls(A2), D0		; is D0 <= high end of range?
+	BLS.S		@FlFndrInfo 			; if (D0 <= # files), continue with next criteria
+	BRA 		@failed 				; D0 too high; fail
+
+@FlFndrInfo:
+	BTST.L		#fsSBFlFndrInfo, D5 	; is finder info included?
+	BEQ.S		@FlXFndrInfo			; go check the next thing (extra finder info)
+	MOVEM.L 	A0/A4/A5, -(A6) 		; save A0/A4/A5 around test
+	MOVEQ.L 	#(FlFndrInfoLen/4-1), D0; D0 = DBRA count for # of finder info bytes
+	LEA.L		ioFlUsrWds(A0), A4		; A4 = ptr(target user words)
+	LEA.L		ioFlUsrWds(A2), A5		; A5 = ptr(mask for user words)
+	BTST.B		#isFile, CSSR.flags(A3) ; are we looking at a file record?
+	BEQ.S		@FlFndrInfoIsDir		; if not, go get the right offset for a directory
+	LEA.L		filUsrWds(A1), A0		; A0 = ptr(source data)
+	BRA.S		@1
+@FlFndrInfoIsDir:
+	LEA.L		dirUsrInfo(A1), A0		; A0 = ptr(source data)
+@1:
+	BSR 		CompareMasked			; see if they match
+	MOVEM.L 	(A6)+, A0/A4/A5 		; restore A0/A4/A5
+	BNE 		@failed
+
+@FlXFndrInfo:
+	BTST.L		#fsSBFlXFndrInfo, D5	; is extra finder info included?
+	BEQ.S		@FlLgLen				; go check the next thing (file logical length)
+	MOVEM.L 	A0/A4/A5, -(A6) 		; save A0/A4/A5 around test
+	MOVEQ.L 	#(FlXFndrInfoLen/4-1), D0; D0 = DBRA count for # of Xfinder info bytes
+	LEA.L		ioFlxFndrInfo(A0), A4	; A4 = ptr(target Xfinder info)
+	LEA.L		ioFlxFndrInfo(A2), A5	; A5 = ptr(mask Xfinder words)
+	BTST.B		#isFile, CSSR.flags(A3) ; are we looking at a file record?
+	BEQ.S		@FlXFndrInfoIsDir		; if not, go get the right offset for a directory
+	LEA.L		filFndrInfo(A1), A0 	; A0 = ptr(source data)
+	BRA.S		@2
+@FlXFndrInfoIsDir:
+	LEA.L		dirFndrInfo(A1), A0 	; A0 = ptr(source data)
+@2:
+	BSR 		CompareMasked			; see if they match
+	MOVEM.L 	(A6)+, A0/A4/A5 		; restore A0/A4/A5
+	BNE 		@failed
+
+@FlLgLen:
+	BTST.L		#fsSBFlLgLen, D5		; is logical length included?
+	BEQ.S		@FlPyLen				; go check the next thing (physical length)
+	MOVE.L		filLgLen(A1), D0		; D0 = logical length of current file
+	MOVEQ.L 	#ioFlLgLen, D1			; D1 = offset into CInfoPBRec to find logical length
+	BSR 		CompareRange
+	BNE 		@failed
+
+@FlPyLen:
+	BTST.L		#fsSBFlPyLen, D5		; is physical length included?
+	BEQ.S		@FlRLgLen				; go check the next thing (resource logical length)
+	MOVE.L		filPyLen(A1), D0		; D0 = physical length of current file
+	MOVEQ.L 	#ioFlPyLen, D1			; D1 = offset into CInfoPBRec to find physical length
+	BSR 		CompareRange
+	BNE 		@failed
+
+@FlRLgLen:
+	BTST.L		#fsSBFlRLgLen, D5		; is resource logical length included?
+	BEQ.S		@FlRPyLen				; go check the next thing (resource physical length)
+	MOVE.L		filRLgLen(A1), D0		; D0 = resource logical length of current file
+	MOVEQ.L 	#ioFlRLgLen, D1 		; D1 = offset into CInfoPBRec to find resource logical length
+	BSR 		CompareRange
+	BNE.S		@failed
+
+@FlRPyLen:
+	BTST.L		#fsSBFlRPyLen, D5		; is resource physical length included?
+	BEQ.S		@FlCrDat				; go check the next thing (file create date)
+	MOVE.L		filRPyLen(A1), D0		; D0 = resource physical length of current file
+	MOVEQ.L 	#ioFlRPyLen, D1 		; D1 = offset into CInfoPBRec to find resource physical length
+	BSR 		CompareRange
+	BNE.S		@failed
+
+@FlCrDat:
+	BTST.L		#fsSBFlCrDat, D5		; is creation date included?
+	BEQ.S		@FlMdDat				; go check the next thing (file modification date)
+	BTST.B		#isFile, CSSR.flags(A3) ; are we looking at a file record?
+	BEQ.S		@FlCrDatIsDir			; if not, go get the right offset for a directory
+	MOVE.L		filCrDat(A1), D0		; D0 = creation date of current cNode
+	BRA.S		@3
+@FlCrDatIsDir:
+	MOVE.L		dirCrDat(A1), D0		; D0 = creation date of current cNode
+@3:
+	MOVEQ.L 	#ioFlCrDat, D1			; D1 = offset into CInfoPBRec to find creation date
+	BSR 		CompareRange
+	BNE.S		@failed
+
+@FlMdDat:
+	BTST.L		#fsSBFlMdDat, D5		; is modification date included?
+	BEQ.S		@FlBkDat				; go check the next thing (file backup date)
+	BTST.B		#isFile, CSSR.flags(A3) ; are we looking at a file record?
+	BEQ.S		@FlMdDatIsDir			; if not, go get the right offset for a directory
+	MOVE.L		filMdDat(A1), D0		; D0 = modification date of current cNode
+	BRA.S		@4
+@FlMdDatIsDir:
+	MOVE.L		dirMdDat(A1), D0		; D0 = modification date of the current cNode
+@4:
+	MOVEQ.L 	#ioFlMdDat, D1			; D1 = offset into CInfoPBRec to find modification date
+	BSR 		CompareRange
+	BNE.S		@failed
+
+@FlBkDat:
+	BTST.L		#fsSBFlBkDat, D5		; is backup date included?
+	BEQ.S		@hit					; that's the last one, so we hit
+	BTST.B		#isFile, CSSR.flags(A3) ; are we looking at a file record?
+	BEQ.S		@FlBkDatIsDir			; if not, go get the right offset for a directory
+	MOVE.L		filBkDat(A1), D0		; D0 = backup date of current cNode
+	BRA.S		@5
+@FlBkDatIsDir:
+	MOVE.L		dirBkDat(A1), D0		; D0 = backup date of current cNode
+@5:
+	MOVEQ.L 	#ioFlBkDat, D1			; D1 = offset into CInfoPBRec to find backup date
+	BSR 		CompareRange
+	BEQ.S		@hit
+
+@failed:
+	MOVEQ.L 	#1, D0					; indicate failure
+	BRA.S		@CheckNegate
+@hit:
+	MOVEQ.L 	#0, D0					; indicate success
+
+@checkNegate:
+	btst.l		#fsSBNegate, d5 		; do we want everything that doesn't match?
+	beq.s		@CompareExit			; no; the result stands
+
+	eor.b		#1, d0					; reverse the outcome
+	bra.s		@compareExit
+
+@notSearchable: 						; not a file or directory record
+	moveq.l 	#1, d0					; indicate failure
+
+@CompareExit:
+	tst.w		d0						; set Z to indicate success
+	MOVEA.L 	(A6)+, A0
+	RTS
+	_CSDebug	'CheckCriteria', 0
+	endproc
+
+;__________________________________________________________________________________
+;
+; Routine:		VerifyCSPB
+;
+; Function: 	Verify that a param block contains legal values
+;
+; Input:		A0.L  -  parameter block pointer
+;
+; Register Usage (during call):
+;	A0.L  -  pointer to user's param block              D0.L - scratch
+;	A1.L  -  pointer to ioSearchInfo1							D1.L - scratch
+;														D2.B - copy of user's ioFlAttrib mask
+;														D3.L - cssr.flags byte
+;	A4.L  -  pointer to ioSearchInfo2
+;	A5.L  -  pointer to user's param block              D5.L - ioSearchBits
+;
+; Output:
+;	d0.W  -  result code (noErr, paramErr)
+;	d2.b  -  copy of user's ioFlAttrib mask, ioDirFlg masked
+;	d3.b  -  cssr.flags with inclFiles, inclDirs and inclNames set correctly
+;
+;__________________________________________________________________________________
+VerifyCSPBRegs	reg 		A1/A4-A5/D1/D5
+VerifyCSPB: 	proc		export
+
+	movem.l 	VerifyCSPBRegs, -(sp)
+	MOVE.L		a0, a5						; a5 = ptr(user's pb)
+
+	; look for conditions that return paramErr
+	TST.L		ioMatchPtr(A5)			; Nil mBuf? 							(P1)
+	BEQ 		@ParamErrExit				; is a param err
+	TST.L		ioSearchInfo1(A5)				; Nil ioSearchInfo1?							(P2)
+	BEQ 		@ParamErrExit				; is a param err
+	MOVE.L		ioSearchBits(A5), D5		; D5 = spec mask
+	MOVE.L		D5, D1						; D1 = scratch copy of spec mask
+	ANDI.L		#maskNotSearchInfo2, D1		; any criteria that requires ioSearchInfo2?	(P3)
+	BEQ.S		@checkNamesIncluded 		; if not, we don't worry about ioSearchInfo2
+	TST.L		ioSearchInfo2(A5)				; Nil ioSearchInfo2?
+	BEQ 		@ParamErrExit				; is a param err
+
+@checkNamesIncluded:
+; If the search includes names, make a note of it and check to make sure that the name
+; is non-nil and non-zero length.
+	clr.b		d3							; d3 will become cssr.flags byte
+	BTST.L		#fsSBPartialName, D5		; does search includes partial name?
+	BNE.S		@cNameCheck 				; then go check it
+	BTST.L		#fsSBFullName, D5			; does search includes full name?
+	BEQ.S		@checkSpecBits				; no? then don't need to copy name
+
+@cNameCheck:								; make sure name is not nil or zero length
+	MOVEA.L 	ioSearchInfo1(A5), A1			; A1 = ptr(ioSearchInfo1)
+	MOVEA.L 	ioFileName(A1), A1			; A1 = ptr(ioName)
+	MOVE.L		A1, D2						; nil ioNamePtr?						(P4)
+	BEQ 		@ParamErrExit				; is a param err
+	MOVEQ.L 	#0, D0						; clear D0 to clear high bytes
+	MOVE.B		(A1), D0					; D0 = len(target cName)
+	BEQ 		@ParamErrExit				; zero length target name is a param err(P5)
+	BSET.L		#inclNames, d3				; note that the search includes names
+
+@checkSpecBits:
+	MOVEA.L 	ioSearchInfo1(A5), A1			; A1 = ptr(ioSearchInfo1)
+	MOVEA.L 	ioSearchInfo2(A5), A4			; A4 = ptr(ioSearchInfo2)
+	BTST.L		#fsSBFlAttrib, D5			; are file attributes included in the search?
+	BEQ.S		@includeBoth				; if not, search is on both files and directories
+
+	move.b		ioFlAttrib(a4), d2			; d2.b = user's attribute mask
+	MOVE.B		#maskBadAttribs, D0 		; D0 = illegal attribute bits on		(P6)
+	AND.B		ioFlAttrib(A4), D0			; are there any illegal attribute bits included?
+	BNE 		@ParamErrExit				; then it's a param err
+	BTST.L		#ioDirFlg, d2				; is the mask bit for directories on?
+	BEQ.S		@includeBoth				; no, which means to include both
+	BTST.B		#ioDirFlg, ioFlAttrib(A1)	; what's the desired value for the directory bit?
+	BEQ.S		@justFiles					; caller wants it off, i.e. just files
+	BSET.L		#inclDirs, d3				; caller wants it on, i.e. just directories
+	BRA.S		@clearMaskBit				; we're done deciding about files vs. directories
+
+@includeBoth:
+	BSET.L		#inclDirs, d3				; the search includes directories
+@justFiles:
+	BSET.L		#inclFiles, d3				; the search includes files
+
+@clearMaskBit
+	BCLR.L		#ioDirFlg, d2				; clear the dir bit; it isn't actually on disk
+
+@P7:										;										(P7)
+	BTST.L		#inclDirs, d3				; are directories included in the search?
+	BEQ.S		@P8 						; if not, don't worry about rule 7
+	BTST.L		#fsSBFlAttrib, D5			; does the search include file attributes?
+	BEQ.S		@P8 						; if not, don't worry about rule 7
+	BTST.B		#ioLockFlg, ioFlAttrib(A4)	; did caller care about the locked bit?
+	BNE.S		@ParamErrExit				; locked attribute is meaningless on a directory
+
+@P8:										;										(P8)
+	BTST.L		#fsSBDrNmFls, D5			; is #files per directory included?
+	BEQ.S		@P9 						; then can't conflict with files
+	BTST.L		#inclFiles, d3				; does the search include files?
+	BNE.S		@ParamErrExit				; then that's a param error
+
+@P9:										;										(P9-P12)
+	BTST.L		#inclDirs, d3				; are directories included in the search?
+	BEQ.S		@OKExit 					; if not, don't worry about rules 9-12
+	MOVE.L		D5, D0						; make a copy of ioSearchBits
+	ANDI.L		#maskLengthBits, D0 		; kill all but the bits specifying some sort of length
+	BNE.S		@ParamErrExit				; any length spec is meaningless in a directory
+
+@OKExit:
+	moveq.l 	#noErr, d0
+	bra.s		@Exit
+
+@ParamErrExit:
+	move.w		#paramErr, d0
+
+@Exit:
+	movem.l 	(sp)+, VerifyCSPBRegs
+	rts
+
+	endproc
+
+; Here are the parameter checking rules for PBCatSearch:						<1.3>
+; The labels at the left also appear in the code which checks that rule.
+
+; You get a paramErr if
+; P1	ioMBufPtr is nil
+; P2	ioSearchInfo1 is nil
+; P3	(ioSearchBits includes not(fsSBPartialName or fsSBFullName or fsSBNegate)) and ioSearchInfo2 is nil;
+;		i.e. A selected search bit requires the presence of ioSearchInfo2
+;
+; Then these,
+; ioSearchBits rules: You get a paramErr if
+; P4	fsSBPartialName
+;		and (ioSearchInfo1->ioNamePtr = (nil or empty string))
+; P5	fsSBFullName (same as above)
+; P6	fsSBFlAttrib and some bit other than 0 (locked) or 4 (directory) returns paramErr
+; P7	search includes directories and
+;		(ioSearchBits includes fsSBFlAttrib) and (ioSearchInfo2^.ioFlAttrib bit 0 = 1)
+;		return paramErr
+;		(i.e. "locked directory" makes no sense)
+; P8	fsSBDrNmFls and files returns paramErr
+; P9	fsSBFlLgLen and directories returns paramErr
+; P10	fsSBFlPyLen (same as above)
+; P11	fsSBFlRLgLen (same as above)
+; P12	fsSBFlRPyLen (same as above)
+;
+; A search includes (files only) if
+;	ioSearchBits includes fsSBFlAttrib
+;			- and -
+;	ioSearchInfo1^.ioFlAttrib bit 4 = 0 		i.e. explicitly looking for non-directories
+;			- and -
+;	ioSearchInfo2^.ioFlAttrib bit 4 = 1
+;
+; A search includes (directories only) if
+;	ioSearchBits includes fsSBFlAttrib
+;			- and -
+;	ioSearchInfo1^.ioFlAttrib bit 4 = 1 		i.e. explicitly looking for directories
+;			- and -
+;	ioSearchInfo2^.ioFlAttrib bit 4 = 1
+
+; A search includes both if
+;	ioSearchBits includes fsSBFlAttrib
+;			- and -
+;	ioSearchInfo2^.ioFlAttrib bit 4 = 0 		i.e. don't care about the directory bit
+;
+;			- OR -
+;	ioSearchBits doesn't include fsSBFlAttrib   i.e. don't care about attributes at all
+
+
+;__________________________________________________________________________________
+;
+; Routine:		CheckCSPB
+;
+; Function: 	Check that a param block contains legal values
+;				This is a wrapper of VerifyCSPB that is set up as an
+;				unqueued a060 call.  Its main purpose in life is to let
+;				external file systems get a quick parameter block check
+;				on a CatSearch call.
+;
+;				(Unqueued a060 call means that this is pretty much a register-based
+;				 OS trap. )
+;
+; Input:		A0.L  -  parameter block pointer
+;
+; Output:		D0.W  -  noErr or paramErr
+;__________________________________________________________________________________
+CheckCSPBRegs	reg 	d2/d3			; the output registers from VerifyCSPB
+CheckCSPB		proc	export
+
+	movem.l 	CheckCSPBRegs, -(sp)
+	bsr 		VerifyCSPB
+	movem.l 	(sp)+, CheckCSPBRegs
+	rts
+	endproc
+
+;__________________________________________________________________________________
+;
+; Routine:		CMCatSearch
+;
+; Function: 	Locates files by search criteria
+;
+; Input:		A0.L  -  parameter block pointer
+;
+; Register Usage (during call):
+;	A0.L  -  scratch									D0.L - scratch
+;	A1.L  -  scratch									D1.L - scratch
+;	A2.L  -  scratch									D2.L - scratch
+;	A3.L  -  pointer to CatSearch State Record (CSSR)	D3.L - scratch
+;	A4.L  -  pointer to PScan State Record (PSR)		D4.L - scratch
+;	A5.L  -  pointer to user's param block              D5.L - ioSearchBits
+;	A6.L  -  standard file system stack
+;														D7.L - ioActMatchCount
+;
+; Output:		D0.W  -  result code (noErr, extFSErr, ioErr, nsvErr, catChanged, paramErr)
+;	A0.L, A1.L - trash
+;	D0.L, D1.L, D2.L - trash
+;__________________________________________________________________________________
+CMCatSearch:	proc	export
+
+	jsrRom		FSQUEUE   					; queue up the request
+	SUBA.W		#CSSR.size, A6				; allocate a CSSR on A6 					moved here <1.3>
+	CLR.B		CSSR.flags(A6)				; clear the flags							moved here <1.3>
+	MOVEA.L 	A6, A3						; move CSSR ptr to a safe register				<12>
+	MOVEA.L 	A0, A5						; move userPB ptr to a safe register			<12>
+
+	move.l		ioSearchTime(a5), d0		; get max search time (time mgr count)			<12>
+	bsr 		StartTimer					; start a timer, if needed, right away			<12>
+
+	jsrRom		DTRMV3   					; find vol using ioNamePtr & ioVRefNum (D023/A234 trashed)
+	MOVEA.L 	A6, A3						; reload pointer to CSSR (doesn’t hurt CCs)		<12>
+	BNE 		@Exit						; (DtrmV3 puts VCBPtr in A2)
+	MOVE.W		vcbSigWord(A2), D0			; Check out the volume signature
+	CMP.W		#SigWord, D0				; Is this an MFS disk?	•• use TFSVCBCk
+	BNE.S		@ItsHFS 					; Keep going if not
+	MOVE.W		#wrgVolTypErr, D0			; Tell the silly caller
+	BRA 		@Exit						; and cruise
+
+@ItsHFS:
+	jsrRom		EXTOFFLINCK   				; Is this volume on-line and one of ours?				<1.2>
+	BEQ.S		@VolumeIsCool				; Keep going if so										<1.2>
+	BRA 		@Exit						; Go home if not (with extFSErr or volOffLinErr in D0)	<1.2>
+
+@VolumeIsCool:
+
+	MOVE.L		ioSearchBits(A5), D5		; D5 = user's spec mask
+	MOVEQ.L 	#0, D7						; no matches yet
+	MOVE.L		D7, ioActMatchCount(A5) 	; set PB to initial value
+
+	MOVE.L		ioMatchPtr(A5), CSSR.nextMBuf(A3) ; 1st MBuf entry is at the beginning of the buffer
+
+; a0 = cspb
+	bsr 		VerifyCSPB					; d2 = ioFlAttrib, d3 = cssr.flags
+	bne 		@Exit						; no? ->
+	move.b		d2, cssr.attribMask(a3) 	; save copy of user's attrib bits
+	or.b		d3, cssr.flags(a3)			; add flags, keeping timer bit		<13>
+
+; look for conditions that don't return paramErr, but are reason to quit now
+	TST.L		ioReqMatchCount(A5) 		; max 0 matches?
+	BEQ 		@LeaveEarly 				; just quit now; no error
+
+; name setup - if the search includes any of the file name bits we need to make an
+; uppercase copy of the target file name.
+	BTST.L		#inclNames, d3				; does the search include names?
+	BEQ.S		@go 						; if not, we're ready to roll
+	MOVEA.L 	ioSearchInfo1(A5), A0		; A0 = ptr(ioSearchInfo1)
+	MOVEA.L 	ioFileName(A0), A0			; A0 = ptr(ioName)
+	MOVEQ.L 	#0, D0						; clear D0 to clear high bytes
+	MOVE.B		(A0), D0					; D0 = len(target cName)
+	CMPI.B		#31, D0						; is length > max hfs length?			<14>
+	BHI.S		@NoWayName					; then we do this little optimization	<14>
+	ADDQ.B		#1, D0						; D0 = len(target cName) + length byte
+	LEA.L		CSSR.copyTarg(A3), A1		; A1 = ptr(copy of target cName)
+	_BlockMove								; make the copy
+	MOVEQ.L 	#0, D0						; clear D0 to clear high bytes
+	MOVEA.L 	A1, A0						; A0 = ptr(length byte of copy of target cName)
+	MOVE.B		(A0)+, D0					; D0 = len(target cName)
+	_FSUprString							; uppercase, strip diacriticals
+	bra.s		@go							;										<14>
+
+; <14>
+; Since we can't copy extra-long names into our private buffer (to let them fail against
+; all the names on this Str31'd hfs volume) we'll psych out the parameter right here.
+@NoWayName:
+	moveq.l		#eofErr, d0					; in case we need this
+	btst.l		#fsSBNegate, D5				; do we match everything or nothing?
+	beq.s		@Exit						; if no negation, match nothing
+	moveq.l		#0, D5						; if negation, clear criteria so as to match everything
+
+; the parameters are cool, so start searching
+@go:
+	MOVE.W		vcbCTRef(A2), D0			; catalog btree refnum
+	BSR 		GetReadBuffer				; A1 = ptr(buffer), D3 = length, cssr.bufferOnStack set
+	LEA.L		ioCatPosition(A5), A0		; A0 = ptr(CatPosition record in param block)	<dnf 1.5>
+
+	BSR 		BTIPScan					; A4 is now ptr(PScan state record), 1st record is read
+	BNE.S		@EndScan					; BTIPScan returns a regular OSErr
+	MOVE.L		A4, CSSR.PSRPtr(A3) 		; save a copy of the PScan state record
+
+@loop:
+	BSR 		CheckCriteria				; do we have a match?
+	BNE.S		@continue					; Z=1 indicates a hit
+
+	BSR 		MBufInsert					; yes, so add entry to match buffer
+	ADDQ.L		#1, D7						; tally this match
+	MOVE.L		D7, ioActMatchCount(A5)		; update PB, so async users can watch
+	CMP.L		ioReqMatchCount(A5), D7		; hit user match limit?
+	BHS.S		@LimitExit
+
+@continue:
+	btst		#timerFired, CSSR.flags(a3)	; did the timer fire?						<12>
+	bz.s		@noTimerYet					; no, don’t bug Mr. Scanner					<12>
+	bset		#noMoreReads, PSR.flags(a4)	; yes, tell him not to hit the disk again	<12>
+@noTimerYet
+
+	BSR 		BTGetPhys					; on to the next record
+	BNE.S		@EndScan					; either a real error, or just EOF
+	BRA.S		@loop
+
+; Exit code
+; There are 5 paths out of CatSearch
+;	1) LeaveEarly - set result to noErr, don't clean up PScan
+;	2) ParamErrExit - set result to paramErr, don't clean up PScan
+;	3) LimitExit - set result to noErr, and clean up the PScan
+;	4) EndScan - don't touch the result, and clean up the PScan
+;	5) Exit - don't touch the result code, don't clean up the PScan.
+
+@LeaveEarly:
+	MOVEQ.L 	#noErr, D0					; No error
+	BRA.S		@Exit						; No PScan cleanup
+
+@ParamErrExit:
+	MOVE.W		#paramErr, D0
+	BRA.S		@Exit
+
+@LimitExit:
+	MOVEQ.L 	#noErr, D0					; user limit condition implies noErr
+
+@EndScan:
+	CMP.W		#userCanceledErr, d0		; is this because noMoreReads was set?
+	BNE.S		@errorIsReal				; if not, this must be a real error
+	MOVEQ.L 	#noErr, d0					; if so, replace the signal error with noErr
+
+@errorIsReal:
+	LEA.L		ioCatPosition(A5), A0		; A0 = ptr(CatPosition record in param block)		<dnf 1.5>
+	BSR 		BTEndPScan					; clean up PScan (update CatPosition record)
+
+@Exit:										; Pass the error code on and exit
+	BSR 		StopTimer					; Stop the timer if we started one			<12>
+	BTST.B		#bufferOnStack, CSSR.flags(A3)	; do we have our buffer on the stack?
+	BEQ.S		@notBufferOnStack			; if not, don't deallocate one
+	ADDA.L		#CSMinBufferSize, A6		; deallocate read buffer
+@notBufferOnStack:
+	ADDA.W		#CSSR.size, A6				; deallocate CSSR
+	suba.l		a3, a3						; clear WDCB pointer for external file systems		<17>
+	jmpRom		CMDDONE   
+
+	_CSDebugRts 'CMCatSearch', 0
+	endproc
+	end

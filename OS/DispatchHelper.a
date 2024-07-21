@@ -1,0 +1,313 @@
+;
+;	File:		DispatchHelper.a
+;
+;	Written by:	Jeff Miller
+;
+;	Contains:	Code implementing the generic dispatcher (DispatchHelper) and generic procedure
+;				dispatcher (ProcHelper).  Both are installed as OSTraps, but they should always
+;				be called from the low memory vector rather than through the trap mechanism.
+;
+;	Copyright:	й 1990-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <8>	 8/29/91	JSM		Cleanup header.
+;		 <7>	10/22/90	JSM		<dba> Use dispatchFlags equates and DispatchUnimplementedRoutine
+;									macro, add support for more efficient linked patch dispatching
+;									with absolute addresses, don't support NULL dispatch table
+;									entries anymore for more efficient dispatching, misc. other
+;									optimizations.
+;		 <6>	 9/25/90	KIP		Change it back to a linked patch.
+;		 <5>	  8/9/90	gbm		LinkPatch REALLY hates main modules...
+;		 <4>	  8/8/90	SAM		Making DispatchHelper & ProcHelper load as an old style ptch.
+;									еее---> Temporary <---еее remove this when the Sound Mgr code is
+;									converted to a linked patch (as it should be).
+;		 <3>	 7/12/90	STB		Moved _ProcHelper & _DispatchHelper patch installation code from
+;									MiscPatches.a to here.
+;		 <2>	  7/8/90	JSM		ProcHelper takes a pointer to use count instead of an offset
+;									now.
+;		 <1>	  7/7/90	JSM		First checked in.
+;
+
+			LOAD		'StandardEqu.d'
+			INCLUDE		'DispatchHelperPriv.a'
+			INCLUDE		'LinkedPatchMacros.a'
+
+;___________________________________________________________________________________
+; 			These linked patches are installed on all ROM families
+;
+			ROMs Plus,SE,II,Portable,IIci									
+
+;___________________________________________________________________________________
+;			DispatchHelper
+;
+;			A generic dispatcher.  Assumes all routines it dispatches to are
+;			Pascal functions returning an OSErr.  Installed as OS trap $A0EC, but
+;			should always be called directly through the vector at $7B0.
+;
+;			Selectors are in D0.W, with the low byte containing the actual selector
+;			and the high byte containing the number of words of parameters on the
+;			stack.
+;
+;			Uses a standard DispatchHelperTable specifying the valid selector range and
+;			offsets to each routine.
+;
+;			If the low byte of D0 is out of range, DispatchHelper strips the parameters
+;			off the stack and returns paramErr.
+;
+;			If bit 1 (dhAbsoluteEntries) of dispatchFlags in the DispatchHelperTable is set,
+;			DispatchHelper assumes that the entries in the dispatch table are 4 byte absolute
+;			addresses (used mainly in linked patches).  Otherwise, entries in the dispatch
+;			table are 2 byte offsets from the beginning of the table to the actual routine.
+;
+;			If bit 0 (dhSelectorsEven) of dispatchFlags in the DispatchHelperTable is set,
+;			DispatchHelper assumes that the selector in D0 is already even and doesn't multiply
+;			it by two to get to the offset.  Note that all even selectors are currently unsupported
+;			for absolute address dispatch tables.
+;
+;			General implementation strategy:  since absolute addresses are used by linked patches in
+;			some very common cases (for example: dialogs, windows, and menus), we want that case to
+;			execute the fastest (i.e. with the fewest branches).  Note that trying to overload
+;			dispatchFlags too much goes against the original intent of DispatchHelper, which is
+;			speed.
+;
+;			Inputs:
+;				A0 		Pointer to DispatchHelperTable.
+;				D0.W	Low byte is selector, high byte is number of words of parameters.
+;
+;			Outputs:
+;				D0.W	untouched
+;
+;			Destroys:
+;				D1, A0
+;
+;___________________________________________________________________________________
+DispatchHelper	PatchProc	_DispatchHelperTrap
+
+				WITH		DispatchHelperTable
+				MOVE.W		D0,D1							; get selector in D1 so we don't touch D0
+;
+;				Make sure the selector is in range
+;
+				CMP.B		lastSelector(A0),D1				; is selector too large?
+				BGT.S		DispatchHelperBadSelector		; yes, cleanup and return
+				SUB.B		firstSelector(A0),D1			; get absolute zero-based selector
+				BLT.S		DispatchHelperBadSelector		; if too small, cleanup and return
+;
+;				Selector is in range, now dispatch
+;				Since we only support dhAbsoluteEntries or dhSelectorsEven, but never both
+;				at the same time, we can do a CMP, which is faster than a BTST.
+;
+				EXT.W		D1								; selector OK, make it a word
+				CMP.W		#(1<<dhAbsoluteEntries),dispatchFlags(A0)	; are entries absolute addresses?
+				BNE.S		@offsetEntries					; no, they're word offsets
+
+;
+;				Entries in DispatchHelperTable are absolute addresses (used in linked patches)
+;
+				ASL.W		#2,D1							; convert to offset from firstAddress
+				MOVE.L		firstAddress(A0,D1.W),A0		; A0 = absolute address of routine entry point
+				JMP			(A0)							; jump to entry point
+
+;
+;				Entries in DispatchHelperTable are word offsets from beginning
+;
+@offsetEntries
+				CMP.W		#(1<<dhSelectorsEven),dispatchFlags(A0)	; are selectors even?
+				BEQ.S		@D1IsOffset						; yes, no need to double D1
+				ADD.W		D1,D1							; convert to offset from firstOffset
+@D1IsOffset
+				MOVE.W		firstOffset(A0,D1.W),D1			; D1.W = routine offset from DispatchHelperTable
+				ADD.W		D1,A0							; A0 = actual routine entry point
+				JMP			(A0)							; jump to entry point
+
+				ENDWITH										; DispatchHelperTable
+
+;
+;				Selector is out of range, clean up stack and return paramErr
+;
+				EXPORT		DispatchHelperBadSelector		; so Dispatcher linked patch macro can reference it
+DispatchHelperBadSelector
+				DispatchUnimplementedRoutine				; cleans up stack and returns to caller
+
+				ENDPROC										; DispatchHelper
+
+;___________________________________________________________________________________
+;			ProcHelper
+;
+;			A resource-based procedure dispatcher.  Assumes all routines it dispatches
+;			to are Pascal functions returning an OSErr.  Originally designed for
+;			use with PACKs, but will work with all resource-based code of the correct
+;			format.  Installed as OS trap $A09A, but should always be called directly
+;			through the vector at $668.
+;
+;			Uses DispatchHelper, so selectors are in D0.W, with the low byte containing
+;			the actual selector and the high byte containing the number of words of
+;			parameters on the stack.
+;
+;			A0 should be a handle to the procedure resource ('PACK', 'proc', or
+;			whatever) that begins with a ProcHelperHeader.  If the handle is NIL,
+;			returns memFullErr.  If the handle has been purged, and LoadResource fails,
+;			returns ResError.  In either case, the parameters are stripped of the stack
+;			before returning.
+;
+;			For maximum memory usage benefits, procedure resources should be purgeable.
+;
+;			A1 should be a pointer to a word of globals ProcHelper can use to store a
+;			use count for this resource.  The word should be initialized to 0 before
+;			ProcHelper is called the first time for a resource.  ProcHelper uses this
+;			count to handle locking and unlocking the resource.  ProcHelper updates
+;			this use count be changing the return address to always come back through
+;			ProcHelperReturn.  See the ERS for more details on the stack manipulation
+;			used to do this, but here is an example of what happens to the stack
+;			when there are three words of parameters:
+;
+;								       On entry to called routine
+;		
+;		 								+--------+--------+
+;										| ProcHelperReturn|
+;		 								+--------+--------+
+;										| param3 | param2 | 
+;		  On entry to ProcHelper		+--------+--------+
+;										| param1 |  OSErr | 
+;		 	+--------+--------+			+--------+--------+
+;			| return  address | 		| return  address | 
+;			+--------+--------+			+--------+--------+	
+;			| param3 | param2 | 		|  use count ptr  |
+;			+--------+--------+			+--------+--------+	
+;			| param1 | OSErr  | 		|   proc handle   |  
+;			+--------+--------+			+--------+--------+	
+;
+;			Inputs:
+;				D0.W	Low byte is selector, high byte is number of words of parameters.
+;				A1		Pointer to the use count global for this procedure
+;				A0		Handle to procedure resource
+;
+;			Outputs:
+;				When branching to DispatchHelper:
+;					A0 		Pointer to DispatchHelperTable.
+;					D0.W	Low byte is selector, high byte is number of words of parameters.
+;
+;				When returning to application:
+;					None
+;
+;			Destroys:
+;				When branching to DispatchHelper:
+;					D1, D2, A1 
+;
+;___________________________________________________________________________________
+
+ProcHelper		PatchProc	_ProcHelperTrap
+
+;
+;				Reload procedure resource, if necessary
+;
+				MOVE.L		A0,D1							; is the procedure handle NIL?
+				BEQ.S		ResHandleNil					; no handle -> resource gone
+				TST.L		(A0)							; is procedure pointer NIL?
+				BNE.S		@resLoaded						; no, we're OK
+
+				MOVE.L		A0,-(SP)						; push handle for LoadResource
+				MOVE.W		#MapTrue,ROMMapInsert			; use ROM map as well ???
+				_LoadResource								; Note: preserves ALL registers
+
+				TST.L	 	(A0)							; Did load fail?
+				BEQ.S		ResNotLoaded					; NIL handle -> could not load
+
+@resLoaded
+;
+;				Check use count to see if there is already a call in progress 
+;
+				TST.W		(A1)							; is there a call in process (count <> 0)?
+				BNE.S		@procNowLocked					; yes, not first time through
+				
+;
+;				This is the first call, so lock down the procedure resource
+;
+				MOVE.W		D0,-(SP)						; save selector on stack across HLock
+				_HLock										; lock down resource
+				MOVE.W		(SP)+,D0						; restore selector
+
+@procNowLocked
+				ADDQ.W		#1,(A1)							; increment use count
+				MOVE.L		A1,D2							; save ptr to use count
+				
+;
+;				Make space on stack for moving parameters down and saving of
+;				old return address, use count pointer, and resource handle
+;
+				SUBQ		#8,SP							; need two longs for use count ptr and proc handle
+				PEA			ProcHelperReturn				; return to this address after call
+				MOVE.L		12(SP),-(SP)					; save off real return address
+
+;
+;				Loop through number of words of parameters, moving them down each time
+;
+				
+				MOVE.W		D0,D1							; D1.W = selector
+				LSR.W		#8,D1							; D1.W = words of parameters
+				LEA			8(SP),A1						; get ptr to place to put parameters
+@moveLoop
+				MOVE.W		12(A1),(A1)+					; D0.W = current parameter
+				DBRA		D1,@moveLoop					; continue moving parameters
+			
+;
+;				Save off needed values underneath the parameters we just moved
+;
+				MOVE.L		(SP)+,(A1)+						; save real return address 
+				MOVE.L		D2,(A1)+						; save ptr to use count
+				MOVE.L		A0,(A1)+						; save handle to proc
+
+;	
+;				Set up A0 to point to DispatchTable, then branch to dispatcher
+;
+				MOVE.L		(A0),A0							; A0 = pointer to proc header
+				ADD.L		#ProcHelperHeader.ProcDispTable,A0	; A0 = pointer to start of dispatch table
+				_DispatchHelper								; call DispatchHelper through vector
+
+;
+;  				Procedure called through DispatchHelper returns to here
+;
+ProcHelperReturn
+				MOVE.W		(SP)+,D1						; D1.W = returned OSErr
+				MOVE.L		(SP)+,A1						; get real return address
+				MOVE.L		(SP)+,A0						; get pointer to use count
+				SUBQ.W		#1,(A0)							; decrement use count
+				MOVE.L		(SP)+,A0						; get handle to procedure resource
+				BNE.S		@stillInUse						; if use count not zero, still calls processing
+				_HUnlock									; unlock procedure resorce in A0
+@stillInUse
+				MOVE.W		D1,-(SP)						; restore returned OSErr
+				JMP			(A1)							; return to proc caller
+
+
+ResHandleNil
+;
+;				No handle for procedure, return memFullErr
+;
+				MOVE.W		#memFullErr,D1					; put error in D1.W
+				BRA.S		ProcHelperError					; and return
+				
+ResNotLoaded
+;
+;				Could not reload the procedure resource, return ResError
+;
+				MOVE.W		ResErr,D1						; get ResError() in D1.W
+				;BRA.S		ProcHelperError					; fall through to ProcHelperError
+
+;
+;				An error occurred before the dispatch could happen.
+;				Clean up the stack, and return to caller with error code in D1.W.
+;
+
+ProcHelperError
+				MOVE.L		(SP)+,A0						; get caller's return address
+				LSR.W		#8,D0							; D0.W = words of parameters
+				LSL.W		#1,D0							; D0.W = bytes of parameters
+				ADD.W		D0,SP							; strip off parameters
+				MOVE.W		D1,(SP)							; return error in D1.W
+				JMP			(A0)							; return to caller
+				
+				ENDPROC										; ProcHelper
+
+				END

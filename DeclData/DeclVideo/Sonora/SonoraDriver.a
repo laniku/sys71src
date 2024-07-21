@@ -1,0 +1,2666 @@
+;
+;	File:		SonoraDriver.a
+;
+;	Contains:	This file contains the video driver for use by the Macintosh
+;				OS for the Sonora hardware.
+;
+;	Written by: Mike Puckett, December 3, 1991.
+;
+;	Copyright:	© 1991-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM20>	 10/6/93	RC		Added Dark Star Support by adding the Control call SetSync and
+;									the Status call GetSync
+;	  <SM19>	09-23-93	jmp		Made the SetDefaultMode call more Display Manager friendly.
+;	  <SM18>	08-06-93	jmp		Updated the GetConnection call to support all three types of
+;									multiscan display codes.
+;	  <SM17>	08-03-93	jmp		Began cleaning up the support for dynamically allocating RAM in
+;									PDM for video, as well as added initial support for the three
+;									new Apple multiscan displays.
+;		<16>	  7/2/93	IH		#1096920: Slot Manager not correctly updated in set resolution
+;									call.  Added SUpdateSRT call.
+;		<15>	 6/25/93	IH		As per Mike's suggestion, make new Display Manager control and
+;									status calls clear only those fields that they use.
+;		<14>	 6/22/93	IH		Fix connection info status call.
+;	  <SM13>	  6/1/93	IH		Update mode switch calls to VDSWitchInfo record and add more
+;									support for mode timings.
+;	  <SM12>	 5/28/93	IH		Added VGA mode to MultiSync family.
+;	  <SM11>	04-07-93	jmp		Added initial low-level support for the Display Manager.
+;	  <SM10>	04-01-93	jmp		Fixed yet another bug in the GetEntries code.
+;	   <SM9>	04-01-93	jmp		Beefed-up the SetDefaultMode call to support the (hopefully)
+;									temporary interface to the RAM allocation on boot for video in
+;									PDM.
+;	   <SM8>	  3/9/93	jmp		Fixed a couple of long-standing out-of-range bugs in
+;									Get/SetEntries, and now turn video blanking on when the video
+;									driver is closed.
+;	   <SM7>	 1/12/93	SAM		Disabled VRAM cache flushing at every VBL on PDMs.  Copyback
+;									VRAM just doesn't look good.
+;	   <SM6>	 11/6/92	jmp		Added a little more PDM bring-up code.
+;	   <SM5>	 11/5/92	SWC		Changed VideoEqu.a->Video.a and ShutdownEqu.a->Shutdown.a.
+;	   <SM4>	 11/2/92	kc		Don't include SonicEqu.a.
+;	   <SM3>	10-21-92	jmp		Added code to effectively flush the copyback framebuffer for
+;									PDM.
+;	   <SM2>	10-17-92	jmp		Added temporary hack to support PDM’s (broken) bring-up
+;									hardware.
+;	   <SM1>	 10/6/92	GDW		New location for ROMLink tool.
+; ———————————————————————————————————————————————————————————————————————————————————————
+;	  Pre-ROMLink comments begin here.
+; ———————————————————————————————————————————————————————————————————————————————————————
+;	   <SM5>	09-29-92	jmp		(jmp,H16) Fixed a problem in SetGamma where various randomly bad
+;									things could have occurred when going from a 3-to-1 or 1-to-3
+;									channel gamma tables (not something that’s done very often, but
+;									still...).
+;	   <SM4>	09-03-92	jmp		(jmp,H15) Corrected .s vs. non-.s branches and odd-alignment
+;									problems.
+;	   <SM3>	 6/18/92	KW		(jmp,H14) Updated the Rubik 512<->560 routine to accomodate the
+;									Omega-2 parameters.
+;	   <SM2>	  6/4/92	KW		(NJV,H13) Added new sndSonoraReverseDFAC equate in place of
+;									hard-coded value
+;									(jmp,H12) Fixed a problem where I wasn’t always returning the
+;									correct frame buffer base address where I was supposed to.
+;									(NJV,H11) Temporarily using hard-coded $57 for DFAC Sound
+;									initialization to get rid of annoying playthrough.
+;									(NJV,H10) Fixed bug with DFAC setup for sound
+;									(jmp,H9) Added a small optimization to the interrupt handler.
+;									(JC,H8) Fix problem in Uncorrected Gamma in 16-bit mode.
+;	   <SM1>	  5/2/92	kc		Roll in Horror. Comments follow:
+;		<H7>	04/24/92	jmp		Added constants to support for the “switch-on-the-fly” Rubik-512
+;									to Rubik-560 and vice-versa call for DoubleExposure.
+;		<H6>	04/20/92	jmp		In order to fully support family modes, changed the way I was
+;									dealing with the Rubik-560 mode in GrayScreen.
+;		<H5>	 4/13/92	JC		Replace references to SonoraAddr (it is going away) with
+;									references to VIA1Addr.
+;		<H4>	01/22/92	jmp		Updated the original “No Connect” code to take full advantage of
+;									the newly-defined extended sense codes.  Changed the name from
+;									“NoConnect” to “AltSense.”
+;		<H3>	01/11/92	jmp		Eliminated a BoxFlag dependency.
+;		<H2>	12/19/91	jmp		Added the initial support for Rubik-560 mode for Sonora.
+;		 <1>	12/12/91	jmp		first checked in
+
+				STRING 	C
+
+				PRINT	OFF
+				LOAD	'StandardEqu.d'
+
+				INCLUDE	'IOPrimitiveEqu.a'
+				
+				INCLUDE 'HardwarePrivateEqu.a'
+				INCLUDE 'EgretEqu.a'
+				INCLUDE 'ROMEqu.a'
+				INCLUDE	'Video.a'
+				INCLUDE 'GestaltEqu.a'
+				INCLUDE	'SlotMgrEqu.a'
+				INCLUDE	'UniversalEqu.a'
+				
+				INCLUDE	'DepVideoEqu.a'
+				PRINT	ON
+
+				SEG		'_sSonoraDriver'
+
+				BLANKS		ON
+				STRING		ASIS
+				MACHINE		MC68020
+
+; This is device storage which is stored in the dCtlStorage field of the AuxDCE.
+
+SonoraVidPrivates	RECORD		0
+saveBaseAddr 		DS.L		1				; the screen base address
+saveSQElPtr 		DS.L		1				; the SQ element pointer (for _SIntRemove).
+saveGammaPtr 		DS.L		1				; the pointer to the Gamma correction table
+saveGamDispPtr		DS.L		1				; the pointer to the Gamma block
+saveVidPtr			Ds.l		1				; the pointer to the vidParams block
+saveVDACBase		DS.L		1				; the base addr of the VDAC
+saveSonoraBase		Ds.l		1				; the base addr of Sonora
+GFlags				DS.B		1				; flags word (hi-order byte, actually)
+noVRAM				Ds.b		1				; the no real VRAM flag
+saveMode			DS.W		1				; the current mode setting
+saveMonID			DS.W		1				; monitor type ID
+saveSizeVRAM		Ds.b		1				; amount of vRAM/RAM
+SonoraVidPrivSize	EQU			*
+					ENDR
+
+LSonoraDriver		MAIN	EXPORT
+;-------------------------------------------------------------------
+;	Video Driver Header
+;-------------------------------------------------------------------
+;		
+SonoraVidDrvr	
+				DC.W	$4C00								; ctl,status,needsLock
+				DC.W	0,0,0								; not an ornament
+
+; Entry point offset table
+
+				DC.W	SonoraVidOpen-SonoraVidDrvr 		; open routine
+				DC.W	SonoraVidDrvr-SonoraVidDrvr			; no prime in normal video drivers
+				DC.W	SonoraVidCtl-SonoraVidDrvr			; control
+				DC.W	SonoraVidStatus-SonoraVidDrvr		; status
+				DC.W	SonoraVidClose-SonoraVidDrvr		; close
+
+				STRING	Pascal
+SonoraVidTitle
+				DC.B	'.Display_Video_Apple_Sonora'		
+			
+				ALIGN	2									; make sure we're aligned
+				DC.W	CurSonoraDrvrVersion				; current version
+
+				STRING	ASIS
+
+;
+; SonoraCLUTTbl contains information required to write to the CLUT in the different screen depths.
+;	Each depth's information has three values.  The first is the number of entries-1 in this depth
+;	for range checking.  The second is the address of the first active CLUT position for that 
+;	screen depth.  The last number is the “skip” factor.  This is required because, in 1-4bpp, the
+;	entries are distributed throughout the CLUT address space.  As a result, we use sequential CLUT mode
+;	ONLY in 8/16bpp modes.  The skip factor is the address difference between adjacent active positions
+;	in each mode.  
+;
+; Generally, these rules are true for any particular depth:
+;					#entries = (2^^depth)-1				
+;					startposition = (256 / (2^^depth))-1
+;					skipfactor = 256 / (2^^depth)
+
+SonoraCLUTTbl
+				DC.B	$01,$7F,$00,$80					; for one-bit mode
+				DC.B	$03,$3F,$00,$40					; for two-bit mode
+				DC.B	$0F,$0F,$00,$10					; for four-bit mode
+				DC.B	$FF,$00,$00,$01					; for eight-bit mode
+				DC.B	$1F,$00,$00,$01					; for sixteen-bit mode
+
+SonoraCLUTRec	RECORD	0								; 
+scRange			DS.B	1								; maximum index value in this depth
+scStart			DS.B	1								; lowest active CLUT address
+scSkip			DS.W	1								; skip value between active addresses
+SonoraCLUTSize	Equ		*
+				ENDR
+
+;
+; These are the bit patterns for grays in each depth
+;
+SonoraPats		Dc.l	OneBitGray,TwoBitGray,FourBitGray,EightBitGray,SixteenBitGray
+
+;
+; The following table is used by the SwitchMode call to determine two things.  First,
+;	it must decide whether the requested mode to switch to is valid or not.  If
+;	the requested mode is not in the SwitchTable, the call will fail.  Also, even
+;	if the requested mode is in table, if the current bit depth is too large
+;	for the requested mode, SwitchMode must still fail.
+;
+
+SwitchTable
+				Dc.b	sRsrc_Vid_Sonora_GSM,	FifthVidMode
+				Dc.b	sRsrc_Vid_Sonora_MSB1,	FifthVidMode
+				Dc.b	sRsrc_Vid_Sonora_MSB2,	FourthVidMode
+				Dc.w	-1
+
+;
+; The following tables are used to support the Get/SetAltSense codes.  The first set of
+;	tables are pairs of codes and indices, terminated by a -1.  Each of these tables
+;	is composed of a particular sense-code types (i.e., 3, 5, 6, and 7).  The final
+;	table is also composed of pairs -- the first value is the sense-code type, and
+;	the corresponding second value is an offset to the sense-code index tables.
+;
+
+Type_0_MonIDs
+				Dc.b	indexedSenseFP,			indexedSenseFP
+				Dc.b	indexedSenseRubik,		indexedSenseRubik
+				Dc.b	indexedSenseRGBFP,		indexedSenseRGBFP
+				Dc.b	indexedSenseHR,			indexedSenseHR
+				Dc.b	indexedNoConnect,		indexedNoConnect
+				Dc.w	-1
+				
+Type_6_MonIDs
+				Dc.b	extendedMSB1,			indexedSenseMSB1
+				Dc.b	extendedMSB2,			indexedSenseMSB2
+				Dc.b	extendedMSB3,			indexedSenseMSB3
+				Dc.w	-1
+				
+Type_7_MonIDs
+				Dc.b	extendedSenseVGA,		indexedSenseVGA
+				Dc.b	extendedSenseGF,		indexedSenseGF
+				Dc.b	extendedNoConnect,		indexedNoConnect
+				Dc.w	-1
+				
+MonIDsTbl		Dc.w	0,						Type_0_MonIDs-MonIDsTbl					
+				Dc.w	3,						0
+				Dc.w	5,						0
+				Dc.w	6,						Type_6_MonIDs-MonIDsTbl
+				Dc.w	7,						Type_7_MonIDs-MonIDsTbl
+				Dc.w	-1
+				
+;
+; Unlike the SwitchTable above, the DepthTable tells SetDefaultMode what to write in the SP_Depth
+;	field of sPRAM.  If the depth value is zero, SetDefaultMode is just supposed to leave
+;	the SP_Depth field alone.  If the depth values is negative one, then SetDefaultMode is
+;	supposed to check to see if the current mode is valid or not.
+;
+
+DepthTable		
+				Dc.b	sRsrc_Vid_Sonora_FP,		FirstVidMode
+				Dc.b	sRsrc_Vid_Sonora_FPc,		FourthVidMode
+				
+				Dc.b	sRsrc_Vid_Sonora_GS,		FirstVidMode
+				Dc.b	sRsrc_Vid_Sonora_GSa,		FourthVidMode
+				Dc.b	sRsrc_Vid_Sonora_GSb,		FifthVidMode
+				Dc.b	sRsrc_Vid_Sonora_GSM,		0
+				
+				Dc.b	sRsrc_Vid_Sonora_RGBFP,		FirstVidMode
+				Dc.b	sRsrc_Vid_Sonora_RGBFPc,	FourthVidMode
+				
+				Dc.b	sRsrc_Vid_Sonora_HR,		FirstVidMode
+				Dc.b	sRsrc_Vid_Sonora_HRb,		FourthVidMode
+				Dc.b	sRsrc_Vid_Sonora_HRc,		FifthVidMode
+				Dc.b	sRsrc_Vid_Sonora_MSB1,		0
+				
+				Dc.b	sRsrc_Vid_Sonora_VGA,		FirstVidMode
+				Dc.b	sRsrc_Vid_Sonora_VGAb,		FourthVidMode
+				Dc.b	sRsrc_Vid_Sonora_VGAc,		FifthVidMode
+				
+				Dc.b	sRsrc_Vid_Sonora_GF,		FirstVidMode
+				Dc.b	sRsrc_Vid_Sonora_GFb,		FourthVidMode
+				Dc.b	sRsrc_Vid_Sonora_MSB2,		-1
+				
+				Dc.w	-1
+
+**********************************************************************
+*
+*	VidOpen allocates private storage for the device in the AuxDCE and locks
+*	it down for perpetuity. Also, it installs the interrupt handler and enables
+*	the (VBL) interrupts.
+*
+* Entry:	A0 = param block pointer
+*			A1 = AuxDCE pointer
+*
+* Locals:	A3 = pointer to private storage
+*
+*			A4/D2/D3 used as scratch
+*
+**********************************************************************
+
+				WITH	VDPageInfo,SlotIntQElement,SonoraVidPrivates
+SonoraVidOpen
+;
+; Allocate private storage (since block is CLEAR, GFlags are zeroed) and get
+;	a pointer to it in A3
+;
+
+				MOVEQ		#SonoraVidPrivSize,D0			; get size of parameters
+				_ResrvMem	,SYS 							; make room as low as possible
+				MOVEQ		#SonoraVidPrivSize,D0			; get size of parameters
+				_NewHandle	,SYS,CLEAR						; get some memory for private storage
+				BNE   		@OpError1						; => return an error in open
+				MOVE.L		A0,dCtlStorage(A1)				; save returned handle in AuxDCE
+				_HLock										; and lock it down forever
+				
+				MOVE.L	(A0),D0								; get a pointer to it
+				_StripAddress								; clean it up
+				MOVE.L	D0,A3								; get pointer to privates in A3
+
+;
+; Remember the VDAC, Sonora, and framebuffer base addresses since they're non-trivial to
+;	look up.  
+;
+				WITH	ProductInfo,DecoderInfo,VideoInfo
+				
+				MOVE.L	UnivInfoPtr,A0						; get a pointer to universal data
+				ADDA.L	DecoderInfoPtr(A0),A0				; point to the base address table
+				MOVE.L	VDACAddr(A0),saveVDACBase(A3)		; save VDAC’s base address
+				Move.l	VIA1Addr(A0),saveSonoraBase(A3)		; save Sonora’s base address (same as VIA1)<H5>
+				
+				MOVE.L	UnivInfoPtr,A0				 
+				ADDA.L	VideoInfoPtr(A0),A0					; point to the VideoInfo record		
+				MOVE.L	VRAMLogAddr32(A0),saveBaseAddr(A3)	; save base address too
+
+				ENDWITH				
+
+;
+; Get and install the interrupt handler.  Call the EnableVGuts utility code to do 
+;	this.  This utility also starts the interrupts going.  If there is an error
+;	condition, EnableVGuts returns with the Z-bit cleared.
+			
+				MOVEQ	#sqHDSize,D0						; allocate a slot queue element
+				_NewPtr	,SYS,CLEAR							; get it from system heap cleared
+				BNE   	@OpError2							; if not allocated, return bad
+				MOVE.L	A0,saveSQElPtr(A3)					; save the SQ element pointer.
+
+; If the video driver was closed, let’s ensure that video is unblanked before we
+;	re-enable interrupts.
+;
+				Movea.l	saveSonoraBase(A3),A0				; Get the Sonora base address.
+				Adda.l	#SonoraVdCtlBase,A0					; Point to the video control register space.
+				Bclr	#SonoraVidBlnkBit,SonoraVdModeReg(A0) ; Turn off video blanking.
+				
+				BSR		SonoraEnableVGuts					; do it
+				BNE 	@OpError2							; 
+
+;
+; Load the default gamma table from the slot resource list.
+;
+
+				WITH	SpBlock
+				
+				SUBA	#spBlockSize,SP						; make a slot parameter block
+				MOVE.L	SP,A0								; get pointer to block in A0
+				MOVE.B	dCtlSlot(A1),spSlot(A0)				; copy the slot number
+				MOVE.B	dCtlSlotId(A1),spID(A0)				; copy the spID of the video sRsrc
+				CLR.B	spExtDev(A0)						; 
+				_sRsrcInfo									; get the spsPointer
+				BNE		@OpError3							; if failed, then quit.
+				
+				MOVE.B	#sGammaDir,spID(A0)					; look for the gamma directory
+				_sFindStruct								; get that baby
+				BNE.S	@DoLinear							; if failed, then do linear
+				
+				MOVE.B	#128,spID(A0)						; get the default gamma table, (always 128)
+				_sGetBlock									; we can use this since we want it on the sys heap
+				BNE.S	@DoLinear							; if failed, then do linear
+			
+; Skip over gamma header.
+			
+				MOVE.L	spResult(A0),A0						; point to head of the block
+				MOVE.L	A0,saveGamDispPtr(A3)				; save the ptr to the gamma block
+				ADDA	#2,A0								; skip resID
+@Name			TST.B	(A0)+								; skip over gamma name
+				BNE.S	@Name								;
+				MOVE.L	A0,D0								; get in d-reg
+				ADDQ	#1,D0								; word align pointer
+				BCLR	#0,D0								; round it off
+				
+				MOVE.L	D0,saveGammaPtr(A3)					; put it in private storage
+				Bra.s	@VidParams							; Jump around linear code.
+			
+;
+; Build a linear default gamma table if necessary.
+;
+
+@DoLinear
+				Moveq	#gFormulaData,D0					; Get gamma table header size.
+				Add		#256,D0								; Add in one-byte per entry.
+				_NewPtr	,SYS,CLEAR							; Clear it.
+				Bne		@OpError3							; If failed, quit.
+				
+				Move.l	A0,saveGamDispPtr(A3)				; Save head of gamma table for disposal.
+				Move.l	A0,saveGammaPtr(A3)					; Head and top are same here.
+				Move.w	#drHwSonora,gType(A0)				; Set up gType.
+				Move.w	#1,gChanCnt(A0)						; Set up gChanCnt.
+				Move.w	#256,gDataCnt(A0)					; Set up gDataCnt.
+				Move.w	#8,gDataWidth(A0)					; Set up gDataWidth.
+				Adda	#gFormulaData+256,A0				; Point to end of data table.
+				Move.w	#255,D0								; Set up loop counter.
+@Loop			Move.b	D0,-(A0)							; Write out value.
+				Dbra	D0,@Loop							; Loop.
+	
+;
+; Get a pointer to the video hardware setup parameter block.  Use this functional spID's spsPointer
+;	found above in the gamma section.
+;
+
+@VidParams
+				
+				Move.l	Sp,A0								; Point to the spBlock on the stack.
+				Clr.w	spID(A0)							; Start looking at spID 0, no external devices.
+				Clr.b	spTBMask(A0)						; Only look for the board sRsrc.
+				Move.w	#catBoard,spCategory(A0)			; Look for:	catBoard,
+				Move.w	#typBoard,spCType(A0)				;			typBoard,
+				Clr.w	spDrvrSW(A0)						;			0,
+				Clr.w	spDrvrHW(A0)						;			0.
+				Clr.l	spParamData(A0)						; (The board sRsrc must be enabled.)
+				Bset	#foneslot,spParamData+3(A0)			; Limit search to slot 0.
+				_GetTypeSRsrc								; Get the spsPointer.
+				Bne		@OpError4							; If failed, quit.
+				
+				MOVE.B	#sVidParmDir,spID(A0)				; look for the video parameters dir
+				_sFindStruct								; Try to load it.
+				Bne.s	@OpError4							; If failed, quit.
+	
+				MOVE.B	dCtlSlotId(A1),spID(A0)				; look in the directory for this config's parameters
+				_sGetBlock									; Try to load it.
+				Bne.s	@OpError4							; If failed, quit.
+				
+				MOVE.L	spResult(A0),saveVidPtr(A3)			; get pointer to it				
+;
+; At PrimaryInit time, we used the sense lines to determine the type of attached display.  For extended
+;	sense displays, we just mapped them to the end of indexed-sense displays.  Since the gamma-correction
+;	code uses the monitor ID to determine if the passed-in table is applicable, we need to know the “real”
+;	monitor ID.  At PrimaryInit time, we store the real monitor ID in slot pRAM.  So, we extract that
+;	information out here.  Also, it should be noted that it would actually be inappropriate for us
+;	to re-read the sense-lines now, in that someone could potentially change/unplug the attached
+;	display between PrimaryInit and VidOpen, and that would cause us all sorts of havoc.
+;
+				With	SP_Params
+				
+				Move.l	Sp,A0								; Point to spBlock on the stack.
+				Move.b	dCtlSlot(A1),spSlot(A0)				; Put slot into spBlock.
+	
+				Suba	#sizeSPRamRec,Sp					; Allocate an SPRam block on the stack.
+				Move.l	Sp,spResult(A0)						; Point to it.
+				_SReadPRAMRec								; Read Slot PRam.
+				Bne.s	@OpError5							; If failed quit.
+				
+				Moveq	#0,D2								; Clear D2.w.
+				Move.b	SP_MonID(Sp),D2						; Get the monID (it’s byte sized).
+				Move.b	SP_Flags(Sp),D1						; Get the flags.
+				
+				Adda	#sizeSPRamRec+spBlockSize,Sp		; Clean up the stack.
+	
+				EndWith
+
+;
+; Do a little bookkeeping…
+;
+				Move.w	D2,saveMonID(A3)					; Save the monID for later.
+				Btst	#spNoVRAM,D1						; Test for real VRAM or not.
+				Sne		noVRAM(A3)							; Remeber it for later.
+				Bfextu	D1{spVRamBits:numSPVRamBits},D1		; Extract the vRAM/RAM size from the flags byte…
+				Move.b	D1,saveSizeVRAM(A3)					; … and save it for later.
+				
+;
+; Set GFlags to reflect monochrome-only displays.
+;
+				Cmp.w	#indexedSenseFP,saveMonID(A3)		; If this is a Mono-Only Full Page,
+				Beq.s	@SetMonoFlags						;	then say so.
+				Bra.s	@ChkRubik560						; Otherwise, skip.
+
+@SetMonoFlags	Bset	#IsMono,GFlags(A3)					; Turn on the IsMono and
+				Bset	#GrayFlag,GFlags(A3)				;	 GrayFlag flags.
+
+;
+; Set GFlags to reflect whether we started up in Rubik-560 mode or not.
+; 
+@ChkRubik560
+				Cmp.b	#sRsrc_Vid_Sonora_GS560a,dCtlSlotId(A1) ; If we’re in Rubik-560a mode,
+				Beq.s	@SetRubik560							;	then say so.
+				Cmp.b	#sRsrc_Vid_Sonora_GS560b,dCtlSlotId(A1)	; If we’re not in Rubik-560b mode,
+				Bne.s	@AllDone								;	then just go on.
+				
+@SetRubik560	Bset	#InRubik560Mode,GFlags(A3)				; Remember that we started up in Rubik-560 mode.
+
+;
+; All done!
+;
+
+@AllDone		MOVEQ	#noErr,D0							; no error
+@EndOpen		RTS 										; return
+
+@OpError5		Adda	#sizeSPRamRec,Sp					; Release the SPRam block.
+@OpError4		Move.l	saveGamDispPtr(A3),A0				; Set up to dispose of gamma table.
+				_DisposPtr									; Dispose it.
+@OpError3		ADDA	#spBlockSize,SP						; release the spBlock
+@OpError2		MOVE.L	dCtlStorage(A1),A0					; get the private storage back
+				_DisposHandle								; release the driver private storage
+@OpError1		MOVE.L	#OpenErr,D0							; say can't open driver
+				BRA.S	@EndOpen
+
+				ENDWITH
+
+**********************************************************************
+*
+* Video Driver Control Call Handler.  There are 11 standard calls:
+*
+*	($00) Reset (VAR mode, page: INTEGER; VAR BaseAddr: Ptr);
+*	($01) KillIO
+*	($02) SetMode(mode, page: INTEGER; VAR BaseAddr: Ptr);
+*	($03) SetEntries (Table: Ptr; Start,Count : integer );
+*	($04) SetGamma (Table : Ptr );
+*   ($05) GrayPage (page);
+*   ($06) SetGray (csMode = 0 for color, 1 for gray)
+*	($07) SetInterrupt (csMode = 0 for enable, non-zero for disable);
+*	($08) DirectSetEntries (Table: Ptr; Start,Count : integer );
+*	($09) SetDefaultMode (csMode = mode to set);
+*	($0A) SwitchMode(csMode, csData, csPage, csBaseAddr);
+*
+* The following calls are Sonora-specific:
+*
+*	($81) SetRubik560Mode (csMode = 0 for enable, non-zero for disable);
+*	($83) SetAltSense(csMode = byte 0 is sense code, byte 1 is type);
+*
+*   Entry: 	A0 		= param block pointer
+*			A1 		= AuxDCE pointer
+*	Uses:	A2		= cs parameters (ie. A2 <- csParam(A0))  (must be preserved)
+*			A3 		= ptr to our privates/scrarch (doesn’t need to be preserved)
+*			A4		= scratch (must be preserved)
+*			D0-D3 	= scratch (don't need to be preserved)
+*
+*	Exit:	D0	  	= error code
+*
+**********************************************************************
+
+;
+; Decode the call…
+;
+SonoraVidCtl	
+			
+				MOVEM.L	A0/A1,-(SP)							; Save exit registers.
+
+				MOVE.L	csParam(A0),A2						; A2 <- Ptr to control parameters
+						
+				MOVE.L	dCtlStorage(A1),A3					; A3 <- Ptr to private storage
+				MOVE.L	(A3),D0								;
+				_StripAddress								;
+				MOVE.L	D0,A3								;
+
+				MOVE.W	csCode(A0),D0						; get routine selector
+				
+				Cmp.w	#cscRubik560,D0						; If we got the Rubik560 mode call,
+				Beq		SonoraSetRubik560Mode				;	hop to it.
+				
+				Cmp.w	#cscAltSense,D0						; If we got the alternate senseID call,
+				Beq		SonoraSetAltSense					;	hop to it.
+				
+				CMP.W	#$0B,D0								; IF csCode NOT IN [0..$0A] THEN				; <sm20>
+				BHI.S	SonoraCtlBad						;   Error, csCode out of bounds.
+				MOVE.W	SonoraCtlJumpTbl(PC,D0.W*2),D0		; Get the relative offset to the routine.
+				JMP		SonoraCtlJumpTbl(PC,D0.W)			; GOTO the proper routine.
+				
+SonoraCtlJumpTbl	
+				DC.W	SonoraVidReset-SonoraCtlJumpTbl		; $00 => VidReset
+				DC.W	SonoraCtlGood-SonoraCtlJumpTbl		; $01 => CtlGood (no async routines here)
+				DC.W	SonoraSetVidMode-SonoraCtlJumpTbl	; $02 => SetVidMode
+				DC.W	SonoraSetEntries-SonoraCtlJumpTbl	; $03 => SetEntries
+				DC.W	SonoraSetGamma-SonoraCtlJumpTbl		; $04 => SetGamma
+				DC.W	SonoraGrayPage-SonoraCtlJumpTbl		; $05 => GrayPage
+				DC.W	SonoraSetGray-SonoraCtlJumpTbl		; $06 => SetGray
+				DC.W	SonoraSetInterrupt-SonoraCtlJumpTbl	; $07 => SetInterrupt
+				DC.W	SonoraDirectSetEntries-SonoraCtlJumpTbl	; $08 => DirectSetEntries
+				DC.W	SonoraSetDefaultMode-SonoraCtlJumpTbl 	; $09 => SetDefaultMode
+				DC.W	SonoraSwitchMode-SonoraCtlJumpTbl	; $0A => SwitchMode
+				DC.W	SonoraSetSync-SonoraCtlJumpTbl		; $0B => SetSync								; <sm20>
+
+SonoraCtlBad	MOVEQ	#controlErr,D0						; else say we don't do this one
+				BRA.S	SonoraCtlDone						; and return
+			
+SonoraCtlGood	MOVEQ	#noErr,D0							; return no error
+
+SonoraCtlDone	MOVEM.L	(SP)+,A0/A1							; Restore Exit registers.
+				BRA		SonoraExitDrvr
+
+SonoraVidReset
+;---------------------------------------------------------------------
+;
+;	Reset the card to its default
+;
+;---------------------------------------------------------------------
+
+				WITH	SonoraVidPrivates
+			
+				MOVE	#FirstVidMode,csMode(A2)			; return default mode
+				MOVE	#FirstVidMode,saveMode(A3)			; remember FirstVidMode as the requested mode
+				MOVEQ	#0,D1								; get default depth in D1 (#firstVidMode-#firstVidMode)
+				MOVEQ	#0,D0								; get page in D0
+				MOVE	D0,csPage(A2)						; return the page
+				BSR		SonoraSetDepth						; set the depth	from D1
+				BCLR	#IsDirect,GFlags(A3)				; turn off direct mode bit
+				Move.l	saveBaseAddr(A3),csBaseAddr(A2)		; return the base address
+				BSR		SonoraGrayScreen					; paint the screen gray
+				BRA.S	SonoraCtlGood						; => no error
+	
+				ENDWITH
+
+SonoraSetVidMode
+;---------------------------------------------------------------------
+;
+;  Set the card to the specified mode.  Only page zero is possible,
+;	 so we need to check that the request was OK.
+;
+;  If the card is already set to the specified mode, then do nothing.
+;
+;---------------------------------------------------------------------
+
+				WITH	SonoraVidPrivates
+			
+				MOVE.W	csMode(A2),D1						; D1 = mode
+				BSR		SonoraChkMode						; check mode and convert
+				BNE.S	SonoraCtlBad						; => not a valid mode
+	
+				TST.W	csPage(A2)							; only page zero is valid
+				BNE.S	SonoraCtlBad						; => not a valid page
+
+; Only set if mode has changed.
+
+SonoraSetVidModeGuts
+	
+				MOVE.W	csMode(A2),D2						; get the mode spID (D1 has the zero-based mode)
+				CMP		saveMode(A3),D2						; has the mode changed?
+				BEQ		@ModeOK1							; if not, then skip graying
+		
+; Remember the newly requested mode.
+
+				MOVE.W	D2,saveMode(A3)						; remember requested mode
+						
+; Set the entire color table to gray before switching to avoid screen anomalies.
+
+				Movem.l	A4-A6,-(Sp)							; Save gamma-table registers.
+	
+				Move.l	saveGammaPtr(A3),A0					; Get pointer to gamma data structure.
+				Lea		gFormulaData(A0),A4					; Point to first gamma table.
+				Adda.w	gFormulaSize(A0),A4					;
+				Move.l	A4,A5								; Point to green data (assuming gChanCnt = 1).
+				Move.l	A4,A6								; Point to red data (assuming gChanCnt = 1).
+							
+				Cmp.w	#1,gChanCnt(A0)						; If there’s only one table,
+				Beq.s	@OnlyOneTable						;	then we’re set.
+				
+				Move.w	gDataWidth(A0),D2					; Get width of each entry (in bits).
+				Move.w	gDataCnt(A0),D0						; Get # of entries in table.
+				Addq	#7,D2								; Round to nearest byte.
+				Lsr.w	#3,D2								; Get bytes per entry.
+				Mulu	D2,D0								; Get size of table in bytes.
+				
+				Adda.w	D0,A5								; Calc base of green (red base + D0).
+				Adda.w	D0,A6								; Calc base…
+				Adda.w	D0,A6								;	…of blue (red base + D0 + D0).
+
+@OnlyOneTable
+			
+				Move.w	gDataCnt(A0),D3						; Save number of gamma entries.
+								
+				MOVE.L	saveVDACBase(A3),A0					; get the VDAC base addr
+				ADDA	#ArielDataReg,A0					; point to data register
+				CLR.B	ArielAddrReg-ArielDataReg(A0)		; start at the beginning of CLUT
+			
+				MOVE.W	SR,-(SP)							; preserve the status register
+				BSR		SonoraWaitVSync						; wait for next blanking period (preserves A0)
+
+; Write out gamma-corrected true-gray CLUT…
+;
+				Move.w	D3,D0								; Init loop counter.
+				Subq	#1,D0								; Zero base it.
+				
+				Move.w	GFlags(A3),D2						; Get the GFlags into a convenient register.
+				Lsr.w	#1,D3								; Get midpoint of table(s).
+
+@Repeat			Btst	#IsMono,D2							; If this is not a mono-only display
+				Beq.s	@DoRGB								;	then do the standard RGB stuff.
+				Clr.b	(A0)								; Otherwise, just write black out								
+				Clr.b	(A0)								;	to the red & green channels.
+				Bra.s	@DoMono								;
+
+@DoRGB			Move.b	(A4,D3),(A0)						; Write: red,
+				Move.b	(A5,D3),(A0)						;		 green,
+@DoMono			Move.b	(A6,D3),(A0)						; 		 blue.
+				Dbra	D0,@Repeat	
+				
+				MOVE	(SP)+,SR							; restore the status reg
+				
+				Movem.l	(Sp)+,A4-A6							; Restore gamma-table registers.
+				BSR		SonoraSetDepth						; set the depth from D1
+
+; Finish up the bookkeeping.
+	
+				CMP.W	#FifthVidMode,saveMode(A3)			; was it a direct mode?
+				BLT.S	@BitOff								; no, so turn flag off
+			
+				BSET	#IsDirect,GFlags(A3)				; turn on bit
+				BRA.S	@ModeOK1							;
+@BitOff
+				BCLR	#IsDirect,GFlags(A3)				; turn off bit
+
+@ModeOK1		Move.l	saveBaseAddr(A3),csBaseAddr(A2)		; return the base addr
+				BRA 	SonoraCtlGood						; 	return no error
+			
+				ENDWITH
+
+SonoraSetEntries
+;---------------------------------------------------------------------
+;
+;	Input :
+;			csParam -> datablock
+;			datablock = csTable -> table of colorSpecs (not colortable)
+;						csStart -> where to start setting, or -1
+;						csCount -> # of entries to change
+;
+;  	This call has two modes.  In SEQUENCE mode, csCount entries are changed
+;	in the CLUT, starting at csStart.  In INDEX mode, csCount entries are
+;	installed into the CLUT at the positions specified by their .value fields.
+;	This mode is selected by passing csStart = -1.  In both cases, entries are
+;	range-checked to the dynamic range of the video mode (bits/pixel).
+;
+;---------------------------------------------------------------------
+;
+;	Set the CLUT
+;		A0 = Ptr to the table
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private data, later to CLUT constants table
+;		A4 = Ptr to gamma red table
+;		A5 = Ptr to gamma green table
+;		A6 = Ptr to gamma blue table
+;
+;		D0-D3 = Scratch
+;		D4 = Size of stack color table buffer
+;       D5 = GFlags word
+;		D6 = Index range [0..n]
+;		D7 = gamma channel size in bits
+;
+;---------------------------------------------------------------------
+
+; Initialize loop.
+	
+				WITH 	SonoraVidPrivates,SonoraCLUTRec
+			
+				BTST	#IsDirect,GFlags(A3)				; are we in a direct mode?
+				BNE		SonoraCtlBad						; error if so
+
+SonoraSEGuts			
+				TST.L	csTable(A2)							; Check for a nil pointer
+				BEQ 	SonoraCtlBad						;
+								
+				MOVEM.L	A1/A4-A6/D4-D7,-(SP)				; save registers for gamma
+	
+				MOVE.W	GFlags(A3),D5						; get GFlags word in D5
+	
+				CMP.W	#indexEntries,csStart(A2)			; was it indexed mode?
+				BEQ.S	@SkipSeq							; if so, then leave bit off (it's never turned on in GFlags)
+				Bset	#PsuedoIndex,D5						; turn on the bit that denotes a seq write that was xlated to indexed
+				Cmp.w	#FourthVidMode,saveMode(A3)			; If it’s not 8bbp or 16bpp,
+				Blt.s	@SkipSeq							;	need to use “indexed”.
+				BSET	#UseSeq,D5							; otherwise, turn on sequential mode bit
+@SkipSeq
+				MOVE.L	saveGammaPtr(A3),A0					; get pointer to gamma data structure
+				MOVE.W	gFormulaSize(A0),D0					; get the size of formula data
+				LEA		gFormulaData(A0,D0),A4				; red correction table starts here
+				MOVE.L	A4,A5								; get default pointer to green data
+				MOVE.L	A4,A6								; get default pointer to blue data
+				MOVE	gDataWidth(A0),D7					; get width of each entry in bits
+				CMP		#1,gChanCnt(A0)						; if only only one table, we're set
+				BEQ.S	@OneTbl								; => just one table
+	
+				MOVE	gDataCnt(A0),D0						; get # entries in table
+				MOVE	D7,D1								; copy it to goof around
+				ADDQ	#7,D1								; round to nearest byte
+				LSR		#3,D1								; get bytes per entry
+				MULU	D1,D0								; get size of table in bytes
+	
+				ADDA	D0,A5								; calc base of green
+				ADDA	D0,A6								; calc base of blue
+				ADDA	D0,A6								; calc base of blue
+
+@OneTbl
+
+;
+; Get the maximum number of entries, zero based from a convenient table.
+;
+
+				MOVE.W	saveMode(A3),D1						; get the current video mode
+				SUB.W	#FirstVidMode,D1					; convert to a index
+				
+				Moveq	#0,D4								; clear all of D4 for .w compare.
+				Lea		SonoraCLUTTbl,A0					; Point to the table of CLUT data.
+				Lea		(A0,D1*SonoraCLUTSize),A0			; Point to the right entry.
+				Move.b	scRange(A0),D4						; Get the range.
+				
+;
+; Allocate a temporary color table on the stack.  We'll pre-process all the entries that will 
+;	change here so we can hit the hardware as quickly as possible.
+;
+	
+				Move.w	csCount(A2),D3						; Get the number of entries to change,
+				Bmi		SonoraSEBadExit						; 	and hike if it’s out of range.
+				Cmp.w	D4,D3								; If D3-D4 > 0 (count - range > 0),
+				Bhi		SonoraSEBadExit						;	then hike.
+				Tst.w	csStart(A2)							; If we’re doing indexed entries (-1),
+				Bmi.s	@skipStartChk						;	then just go on.
+				Add.w	csStart(A2),D3						; Adjust count for starting position.
+				Cmp.w	D4,D3								; If D3-D4 > 0 (count - range > 0),
+				Bhi		SonoraSEBadExit						;	then hike.
+				Move.w	csCount(A2),D3						; Otherwise, re-get the count.
+
+@skipStartChk
+								
+				Move.w	D3,D4								; Make a copy of the table size (zero-based).
+				Addq	#1,D4								; Make it a counting number.
+				Btst	#UseSeq,D5							; If we’re not in sequential mode,
+				Beq.s	@IsIndex							;	then do the indexed stuff.
+				Mulu	#3,D4								; Make room for just R,G,B in sequential mode.
+				Bra.s	@AllocIt							; And continue.
+@IsIndex		Asl.w	#2,D4								; Make room for i,R,G,B in indexed mode.
+@AllocIt		Sub.w	D4,Sp								; Allocate the table on the stack.
+								
+;
+; Construct the stack version of the color table. It looks like a color table, but each of the
+;	components is only eight bits (rather than 16).
+;
+				
+				Move.l	A3,D6								; We’re about to torch A3, so save it for later.
+				Move.l	A0,A3								; Save the CLUT table entry pointer.
+
+				MOVE.L	SP,A0								; copy the stack buffer pointer
+				MOVE.L	csTable(A2),A1						; get colorSpec pointer into A1
+				
+; Death!  Totally out of registers in this routine, so I'm using the top half of D4 (the temp buffer
+;	size) as the sequence counter used in most video modes to translate sequential requests into
+;	the indexed write that the hardware needs.
+
+				SWAP	D4									; flip the buffer size to the top half
+				MOVE.W	csStart(A2),D4						; pick up the sequential start position.  It might
+															; 	be -1 on a true indexed write, but we won't 
+															;	use it below if it is.
+;													
+; Write the index if in indexed mode.  If in sequential (8/16) mode, blow it off completely,
+;	since it won't be needed. 
+
+@SetupLoop
+				MOVE.W	(A1)+,D0							; get index
+	
+				BTST	#UseSeq,D5							; is it sequence mode?
+				BNE.S	@SLSeq								; yup, so go there
+				
+				Btst	#PsuedoIndex,D5						; If we are doing an “indexed” mode,
+				Beq.s	@IndexPresent						;	then go there now.
+				
+; This case is a sequential request in a screen depth that does not allow sequential CLUT writes 
+;	(any non-8/16 bit mode).  In this case, we substitute the sequence counter for D0 on each
+;	entry.
+				
+				Move.w	D4,D0								; Copy the sequence counter to D0.
+				Addq	#1,D4								; Increment it.
+				
+@IndexPresent	Mulu.w	scSkip(A3),D0						; Calculate the new position at this depth.
+				Add.b	scStart(A3),D0						; Add in the first entry offset.
+				Move.b	D0,(A0)+							; Write out this index.
+
+@SLSeq			
+				MOVE.W	(A1)+,D0							; get red
+				MOVE.W	(A1)+,D1							; get green
+				MOVE.W	(A1)+,D2							; get blue
+	
+				TST		D5									; test hi bit of the flags
+				BPL.S	@NoGray								; if not set, don't luminence map
+				
+				BTST	#IsDirect,D5						; test for direct mode as well
+				BNE.S	@NoGray								; don't allow luminence mapping in direct mode
+
+; We're luminence mapping here.
+	
+				MULU	#$4CCC,D0							; multiply by red weight (0.30)
+				MULU	#$970A,D1							; multiply by green weight (0.59)
+				MULU	#$1C29,D2							; multiply by blue weight (0.11)
+				ADD.L	D1,D0								; sum red and green
+				ADD.L	D2,D0								; blue also
+				BFEXTU	D0{0:D7},D0							; get gChanWidth bits for gamma table lookup
+				MOVE.W	D0,D1								; copy into green register
+				MOVE.W	D0,D2								; copy into blue register
+	
+				BRA.S	@WriteSP							; go on and write it in the stack buffer
+			
+@NoGray
+				BFEXTU	D0{16:D7},D0						; get gChanWidth bits of red
+				BFEXTU	D1{16:D7},D1						; get gChanWidth bits of green
+				BFEXTU	D2{16:D7},D2						; get gChanWidth bits of blue	
+				
+@WriteSP
+				BTST	#IsMono,D5							; if monochrome display, write black to red & green
+				BEQ.S	@Brighter							; if not, then set all three channels
+				CLR.B	(A0)+								; write black for red
+				CLR.B	(A0)+								;	and green
+				BRA.S	@Looper								; write out normal blue
+
+@Brighter	
+				MOVE.B	(A4,D0),(A0)+						; write gamma corrected red
+				MOVE.B	(A5,D1),(A0)+						; write gamma corrected green
+			
+@Looper
+				MOVE.B	(A6,D2),(A0)+						; write gamma corrected blue
+				DBRA	D3,@SetupLoop						; and loop for each entry
+				
+				Swap	D4									; Put the temp buffer size back in the lo-half.
+
+;
+; OK, the stack table is set up.  Now let's load the hardware.
+;
+				Move.l	D6,A3								; Get our privates pointer back into A3 (for WaitVSync).
+				Move.w	Sr,-(SP)							; Preserve the status register.
+				BSR		SonoraWaitVSync						; Wait for next blanking period (preserves A0/D0).
+				
+				MOVE.W	csCount(A2),D3						; get the count again
+				MOVE.L	saveVDACBase(A3),A3					; get the VDAC base
+				LEA		ArielDataReg(A3),A3					; point to VDAC data register
+	
+				LEA		2(SP),A0							; point to the stack buffer again
+						
+				BTST	#UseSeq,D5							; is it sequence mode?
+				BNE.S	SonoraSeqWrite						; yup, sequence mode, so go there
+			
+;
+; Here's the loop that actually writes to the hardware when in indexed mode.
+;
+
+SonoraIndexWrite
+				MOVE.B	(A0)+,ArielAddrReg-ArielDataReg(A3) ; write the index value to the CLUT address
+				MOVE.B	(A0)+,(A3)							; write red			
+				MOVE.B	(A0)+,(A3)							; write green
+				MOVE.B	(A0)+,(A3)							; write blue
+				DBRA	D3,SonoraIndexWrite					; and loop
+				BRA.S	SonoraSEDone						;
+		
+;
+; Write the translated starting position for sequence mode.
+;
+
+SonoraSeqWrite	
+				MOVE.W	csStart(A2),D0						; get sequence start address
+				MOVE.B	D0,ArielAddrReg-ArielDataReg(A3)	; write the sequence start position
+			
+;
+; Here's the loop that actually writes to the hardware when in sequence mode.
+;
+
+@SeqLoop
+				MOVE.B	(A0)+,(A3)							; write red			
+				MOVE.B	(A0)+,(A3)							; write green
+				MOVE.B	(A0)+,(A3)							; write blue
+				DBRA	D3,@SeqLoop							; and loop
+		
+;
+; Clean up and go home.
+;
+
+SonoraSEDone		
+				MOVE.W	(SP)+,SR							; restore status register
+			
+				ADD.W	D4,SP								; release stack buffer
+				MOVEM.L	(SP)+,A1/A4-A6/D4-D7				; restore registers
+				BRA		SonoraCtlGood						; return O-Tay!
+			
+SonoraSEBadExit	
+				MOVEM.L	(SP)+,A1/A4-A6/D4-D7				; restore registers
+				BRA		SonoraCtlBad						; return an error code
+		
+				ENDWITH
+
+SonoraSetGamma
+;---------------------------------------------------------------------
+;
+;	Set the gamma table.  This call copies the supplied gTable so the 
+;		caller does not have to put the source on the system heap.  It
+;		tests if the gamma table is exactly a match to the currently
+;		connected monitor, or always allows it if the monitor number in
+;		the FormulaData is -1.  If supplied gamma table ptr is NIL, then
+;		it loads a linear gamma table into the private table
+;
+;		A0 = Ptr to private storage
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;
+;---------------------------------------------------------------------
+			
+				WITH	SonoraVidPrivates
+		
+; Get new gamma table and check that we know how to handle it.
+			
+				MOVE.L	csGTable(A2),D0						; test for a NIL pointer
+				BEQ		@LinearTab							; if so, then set up a linear gamma table
+				MOVE.L	D0,A2								; get pointer to new gamma table
+			
+				TST.W	gVersion(A2)						; version = 0?
+				BNE		SonoraCtlBad						; => no, return error
+				Tst.w	gType(A2)							; Test the hardwareID.
+				Beq.s	@ChangeTable						; If 0, then accept a TFB-style gamma table.
+				CMP.W	#drHwSonora,gType(A2)				; type = Sonora?
+				BNE		SonoraCtlBad						; => no, return error
+				TST.W	gFormulaSize(A2)					; if gType=Sonora, then check for monID in gFormulaData
+				BEQ.S	@ChangeTable						; if zero, then generic, so continue
+
+				MOVE.W	gFormulaData(A2),D0					; get the monitor ID this table was intended for
+				CMP.W	saveMonID(A3),D0					; is this the monitor? 
+				BEQ.S	@ChangeTable						; yes, so do it
+				ADDQ	#1,D0								; was it -1?
+				BNE 	SonoraCtlBad						; nope, so must be wrong monitor
+			
+; If new table is a different size, reallocate memory.
+
+@ChangeTable
+
+				MOVE.L	saveGammaPtr(A3),A0					; get current gamma in A0
+				MOVE	gFormulaSize(A2),D0					; get size of formula in new
+				CMP		gFormulaSize(A0),D0					; same as current gamma table
+				BNE.S	@GetNew								; =>no, resize pointer
+				MOVE	gChanCnt(A2),D0						; get number of tables in new
+				CMP		gChanCnt(A0),D0						; same as current gamma table?
+				BEQ.S	@SizeOK								; => yes, data size ok
+				BGT.S	@GetNew								; => new one is bigger, save old one
+@NewSize		Move.l	saveGamDispPtr(A3),A0				; if new one is smaller,
+				_DisposPtr									;	dispose old one								
+				CLR.L	saveGamDispPtr(A3)					; flag it's been disposed
+			
+@GetNew			Moveq	#0,D0								; (_NewPtr takes a long, so clear D0 for later.)
+				MOVE	gDataCnt(A2),D0						; get number of entries
+				MULU	gChanCnt(A2),D0						; multiply by number of tables
+				ADD		gFormulaSize(A2),D0					; add size of formula data
+				ADD		#gFormulaData,D0					; add gamma table header size
+				_NewPtr ,Sys								; and allocate a new pointer
+				BNE		SonoraCtlBad						; => unable to allocate storage
+			
+				MOVE.L	saveGamDispPtr(A3),D0				; get old gamma table
+				MOVE.L	A0,saveGammaPtr(A3)					; save new gamma table
+				TST.L	D0									; was there an old one?
+				BEQ.S	@SizeOK								; => no, already disposed
+				MOVE.L	D0,A0								; else get old table
+				_DisposPtr									; and dispose of old gamma table
+				
+				MOVE.L	saveGammaPtr(A3),A0					; get new gamma table back
+				Move.l	A0,saveGamDispPtr(A3)				; save it for disposal
+						
+; Copy the gamma table header.
+			
+@SizeOK			MOVE	gChanCnt(A2),D0						; get number of tables
+				MOVE	gFormulaSize(A2),D1					; get size of formula data
+				MOVE	gDataCnt(A2),D2						; get number of entries
+				MOVE.L	(A2)+,(A0)+							; copy gamma header
+				MOVE.L	(A2)+,(A0)+							; which is
+				MOVE.L	(A2)+,(A0)+							; 	12 bytes long
+			
+; Copy the data.
+			
+				MULU	D0,D2								; multiply by number of tables
+				ADD		D1,D2								; add in size of formula data
+				SUBQ	#1,D2								; get count - 1
+@NxtByte		MOVE.B	(A2)+,D0							; get a byte
+				MOVE.B	D0,(A0)+							; move a byte
+				DBRA	D2,@NxtByte							; => repeat for all bytes
+
+				Bra.s	@GammaDone							; Check to see if it’s a direct device.
+
+;
+; Set up a linear gamma table.  To prevent memory thrash, build this new one
+;	the same size as the existing one (one or three channel).  
+;
+
+@LinearTab
+
+				MOVE.L	saveGammaPtr(A3),A0					; get current gamma in A0
+				MOVE.W	gFormulaSize(A0),D0					; get size of formula in new
+				MOVE.W	gChanCnt(A0),D2						; get the number of tables
+				SUBQ	#1,D2								; zero based, of course
+				Move.w	gDataCnt(A0),D3						; get the number of entries
+				Subq	#1,D3								; zero base
+				ADDA	#gFormulaData,A0					; point to tables
+				ADDA	D0,A0								; point past monID, if present
+@ChanLoop		MOVE.W	D3,D0								; loop count within each channel
+@entryLoop		MOVE.B	D0,(A0)								; write this value out
+				Not.b	(A0)+								; invert to make table ramp properly
+				DBRA	D0,@entryLoop						; for each entry in channel
+				DBRA	D2,@ChanLoop						; and each channel
+
+@GammaDone			
+				BTST	#IsDirect,GFlags(A3)				; are we in a direct mode?
+				BEQ.S	@Out								; if not, then we're done
+				BSR		SonoraDirectCLUTSet					; if so, then set up direct CLUT ramps
+			
+@Out
+				BRA		SonoraCtlGood						; => return no error
+			
+				ENDWITH
+
+SonoraGrayPage											
+;---------------------------------------------------------------------
+;
+;	Clear the specified page in the current mode to gray
+;
+;		A0 = Ptr to private storage
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to driver privates
+;
+;---------------------------------------------------------------------
+			
+				WITH 	SonoraVidPrivates
+	
+				MOVE	saveMode(A3),D1						; D1 = mode
+				BSR		SonoraChkMode						; convert mode to depth in D1
+				BNE		SonoraCtlBad						; => not a valid depth
+				
+				MOVE	csPage(A2),D0						; D0 = page
+				BNE 	SonoraCtlBad						; => not a valid page
+	
+				BSR		SonoraGrayScreen					; paint the screen gray
+	
+				BTST	#IsDirect,GFlags(A3)				; are we in a direct mode?
+				BEQ.S	@Out								; if not, then we're done
+				BSR		SonoraDirectCLUTSet					; if so, then set up direct CLUT ramps
+@Out
+				BRA		SonoraCtlGood						; => return no error
+	
+				ENDWITH
+
+SonoraSetGray
+;---------------------------------------------------------------------
+;
+;	Set luminance mapping on (csMode = 1) or off (csMode = 0)
+;
+;   When luminance mapping is on, RGB values passed to setEntries are mapped
+; 	to grayscale equivalents before they are written to the CLUT.
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;
+;---------------------------------------------------------------------
+			
+				WITH	SonoraVidPrivates
+		
+				BTST	#IsMono,GFlags(A3)					; is this a mono-only monitor?
+				BEQ.S	@1									; if not, then go ahead
+				MOVE.B	#1,csMode(A2)						; always turn on for mono devices
+@1				MOVEQ	#0,D1								; set up for BFEXTU to point to GrayFlag
+				BSR.S	SonoraSetIntCom						; call common code
+				BRA		SonoraCtlGood						; all done
+			
+;
+; This shared routine setup up a flag in GFlags.  It takes a pointer to 
+;	private storage in A3, and the bit field start location in D1.
+;
+			
+SonoraSetIntCom											
+				MOVE.B	csMode(A2),D0						; get boolean
+				BFINS	D0,GFlags(A3){D1:1}					; set flag bit
+				RTS											; and return
+
+				ENDWITH
+
+SonoraSetInterrupt
+;---------------------------------------------------------------------
+;
+;	Enable (csMode = 0) or disable (csMode = 1) VBL interrupts
+;
+;   As a future performance enhancement, interrupts on the card can be
+;	disabled or enabled from software. For instance, if the cursor is
+;	not on a screen, and there is nothing in the Slot Interrupt Queue
+;	for that device, interrupts may be disabled reducing interrupt 
+;	overhead for the system.
+;
+;	The slot interrupt queue element is always allocated by the Open call.
+;	This routine just inserts and removes it from the slot interrupt task queue.
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+
+				WITH	VDPageInfo,SlotIntQElement,SonoraVidPrivates
+			
+				MOVEQ	#1,D1								; set up for BFEXTU to point to IntDisFlag
+				BSR.S 	SonoraSetIntCom						; call common code
+				BNE.S	@DisableThem						; if zero, then enable
+
+; This code enables interrupts and installs the interrupt handler.
+;
+				BSR.S	SonoraEnableVGuts					; call common code
+				BNE		SonoraCtlBad						; error, flag problem
+				BRA		SonoraCtlGood						; and go home
+			
+; This code disables VBL interrupts, then removes the interrupt handler.
+;
+@DisableThem	
+				BSR.S	SonoraDisableVGuts					; jump to the disabling utility
+				BRA		SonoraCtlGood						; all done
+			
+; The following two routines are common code shared between the Open/Close calls
+;	and the SetInterrupt control call.
+;
+SonoraDisableVGuts
+				
+				MOVE.W	SR,-(SP)							; preserve the status register
+				BSR		SonoraWaitVSync						; to be safe, wait for the next VBL
+
+				Move.l	saveSonoraBase(A3),A0				; Get the Sonora base address.
+				Adda.l	#SonoraVIA2Base,A0					; Point to the interrupt register space.
+				Move.b	#$40,SonoraSlotIER(A0)				; Disable Slot $0 interrupts.
+				MOVE	(SP)+,SR							; re-enable cursor interrupts
+	
+				CLR		D0									; setup slot # for _SIntRemove (slot zero!)
+				MOVE.L	saveSQElPtr(A3),A0					; get the SQ element pointer
+				_SIntRemove									; remove the interrupt handler
+				RTS
+
+SonoraEnableVGuts
+
+				MOVE.L	saveSQElPtr(A3),A0					; get the queue element
+				LEA		SonoraBeginIH,A2					; save Pointer to interrupt handler
+				MOVE.W	#SIQType,SQType(A0)					; setup queue ID
+				MOVE.L	A2,SQAddr(A0)						; setup int routine address
+				MOVE.L	A3,SQParm(A0)						; pass pointer to privates as the parameter
+				CLR.W	D0									; setup slot zero
+				_SIntInstall								; and do install
+				BNE.S 	@IntBad
+			
+				Move.l	A0,-(Sp)							; Save the queue element pointer.
+				Move.l	saveSonoraBase(A3),A0				; Get the Sonora base address.
+				Adda.l	#SonoraVIA2Base,A0					; Point to the interrupt register space.
+				Move.b	#$C0,SonoraSlotIER(A0)				; Enable Slot $0 interrupts.
+				Move.l	(Sp)+,A0							; Restore the queue elemetn pointer.
+
+				CMP		D0,D0								; clear z-bit for good result
+@IntBad			RTS											; return home (if bad, z-bit is set above, so just leave) <8>
+
+				ENDWITH
+
+SonoraDirectSetEntries
+;---------------------------------------------------------------------
+;
+;	Change the CLUT in a direct mode.
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;	This routine allows knowledgeable programs modify the contents
+;	of the CLUT in direct modes (usually for limited color previewing).
+;	It takes the same parameter block as SetEntries, but SetEntries
+;	intentionally does not operate when the card is in a direct pixMode.
+;	This routine takes the same data and operates ONLY when in direct 
+;	modes.  It calls the same SetEntries guts as the regular routine.
+;
+;---------------------------------------------------------------------
+
+				BTST	#IsDirect,GFlags(A3)				; are we in a direct mode?
+				BEQ		SonoraCtlBad						; error if not
+				BRA		SonoraSEGuts						; jump to SetEntries internals if it's OK
+
+SonoraSetDefaultMode
+;---------------------------------------------------------------------
+;
+;	Write the card default mode into slot pRAM.
+;
+;		A1 = Ptr to AuxDCE (but trashed on exit)
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;	This routine is called by Monitors when somebody selects an alternate 
+;	video mode family in the Options dialog.
+;
+;---------------------------------------------------------------------
+
+				WITH 		spBlock,SonoraVidPrivates,SP_Params
+
+;
+; Set up a slot parameter block on the stack.
+;
+	
+				SUBA		#spBlockSize,SP					; make an slot parameter block on stack
+				MOVE.L		SP,A0							; get pointer to parm block now
+				MOVE.B		dCtlSlot(A1),spSlot(A0)			; put slot in pBlock
+				CLR.B		spExtDev(A0)					; external device = 0
+
+;
+; Read the slot pRAM to determine what the currently saved mode is.  The first
+;	word is the board ID, followed by the default screen depth.  Built-in video keeps the video
+;	sRsrc spID in VendorUse2.  
+;
+				
+				SUBA		#SizesPRAMRec,SP				; allocate block for pRAM record
+				MOVE.L		SP,spResult(A0)					; point to it
+				_sReadPRAMRec								; read it
+
+;
+; Since PrimaryInit relies on the default mode being set correctly, we check to see that
+;	the mode to be set is actually valid.  Monitors can only see valid sRsrcIDs, so
+;	it probably won’t cause a problem.  But we should check it anyway for unsavory
+;	applications.
+;
+				
+				Move.b		csMode(A2),spID(A0)				; Look for the passed in spID.
+				Clr.l		spParamData(A0)					; Clear the fNext flag; we want THIS sRsrc.
+				Ori.b		#(1<<fall)|\					; Search for both enabled/disabled sRsrc’s
+							(1<<foneslot),spParamData+3(A0)	; Only search in our slot.
+				_GetsRsrc									; Do it.
+				Bne			@BadExit						; If failed, quit.
+				
+				Move.w		spCategory(A0),D0				; Get the category.
+				Cmp.w		#catDisplay,D0					; If it’s not catDisplay,
+				Bne			@BadExit						;	then quit.
+				Move.w		spCType(A0),D0					; Get the type.
+				Cmp.w		#typVideo,D0					; If it’s not typVideo,
+				Bne			@BadExit						;	then quit.
+				Move.w		spDrvrSw(A0),D0					; Get the software kind.
+				Cmp.w		#drSwApple,D0					; If it’s not drSwApple,
+				Bne			@BadExit						;	then quit.
+				Move.w		spDrvrHw(A0),D0					; Get the hardware ID.
+				Cmp.w		#drHwSonora,D0					; If it’s not drHwSonora,
+				Bne			@BadExit						;	then quit.
+
+;
+; It is very important that Monitors (or someone) invalidate and setup the screen resource
+;   if this call is exercised.  Monitors needs to verify (and potentially re-write to pRAM)
+;	the proper screen depth in the new world.
+;
+				Move.b		csMode(A2),D1					; Copy the desired family mode.
+				Cmp.b		SP_LastConfig(Sp),D1			; If we’re already going to this mode,
+				Beq.s		@GoodExit						;	then just go on.
+				
+				Movea.l		A0,A1							; Save the SpBlockPtr.
+				Tst.b		noVRAM(A3)						; If we have real VRAM, then
+				Beq.s		@WriteIt						;	just go on.
+
+				Move.l		#gestaltDisplayMgrAttr,D0		; We need to know if the Display Manager is around.
+				_Gestalt									; Ask, and ye shall receive.
+				Bne.s		@NoDM							; Oops, got an error.
+				Move.l		A0,D0							; Get the result into D0.
+				Btst		#gestaltDisplayMgrPresent,D0	; If the Display Manager is not around,
+				Beq.s		@NoDM							;	then do the non-dynamic stuff.
+				Cmpi.w		#indexedSenseMSB1,saveMonID(A3) ; If we’re driving a multiscan display,
+				Beq.s		@WriteIt						;	then skip the non-dynamic stuff.
+				Cmpi.w		#indexedSenseMSB2,saveMonID(A3) ; If we’re driving a multiscan display,
+				Beq.s		@WriteIt						;	then skip the non-dynamic stuff.
+				Cmpi.w		#indexedSenseMSB3,saveMonID(A3) ; If we’re driving a multiscan display,
+				Beq.s		@WriteIt						;	then skip the non-dynamic stuff.
+				
+@NoDM			Bset		#spFamilyChanged,SP_Flags(Sp)	; Say that we’re changing the mode.
+				Lea			DepthTable,A1					; Point to table of depths.
+@DepthLoop		Move.b		(A1)+,D0						; Get the next sRsrcID.
+				Cmpi.b		#-1,D0							; If we’re at the end of the table,
+				Beq.s		@WriteIt						; 	then just go on.
+				Move.b		(A1)+,D2						; Save the depth. 
+				Cmp.b		D0,D1							; Otherwise, if the sRsrcIDs don’t match,
+				Bne.s		@DepthLoop						;	then keep looping.
+				Tst.b		D2								; If the depth byte is zero,
+				Beq.s		@WriteIt						; 	then just leave things alone.
+				Cmpi.b		#-1,D2							; If the depth byte is negative one,
+				Beq.s		@ChkDepth						; 	then check the current depth.
+				Move.b		D2,SP_Depth(Sp)					; Otherwise, write it out.
+				Bra.s		@WriteIt		
+
+@ChkDepth		Cmpi.b		#FifthVidMode,SP_Depth(Sp)		; If were not set for 16bpp mode,
+				Bne.s		@WriteIt						; 	then just go on.
+				Move.b		#FourthVidMode,SP_Depth(Sp)		; Otherwise, say we want 8bpp instead.
+
+@WriteIt		Movea.l		A1,A0							; Restore the SpBlockPtr.
+				MOVE.B		D1,SP_LastConfig(SP)			; write the mode into pRAM buffer
+				MOVE.L		SP,spsPointer(A0)				; set up parameter block
+				_sPutPRAMRec								; write the new record out
+
+@GoodExit		ADDA		#SizesPRAMRec+spBlockSize,SP	; Deallocate buffer and
+				BRA			SonoraCtlGood					;	return good result.
+				
+@BadExit		Adda		#SizesPRAMRec+spBlockSize,SP	; Deallocate buffer and
+				Bra			SonoraCtlBad					;	return bad result.
+				
+				ENDWITH
+				
+SonoraSwitchMode
+;---------------------------------------------------------------------
+;
+;	When driving a multiscan-capable display, this routine allows
+;		the various modes to swapped out both from a low-level software
+;		(i.e., Driver & Slot Manager) and hardware point of view.
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+
+				With		SonoraVidPrivates,SpBlock,VDPageInfo
+				
+; Check to see if we even need to be here or not…
+;
+				Cmpi.w		#indexedSenseMSB1,saveMonID(A3) ; If we’re driving a multiscan display,
+				Beq.s		@EndMSChk						;	then just keep going.
+				Cmpi.w		#indexedSenseMSB2,saveMonID(A3) ; If we’re driving a multiscan display,
+				Beq.s		@EndMSChk						;	then just keep going.
+				Cmpi.w		#indexedSenseMSB3,saveMonID(A3) ; If we’re driving a multiscan display,
+				Beq.s		@EndMSChk						;	then just keep going.
+				Bra			SonoraCtlBad					; Otherwise, just go away.
+@EndMSChk
+
+; Check to see if we can even do what was requested…
+;
+				Tst.w		csPage(A2)						; If requested page is not zero,
+				Bne.s		SonoraCtlBad					;	then we can’t help ’em.
+				
+				Move.l		csData(A2),D2					; Get the requested SpID.
+				Moveq		#0,D0							; Clear hi-half of mode/depth register.
+				Lea			SwitchTable,A0					; Point to the SwitchMode table.
+@ChkLoop		Move.b		(A0)+,D1						; Get the next sRsrcID.
+				Cmpi.b		#-1,D1							; If we’re at the end of the table,
+				Beq			SonoraCtlBad					; 	then something’s wrong.
+				Move.b		(A0)+,D0						; Get the max mode for this config.
+				Cmp.b		D1,D2							; If this is not the requested mode,
+				Bne.s		@ChkLoop						;	then keep looping.
+				
+; Make sure the new depth is okay for switching…
+;
+				Move.w		csMode(A2),D1					; Get the requested mode (depth).
+				Subi.w		#FirstVidMode,D1				; Make it indexed.
+				Subi.w		#FirstVidMode,D0				; Make the new max mode indexed.
+				Cmp.w		D0,D1							; If the current mode is > new max mode,
+				Bgt			SonoraCtlBad					;	then punt.
+				Move.w		D1,D0							; Save the indexed mode.
+
+; Switch to the new resolution…
+;
+				Cmp.b		dCtlSlotID(A1),D2				; If we’re already in the requested resolution,
+				Beq			SonoraSetVidModeGuts			;	then go try the depth switch.
+				
+				Move.b		D2,D1							; Set up to do the resolution switch.
+				Bsr			SonoraSetResolution				; Switch to the new resolution.
+				Move.w		D0,D1							; Set up to do the depth switch.
+				Bra			SonoraSetVidModeGuts			; Switch to the new depth.
+				
+				Endwith
+
+SonoraSetSync																										; <sm20>
+;---------------------------------------------------------------------
+;
+;	Enable (csMode = 0) or disable (csMode = 1) the DB15 Sync
+;
+;	This routine will disable the sync lines going to the DB15 connector
+;   so that "green-aware" monitors can go into power-saving mode.  If we
+;   are not driving a monitor out of that port, it will return an error.
+;
+;	Note:  It might be that in the future, there will be several levels of
+;  		   power-saving;  Dropping CSYNC- will be one, HSYNC-, another, and
+;		   both syncs another.  Since Civic can only drop both, I will ignore
+;		   a second undefined parameter.
+;
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+				WITH	SonoraVidPrivates																			; <sm20>
+																													; <sm20>
+				movea.l	saveSonoraBase(a3),a0				; Get Sonora Base (VIA1 base $50f00000)					; <sm20>
+				adda.l	#SonoraVdCtlBase,a0					; add the difference to get Vid Reg ($28000)			; <sm20>
+				Move.b	SonoraVdModeReg(A0),D0				; Get the appropriate monitor code.						; <sm20>
+																													; <sm20>
+				Bset	#SonoraVidBlnkBit,D0				; Set up for SonoraWrite								; <sm20>
+				MOVE.b	csMode(A2),D1						; get the mode											; <sm20>
+				Bne.s	@WriteToSyncs						; To disable, write a 1 to SonoraSyncEnable				; <sm20>
+				Bclr	#SonoraVidBlnkBit,D0				; else, write a 0 to enable								; <sm20>
+@WriteToSyncs																										; <sm20>
+				Move.b	D0,SonoraVdModeReg(A0)				; And disable or enable the sycns						; <sm20>
+																													; <sm20>
+				BRA		SonoraStatGood						; => return no error									; <sm20>
+																													; <sm20>
+				ENDWITH																								; <sm20>
+
+
+SonoraSetRubik560Mode
+;---------------------------------------------------------------------
+;
+;	Enable (csMode = 0) or disable (csMode = non-zero) Rubik-560 mode.
+;
+;		Note:  “Enable” means “switch from 512 to 560” if you’re
+;				not already in 560 mode, and “disable” means “switch
+;				from “560 to 512” if you’re not already in 512 mode.
+;
+;				Also, note that this call will do nothing if we
+;				were “started up” in 560 mode.
+;
+;				Finally, this call only switches the Slot Manager,
+;				video driver, and hardware data and data structures.
+;				It is up to the calling application to inform the
+;				graphics environment (e.g., QuickDraw) that things
+;				have changed.
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+
+				With	SonoraVidPrivates,SpBlock
+
+; Check to see if we even need to be here or not…
+;
+				Btst	#InRubik560Mode,GFlags(A3)			; If we “started up” in Rubik-560 mode,
+				Bne		SonoraCtlGood						;	then there’s nothing to do here.
+
+; Check to see if we can even do what was requested…
+;
+				Tst.b	csMode(A2)							; If we’re supposed to be “enabling” 560 mode,
+				Beq.s	@Chk512								;	check to see if we’re in 512 mode.
+				
+				Cmp.b	#sRsrc_Vid_Sonora_GS560a,dCtlSlotID(A1)	; If we’re in 560a mode then,
+				Beq.s	@Setup512a 								;	set up to switch back to 512a mode.
+				Cmp.b	#sRsrc_Vid_Sonora_GS560b,dCtlSlotID(A1)	; If we’re in 560b mode then,
+				Beq.s	@Setup512b								;	set up to switch back to 512b mode.
+				Bra		SonoraCtlBad							; Otherwise, we’re not supposed to be here!
+
+@Chk512			Cmp.b	#sRsrc_Vid_Sonora_GSa,dCtlSlotId(A1)	; If we’re in 512a mode then,
+				Beq.s	@Setup560a							 	;	 set up to switch to 560a mode.
+				Cmp.b	#sRsrc_Vid_Sonora_GSb,dCtlSlotId(A1) 	; If we’re in 512b mode then,
+				Beq.s	@Setup560b							 	;	 set up to switch to 560b mode. 	
+				Bra		SonoraCtlBad							; Otherwise, we’re not supposed to here!
+
+; Do the required switch…
+;
+@Setup512a		Move.b	#sRsrc_Vid_Sonora_GSa,D1			; Set up for 512a mode.
+				Bra.s	@DoIt
+@Setup512b		Move.b	#sRsrc_Vid_Sonora_GSb,D1			; Set up for 512b mode.
+				Bra.s	@DoIt
+@Setup560a		Move.b	#sRsrc_Vid_Sonora_GS560a,D1			; Set up for 560a mode.
+				Bra.s	@DoIt
+@Setup560b		Move.b	#sRsrc_Vid_Sonora_GS560b,D1			; Set up for 560b mode.
+
+@DoIt			Bsr		SonoraSetResolution					; Switch to the desired mode.
+				Bra		SonoraCtlGood						; Return good result.
+
+				Endwith
+
+SonoraSetAltSense
+;---------------------------------------------------------------------
+;
+;	SetAltSense sets up the alternate senseID pRam byte to contain
+;		a valid “index” code if a valid sense code is passed
+;		in csMode (byte 0 is the sense code, byte 1 is the type).
+;
+;		A1 = Ptr to AuxDCE/Ptr to MonIDs table (not restored)
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+
+				With 	SpBlock,SonoraVidPrivates,SP_Params
+				
+;
+; First, set up a slot parameter block on the stack.
+;
+				
+				Suba.w	#spBlockSize,Sp						; Make an SpBlock on the stack.
+				Move.l	Sp,A0								; Get a pointer to it into A0.
+				Move.b	dCtlSlot(A1),spSlot(A0)				; Set it up.
+				Clr.b	spExtDev(A0)
+				
+;
+; Next, read the current pRam so that we can set it appropriately…
+;
+				
+				Suba.w	#SizesPRAMRec,Sp					; Make an sPRAM block on the stack.
+				Move.l	Sp,spResult(A0)						; Point to it.
+				_sReadPRamRec								; Get pRAM.
+				
+;
+; See what we need to do…
+;
+
+				Moveq	#0,D0								; Clear D0 for good measure.
+				Move.b	csMode+1(A2),D0						; Get the sense-code type.
+				Lea		MonIDsTbl,A1						; Point to the MonIDs table.
+
+@TypeLoop		Cmp.w	(A1)+,D0							; If we’ve come to the end of the table,
+				Bmi.s	@MonIDNotValid						;	then leave with an error.
+				Beq.s	@ChkOffset							; If we’ve found a match, then check it.
+				Tst.w	(A1)+								; Otherwise, skip the offset.
+				Bra.s	@TypeLoop							; And keep looping until we’re done.
+
+@ChkOffset		Move.w	(A1)+,D1							; If the offset to the code table is nil,
+				Beq.s	@MonIDNotValid						; 	then leave with an error.
+				Lea		MonIDsTbl,A1						; Otherwise, re-point to the MonIDsTbl.
+				Adda.w	D1,A1								; And point to the appropriate sense-code table.
+				
+				Move.b	csMode(A2),D0						; Get the sense code.
+@CodeLoop		Cmp.b	(A1)+,D0							; If we’ve come to the end of the table,
+				Bmi.s	@MonIDNotValid						;	then leave with an error.
+				Beq.s	@ChkIt								; If we’ve found a match, then check it.
+				Tst.b	(A1)+								; Otherwise, skip the indexed code.
+				Bra.s	@CodeLoop							; And keep looping until we’re done.
+				
+@ChkIt			Move.b	(A1)+,D1							; Get the indexed ID for this code.
+				Cmpi.b	#indexedNoConnect,D1				; If it’s the no-connect code,
+				Beq.s	@ClearIt							;	then say so.
+				
+				Move.b	D1,SP_AltSense(Sp)					; Write out “index” to pRam record.
+				Ori.b	#spAltSenseValidMask,SP_AltSense(Sp) ; Validate it.
+				Bra.s	@WritePRam
+
+@ClearIt		Clr.b	SP_AltSense(Sp)						; Invalidate no-connect byte.
+				
+@WritePRam		Move.l	Sp,spsPointer(A0)					; Set up to whack pRam.
+				_sPutPRAMRec								; Whack it.
+				
+				Adda.w	#SizesPRAMRec+spBlockSize,Sp		; Restore stack…
+				Bra		SonoraCtlGood						; …and leave.
+				
+@MonIDNotValid	Adda.w	#SizesPRAMRec+spBlockSize,Sp		; Restore stack…
+				Bra		SonoraCtlBad						; …leave with error.
+				
+				Endwith
+				
+**********************************************************************
+*
+* VideoClose releases the device's private storage and removes the 
+*		interrupt handler.
+*
+*
+* Entry:	A0 = param block pointer
+*			A1 = AuxDCE pointer
+*
+* Other:	A2 = temporary AuxDCE pointer copy
+*
+**********************************************************************
+	
+SonoraVidClose		
+
+				WITH 	SonoraVidPrivates
+			
+				MOVE.L	dCtlStorage(A1),A3					; A3 <- Ptr to private storage
+				MOVE.L	(A3),D0								;
+				_StripAddress								;
+				MOVE.L	D0,A3								;
+
+; Disable interrupts…
+;
+				BSR		SonoraDisableVGuts					; call utility to deactivate interrupts
+					
+; Blank the screen…
+;
+				Movea.l	saveSonoraBase(A3),A0				; Get the Sonora base address.
+				Adda.l	#SonoraVdCtlBase,A0					; Point to the video control register space.
+				Bset	#SonoraVidBlnkBit,SonoraVdModeReg(A0) ; Turn on video blanking.
+				
+; Dispose of storage…
+;
+				MOVE.L	saveSQElPtr(A3),A0					; get the slot interrupt queue element ptr
+				_DisposPtr
+				
+				MOVE.L	saveGamDispPtr(A3),A0				; get pointer to gamma table block
+				_DisposPtr									; and dispose it
+
+				Move.l	saveVidPtr(A3),A0					; Get pointer to video parameters block,
+				_DisposPtr									;	and dispose of it.
+				
+				MOVE.L	dCtlStorage(A1),A0					; dispose of the private storage
+				_DisposHandle								;
+
+; Return no error…
+;
+				MOVEQ	#noErr,D0							; no error
+				RTS											; and return
+				
+				ENDWITH
+				
+**********************************************************************
+*
+* Video Driver Status Call Handler.  There are eleven standard calls:
+*
+*	($00) Error
+*	($01) Error
+*	($02) GetMode
+*	($03) GetEntries
+*	($04) GetPage
+*	($05) GetPageBase
+*	($06) GetGray
+*	($07) GetInterrupt
+*	($08) GetGamma
+*	($09) GetDefaultMode
+*	($0A) GetCurMode
+*
+* The following calls are Sonora-specific:
+*
+*	($83) GetAltSense
+*
+*   Entry: 	A0 		= paramblock pointer
+*			A1 		= AuxDCE pointer
+*	Uses:	A2		= cs parameters
+*			A3 		= pointer to private storage
+*			D0-D3 	= scratch (don't need to be preserved)
+*
+*	Exit:	D0	  	= error code
+*
+**********************************************************************
+
+SonoraVidStatus	
+
+				MOVEM.L	A0/A1,-(SP)							; Save exit registers.
+				
+				MOVE.L	csParam(A0),A2						; A2 <- Ptr to control parameters
+			
+				MOVE.L	dCtlStorage(A1),A3					; A3 <- Ptr to private storage
+				MOVE.L	(A3),D0								;
+				_StripAddress								;
+				MOVE.L	D0,A3								;
+
+				MOVE.W	csCode(A0),D0						; get routine selector
+				
+				Cmp.w	#cscAltSense,D0						; If we got the AltSense call,
+				Beq		SonoraGetAltSense					;	hop to it.
+			
+				CMP.W	#$0D,D0								;IF csCode NOT IN [0..$0A] THEN
+				BHI.S	SonoraStatBad						;  Error, csCode out of bounds.
+				MOVE.W	SonoraStatJumpTbl(PC,D0.W*2),D0		;Get the relative offset to the routine.
+				JMP		SonoraStatJumpTbl(PC,D0.W)			;GOTO the proper routine.
+				
+SonoraStatJumpTbl
+				DC.W	SonoraStatBad-SonoraStatJumpTbl		;$00 => Error
+				DC.W	SonoraStatBad-SonoraStatJumpTbl		;$01 => Error
+				DC.W	SonoraGetMode-SonoraStatJumpTbl		;$02 => GetMode
+				DC.W	SonoraGetEntries-SonoraStatJumpTbl	;$03 => GetEntries
+				DC.W	SonoraGetPage-SonoraStatJumpTbl		;$04 => GetPage
+				DC.W	SonoraGetPageBase-SonoraStatJumpTbl	;$05 => GetPageBase
+				DC.W	SonoraGetGray-SonoraStatJumpTbl		;$06 => GetGray
+				DC.W	SonoraGetInterrupt-SonoraStatJumpTbl  	;$07 => GetInterrupt
+				DC.W	SonoraGetGamma-SonoraStatJumpTbl		;$08 => GetGamma
+				DC.W	SonoraGetDefaultMode-SonoraStatJumpTbl	;$09 => GetDefaultMode
+				DC.W	SonoraGetCurMode-SonoraStatJumpTbl		;$0A => GetCurMode
+				DC.W	SonoraGetSyncs-SonoraStatJumpTbl		;$0B => cscGetSync							; <sm20>
+				DC.W	SonoraGetConnection-SonoraStatJumpTbl	;$0C => cscGetConnection
+				DC.W	SonoraGetModeTiming-SonoraStatJumpTbl	;$0D => cscGetModeTiming
+
+SonoraStatBad	MOVEQ	#statusErr,D0						; else say we don't do this one
+				BRA.S	SonoraStatDone						; and return
+			
+SonoraStatGood	MOVEQ	#noErr,D0							; return no error
+
+SonoraStatDone	MOVEM.L	(SP)+,A0/A1							; Restore exit registers.
+				BRA		SonoraExitDrvr
+				
+SonoraGetMode
+;---------------------------------------------------------------------
+;
+;	Return the current mode
+;
+;		Inputs : A2 = pointer to csParams
+;				 A3 = pointer to private storage
+;
+;---------------------------------------------------------------------
+
+				WITH	SonoraVidPrivates
+		
+				MOVE.W	saveMode(A3),csMode(A2)				; return the mode
+				Clr.w	csPage(A2)							; return the page number (always 0)
+			
+				Move.l	saveBaseAddr(A3),csBaseAddr(A2)		; Return the screen baseAddr.
+				BRA.S	SonoraStatGood						; => return no error
+	
+				ENDWITH
+
+SonoraGetEntries
+;---------------------------------------------------------------------
+;
+;	Read the current contents of the CLUT.  These values were gamma corrected
+;	when they were set (by SonoraSetEntries), so they may not match the source
+;	cSpec array.
+;
+;		Inputs : A1 = pointer to AuxDCE
+;				 A2 = pointer to csParams/CLUT read register (not restored to csParams)
+;				 A3 = pointer to private storage
+;
+;---------------------------------------------------------------------
+
+				With	SonoraCLUTRec
+				
+				Movem.l	D4-D6,-(Sp)							; Save work registers.
+				Tst.l	-(Sp)								; Make some room.
+				
+				Move.l	csTable(A2),D0						; If we were handed a nil pointer,
+				Beq		@GEErr								; 	then hike.
+				_StripAddress								; Make table pointer 32-bit clean.
+				Move.l	D0,(Sp)								; And save it.
+
+				Move.w	saveMode(A3),D1						; Get the current video mode.
+				Subi.w	#firstVidMode,D1					; Convert it to an index.
+
+				Moveq	#0,D3								; clear all of D3 for .w compare.
+				Lea		SonoraCLUTTbl,A0					; Point to the table of CLUT data.
+				Lea		(A0,D1*SonoraCLUTSize),A0			; Point to the right entry.
+				Move.b	scRange(A0),D3						; Get the CLUT range.
+						
+				Move.w	csCount(A2),D4						; Get the number of entries to change,
+				Bmi		@GEErr								; 	and hike if it’s out of range.
+				Cmp.w	D3,D4								; If D4-D3 > 0 (count - range > 0),
+				Bhi		@GEErr								;	then hike.
+				Tst.w	csStart(A2)							; If we’re doing indexed entries (-1),
+				Bmi.s	@skipStartChk						;	then just go on.
+				Add.w	csStart(A2),D4						; Adjust count for starting position.
+				Cmp.w	D3,D4								; If D4-D3 > 0 (count - range > 0),
+				Bhi		@GEErr								;	then hike.
+
+@skipStartChk
+
+				Move.b	scStart(A0),D2						; Get the starting position.
+				Move.w	scSkip(A0),D5						; Get the inter-entry skip factor.
+				Move.w	csCount(A2),D6						; Remember the csCount.
+				
+				Cmpi.w	#indexEntries,csStart(A2)			; If table accesses are to be indexed,
+				Beq.s	@GECom								; 	then go on.
+			
+; The following code is BAD, BAD, BAD!  We should build our own table here so
+;	as to NOT mess up the user’s data.  But all the previous Apple video drivers
+;	have done the same thing here, so we’ll continue the trend for now.
+
+				Move.l	(Sp),A0								; Get ptr to csTable.
+				Move.w	D6,D1								; Get count.
+
+@TableLoop		Move.w	D4,value(A0,D1*colorSpecSize)		; Write the index into the table.
+				Subq	#1,D4								; Decrement index.
+				Dbra	D1,@TableLoop						;
+			
+@GECom			Move.l	(Sp)+,A0							; Get/restore ptr to csTable.
+
+				Move.l	saveVDACBase(A3),A2					; Get VDAC base address.
+				Add.w	#ArielDataReg,A2					; Add offset to Palette read register.
+						
+				Move.w	Sr,-(Sp)							; Save current interrupt level
+				Bsr		SonoraWaitVSync						; Wait for VBL.
+
+@Repeat			Move.w	value(A0),D1						; Get the NEXT Clut position into D1.
+				Cmp.w	D3,D1								; If this position is out of range,
+				Bhi.s	@Until								; 	then go on.
+							
+				Mulu.w	D5,D1								; Multiply index by skip value.
+				Add.b	D2,D1								; Add in the starting posistion.
+				Move.b	D1,ArielAddrReg-ArielDataReg(A2)	; Tell the Clut where to read from.
+			
+				Move.b	(A2),D1								; Get Red:
+				Move.b	D1,rgb+red(A0)						; 	--> $rrXX
+				Move.b	D1,rgb+red+1(A0)					;	--> $rrrr
+			
+				Move.b	(A2),D1								; Get Green:
+				Move.b	D1,rgb+green(A0)					;	--> $ggXX
+				Move.b	D1,rgb+green+1(A0)					;	--> $gggg
+			
+				Move.b	(A2),D1								; Get Blue:
+				Move.b	D1,rgb+blue(A0)						;	--> $bbXX
+				Move.b	D1,rgb+blue+1(A0)					;	--> $bbbb
+			
+@Until			Addq	#colorSpecSize,A0					; Point to next entry ColorTable.
+				Dbra	D6,@Repeat
+			
+				Move.w	(Sp)+,Sr							; Restore previous interrupt level.
+				
+				Movem.l	(Sp)+,D4-D6							; Restore work registers.
+				Bra		SonoraStatGood						; Return noError.
+			
+@GEErr			Tst.l	(Sp)+								; Clean up stack.
+				Movem.l	(Sp)+,D4-D6							; Restore work registers.
+				Bra		SonoraStatBad						; Return statError.
+				
+SonoraGetPage
+;---------------------------------------------------------------------
+;
+;	Return the number of pages in the specified mode.  It's pretty simple;
+;		every mode has only one page.  We do check if it's valid, however.
+;
+;---------------------------------------------------------------------
+			
+				WITH	SonoraVidPrivates
+		
+				MOVE	csMode(A2),D1						; get the mode
+				BSR		SonoraChkMode						; is this mode OK?
+				BNE		SonoraStatBad						; => not a valid mode
+			
+				MOVE.W	#1,csPage(A2)						; return page count
+				BRA		SonoraStatGood						; => return no error
+
+				ENDWITH
+
+SonoraGetPageBase
+;---------------------------------------------------------------------
+;
+;	Return the base address for the specified page in the current mode
+;
+;---------------------------------------------------------------------
+			
+				WITH	SonoraVidPrivates
+		
+				TST.W	csPage(A2)							; are we returning page zero info?
+				BNE		SonoraStatBad						; only page 0 is valid
+
+				Move.l	saveBaseAddr(A3),csBaseAddr(A2)		; Return the screen baseAddr.
+				BRA 	SonoraStatGood						; => return no error
+			
+				ENDWITH
+			
+SonoraGetGray
+;---------------------------------------------------------------------
+;
+;	Return a boolean, set true if luminance mapping is on
+;
+;---------------------------------------------------------------------
+
+				WITH	SonoraVidPrivates
+		
+				MOVEQ	#0,D1								; set up for BFEXTU
+
+SonoraGetFlagCom
+			
+				BFEXTU	GFlags(A3){D1:1},D0					; get the state of flag 
+				MOVE.B	D0,csMode(A2)						; return value
+				BRA		SonoraStatGood						; => and return
+			
+				ENDWITH
+		
+SonoraGetInterrupt
+;---------------------------------------------------------------------
+;
+;	Return a boolean in csMode, set true if VBL interrupts are disabled
+;
+;---------------------------------------------------------------------
+
+				WITH	SonoraVidPrivates
+		
+				MOVEQ	#1,D1								; set up BFEXTU to point at IntDisFlag
+				BRA.S	SonoraGetFlagCom					; and use common code			
+			
+				ENDWITH
+
+SonoraGetGamma
+;---------------------------------------------------------------------
+;
+;	Return the pointer to the current gamma table
+;
+;---------------------------------------------------------------------
+
+				WITH	SonoraVidPrivates
+		
+				MOVE.L	saveGammaPtr(A3),csGTable(A2)		; return the pointer to the structure
+				BRA		SonoraStatGood						; and return a good result
+			
+				ENDWITH
+
+SonoraGetDefaultMode
+;---------------------------------------------------------------------
+;
+;	Read the card default mode from slot pRAM.
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+
+				WITH 	spBlock,SonoraVidPrivates,SP_Params
+
+;
+; Set up a slot parameter block on the stack.
+;
+	
+				SUBA	#spBlockSize,SP						; make an slot parameter block on stack
+				MOVE.L	SP,A0								; get pointer to parm block now
+				MOVE.B	dCtlSlot(A1),spSlot(A0)				; put slot in pBlock
+				CLR.B	spExtDev(A0)						; external device = 0
+
+;
+; Read the slot pRAM to determine what the currently saved mode is.  The first
+;	byte is the board ID, followed by the default mode.  Built-in video keeps the last 
+;	selected video sRsrc spID in VendorUse2.
+;
+				
+				SUBA	#SizesPRAMRec,SP					; allocate block for pRAM record
+				MOVE.L	SP,spResult(A0)						; point to it
+				_sReadPRAMRec								; read it
+
+				MOVE.B	SP_LastConfig(SP),csMode(A2)		; return the result
+				ADDA	#SizesPRAMRec+spBlockSize,SP		; release buffer
+				BRA		SonoraStatGood						;
+
+				ENDWITH
+
+SonoraGetCurMode
+;---------------------------------------------------------------------
+;
+;	This call will generally be used in conjuntion with the
+;		the SwitchMode control call.  Its function is
+;		basically to fill out the VDPageInfo with the
+;		current status.  Note that, here, csData, is the
+;		current SlotID (sResource number) in use.
+;
+;	Note:  The implementation of this Status call can be used to
+;		determine whether the SwitchMode control call is
+;		implemented or currently accessible.
+;	
+;---------------------------------------------------------------------
+
+			With		SonoraVidPrivates,VDSwitchInfo
+			
+; Check to see if we even need to be here or not…
+;
+			Cmpi.w		#indexedSenseMSB1,saveMonID(A3) ; If we’re driving a multiscan display,
+			Beq.s		@EndMSChk						;	then just keep going.
+			Cmpi.w		#indexedSenseMSB2,saveMonID(A3) ; If we’re driving a multiscan display,
+			Beq.s		@EndMSChk						;	then just keep going.
+			Cmpi.w		#indexedSenseMSB3,saveMonID(A3) ; If we’re driving a multiscan display,
+			Beq.s		@EndMSChk						;	then just keep going.
+			Bra			SonoraStatBad					; Otherwise, just go away.
+@EndMSChk
+
+; Return the appropriate information if all is well…
+;
+			Move.w		saveMode(A3),csMode(A2)			; Return the current mode (bit depth).
+			
+			Moveq		#0,D0							; Clear out return-value register.
+			Move.b		dCtlSlotID(A1),D0				; Get the byte-sized spID.
+			Move.l		D0,csData(A2)					; Make it long.
+			
+			Move.l		saveBaseAddr(A3),csBaseAddr(A2)	; Return the base address for this page.
+			Clr.w		csPage(A2)						; But we only support page #0.
+	
+			Bra			SonoraStatGood					; Vamoose.
+			
+			Endwith
+
+SonoraGetSyncs																										; <sm20>
+;---------------------------------------------------------------------
+;
+;	Return a boolean, set true if RGB Syncs are OFF
+;	Clear the 2nd byte, saying we don't support levels of power-saving.
+;
+;---------------------------------------------------------------------
+
+				WITH	SonoraVidPrivates																			; <sm20>
+																													; <sm20>
+				movea.l	saveSonoraBase(a3),a0				; Get Sonora Base (VIA1 base $50f00000)					; <sm20>
+				adda.l	#SonoraVdCtlBase,a0					; add the difference to get Vid Reg ($28000)			; <sm20>
+				Move.b	SonoraVdModeReg(A0),D0				; Get the appropriate monitor code.						; <sm20>
+																													; <sm20>
+				Andi.l	#$80,D0								; and look at bit 7										; <sm20>
+				Sne		csMode(A2)							; if bit is 1, RGB Syncs are OFF, return true			; <sm20>
+				Clr.b	csMode+1(A2)						; and the next byte for good measure.					; <sm20>
+				BRA		SonoraStatGood						; => and return											; <sm20>
+																													; <sm20>
+				ENDWITH																								; <sm20>
+		
+SonoraGetModeTiming
+;---------------------------------------------------------------------
+;
+;	This call is used by Display Mgr to determine if a mode is
+;		valid on a given display.  There are 5 possible results
+;
+;	(1) The driver has no idea what this call is and returns statErr.
+;		This does not apply to the sonora driver
+;
+;	(2) The driver knows with certainty (via sense codes) or via a 
+;		direct connection to the display that the mode in question
+;		is good.  In this case the timing need not be checked with
+;		an external component for the display.  This is the case with 
+;		non-multisync devices and panel displays directly connected by Apple.
+;
+;	(3) The driver is multimode aware and knows there is a multimode monitor
+;		attached.  The driver does not know the exact range of frequencies
+;		supported by the display and does not know if this mode is supported.
+;
+;	(4) The driver is modeless (many many mode) aware and 
+;
+;	(5)	The driver gives up control of mode searching to a table in the 
+;		decl ROM.  This will be the case for sonora driver.
+;
+;
+;	Note:  This is a driver call so that
+;		(1) patches cannot easily be made to the decl data, but can be
+;				made to the driver.  If we want to replace information,
+;				we can do so in the driver.
+;		(2) we are not tied to a decl data table format for modeless (many
+;				many mode) drivers in the future.  And if we go to a different
+;				bus architeture (as people seem to want to) we will not be
+;				hosed by table based implementations.  We may however be
+;				hosed by driver based implementations, but we can only do
+;				so much planning for the future and still ship product.
+;	
+;---------------------------------------------------------------------
+				With		SonoraVidPrivates,VDTimingInfo
+
+				Cmpi.w		#indexedSenseMSB1,saveMonID(A3) ; If we’re driving a multiscan display,
+				Beq.s		@EndMSChk						;	then just keep going.
+				Cmpi.w		#indexedSenseMSB2,saveMonID(A3) ; If we’re driving a multiscan display,
+				Beq.s		@EndMSChk						;	then just keep going.
+				Cmpi.w		#indexedSenseMSB3,saveMonID(A3) ; If we’re driving a multiscan display,
+				Beq.s		@EndMSChk						;	then just keep going.
+				Bra			SonoraStatBad					; Otherwise, just go away.
+@EndMSChk
+				Move.l		#kDeclROMtables,csTimingFormat(A2)
+				Clr.l		csTimingData(A2)
+				Clr.l		csTimingFlags(A2)
+			
+				Bra			SonoraStatBad					; Bail Anyway (so DisplayMgr will look in decl ROM).
+				ENDWITH
+
+SonoraGetConnection
+;---------------------------------------------------------------------
+;
+;	This call is used by Display Mgr to get information about the connection
+;		betrween the display card and the display.
+;
+;	The assumption is that GetConnetion only alters those fields in the 
+;		VDDisplayConnectInfo record for which it has actual information.
+;		In this case for example, I do not know what the display component
+;		is so I do not touch it.  Same for the csConnectReserved field
+;
+;---------------------------------------------------------------------
+				
+				With		SonoraVidPrivates,VDDisplayConnectInfo
+; •••
+; For now if we don’t have a multiscan display we just say that its fixed.  (Note:  If we really
+;	wanted to support the Vail-specific family modes here, we’d want to denote the GS/GS-560
+;	and the HR/HR-560 display types.  Maybe someday.)
+;
+				Move.w		#kFixedModeCRTConnect,csDisplayType(A2)
+				
+				Clr.l		csConnectFlags(A2)				; ••• Danger:  Tagging stuff not complete! •••
+				Clr.w		csConnectTagged(A2)				;
+; •••
+				Cmpi.w		#indexedSenseMSB1,saveMonID(A3) ; If we’re driving a multiscan display,
+				Beq.s		@EndMSChk1						;	then just keep going.
+				Cmpi.w		#indexedSenseMSB2,saveMonID(A3) ; If we’re driving a multiscan display,
+				Beq.s		@EndMSChk2						;	then just keep going.
+				Cmpi.w		#indexedSenseMSB3,saveMonID(A3) ; If we’re driving a multiscan display,
+				Beq.s		@EndMSChk3						;	then just keep going.
+				Bra			SonoraStatGood					; Otherwise, just go away.
+
+@EndMSChk1		Move.w		#kMultiModeCRT1Connect,csDisplayType(A2)
+				Bra.s		@EndMSChk
+@EndMSChk2		Move.w		#kMultiModeCRT2Connect,csDisplayType(A2)
+				Bra.s		@EndMSChk
+@EndMSChk3		Move.w		#kMultiModeCRT3Connect,csDisplayType(A2)
+@EndMSChk
+				Move.l		#(1<<kAllModesValid),csConnectFlags(A2)
+				Bra			SonoraStatGood
+
+				Endwith
+				
+SonoraGetAltSense
+;---------------------------------------------------------------------
+;
+;	Returns the alternate senseID code that’s in use.  It
+;		should be noted that we cannot disguish between PAL &
+;		NTSC monitors & encoder boxes once SetAltSense has
+;		been called (because both the monitor & box codes are
+;		mapped into the same indexedSense code).  We pas back
+;		this information in csMode (byte 0 is the sense code,
+;		byte 1 is the type).
+;
+;		A1 = Ptr to AuxDCE/Ptr to MonIDs table (not restored)
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;---------------------------------------------------------------------
+
+				With	SpBlock,SonoraVidPrivates,SP_Params
+				
+;
+; First, set up a slot parameter block on the stack.
+;
+				
+				Suba.w	#spBlockSize,Sp						; Make a SpBlock on the stack.
+				Move.l	Sp,A0								; Get a pointer to it into A0.
+				Move.b	dCtlSlot(A1),spSlot(A0)				; Set it up.
+				Clr.b	spExtDev(A0)
+				
+;
+; Next, read the current pRam so that we can determine whether the
+;	alternate senseID code is valid or not.
+;
+				
+				Suba.w	#SizesPRAMRec,Sp					; Make an sPRAM block on the stack.
+				Move.l	Sp,spResult(A0)						; Point to it.
+				_sReadPRamRec								; Get pRAM.
+				
+				Clr.b	csMode+1(A2)						; Assume the code is type-0 for now.			
+				Move.b	SP_AltSense(Sp),D1					; Get the alternate senseID byte.
+				Andi.b	#spAltSenseValidMask,D1				; If it is valid,
+				Bne.s	@Valid								;	return it.
+				Move.b	#indexedNoConnect,csMode(A2)		; Otherwise, return the indexed no-connect code,
+				Bra.s	@Exit								;	 and leave.
+				
+@Valid			Move.b	SP_AltSense(Sp),D1					; Get the no-connect byte again.
+				Andi.b	#spAltSenseMask,D1					; Strip the validation code.
+
+				Lea		Type_0_MonIDs,A1					; Point to the Type_0_MonIDs.
+				Bsr		@ValidLoop							; Search there.
+								
+				Move.b	#6,csMode+1(A2)						; Assume we’ll find a type-6 sense code.
+				Lea		Type_6_MonIDs,A1					; Point to the Type_6_MonIDs.
+				Bsr		@ValidLoop							; Search there.
+				
+				Move.b	#7,csMode+1(A2)						; Assume we’ll find a type-7 sense code.
+				Lea		Type_7_MonIDs,A1					; Point to the Type_7_MonIDs.
+				Bsr		@ValidLoop							; Search there.
+				
+				Clr.b	csMode+1(A2)						; Nothing matched…
+				Moveq	#indexedNoConnect,D0				; …so just say no-connect.
+				
+@WriteIt		Move.b	D0,csMode(A2)						; Return valid sense code.
+@Exit			Adda.w	#SizesPRAMRec+spBlockSize,Sp		; Restore stack, and
+				Bra		SonoraStatGood						;	go home.
+
+@ValidLoop		Move.b	(A1)+,D0							; Get the sense code.
+				Cmp.b	(A1)+,D1							; If the index matches what’s in PRAM,
+				Beq.s	@WriteItOut							;	then return the sense code.
+				Tst.b	(A1)								; If we’re at the end of the list,
+				Bmi.s	@ChkNextType						; 	then move on.
+				Bra.s	@ValidLoop							; Otherwise, loop away.
+
+@WriteItOut		Addq	#4,Sp								; Clean up the stack.
+				Bra.s	@WriteIt							; And leave. 
+
+@ChkNextType	Rts
+
+				Endwith
+				
+;---------------------------------------------------------------------
+;
+;	Exit from Control or Status.
+;
+;	 	A0 = Ptr to param block.
+;		A1 = Ptr to AuxDCE.
+;		D0 = error code.
+;
+;---------------------------------------------------------------------
+
+SonoraExitDrvr	BTST	#NoQueueBit,ioTrap(A0)				; no queue bit set?
+				BEQ.S	SonoraGoIODone						; => no, not immediate
+				RTS 										; otherwise, it was an immediate call
+
+SonoraGoIODone	MOVE.L	JIODone,-(Sp)						; Get the IODone address,
+				Rts											; 	and go there.
+
+;---------------------------------------------------------------------
+;
+;	ChkMode
+;
+;	Verifies the requested mode is legal.  Converts spID in D1 into 
+;	zero-based mode number since lots of people want it that way.
+;
+;	<->	D1: Mode
+;	->	A3:	Pointer to driver privates
+;
+;	All registers preserved
+;
+;	Returns EQ if mode is valid.
+;
+
+			With	SonoraVidPrivates,SonoraVidParams
+
+SonoraChkMode
+
+			Movem.l	A0/D0,-(Sp)								; Save work registers.			
+			
+			Sub.w	#FirstVidMode,D1						; Make mode zero-based.
+			Blt.s	@ModeBad								; If the passed-in mode is < 0,
+															;	then punt.
+
+			Move.l	saveVidPtr(A3),A0						; Get a pointer to the video params.
+			Tst.b	noVRAM(A3)								; If we don’t have VRAM, then
+			Bne.s	@NoVRAM									;	say so.
+			Adda.w	#svpMaxModeBase,A0						; Point to the base of the max mode values.
+			Bra.s	@GetSize								; Skip the no-VRAM case.
+@NoVRAM		Adda.w	#svpNoRAMMaxBase,A0						; Point to the base of the no-VRAM modes.
+@GetSize	Move.b	saveSizeVRAM(A3),D0						; Get the vRAM size index.
+			Move.b	(A0,D0),D0								; Get the maximum mode for this config.
+			Sub.w	#FirstVidMode,D0						; Make the max mode zero-based.
+			Cmp.w	D0,D1									; If the passed-in mode is > max mode,
+			Bgt.s	@ModeBad								; 	then punt.
+			
+			Cmp.w	D1,D1									; Set Eq when okay.
+@ModeBad	Movem.l	(Sp)+,A0/D0								; Restore work registers.
+			Rts
+	
+			Endwith
+			
+;---------------------------------------------------------------------
+;
+;	Wait for vertical blanking.  Interrupts are set to level-2 in
+;	this routine.  
+;
+;	A3 = pointer to private storage
+;---------------------------------------------------------------------
+
+			With	SonoraVidPrivates
+
+SonoraWaitVSync	
+
+			MOVE.L	A0,-(SP)								; Save work registers.
+			MOVE.L	D0,-(SP)								;   (Two MOVEs are faster than a MOVEM.)
+			
+			MOVE.W	SR,-(SP)								; Get the status register on stack.
+			MOVEQ	#7,D0									; Get mask into D0.
+			AND.B	(SP),D0									; Get the interrupt level.
+			SUBQ.B	#2,D0									; 
+			BGE.S	@OK										; If ≥, then don't change.
+			ORI.W	#$0200,SR								; Raise above level-2.
+			ANDI.W	#$FAFF,SR								; Make it level-2
+@OK
+			Tst.w	(Sp)+									; Restore stack.
+			
+			Move.l	saveSonoraBase(A3),A0					; Get the Sonora base address.
+			Adda.l	#SonoraVIA2Base,A0						; Point to the interrupt register space.
+			Move.b	#$40,SonoraSlotIFR(A0)					; Clear any pending interrupts.
+
+			Adda.w	#SonoraSlotIFR,A0						; Point to the interrupt flag register.
+@SyncLoop	Move.b	(A0),D0									; Read the VBL state.
+			Btst	#6,D0									; If it’s none pending (0=pending),
+			Bne.s	@SyncLoop								;	then keep looping.
+															
+@Done		MOVE.L	(SP)+,D0								; Restore work registers.
+			MOVE.L	(SP)+,A0								;   (Two MOVEs are faster than a MOVEM.)
+			RTS
+			
+			Endwith
+
+;---------------------------------------------------------------------
+;
+; SetDepth sets the depth in the DAC and the framebuffer.
+;
+; D1 contains the spID of the depth - $80 (the zero based mode ID)
+; A1 = AuxDCE POINTER
+; A2 = parameter block pointer
+; A3 = dCtlStorage pointer
+;
+; Preserves all registers
+;
+;---------------------------------------------------------------------
+
+SonoraSetDepth	
+
+			With 	SonoraVidPrivates
+
+			Movem.l	A0/D0-D2,-(Sp)							; Save our work registers.
+
+; Wait for the next VBL before trying to switch depths.
+;
+			Move.w	Sr,-(Sp)								; Save the current interrupt level.
+			Bsr.s	SonoraWaitVSync							; Wait for the next VBL.
+
+; Switch the framebuffer’s depth.
+;
+			Move.l	saveSonoraBase(A3),A0					; Get the Sonora base address.
+			Adda.l	#SonoraVdCtlBase,A0						; Point to the video control register space.
+			Move.b	D1,SonoraVdColrReg(A0)					; Set the depth.
+
+; Switch the CLUT/DAC’s depth.
+;
+			Move.l	saveVDACBase(A3),A0						; Point to Ariel.
+			Move.b	ArielConfigReg(A0),D0					; Save the current state.
+			Andi.b	#ClrDepthBitsMask,D0					; Clear the depth bits.
+			Or.b	D1,D0									; Turn on the depth bits.
+			Move.b	D0,ArielConfigReg(A0)					; Set the depth.
+			
+; Go home.
+;
+			Move.w	(Sp)+,Sr								; Restore the interrupt level.
+			Movem.l	(Sp)+,A0/D0-D2							; Restore the work registers.
+			Rts												; Return to caller.
+
+			Endwith
+			
+;---------------------------------------------------------------------
+;
+; SetResolution gets the video driver and the framebuffer controller
+;	set up for being switched to a different resolution.
+;
+; D1 containts the spID to the resolution (mode) to enable.
+; A1 = AuxDCE POINTER
+; A2 = parameter block pointer
+; A3 = dCtlStorage pointer
+;
+; Preserves all registers
+;
+;---------------------------------------------------------------------
+
+SonoraSetResolution
+
+				With	SonoraVidParams,SpBlock,EgretPB,SonoraOmega
+
+				Movem.l	D0-D1/A0/A4-A6,-(Sp)				; Save work registers.
+
+				Move.b	dCtlSlotId(A1),D0					; Remember which sRsrc to disable.
+				Move.b	D1,dCtlSlotId(A1)					; Remember which sRsrc to enable.
+
+; Do the Slot Manager changes…
+;
+				Suba.w	#spBlockSize,Sp						; Allocate a slot parameter block on the stack.
+				Move.l	Sp,A0								; Point to it with A0.
+				Clr.b	spSlot(A0)							; Say that we’re Slot $0.
+				Clr.b	spExtDev(A0)						; Don’t ask why, just clear this guy.
+
+				Move.b	D0,spID(A0)							; Write out the spID of the sRsrc.
+				_SRsrcInfo									; Update our SpBlock for SUpdateSRT call below.
+				Move.l	#1,spParamData(A0)					; Say that we want it disabled.
+				_SetSRsrcState								; Do it.
+
+				Move.b	dCtlSlotId(A1),spID(A0)				; Write out the spID of the sRsrc.
+				Move.l	#0,spParamData(A0)					; Say that we want it enabled.
+				_SetSRsrcState								; Do it.
+				_SUpdateSRT									; Tell Slot Manager to update itself (it should really know, but it does not).
+
+; Load the “new” video hardware setup block…
+;
+				Clr.w	spID(A0)							; Start looking at spID 0, no external devices.
+				Clr.b	spTBMask(A0)						; Only look for the board sRsrc.
+				Move.w	#catBoard,spCategory(A0)			; Look for:	catBoard,
+				Move.w	#typBoard,spCType(A0)				;			typBoard,
+				Clr.w	spDrvrSW(A0)						;			0,
+				Clr.w	spDrvrHW(A0)						;			0.
+				Clr.l	spParamData(A0)						; (The board sRsrc must be enabled.)
+				Bset	#foneslot,spParamData+3(A0)			; Limit search to slot 0.
+				_GetTypeSRsrc								; Get the spsPointer.
+				
+				Move.b	#sVidParmDir,spID(A0)				; Look for the video parameters dir.
+				_sFindStruct								; Load it.
+	
+				Move.b	dCtlSlotId(A1),spID(A0)				; Look in the directory for this config's parameters.
+				_sGetBlock									; Load it.
+		
+				Move.l	spResult(A0),-(Sp)					; Save the new privates.
+				Movea.l	saveVidPtr(A3),A0					; Point to the old privates.
+				_DisposPtr									; Dispose them.
+				Move.l	(Sp)+,saveVidPtr(A3)				; Start using the new ones.
+				
+				Adda.w	#spBlockSize,Sp						; De-allocate the slot parameter block.
+				
+; Change the hardware…
+;
+				Movea.l	saveVidPtr(A3),A4					; Point to vidParams.
+				
+				Move.l	UnivInfoPtr,A6						; Get a pointer to the ProductInfo table.
+				Adda.l	ProductInfo.DecoderInfoPtr(A6),A6	; Point to the base address table.
+				Move.l	DecoderInfo.VIA1Addr(A6),A6			; Get the Sonora base address.
+				Adda.l	#SonoraVdCtlBase,A6					; Point to the video control address space.
+				Bset	#SonoraVidBlnkBit,SonoraVdModeReg(A6) ; Blank video (to eliminate visual artifacts).
+				
+				Adda.l	#SonoraVIA2Base-SonoraVdCtlBase,A6	; Point to the VIA2.
+				Move.b	SonoraVRAMSize(A6),D0				; Pick up the VRAM Sizing parameters.
+				Adda.l	#SonoraVdCtlBase-SonoraVIA2Base,A6	; Point to the video control address space.
+				
+				Move.w	Sr,-(Sp)							; Save current interrupt level
+				Bsr		SonoraWaitVSync						; Wait for next VBL.
+				
+				Tst.b	noVRAM(A3)							; If we don’t have real VRAM, then
+				Bne.s	@SkipDotClock						;	skip the dot-clock setup.
+				
+				Movea.l	A4,A5								; Copy the vidParams Ptr.
+				
+				Cmpi.b	#Sonora512Kb,D0						; If we’ve got 512K on the motherboard
+				Beq.s	@Omega2								;	then we’ve got a new Omega.
+				Cmpi.b	#Sonora768Kb,D0						;
+				Bne.s	@SetOmega							;
+				
+@Omega2			Addq	#SOmegaSize,A5						; Skip past the Omega-1 parameters.		
+
+@SetOmega		Moveq	#0,D0								; n d p <- 0000000 0000000 00
+				Move.b	SOmegaN(A5),D0						; n d p <- 0000000 00NNNNN NN
+				Lsl.w	#OmegaDBits,D0						; n d p <- 00NNNNN NN00000 00
+				Move.b	SOmegaD(A5),D1						; n d p <- 00NNNNN NN00000 00 (0DDDDDDD)
+				Or.b	D1,D0								; n d p <- 00NNNNN NNDDDDD DD
+				Move.b	SOmegaP(A5),D1						; n d p <- 00NNNNN NNDDDDD DD (000000PP)
+				Lsl.w	#OmegaPBits,D0						; n d p <- NNNNNNN DDDDDDD 00 (000000PP)
+				Or.b	D1,D0								; n d p <- NNNNNNN DDDDDDD PP
+				Swap	D0									; Move the ndp value into the MSW.
+				Or.b	#sndSonoraReverseDFAC,D0			; Move our sound value in.
+				
+				Suba.w	#EgretPBSize,Sp						; Allocate space for the Egret param block on the stack.
+				Move.l	Sp,A0								; Point to it with A0.
+				Move.w	#(PseudoPkt<<8)+WrDFAC,pbCmdType(A0) ; Say that we’re writing DFAC.
+				Move.l	D0,pbParam(A0)						; Put out the DFAC data.
+				Move.w	#4,pbByteCnt(A0)					; We’re sending 4 bytes.
+				Clr.w	pbResult(A0)						; Clear the result word.
+				Clr.l	pbCompletion(A0)					; No completion routines here.
+				_EgretDispatch								; Do it.
+				Adda.w	#EgretPBSize,Sp						; De-allocate the Egret parameter block.
+@SkipDotClock				
+				Move.b	svpMonitorCode(A4),SonoraVdModeReg(A6)	; Write out the appropriate monitor code.
+				Bsr		SonoraWaitVSync							; Wait for next VBL.
+				Bclr	#SonoraVidBlnkBit,SonoraVdModeReg(A6)	; Unblank display.
+
+				Move.w	(Sp)+,Sr							; Restore the previous interrupt level.
+				Movem.l	(Sp)+,D0-D1/A0/A4-A6				; Restore the work register.
+				
+				Rts
+
+				Endwith
+
+;---------------------------------------------------------------------
+;
+;	Fill the screen with a 50% dithered gray pattern.  To have gotten here
+;		we must have had a valid display connected, so there are not tests
+;		for inactive displays here.
+;
+;			D1 = spID of screen depth - FirstVidMode
+;			A1 = Ptr to AuxDCE
+;			A3 = driver private storage
+;
+;	All registers are preserved
+;
+
+			With	SonoraVidPrivates,SonoraVidParams
+
+SonoraGrayScreen
+
+			Movem.l	D0-D5/A1-A2,-(Sp)					; Save our work registers.
+			
+			Move.l	saveBaseAddr(A3),A2					; Get the base address of the screen.
+			Move.b	dCtlSlotId(A1),D5					; Get the slotID (which is non-zero).
+			
+			Cmp.b	#sRsrc_Vid_Sonora_GS560a,D5			; If we’re driving the Rubik-560a,
+			Beq.s	@Chk1bpp							;	then check for 1bpp.
+			Cmp.b	#sRsrc_Vid_Sonora_GS560b,D5			; If we’re not driving the Rubik-560b,
+			Bne.s	@GetParms							;	then just go on
+@Chk1bpp	Tst.b	D1									; If we’re not in 1bpp,
+			Bne.s	@GetParms							;	then just go on.
+			Clr.b	D5									; Otherwise, say rowbytes is wrong.
+			
+@GetParms	Move.l	saveVidPtr(A3),A1					; Get a pointer to the vidParams.
+			Move.w	svpNumRows(A1),D4					; Get the number of rows to gray.
+			Adda.w	#SVPHdrSize,A1						; Skip past the header info.
+			Move.w	(A1,D1*2),D3						; Get the number of longwords/row.
+			
+			Lea		SonoraPats,A1						; Point to the table of gray patterns.
+			Move.l	(A1,D1*4),D2						; Get the gray pattern.
+			
+			Moveq	#true32b,D0							; Set up to flip into 32-bit addressing mode.
+			_SwapMMUMode								; Do flip.
+
+@NxtRow		Move.l	D3,D1								; Get the number of longswords/row.
+@NxtLong	Move.l	D2,(A2)+							; Write out gray to the frame buffer…
+			Dbra	D1,@NxtLong							; …for each scanline.
+			Tst.b	D5									; If this is not a Rubik-560 at 1bpp,
+			Bne.s	@Skip560							;	then just go on.
+			Move.w	D2,(A2)+							; Otherwise, write out 16 more pixels.
+@Skip560	Not.l	D2									; Invert the pattern for the next row.
+			Dbra	D4,@NxtRow							; Repeat for each row.
+			
+			_SwapMMUMode								; Switch back to the previous addressing mode.
+			Movem.l	(Sp)+,D0-D5/A1-A2					; Restore the work registers.
+			Rts											; Return to caller.
+			
+			Endwith
+			
+;---------------------------------------------------------------------
+; 
+;	Trans5to8
+;
+; 	<-> D1:  5-bit value to be converted into an 8-bit index.
+;
+
+SonoraTrans5to8
+
+			Move.l	D0,-(Sp)								; Save D0 as scratch.
+			Moveq	#0,D0									; Clear it.
+			
+			Move.w	D1,D0									; D1 = ---43210, D0 = ---43210.
+			Lsl.w	#3,D1									; D1 = 43210---, D0 = ---43210.
+			Lsr.w	#2,D0									; D1 = 43210---, D0 = -----432.
+			Or.w	D0,D1									; D1 = 43210432.
+			
+			Move.l	(Sp)+,D0								; Restore D0.
+			Rts
+
+;---------------------------------------------------------------------
+;
+; DirectCLUTSet writes gamma-corrected ascending grayscale-like ramps
+;	into the CLUT
+;
+; A3 = dCtlStorage pointer
+;
+; Preserves all registers used.
+;
+;---------------------------------------------------------------------
+
+			With		SonoraVidPrivates
+
+SonoraDirectCLUTSet
+
+			MOVEM.L		D0-D2/A0/A4-A6,-(SP)				; save registers
+				
+			MOVE.L		saveGammaPtr(A3),A0					; get pointer to gamma data structure
+			MOVE.W		gFormulaSize(A0),D0					; get the size of formula data
+			LEA			gFormulaData(A0),A4					; point to formula data
+			ADD			D0,A4								; red correction table starts here
+			MOVE.L		A4,A5								; get default pointer to green data
+			MOVE.L		A4,A6								; get default pointer to blue data
+				
+			CMP.W		#1,gChanCnt(A0)						; if only only one table, we're set
+			BEQ.S		@OneTbl								; => just one table
+	
+			MOVE		gDataWidth(A0),D1					; get width of each entry in bits
+			ADDQ		#7,D1								; round to nearest byte
+			LSR			#3,D1								; get bytes per entry
+			MULU		gDataCnt(A0),D1						; get size of table in bytes
+	
+			ADDA		D1,A5								; calc base of green
+			ADDA		D1,A6								; calc base…
+			ADDA		D1,A6								; 	…of blue
+	
+@OneTbl		MOVE.W		gDataCnt(A0),D2						; Get number of entries.
+			Subq		#1,D2								; Make it zero based.
+	
+			MOVE.L		saveVDACBase(A3),A0					; point to the hardware
+			ADDA		#ArielDataReg,A0					; point to data register
+			CLR.B		ArielAddrReg-ArielDataReg(A0)		; start at the beginning of CLUT
+	
+			Move.w		#$1F,D2								; There are only 32 entries to whack in 16bpp mode.
+	
+			MOVE.W		SR,-(SP)							; preserve the status register
+			BSR			SonoraWaitVSync						; wait for next blanking period (preserves A0)
+
+; Write an incrementing grayscale ramp.
+
+			Moveq		#0,D0								; Start the ramp at zero.
+			
+@Repeat		Move.w		D0,D1								; Copy the current index.		<H8>
+			Bsr.s		SonoraTrans5to8						; Translate from 5-bits to 8.
+			
+			MOVE.B		(A4,D1),(A0)						; Write gamma-corrected red.
+			MOVE.B		(A5,D1),(A0)						; Write gamma-corrected green
+			MOVE.B		(A6,D1),(A0)						; Write gamma-corrected blue.
+			
+			Addq		#1,D0								; Increment the ramp index.
+			DBRA		D2,@Repeat							; Loop until done.
+			
+			MOVE.W		(SP)+,SR							; restore the status reg
+			MOVEM.L		(SP)+,D0-D2/A0/A4-A6				; restore saved registers
+			RTS
+			
+			Endwith
+			
+;-------------------------------------------------------------
+;	The Interrupt handler for the Sonora Built-In Video
+;-------------------------------------------------------------
+; On entry A1 contains the pointer to the driver's private storage.
+;
+			With	SonoraVidPrivates
+
+SonoraBeginIH		
+
+			Move.l	saveSonoraBase(A1),A0					; Get the Sonora base address.
+			Adda.l	#SonoraVIA2Base,A0						; Point to the interrupt register space.
+			Move.b	#$40,SonoraSlotIFR(A0)					; Clear this interrupt.
+			
+			Moveq	#0,D0									; Set up for Slot $0…
+			Jsr		([jVBLTask])							; 	…and call the VBL Task Manager.
+			
+			MOVEQ	#1,D0									; signal that int was serviced				
+			RTS												; and return to caller
+			
+			Endwith
+
+	END

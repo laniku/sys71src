@@ -1,0 +1,1955 @@
+;__________________________________________________________________________________________________
+;
+;	File:		ImmgPrimitives.a
+;
+;	Contains:	Primitive tables and init routines for the internal modem manager
+;
+;	Written by:	Steven Swenson
+;
+;	Copyright © 1994-1994 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 1/26/94	rab		Removed padForOverpatch stuff from the end of this file
+;									(SuperMario does not use it…).
+;	   <SM2>	12/21/93	ged		Changed rate11_025khz label to newer rate11025hz definition.
+;	   <H13>	  6/1/93	SES		Made modifications as per SPI review on 6/1/93.  The only real
+;									change was to vector the command count and receive count table
+;									pointers through global storage rather than lea's inside the
+;									mdmPrime routine (prevents someone who wants to patch the count
+;									tables from having to patch the entire mdmPrime routine).  The
+;									other changes were to add comments, and rearrange a few of the
+;									EQU's into a more logical grouping.
+;	   <H12>	 5/23/93	SES		Made changes from code review on 5/19/93.
+;	   <H11>	 5/21/93	SES		Made the Slot9Handler routine check the status register
+;									interrupt level mask.  If the mask is greater than 2, the
+;									routine sets the mask down to 2 and then restores it to whatever
+;									it was.  This is to fix a problem that occurs because the Elan
+;									ethernet driver interrupt handling routine sometimes leaves the
+;									interrupt mask in the status register at 4 or 6, which causes
+;									problems on Optimus (when the slot 9 interrupt is really handled
+;									by the level 3 interrupt handler - if the level 3 handler cannot
+;									execute, the slot 9 interrupt is not cleared, and an infinite
+;									loop results).
+;	   <H10>	 5/17/93	SES		Changed modem sound control and set up primitives. Sound control
+;									keeps track of when it has been called on and off so that it
+;									does not do on or off more than once in a row. The set up
+;									routine initializes the saved input source to none and the saved
+;									playthru volume to zero.
+;		<H9>	 5/11/93	SES		Screwed up! One minor mod needed to happen to make the previous
+;									fix work, the moveq instruction does not work with that large an
+;									operand!
+;		<H8>	 5/11/93	SES		Made mdmWakeup3615 primitive for Optimus return
+;									immgInvalidSelector error rather than no error, since the
+;									routine does not do anything (and in the future, some other
+;									routine might actually do something).
+;		<H7>	 5/10/93	SES		In order to alleviate a possible bus float situation, wrote data
+;									to the modem ID register instead of the ROMBase, since the IO
+;									data bus needed to be cleared, not the processor data bus.
+;		<H6>	  5/6/93	SES		Altered sound control so that the play through volume is set to
+;									equal the slider volume during modem sound transactions.
+;		<H5>	  5/4/93	SES		Removed machine primitives and replaced them with the dispatch
+;									functions in the IntModemMgr.a file.
+;		<H4>	 4/27/93	SES		Enhanced modem manager and adding primitives as per code review
+;									on 4/22/93.  Moved dispatcher to IntModemMgr.a.  Split
+;									primitives into machine primitives and modem primitives.
+;									Significantly reduced size of the command and reply lookup
+;									tables.
+;		<H3>	 4/24/93	SES		Played around with how sound is handled on Optimus for the
+;									modem.
+;		<H2>	 4/15/93	SES		Changed Optimus primitives so that machine does not hang when
+;									powered off.  This means that the power control primitive
+;									disables interrupts from the modem when the modem is "turned
+;									off."  Also implemented the sound control primitive for Optimus
+;									(hits sound control bit in sound control register.  Finally,
+;									altered the structure of the primitives table to have an offset
+;									to the next modem table, effectively creating a linked list of
+;									modem tables so that they do not have to be physically
+;									contiguous in memory.
+;		 <1>	  4/8/93	SES		first checked in
+;		<H1>	  4/8/93	SES		First checked in
+;__________________________________________________________________________________________________
+
+		LOAD	'StandardEqu.d'
+		INCLUDE	'HardwarePrivateEqu.a'
+		INCLUDE	'UniversalEqu.a'
+		INCLUDE	'ROMEqu.a'
+		INCLUDE	'IOPrimitiveEqu.a'
+		INCLUDE	'IntModemMgrEqu.a'
+		INCLUDE	'IntModemMgrPrivEqu.a'
+		INCLUDE	'PowerPrivEqu.a'
+		INCLUDE	'Sound.a'
+
+		MACHINE	MC68020									; <H3>
+
+		STRING	ASIS
+		
+
+;••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••
+;••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••
+;	BEGIN OPTIMUS MODEM PRIMITIVES
+;••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••
+;••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••
+
+;----------------------------------------------------------------------------------------
+; Equates for Optimus modem primitives
+;----------------------------------------------------------------------------------------
+
+OptMdmBase			equ		$50F09000
+
+; Optimus modem address offsets
+
+OptSPIMdmCtl		EQU			$000
+OptSndCtl			EQU			$400
+OptSPISftReg		EQU			$800
+OptLmpSftCtl		EQU			$C00
+OptMdmIDReg			EQU			$FFC
+
+; Optimus OptSPIMdmCtl bit definitions
+OptSPIMdmId			EQU			0				; (1 = SPI modem connected)
+OptSPIAck			EQU			2				; (1 = ack idle)
+OptSPIReq			EQU			3				; (1 = req idle)
+OptSPIIrq			EQU			4				; (1 = interrupting) 
+OptRingDet			EQU			5				; ring detect bit
+
+; Optimus OptLmpSftCtl bit definitions
+OptLmpSPIDir		EQU			4				; shift direction control bit
+
+; Optimus OptSndCtl bit definitions
+bOptIntMask			EQU			0
+bOptSndMask			EQU			1
+
+; Bit definitions for the power manager status bits for modem
+
+bPMMdmPower			EQU			0				; Modem power
+bPMRingWakeUp		EQU			2				; Ring wake up enable
+bPMMdmInstall		EQU			3				; Modem installed
+bPMRingDet			EQU			4				; Ring detect
+
+; equ for Optimus slot interrupt hack
+
+OptHackSlotNum		EQU			9				; slot number for interrupt handler
+
+
+; equ's for dummy slot 9 interrupt handler hack fix of Elan ethernet interrupt handler bug
+
+statMaskBits		EQU			$0700			; mask for status bits in SR
+level3Bits			EQU			$0300			; bits for checking level 3 and above mask in SR
+level2Bits			EQU			$0200			; bits for setting mask in SR to level 2
+
+;----------------------------------------------------------------------------------------
+; Equates for Baby Rock modem primitives
+;----------------------------------------------------------------------------------------
+
+;----------------------------------------------------------------------------------------
+; Private storage data structures for 3615 primitives
+;----------------------------------------------------------------------------------------
+
+immg3615Rec			RECORD		0
+ModemType			DS.L		1					; ID of installed modem
+ModemBase			DS.L		1					; base address of the modem
+Slot9Addr			DS.L		1					; pointer to slot 9 handler queue element
+SndInputSrc			DS.B		1					; saved sound input source					; <H3>
+PlayThruVol			DS.B		1					; saved sound playthrough volume			; <H3>
+PreviousCmd			DS.W		1					; the last command executed through the call; <H10>
+SendTable			DS.L		1					; pointer to modem prime send table
+RecvTable			DS.L		1					; pointer to modem prime receive table
+size				EQU			*-immg3615Rec		; size of record
+					ENDR
+
+
+immg3615SlotQEl		RECORD		0
+sqLink				DS.L		1					; link address
+sqType				DS.W		1					; type of queue element
+sqPrio				DS.W		1					; priority
+sqAddr				DS.L		1					; address of handler
+sqParm				DS.L		1					; optional A1 pointer
+sqInt9Count			DS.L		1					; number of times in slot 9 interrupt
+sqInt3Count			DS.L		1					; number of times in level 3 interrupt
+size				EQU			*-immg3615SlotQEl	; size of record
+					ENDR
+
+;----------------------------------------------------------------------------------------
+; Private storage data structures for Baby Rock primitives
+;----------------------------------------------------------------------------------------
+
+immgBabyRockRec		RECORD		0
+ModemType			DS.L		1					; ID of installed modem
+ModemBase			DS.L		1					; base address of the modem
+SndMonState			DS.W		1					; current modem sound monitoring state
+SndMonVolume		DS.W		1					; current modem sound volume level
+size				EQU			*-immgBabyRockRec	; size of record
+					ENDR
+
+
+
+ImmgPrim		PROC
+				EXPORT	ImmgBabyRock
+ImmgBabyRock
+;----------------------------------------------------------------------------------------
+; ROM root table structure for modem manager initialization for BabyRock Modem in Blackbird.
+; See IntModemMgrPrivEqu.a for the structure that is built below
+;----------------------------------------------------------------------------------------
+immgMdmListHeadBabyRock
+					DC.L		mdmPrimsBabyRock					; offset to the BabyRock primitives
+					DC.L		0									; no further modems supported
+EndImmgBabyRock				
+
+mdmPrimsBabyRock
+					DC.W		0									; flags
+					DC.W		0									; number of primitives (filled in at init time)
+					DC.L		mdmTypeBabyRock-mdmPrimsBabyRock	; offset to modem type routine
+					DC.L		mdmPowerBabyRock-mdmPrimsBabyRock	; offset to modem power routine
+					DC.L		mdmWakeupBabyRock-mdmPrimsBabyRock	; offset to modem wakeup on ring control routine
+					DC.L		mdmStatusBabyRock-mdmPrimsBabyRock	; offset to modem status routine
+					DC.L		mdmPrimeBabyRock-mdmPrimsBabyRock	; offset to modem prime routine
+					DC.L		mdmSndCtlBabyRock-mdmPrimsBabyRock	; offset to modem sound control routine
+					DC.L		mdmExistsBabyRock-mdmPrimsBabyRock	; offset to modem exists routine
+					DC.L		mdmSetUpBabyRock-mdmPrimsBabyRock	; offset to modem set up routine
+					DC.L		mdmTearDownBabyRock-mdmPrimsBabyRock; offset to modem tear down routine
+					DC.L		mdmNameBabyRock-mdmPrimsBabyRock	; offset to modem name routine
+					DC.L		mdmSndVolBabyRock-mdmPrimsBabyRock	; offset to modem sound volume routine
+					DC.L		mdmSndHWBabyRock-mdmPrimsBabyRock	; offset to system sound arbitration routine
+
+;----------------------------------------------------------------------------------------
+; mdmTypeBabyRock
+; 
+; Entry:	a1 = modem primitive global pointer
+;
+; Exit:		d0 = result code
+;			a0 = modem type
+;
+; Trashes:	none
+;
+; Returns the modem type stored in global storage.
+;----------------------------------------------------------------------------------------
+
+mdmTypeBabyRock
+		WITH PowerDispRec,PMgrHookDispRec
+				MOVE.L	#(PModemType<<16)|\
+							(PMgrHookDisp<<0),D0		; get the modem type
+				_PowerDispatch
+				MOVEA.L	D0,A0							; return modem type
+				MOVEQ	#noErr,D0						; never any errors					
+				RTS
+		ENDWITH	
+				
+;----------------------------------------------------------------------------------------
+; mdmPowerBabyRock
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = no error
+;
+; Trashes:	none
+;
+;----------------------------------------------------------------------------------------
+
+mdmPowerBabyRock
+			WITH immgParamBlock
+				MOVE.B	#%00001000,D0					; select power cmd on channel C
+				TST.W	immgCommand(a0)					; IF Power Off Modem THEN
+				BNE.S	@CallSerPwr						;	.
+				ORI.B	#(1<<7),D0						; 	Set Power Off Bit	
+@CallSerPwr		_SerialPower							; Call Serial Power
+				RTS
+			ENDWITH
+;----------------------------------------------------------------------------------------
+; mdmWakeupBabyRock
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Returns immgInvalidSelector error, while we wait for PG&E to …
+; support wake up on ring.  There is no software to take advantage of the wake up on ring
+; feature at the present time.  This routine returns an error so that when software 
+; becomes available that can take advantage of wake up on ring, it can check the return
+; result from this function to determine if the desired behavior has taken place.
+;----------------------------------------------------------------------------------------
+
+mdmWakeupBabyRock
+				MOVE.W	#immgInvalidSelector,D0			; no good
+				RTS
+
+;----------------------------------------------------------------------------------------
+; mdmStatusBabyRock
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Constructs status byte from various sources.
+;----------------------------------------------------------------------------------------
+
+mdmStatusBabyRock
+				BRA		DoPmgrCmd						; run through the Pmgr
+				
+;----------------------------------------------------------------------------------------
+; mdmPrimeBabyRock
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+;
+; Sends and receives bytes to/from the modem.
+;
+; Processor interrupts are masked during this command.  The SCC data is polled during the
+; call and the data is stored on the stack.  Great pains are taken to keep the stack clear
+; for the SCC data.  At the end of the call, the PollProc is called to remove the SCC data
+; from the stack.
+;
+; Interrupts can be disabled by this routine for an indeterminate amount of time.  In
+; practice, the call takes no more than about 4ms.  The time out value for the communication
+; of one byte of data to or from the modem is 32ms.  It is therefore theoretically possible
+; that in a worst case scenario, say some hardware problem where the communication to and
+; from the modem takes 31ms, and there are 100 bytes to receive from the modem, that 
+; interrupts would be disabled for 3.1sec!  This problem is left to future authors of the
+; primitive.
+;
+; SPI stands for Serial Port Interface, and is a standard interface specification for 
+; the Motorola 6805 microcontroller.
+;
+; There is no attempt by this primitive to recover from any errors that may be encountered
+; during the sending or receiving of bytes to/from the modem.  If an error does occur, it
+; is reported, but the hardware may not be in the expected state.
+; 
+; Pointers to the send and receive count tables are stored in the mdmSetUp routine above.
+; This is done so that patching the tables is easy.
+;----------------------------------------------------------------------------------------
+
+mdmPrimeBabyRock
+DoPmgrCmd
+				_PMgrOp
+				RTS
+
+;------------------------------------------------------------------------------------------------
+; mdmSndCtlBabyRock
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Control modem sound for the BabyRock modem. The caller can either enable or disable the modem
+; sound channel.  Note that this channel is a software channel that sends DMA'ed (is that an 
+; adjective?) sound samples from the modem to the sound manager.  The relative volume of that
+; channel is controlled via the mdmSndVolBabyRock primitive.
+;------------------------------------------------------------------------------------------------
+
+mdmSndCtlBabyRock
+
+		WITH immgParamBlock,immgBabyRockRec
+
+@savedRegs	REG		d1
+			
+			movem.l	@savedRegs,-(sp)			; save registers
+
+			move.w	immgCommand(a0),d1			; D1 -> sound command to process
+			
+@chkOnOff	cmpi.w	#immgSndOff,d1				; check for sound monitoring on/off
+			beq.s	@valid
+			cmpi.w	#immgSndOn,d1
+			beq.s	@valid
+			
+@undefined	bra.s	@done						; sound command unrecognized, leave
+
+@valid		cmp.w	SndMonState(a1),d1			; is modem sound already in this state?
+			beq.s	@done						;  if so, then we're done…
+			
+			cmpi.w	#immgSndOn,d1
+			bne.s	@turnOff
+
+@turnOn		; Add Codec programming, not done by primitive code
+
+			; Set codec interface to TCM320AC36
+			move.b	#2,HardRockCodecICR
+		
+			; Set sample rate to SCLK * 256 (i.e. singer clock)
+			move.b	#1,HardRockCodecSRCR
+		
+			; Enable codec
+			move.b	#1,HardRockCodecEnReg
+		
+			; Call interface code
+			move.l	#immgSndOn,-(sp)
+			bsr		ModemSoundCntl
+			addq	#4,sp
+			bne.s	@noGood
+			
+			bra.s	@logIt
+
+@turnOff	move.l	#immgSndOff,-(sp)
+			bsr		ModemSoundCntl
+			addq	#4,sp
+			bne.s	@noGood
+
+@logIt		move.w	d1,SndMonState(a1)			; save state for next time
+
+@noGood		;not much we can do since the interface does not allow an error return, at least
+			;we don't set the SndMonState field incorrectly - so future calls have a shot at
+			;working (of course this shouldn't happen, but…)
+
+@done		moveq	#noErr,d0		
+			movem.l	(sp)+,@savedRegs			; restore registers
+@exit		rts
+
+		ENDWITH
+
+;___________________________________________________________________________________________
+;
+;	Modem Hardware Info Structure
+;
+; 	Used to store pass information about the modem sound hardware until we get the
+;   Internal Modem Manager on-line (so that we can handle various modem hardware during
+;   development).
+;___________________________________________________________________________________________
+
+ModemHWInfo			RECORD				0
+Flags				DS.B				1			; bit flags specifying various modem HW modes
+reserved1			DS.B				1			; reserved for future use
+mSrcSampleRate		DS.L				1			; modem sound source sample rate (unsigned fixed)
+reserved2			DS.L				1			; reserved for future use
+reserved3			DS.L				1			; reserved for future use
+reserved4			DS.L				1			; reserved for future use
+
+ModemHWInfoSize		EQU 				*			; size of ModemHWInfo
+					ENDR
+		
+; =====================================================================
+;
+;	void ModemSoundCntl(Boolean enable);
+;
+;		calls the custom sound primitive to enable/disable modem sound
+;
+;	NOTE: The sample rate passed in the ModemHWInfo structure field must
+;			be in unsigned fixed format. This format is the same as that
+;			described in IM1 except the msb is not interpreted as a
+;			sign bit (e.g. AC440000 is 44,100 and NOT -21,436).
+;
+;	NOTE2: Make sure the CODEC interface has been set up correctly
+;			before calling this routine (we don't touch it).
+;
+; =====================================================================
+HrClockSrcBit		EQU		0					; bit is one if using external clock, zero if using Singer clk					
+
+ModemSoundCntl
+
+ModemSndFrame	RECORD	{A6Link},DECR
+enable			DS.L	1
+return			DS.L	1
+A6Link			DS.L	1
+reserved		DS.L	1
+LocalSize		EQU		*
+				ENDR
+
+@savedRegs	reg			d0-d3/a0-a1
+
+		WITH	ModemHWInfo,ModemSndFrame,ExpandMemRec
+		
+			link	a6,#LocalSize					; set up stack frame
+			movem.l	@savedRegs,-(sp)
+			
+@gotIt		moveq	#ModemHWInfoSize,d0				; allocate *TEMPORARY* pass-in structure
+			_NewPtr	,SYS,CLEAR
+			bne.s	@done
+			movea.l	a0,a1
+
+			;********************* SET HARDWARE CALL MONITORING ATTRIBUTES HERE *********************			
+			;bset	#HrClockSrcBit,Flags(a1)		; flag external clock for HardRock CODEC
+			bclr	#HrClockSrcBit,Flags(a1)		; flag Singer clock for HardRock CODEC
+			move.l	#rate11025hz,mSrcSampleRate(a1) ; set sample rate in unsigned fixed format	
+
+			moveq	#sndModemSndOff,d0				; assume modem sound off
+			tst.l	enable(a6)						; see what the caller wants
+			beq.s	@execute						;  we guessed right, so execute primitive
+			moveq	#sndModemSndOn,d0				; no, select modem sound on
+			
+@execute	movea.l	([ExpandMem],emSndPrimitives),a0 ; get the address of the sound primitive table
+			move.l	sndModemSound*4(a0),d1			; is there a handler?
+			beq.s	@leave							; no, just exit
+			move.l	d1,a0
+			jsr		(a0)							; call the ioprimitive
+			bne.s	@primFailed
+@primOK		clr.w	d3								; save passed value for later check
+			bra.s	@leave
+@primFailed	moveq	#-1,d3							; save error value for later check
+
+@leave		movea.l	a1,a0
+			_DisposPtr								; get rid of *TEMPORARY* pass-in structure
+
+@done		movem.l	(sp)+,@savedRegs
+			unlk	a6
+			rts
+
+		ENDWITH
+		
+
+; ===================================================================== ;
+;
+;	Boolean Error ModemHWCntl(Boolean enable);
+;
+;		calls the custom sound primitive to Grab/Release modem sound hardware
+;
+; ===================================================================== ;
+ModemHWCntl
+
+ModemHWCFrame	RECORD	{A6Link},DECR
+enable			DS.L	1
+return			DS.L	1
+A6Link			DS.L	1
+reserved		DS.L	1
+LocalSize		EQU		*
+				ENDR
+
+@savedRegs	reg		d0-d2/a0-a1
+
+		WITH	ModemHWCFrame,ExpandMemRec
+		
+			link	a6,#LocalSize					; set up stack frame
+			movem.l	@savedRegs,-(sp)
+
+			moveq	#sndReleaseHW,d0				; assume modem sound release
+			tst.l	enable(a6)						; see what the caller wants
+			beq.s	@execute						;  we guessed right, so execute primitive
+			moveq	#sndGrabHW,d0					; no, select modem sound grab
+			
+@execute	movea.l	([ExpandMem],emSndPrimitives),a0 ; get the address of the sound primitive table
+			move.l	sndSoundHWCntl*4(a0),d1			; is there a handler?
+			beq.s	@done							; no, just exit
+			move.l	d1,a0
+			jsr		(a0)							; call the ioprimitive
+			bne.s	@problem
+
+			moveq	#0,d0							; flag that call was successful
+			bra.s	@done
+
+@problem	moveq	#1,d0							; flag that call did not succeed			
+@done		movem.l	(sp)+,@savedRegs
+			unlk	a6
+			rts
+		
+		ENDWITH
+				
+;----------------------------------------------------------------------------------------
+; mdmExistsBabyRock
+; 
+; Entry:	none
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Check if a BabyRock modem is installed in the box.
+;----------------------------------------------------------------------------------------
+
+mdmExistsBabyRock
+		WITH PowerDispRec,PMgrHookDispRec
+				MOVE.L	#(PModemType<<16)|\
+							(PMgrHookDisp<<0),D0		; get the modem type
+				_PowerDispatch
+				TST.W	D0								;
+				BEQ.S	@noModem
+				MOVEQ	#noErr,D0						; indicate modem exists
+				RTS
+@noModem	
+				MOVE.W	#immgNoBoardErr,d0				; indicate no board
+				RTS
+		ENDWITH		
+
+;----------------------------------------------------------------------------------------
+; mdmSetUpBabyRock
+; 
+; Entry:	none
+;
+; Exit:		d0 = result code
+;			a0 = pointer to modem primitives globals
+;
+; Trashes:	none
+;
+; Set up the primitives for the 3615 modem.
+;----------------------------------------------------------------------------------------
+
+mdmSetUpBabyRock
+@savedRegs		REG	a1-a3
+
+				movem.l	@savedRegs,-(sp)					; save registers
+				
+			WITH immgBabyRockRec
+
+		; allocate private storage for modem primitives
+
+				move.l	#immgBabyRockRec.size,d0			; get size of private storage
+				_NewPtr	,SYS,CLEAR							; get a pointer in the system heap	; <H10>
+				tst.w	d0									; check for errors
+				bne.w	@error1								; if no memory, cannot continue
+				movea.l	a0,a3								; a3 = pointer to private storage
+
+				movea.l	#HardRockSlotBase,a2				; get base address of modem
+				move.l	a2,ModemBase(a3)					; store base address
+				
+				movea.l	#FIFOMEM_BASE,a0					; set up the HardRock FIFO bases (for DMA)
+				IMPORT	GetRealProc
+				bsr.l	GetRealProc
+				movea.l	a0,a1
+				adda.l	#FIFO_0_OFFSET,a1
+				move.l	a1,HardRockFifoBase0
+				movea.l	a0,a1
+				adda.l	#FIFO_1_OFFSET,a1
+				move.l	a1,HardRockFifoBase1
+				movea.l	a0,a1
+				adda.l	#FIFO_2_OFFSET,a1
+				move.l	a1,HardRockFifoBase2
+				
+		WITH PowerDispRec,PMgrHookDispRec
+				MOVE.L	#(PModemType<<16)|\
+							(PMgrHookDisp<<0),D0			; get the modem type
+				_PowerDispatch
+		ENDWITH
+				move.l	d0,ModemType(a3)					; store the modem type in private storage
+
+				move.w	#immgSndOff,SndMonState(a3)			; initialize state variables to track modem sound
+				move.w	#$FF,SndMonVolume(a3)				; initialize modem sound volume (to full)
+				
+				movea.l	a3,a0								; return pointer to primitives globals
+				moveq	#noErr,d0							; no error	
+
+@exit			movem.l	(sp)+,@savedRegs					; restore registers
+				rts
+
+	; indicate initialization error
+@error1			move.w	#immgInitError,d0					; bad...
+				bra.s	@exit
+				
+			ENDWITH
+				
+				
+;----------------------------------------------------------------------------------------
+; mdmTearDownBabyRock
+; 
+; Entry:	a1 = pointer to modem primitives globals
+;
+; Exit:		d0 = no error
+;			
+; Trashes:	none
+;
+; Deallocates everything that the set up routine allocated and sets PrimeTime so that
+; no modem interrupts are generated.
+;----------------------------------------------------------------------------------------
+
+mdmTearDownBabyRock
+			WITH immgBabyRockRec
+				
+		; deallocate private storage for modem primitives
+
+				movea.l	a1,a0								; A0 -> pointer to private storage
+				_DisposPtr
+				
+				moveq	#noErr,d0							; no error
+
+@exit			rts
+				
+			ENDWITH
+				
+				
+
+;----------------------------------------------------------------------------------------
+; mdmNameBabyRock
+; 
+; Entry:	a0 = pointer to string buffer
+;			a1 = pointer to modem primitives globals
+;
+; Exit:		d0 = no error
+;			a0 = pointer to null terminated string
+;			
+; Trashes:	A1
+;
+; Returns the name of the modem.
+;----------------------------------------------------------------------------------------
+
+mdmNameBabyRock
+				MOVE.L	A0,-(sp)							; save pointer
+				
+				MOVEA.l	A0,A1								; destination
+				LEA		@modemName,A0						; source (skip over length byte)
+@loop			MOVE.B	(A0)+,(A1)+							; copy one byte
+				BNE.S	@loop								; keep copying until null terminal byte is copied
+				
+				MOVEA.L	(SP)+,A0							; return modem name in A0
+				MOVEQ	#noErr,D0							; no error
+
+@exit			RTS
+
+@modemName		DC.B	'Baby Rock'
+				DC.B	0
+				
+			ALIGN 2				
+				
+;----------------------------------------------------------------------------------------
+; mdmSndVolBabyRock
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Controls the volume of the modem sound channel relative to the overall hardware sound
+; level.
+;----------------------------------------------------------------------------------------
+
+mdmSndVolBabyRock
+		WITH immgParamBlock,immgBabyRockRec,ExpandMemRec
+
+@savedRegs	REG		a0/d1
+			
+			movem.l	@savedRegs,-(sp)			; save registers
+			
+			move.w	immgCommand(a0),d1			; D1 -> sound command to process
+			
+@chkCmd		cmpi.w	#immgVolSet,d1				; dispatch to appropriate code…
+			beq.s	@setVol
+			cmpi.w	#immgVolRead,d1
+			beq.s	@readVol
+			
+@undefined	bra.s	@badCmd						; sound command unrecognized, leave
+
+@setVol		cmpi.w	#2,immgLength(a0)			; verify the volume parameter format
+			bne.s	@formatErr
+			move.w	([immgSBuffer,a0]),d0		; get volume level to set
+			
+			movea.l	([ExpandMem],emSndPrimitives),a0 ; get the address of the sound primitive table
+			move.l	sndModemSndVol*4(a0),d1		; is there a handler?
+			beq.s	@problemo					;  no, so bail
+			move.l	d1,a0
+			jsr		(a0)						; call the snd primitive
+			bne.s	@problemo					; bail if the primitive returns an error
+
+			move.w	d0,SndMonVolume(a1)			; save current modem sound level (for later read calls)			
+			bra.s	@normal
+
+@readVol	move.w	#2,immgLength(a0)			; set up for volume parameter return
+			tst.l	immgRBuffer(a0)				; be paranoid and make sure a return buff ptr is present
+			beq.s	@formatErr
+			move.w	SndMonVolume(a1),([immgRBuffer,a0])
+			bra.s	@normal
+
+@problemo	move.w	#immgCommandError,d0		; signals a generic problem with command execution
+			bra.s	@exit
+@formatErr	move.w	#immgSendEndErr,d0			; simulate a data transfer error
+			bra.s	@exit
+@badCmd		move.w	#immgInvalidCommand,d0
+			bra.s	@exit
+
+@normal		moveq	#noErr,d0
+
+@exit		movem.l	(sp)+,@savedRegs			; restore registers
+			rts
+
+		ENDWITH
+		
+		
+
+;----------------------------------------------------------------------------------------
+; mdmSndHWBabyRock
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Allows the caller to negotiate/release exclusive control of the sound hardware.
+;----------------------------------------------------------------------------------------
+
+mdmSndHWBabyRock
+		WITH immgParamBlock,immgBabyRockRec,ExpandMemRec
+
+@savedRegs	REG		a0-a1/d1
+			
+			movem.l	@savedRegs,-(sp)			; save registers
+			
+			move.w	immgCommand(a0),d1			; D1 -> sound command to process
+			
+@chkCmd		cmpi.w	#immgSndRelease,d1			; dispatch to appropriate code…
+			beq.s	@valid
+			cmpi.w	#immgSndTakeover,d1
+			beq.s	@valid
+			
+@undefined	bra.s	@badCmd						; sound command unrecognized, leave
+
+@valid		movea.l	([ExpandMem],emSndPrimitives),a1 ; get the address of the sound primitive table
+			move.l	sndSoundHWState*4(a1),d0	; is there a handler?
+			beq.s	@problemo					;  no, so bail
+			move.l	d0,a1
+			jsr		(a1)						; call the snd primitive
+			bne.s	@problemo					; bail if the primitive returns an error
+			
+			cmpi.w	#immgSndRelease,d1			; see if command makes sense given current HW state
+			bne.s	@isGrabOK
+@isRlseOK	cmpi.b	#sndReleaseHW,d0
+			beq.s	@problemo					;  (bail if command is release and we are already released)
+			bra.s	@tryRelease
+@isGrabOK	cmpi.b	#sndReleaseHW,d0
+			bne.s	@problemo					;  (bail if command is grab and HW is already "grabbed")
+			
+@tryGrab	move.w	#sndGrabHW,d0
+			bra.s	@arbitrate
+
+@tryRelease	move.w	#sndReleaseHW,d0
+
+@arbitrate	movea.l	([ExpandMem],emSndPrimitives),a1 ; get the address of the sound primitive table
+			move.l	sndSoundHWCntl*4(a1),d1		; is there a handler?
+			beq.s	@problemo					;  no, so bail
+			move.l	d1,a1
+			jsr		(a1)						; call the snd primitive
+			bne.s	@arbFailed
+
+@arbGood	move.w	#immgArbOK,d1
+			bra.s	@normal
+
+@arbFailed	move.w	#immgArbFailed,d1
+			
+@normal		moveq	#noErr,d0
+			bra.s	@report
+
+@problemo	move.w	#immgCommandError,d0		; signals a generic problem with command execution
+			move.w	#immgArbFailed,d1
+			bra.s	@report
+@badCmd		move.w	#immgInvalidCommand,d0
+			move.w	#immgArbFailed,d1
+
+@report		move.w	#2,immgLength(a0)
+			tst.l	immgRBuffer(a0)				; be paranoid and check for receive buffer ptr
+			beq.s	@formatErr
+			move.w	d1,([immgRBuffer,a0])
+			bra.s	@exit
+
+@formatErr	move.w	#immgRecvEndErr,d0			; simulate a data transfer error
+
+@exit		movem.l	(sp)+,@savedRegs			; restore registers
+			rts
+
+		ENDWITH
+		
+
+
+				EXPORT	ImmgOptimus
+ImmgOptimus
+
+
+;----------------------------------------------------------------------------------------
+; ROM root table structure for modem manager initialization for Optimus.
+; See IntModemMgrPrivEqu.a for the structure that is built below
+;----------------------------------------------------------------------------------------
+
+immgMdmListHeadOpt
+					DC.L		mdmPrims3615-immgMdmListHeadOpt		; offset to 3615 primitives
+					DC.L		0									; no further modems supported
+
+EndImmgOptimus
+
+
+mdmPrims3615
+					DC.W		0									; flags
+					DC.W		0									; number of primitives (filled in at init time)
+					DC.L		mdmType3615-mdmPrims3615			; offset to modem type routine
+					DC.L		mdmPower3615-mdmPrims3615			; offset to modem power routine
+					DC.L		mdmWakeup3615-mdmPrims3615			; offset to modem wakeup on ring control routine
+					DC.L		mdmStatus3615-mdmPrims3615			; offset to modem status routine
+					DC.L		mdmPrime3615-mdmPrims3615			; offset to modem prime routine
+					DC.L		mdmSndCtl3615-mdmPrims3615			; offset to modem sound control routine
+					DC.L		mdmExists3615-mdmPrims3615			; offset to modem exists routine
+					DC.L		mdmSetUp3615-mdmPrims3615			; offset to modem set up routine
+					DC.L		mdmTearDown3615-mdmPrims3615		; offset to modem tear down routine
+					DC.L		mdmName3615-mdmPrims3615			; offset to modem name routine
+					DC.L		mdmSndVol3615-mdmPrims3615			; offset to modem sound volume routine
+					DC.L		mdmSndHW3615-mdmPrims3615			; offset to system HW arbitration routine
+
+
+
+;----------------------------------------------------------------------------------------
+; mdmType3615
+; 
+; Entry:	a1 = modem primitive global pointer
+;
+; Exit:		d0 = result code
+;			a0 = modem type
+;
+; Trashes:	none
+;
+; Returns the modem type stored in global storage.
+;----------------------------------------------------------------------------------------
+
+mdmType3615
+		WITH immg3615Rec
+			move.l	ModemType(a1),a0		; A0 -> modem type from private storage
+			moveq	#noErr,d0				; no error
+			rts
+		ENDWITH
+		
+		
+;----------------------------------------------------------------------------------------
+; mdmPower3615
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = no error
+;
+; Trashes:	none
+;
+; The express modem on Optimus cannot be turned on and off like the express modem on the
+; portables.  Thus this routine disables interrupts from the modem to simulate the modem 
+; power being turned off, and enables interrupts from the modem to simulate the modem 
+; power being turned on.
+;----------------------------------------------------------------------------------------
+
+mdmPower3615
+		WITH immg3615Rec, immgParamBlock
+			move.l	a2,-(sp)				; save a2
+			movea.l	ModemBase(a1),a2		; base address of modem
+			move.b	OptSndCtl(a2),d0		; get the current status
+			bclr	#bOptIntMask,d0			; assume power on, unmask interrupts
+			tst.w	immgCommand(a0)			; check power on or off					; <H10>
+			bne.s	@commonExit
+			bset	#bOptIntMask,d0			; mask interrupts
+@commonExit	move.b	d0,OptSndCtl(a2)		; set the status
+			move.l	(sp)+,a2				; restore a2
+			moveq	#noErr,d0
+			rts
+		ENDWITH
+		
+		
+;----------------------------------------------------------------------------------------
+; mdmWakeup3615
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Returns immgInvalidSelector error, since the express modem on Optimus does not currently
+; support wake up on ring.  There is no software to take advantage of the wake up on ring
+; feature at the present time.  This routine returns an error so that when software 
+; becomes available that can take advantage of wake up on ring, it can check the return
+; result from this function to determine if the desired behavior has taken place.
+;----------------------------------------------------------------------------------------
+
+mdmWakeup3615
+		WITH immg3615Rec
+			move.w	#immgInvalidSelector,d0											; <H8>
+			rts
+		ENDWITH
+		
+		
+;----------------------------------------------------------------------------------------
+; mdmStatus3615
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Constructs status byte from various sources.
+;----------------------------------------------------------------------------------------
+
+mdmStatus3615
+		WITH immgParamBlock
+			moveq	#(1<<bPMMdmPower)	|	\	; modem is on
+					(1<<bPMRingWakeUp) 	|	\	; ring wakeup is enabled
+					(1<<bPMMdmInstall),d0		; modem is installed
+			btst.b	#OptRingDet,OptMdmBase+OptSPIMdmCtl	; test if ring detect is set
+			beq.s	@noRingDet
+			moveq	#(1<<bPMMdmPower)	|	\	; modem is on
+					(1<<bPMRingWakeUp) 	|	\	; ring wakeup is enabled
+					(1<<bPMMdmInstall)	|	\	; modem is installed
+					(1<<bPMRingDet),d0			; ring detect is set 
+@noRingDet	move.w	#1,immgLength(a0)		; set the length to one byte
+			move.l	immgRBuffer(a0),a0		; A0 -> pointer to receive buffer
+			move.b	d0,(a0)					; put the status into the return buffer
+			move.w	#noErr,d0				; set error code
+			rts
+		ENDWITH
+		
+		
+;----------------------------------------------------------------------------------------
+; mdmPrime3615
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Uses:
+;	D0: scratch register, result code
+;	D1: high word: scratch; low word: command number
+;	D2: scratch (by lower level routines)
+;	D3: scratch
+;	D4: scratch
+;	D5: scratch
+;	D6: high word: contents of status register; low word: scratch
+;	D7: stack base for poll stack
+;	
+;	A0: modem manager parameter block pointer
+;	A1: scratch, VIA 1 base
+;	A2:	modem base address
+;	A3:	scratch (by lower level routines, return address)
+;	A4: scratch (by lower level routines, return address)
+;	A5: pointer to immg3615Rec, not valid after UnloadPollStack
+;	A6: pointer to SCC channel A data register
+;	A7: stack pointer, pollstack pointer
+;
+; Sends and receives bytes to/from the modem.
+;
+; Processor interrupts are masked during this command.  The SCC data is polled during the
+; call and the data is stored on the stack.  Great pains are taken to keep the stack clear
+; for the SCC data.  At the end of the call, the PollProc is called to remove the SCC data
+; from the stack.
+;
+; Interrupts can be disabled by this routine for an indeterminate amount of time.  In
+; practice, the call takes no more than about 4ms.  The time out value for the communication
+; of one byte of data to or from the modem is 32ms.  It is therefore theoretically possible
+; that in a worst case scenario, say some hardware problem where the communication to and
+; from the modem takes 31ms, and there are 100 bytes to receive from the modem, that 
+; interrupts would be disabled for 3.1sec!  This problem is left to future authors of the
+; primitive.
+;
+; SPI stands for Serial Port Interface, and is a standard interface specification for 
+; the Motorola 6805 microcontroller.
+;
+; There is no attempt by this primitive to recover from any errors that may be encountered
+; during the sending or receiving of bytes to/from the modem.  If an error does occur, it
+; is reported, but the hardware may not be in the expected state.
+; 
+; Pointers to the send and receive count tables are stored in the mdmSetUp routine above.
+; This is done so that patching the tables is easy.
+;----------------------------------------------------------------------------------------
+
+mdmPrime3615
+immgrPollRegs	REG		D3/D4/D5/D6/A0/A1/A2/A4	; registers to save across pollproc call
+@numPollRegs	EQU		4+4						; number of registers to save across pollproc call
+@savedRegs		REG		D1-D7/A0-A6				; registers saved across this routine
+
+			movem.l	@savedRegs,-(SP)		; save working registers
+
+			move.w	sr,d6					; save the entry SR in the upper half of D6
+			swap	d6
+
+		WITH immgParamBlock
+
+			movea.l	immg3615Rec.ModemBase(a1),a2	; point to modem base address
+			movea.l	a1,a5					; save pointer to immg3615Rec
+			
+; disable interrupts during the time of this call
+
+			ori		#HiIntMask,sr			; no interrupts
+
+;  set up for SCC polling...
+
+			lea		-4*@numPollRegs(sp),sp	; allocate space for registers saved if we call PollProc
+			move.l	sp,d7					; point to the stack top for our SCC poll stack
+		
+			movea.l	SccRd,a6				; point to the SCC channel A's data register			<H26>
+			addq.w	#aData,a6				;														<H26>
+			tst.l	PollProc				; is a poll proc installed?								<H52>
+			bne.s	@WillPoll				; -> yes												<H52>
+
+; the offset +sccData is added to the address below because the routines that read the 
+; scc data out of the address subtract sccData from the base of the scc when reading data.
+; See WaitSPIAckHi and WaitSPIAckLo below.
+
+			lea		@NoPollSCC+sccData,a6	; no, avoid collecting bytes no one will use			<H52>
+
+@WillPoll
+
+; ----- send command and count ----
+
+			move.w	immgCommand(a0),d3
+			move.w	d3,d1
+			bsr		SendSPI					; send command byte
+			bne.s	@ImmgOpExit				; exit if error returned						<H24>
+			
+			movea.l	immg3615Rec.SendTable(a5),a1	; and get the send count table					<H21>
+			move.w	immgLength(a0),d5		; pop the count into d5
+			bsr		GetLenCount				; D0 -> number of bytes to send, -1 for dynamic
+			bpl.s	@noCount				; if positive, no count
+			
+			move.w	d5,d1
+			bsr		SendSPI					; send count byte
+			bne.s	@ImmgOpExit				; exit if error returned						<H24>
+
+; ----- send data ----
+
+@noCount	movea.l	immgSBuffer(a0),a1		; get the pointer to the command's data bytes
+			moveq	#0,d1					; (set CCR for BEQ so DBNE below won't fall thru)
+			bra.s	@StartSend
+
+@SendData	move.b	(a1)+,d1				; get the next data byte
+			bsr		SendSPI					;  and send it
+@StartSend	dbne	d5,@SendData			; -> more bytes to send
+			bne.s	@ImmgOpExit				; -> error
+
+; ----- receive data -----
+			movea.l	immg3615Rec.RecvTable(a5),a1	; and get the receive count table				<H21>
+			bsr		GetLenCount				; D0 -> number of bytes to send, -1 for dynamic
+			move.b	d1,d3
+			bmi.s	@readReplyCount			; (<0)
+			cmp.b	#1,d3					; test against 1
+			ble.s	@readData				; if ( =0 or =1 ) go to read
+			subq	#1,d3					; (>1) correct count
+			bra.s	@readData				; if 0 or 1 go to read
+
+@readReplyCount
+			bsr		ReceiveSPI				; read first byte for receive count
+			bne.s	@ImmgOpExit				; exit if error returned						<H24>
+			move.b	d1,d3					; move count into d3
+
+@readData									; d4 has receive byte count
+			movea.l	immgRBuffer(a0),a1		; a1 new points
+			move.w	d3,immgLength(a0)			; 
+			bra.s	@StartReceive			; start receiving data
+
+@ReceiveByte	
+			bsr		ReceiveSPI				; read a byte into d1
+			bne.s	@ImmgOpExit				; -> error
+			move.b	d1,(a1)+				; move data byte into buffer
+
+@StartReceive	
+			dbra	d3,@ReceiveByte			; -> more bytes to send
+
+@ImmgOpExit	
+
+;  check if any SCC bytes were collected so we can send them to the serial driver...
+			
+			move.l	d0,d4					; save return result
+			movea.l	VIA,a1					; point to VIA1
+			bsr		UnloadPollstack			; unload any SCC data stashed while interrupts were disabled
+			lea		4*@numPollRegs(sp),sp	; de-allocate PollProc saved register frame
+			move.l	d4,d0					; restore return result
+
+;  clean everything up...
+
+			swap	d6
+			move.w	d6,sr
+			tst.l	d0						; to set condition codes
+
+@exit		movem.l	(sp)+,@savedRegs		; restore working registers
+
+			rts
+
+	ENDWITH
+	
+@NoPollSCC	dc.w	0						; A6 points here if no PollProc to avoid stack overflow	<H52>
+
+
+	
+;————————————————————————————————————————————————————————————————————————————————			<H24>
+; Routine:		WaitSPIAckHi
+;
+; Input:		a2.l - pointer to modem base
+;				a6 - pointer to serialpoll data area
+;
+; Destroys:		d2,d1,a3
+;
+; Returns		d0.b - 0 = ok, non-zero = error
+;
+; Function:		wait for SPI ack high
+;————————————————————————————————————————————————————————————————————————————————			<H24>
+WaitSPIAckHi
+			move.l	(sp)+,a3								; pop return address into a3	<37>
+			move.w	#32,d2									; loop to max 32 msec
+@nextmsec			
+			move.w	timedbra,d1								; 1 msec count
+@waitAckhi	
+			btst.b	#RxCA,-sccData(A6)						; SCC data available?			<37>				
+			beq.s	@WaitLoop								;								<37>
+			move.b	(A6),-(SP)								; yes, push it on the stack		<37>
+@WaitLoop													;								<37>
+			btst.b	#OptSPIAck,OptSPIMdmCtl(a2)				; test ack
+			dbne	d1,@waitAckhi							; loop for upto 1 msec
+			dbne	d2,@nextmsec							; loop for d2 msec
+			seq		d0										; set result (d0 <> 0 = error), bit lo
+			tst.b	d0										; set the condition codes		<H26>
+			jmp		(a3)									; return through a3				<37>
+
+;————————————————————————————————————————————————————————————————————————————————			<H24>
+; Routine:		WaitSPIAckLo
+;
+; Input:		a2 - pointer to modem base
+;				a6 - pointer to serialpoll data area
+;
+; Destroys:		d2,d1,a3
+;
+; Returns		d0 - 0 = ok, non-zero = error
+;
+; Function:		wait for SPI ack lo
+;
+;————————————————————————————————————————————————————————————————————————————————			<H24>
+WaitSPIAckLo
+			move.l	(sp)+,a3								; pop return address into a3	<37>
+			move.w	#32,d2									; loop to max 32 msec
+@nextmsec			
+			move.w	timedbra,d1								; 1 msec count
+@waitAckhi	
+			btst.b	#RxCA,-sccData(A6)						; SCC data available?			<37>				
+			beq.s	@WaitLoop								;								<37>
+			move.b	(A6),-(SP)								; yes, push it on the stack		<37>
+@WaitLoop													;								<37>
+			btst.b	#OptSPIAck,OptSPIMdmCtl(a2)				; test ack
+			dbeq	d1,@waitAckhi							; loop for upto 1 msec
+			dbeq	d2,@nextmsec							; loop for d2 msec
+			sne		d0										; set result (d0 <> 0 = error), bit hi
+			tst.b	d0										; set the condition codes		<H26>
+			jmp		(a3)									; return through a3				<37>
+
+;————————————————————————————————————————————————————————————————————————————————
+; Routine:		SendSPI
+;
+; Input:		a2.l - pointer to modem base
+;				a6 - pointer to serialpoll data area
+;				d1.b - byte to send
+;
+; Destroys:		a4
+; Destroys:		d2,d1,a3 (by lower level routines)
+;
+; Returns		d0.w - 0 = ok, non-zero = error
+;
+; Function:		send a byte thru the SPI
+;
+;————————————————————————————————————————————————————————————————————————————————
+SendSPI
+			move.l	(sp)+,a4								; pop return address into a4	<37>
+			swap	d1										; save the data byte in the hi work of d0
+			bsr.s	WaitSPIAckHi							; (1) wait for pmgr idle		<H24>
+			bne.s	@error									; if bit low, error				<H24>
+
+;begin transaction
+			swap	d1										; get the data byte back
+			bset.b	#OptLmpSPIDir,OptLmpSftCtl(a2)			; (2) set direction to output
+			move.b	d1,OptSPISftReg(a2)						; (3) write data
+			bclr.b	#OptSPIReq,OptSPIMdmCtl(a2)				; (4) assert data valid
+			bsr.s	WaitSPIAckLo							; (5) --> modem shift data		<H24>
+															; (6) wait for data accepted	<H24>
+			bne.s	@error									; if bit low, error				<H24>
+			bset.b	#OptSPIReq,OptSPIMdmCtl(a2)				; (7) clear data valid
+
+			move.w	#noErr,d0								; report no error
+			jmp		(a4)
+
+@error														;								<H24>
+			bset.b	#OptSPIReq,OptSPIMdmCtl(a2)				; (7) clear data valid			<28>
+			move.w	#immgSendStartErr,d0					; report send error				<H24>
+			jmp		(a4)
+
+;————————————————————————————————————————————————————————————————————————————————
+; Routine:		ReceiveSPI
+;
+; Input:		a2.l - pointer to modem base
+;				a6 - pointer to serialpoll data area
+;				d1.b - byte to send
+;
+; Destroys:		a4
+; Destroys:		d2,a3 (by lower level routines)
+;
+; Returns		d0.w - 0 = ok, non-zero = error
+;				d1.b - data byte read
+;
+; Function:		read a byte from the spi
+;
+;————————————————————————————————————————————————————————————————————————————————
+ReceiveSPI
+			move.l	(sp)+,a4								; pop return address into a4	<37>
+			bsr.s	WaitSPIAckHi							; (1) wait for pmgr idle		<H24>
+			bne.s	@error									; if bit low, error				<H24>
+
+;begin transaction
+			bclr.b	#OptLmpSPIDir,OptLmpSftCtl(a2)			; (2) set direction to input
+			bclr.b	#OptSPIReq,OptSPIMdmCtl(a2)				; (3) (RFD) ready for data
+			bsr.s	WaitSPIAckLo							; (4) acknowledge req			<H24>
+															; (5) <-- modem shifting		<H24>
+			bne.s	@error									; if bit low, error				<H24>
+			bset.b	#OptSPIReq,OptSPIMdmCtl(a2)				; (6) acknowledge ack
+
+			bsr.s	WaitSPIAckHi							; (7) wait (DAV)				<H24>
+			bne.s	@error									; if bit low, error				<H24>
+			move.b	OptSPISftReg(a2),d1						; (8) read data
+
+			move.w	#noErr,d0								; report no error
+			jmp		(a4)
+
+@error			
+			bset.b	#OptSPIReq,OptSPIMdmCtl(a2)				; (7) clear data valid			<28>
+			move.w	#immgRecvStartErr,d0					; mark as recieve error			<H24>
+			jmp		(a4)
+
+		
+		
+;_______________________________________________________________________
+;
+; Routine:	UnloadPollstack
+;
+; Inputs:	D7 -- pointer to top of poll stack
+;			A1 -- pointer to VIA1 base
+;			A6 -- pointer to SCC channel A data register
+;			SP -- pointer to bottom of poll stack
+;
+; Outputs:	D7 -- pointer to top of poll stack
+;			A1 -- pointer to VIA1 base
+;			A6 -- pointer to SCC channel A data register
+;			SP -- pointer to top of poll stack
+;
+; Trashes:	D0,D1,D2,A3,A4,A5
+;
+; Function:	calls the poll proc to unload any bytes stashed from SCC
+;			port A while interrupts were disabled
+;_______________________________________________________________________
+
+UnloadPollstack
+			movea.l	(sp)+,A4				; pop the return address
+			cmpa.l	d7,sp					; is there any poll data?
+			beq.s	@NoSCCData				; -> no
+			move.l	PollProc,d0				; is there a poll proc?
+			beq.s	@NoPollProc				; -> no
+			move.l	d7,PollStack			; stuff the PollStack
+
+			movea.l	d7,a3
+			movem.l	immgrPollRegs,(a3)		; save regs while calling poll proc W/O USING STACK
+
+			lea		vBufA(a1),a5			; point to the register with the SCC WR/REQ bit in VIA 1<H26>
+
+			movea.l	d0,a3
+			jsr		(a3)					; run the poll proc
+
+			movea.l	d7,a3
+			movem.l	(a3),immgrPollRegs		; restore our registers
+@NoPollProc	movea.l	d7,sp					; toss any bytes left on the pollstack					<H26>
+@NoSCCData	jmp		(a4)
+
+
+
+
+;----------------------------------------------------------------------------------------
+; mdmSndCtl3615
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Hit the bit in the modem sound control register to turn sound on or off.  Use sound
+; primitives to set the sound input source and the play thru volume.
+;----------------------------------------------------------------------------------------
+
+mdmSndCtl3615
+sndInvalidSrc		EQU		$ff					; invalid sound input source
+
+		WITH immg3615Rec, immgParamBlock, ExpandMemRec, SoundIOHeader
+
+@savedRegs			REG		d1					; registers to save over call
+
+			movem.l	@savedRegs,-(sp)			; save registers
+
+			move.w	immgCommand(a0),d1			; D1 -> sound on or off command				; <H10>
+			cmp.w	PreviousCmd(a1),d1			; make sure that we are doing the opposite of what has been done	; <H10>
+			beq.s	@done						; if the same, that means sound on request 	; <H10>
+												; with sound on already, or sound off request; <H10>
+												; with sound off already					: <H10>
+			
+			move.w	d1,PreviousCmd(a1)			; save the command being executed			; <H10>
+
+			move.b	OptMdmBase+OptSndCtl,d0		; pick up the current state
+			bclr	#bOptSndMask,d0				; assume modem sound off
+			cmp.w	#immgSndOn,d1				; check if sound should go on
+			bne.s	@continue					; if not, continue
+			bset	#bOptSndMask,d0				; turn modem sound on
+@continue	move.b	d0,OptMdmBase+OptSndCtl		; make it so!
+
+			cmp.w	#immgSndOn,d1				; check if sound should go on				; <H3>
+			beq.s	@saveIt						; if sound on, save the current state		; <H3>
+			move.b	SndInputSrc(a1),d0			; no, restore sound input
+			move.b	PlayThruVol(a1),d1			; D1 -> saved playthrough volume
+			exg		d0,d1						; D0 -> playthrough volume
+			bsr		SetPlayThru					; reset playthrough volume first
+			exg		d0,d1						; D0 -> sound input source
+			bsr		SetInputSrc					; reset input source last
+			bra.s	@done						; continue to just set sound input			; <H3>
+			
+@saveIt		movea.l	([ExpandMem],emSndPrimitives),a0										; <H3>
+			move.b	UserVolume(a0),PlayThruVol(a1)	; save playthrough volume setting
+			move.b	SDVolume,d1					; D1 -> playthrough volume
+			tst.l	sndInputSource*4(a0)		; is there a handler?						; <H3>
+			beq.s	@done						; no, just exit								; <H3>
+			move.l	sndInputSource*4(a0),a0													; <H3>
+			jsr		(a0)						; call the ioprimitive						; <H3>
+
+	; check that the source that was returned is not invalid.  The primitives for Optimus
+	; currently return sndInvalidSrc if the sound input source is undefined (not yet been
+	; set).  Unfortunately, if we try to restore the sound input source to the value
+	; sndInvalidSrc, DFAC II hangs.
+	
+			cmp.b	#sndInvalidSrc,d0			; check for garbage							; <H3>
+			bne.s	@okToSave					; if not garbage, save it					; <H3>
+			moveq	#0,d0						; assume no input							; <H3>
+@okToSave	move.b	d0,SndInputSrc(a1)			; save previous input source				; <H3>
+			moveq	#sndAuxiliary,d0			; set modem sound on						; <H3>
+			bsr		SetInputSrc					; set input source first
+			exg		d0,d1						; D0 -> playthrough volume
+			bsr		SetPlayThru					; set playthrough last
+						
+@done		move.w	#noErr,d0		
+			movem.l	(sp)+,@savedRegs			; restore registers
+@exit		rts
+		
+SetPlayThru	movea.l	([ExpandMem],emSndPrimitives),a0										; <H3>
+			tst.l	sndPlayThruVol*4(a0)		; is there a handler?						; <H3>
+			beq.s	@done						; no, just exit								; <H3>
+			move.l	sndPlayThruVol*4(a0),a0		
+			jsr		(a0)						; call the ioprimitive
+@done		rts
+
+SetInputSrc	movea.l	([ExpandMem],emSndPrimitives),a0										; <H3>
+			tst.l	sndInputSelect*4(a0)		; is there a handler?						; <H3>
+			beq.s	@done						; no, just exit								; <H3>
+			move.l	sndInputSelect*4(a0),a0													; <H3>
+			jsr		(a0)						; call the ioprimitive						; <H3>
+@done		rts
+		ENDWITH
+			
+		
+;----------------------------------------------------------------------------------------
+; mdmExists3615
+; 
+; Entry:	none
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Check if a 3615 modem is installed in the box.
+;----------------------------------------------------------------------------------------
+
+mdmExists3615
+
+@savedRegs			REG		d1/a2							; registers to save over call
+
+				movem.l	@savedRegs,-(sp)					; save registers
+
+; now, how to tell if a modem is installed?  Unfortunately, we do NOT get a
+; bus error reading the modem register space (since this is ethernet prom space).
+; This means that we must write a register in the modem and read it back to determine
+; if there is anything at that address that will latch the data we send.
+
+				move.b	BIOS_Config2+BIOSAddr,d0			; get BIOS config 2 reg contents
+				bset	#bBIOSIOCSTime,d0					; set IO_CS_Time to be asserted on writes
+				move.b	d0,BIOS_Config2+BIOSAddr			; put byte into configuration reg
+				movea.l	#OptMdmBase,a2						; get base address of modem
+				move.b	OptSndCtl(a2),d0					; contents of interrupt req reg
+				not.b	d0									; invert bits
+				bset	#bOptIntMask,d0						; never unmask interrupts unless handler is installed
+				move.b	d0,OptSndCtl(a2)					; write invert out to int req reg
+				not.b	d0									; put back original
+				bset	#bOptIntMask,d0						; never unmask interrupts unless handler is installed
+
+	; Do a write to the modem ID reg so that the bus does not float to the thing just 
+	; written to the register.  MdmID is a safe place to write arbitrary data.  If the 
+	; byte written to MdmID floats on the next read, we will conclude that there is no
+	; modem installed (due to the eor).
+	
+				move.b	d0,OptMdmBase+OptMdmIDReg			; Place bad data on the bus		; <H7>
+
+				move.b	OptSndCtl(a2),d1					; read back contents
+				eor.b	d1,d0								; to test if bit for int mask latched
+				btst.l	#bOptSndMask,d0						; check int mask bit
+				beq.w	@noModem							; no modem!
+
+				move.w	#noErr,d0							; indicate modem exists
+
+@exit			move.b	BIOS_Config2+BIOSAddr,d1			; get BIOS config 2 reg contents
+				bclr	#bBIOSIOCSTime,d1					; set IO_CS_Time to not be asserted on writes
+				move.b	d1,BIOS_Config2+BIOSAddr			; put byte into configuration reg
+
+				movem.l	(sp)+,@savedRegs					; restore registers
+				rts		
+
+@noModem		move.w	#immgNoBoardErr,d0					; indicate no board
+				bra.s	@exit
+		
+;----------------------------------------------------------------------------------------
+; mdmSetUp3615
+; 
+; Entry:	none
+;
+; Exit:		d0 = result code
+;			a0 = pointer to modem primitives globals
+;
+; Trashes:	none
+;
+; Set up the primitives for the 3615 modem.
+;----------------------------------------------------------------------------------------
+
+mdmSetUp3615
+@savedRegs		REG	a2-a3
+
+				movem.l	@savedRegs,-(sp)					; save registers
+				
+			WITH immg3615Rec, immg3615SlotQEl
+
+		; allocate private storage for modem primitives
+
+				move.l	#immg3615Rec.size,d0				; get size of private storage
+				_NewPtr	,SYS,CLEAR							; get a pointer in the system heap	; <H10>
+				tst.w	d0									; check for errors
+				bne.w	@error1								; if no memory, cannot continue
+				movea.l	a0,a3								; a3 = pointer to private storage
+
+				movea.l	#OptMdmBase,a2						; get base address of modem
+				move.l	a2,ModemBase(a3)					; store base address
+				
+				lea		cmdCounts,a0						; A0 -> pointer to command send count table for mdmPrime
+				move.l	a0,SendTable(a3)					; store command send count table
+				lea		replyCounts,a0						; A0 -> pointer to receive count table
+				move.l	a0,RecvTable(a3)					; store receive count table
+
+				moveq	#0,d0								; clear D0
+				move.b	OptMdmIDReg(a2),d0					; get modem ID
+				move.l	d0,ModemType(a3)					; store the modem type in private storage
+
+				move.b	#(1<<bOptIntMask),OptSndCtl(a2)		; set modem interrupt bit, clear speaker sound bit		; <H10>
+
+; The bit in the via2 is set for a slot 9 interrupt whenever the modem interrupts, even
+; though the modem interrupt comes in at level 3.  If the process of a level 2 interrupt
+; has already begun, the slot 9 interrupt will attempt to be handled, which causes a 
+; problem.  Is there anything that we should be aware of that might bite us in the butt
+; later since we are installing a minimal slot 9 interrupt handler?  How can the slot 9
+; handler actually tell that the modem caused the interrupt and the interrupt is not 
+; actually a spurious one?
+
+				move.l	#immg3615SlotQEl.size,d0			; size of 3615 slot queue element (modified)
+				_NewPtr	,SYS								; get a slot queue element in the system heap
+				tst.w	d0									; check for valid pointer
+				bne.s	@error2								; cannot go on like this...
+				
+				move.l	a0,Slot9Addr(a3)					; save pointer to slot 9 handler
+				move.w	#0,sqPrio(a0)						; set priority to 0, the lowest priority
+				move.w	#sIQType,sqType(a0)					; set type to slot interrupt type
+				lea		sqInt9Count(a0),a2					; get pointer to count buffer
+				move.l	#0,(a2)								; initialize counter
+				move.l	a2,sqParm(a0)						; set up optional a1 pointer to the counter space
+				lea		Slot9Handler,a2						; get the address of the slot interrupt handler
+				move.l	a2,sqAddr(a0)						; put pointer into slot queue element routine address
+				move.l	#OptHackSlotNum,d0					; install the handler in slot 9
+				_SIntInstall
+				tst.w	d0									; any error?
+				bne.s	@error3								; we just can't go on...
+				
+				move.b	BIOS_Config2+BIOSAddr,d0			; get BIOS config 2 reg contents
+				ori.b	#(1<<bBIOSENETIRQLVL)	|	\		; set irq level to level 3
+						(1<<bBIOSIOCSTime),d0				; set IO_CS_Time to be asserted on writes
+				move.b	d0,BIOS_Config2+BIOSAddr			; put byte into configuration reg
+				
+				move.l	ModemBase(a3),a2					; A2 -> modem base address							; <H10>
+				move.b	#(1<<bOptIntMask),OptSndCtl(a2)		; set modem interrupt bit, clear speaker sound bit		; <H10>
+
+				movea.l	a3,a0								; return pointer to primitives globals
+				moveq	#noErr,d0							; no error	
+
+@exit			movem.l	(sp)+,@savedRegs					; restore registers
+				rts
+
+	; have allocated a slot queue element (in globals)
+@error3			movea.l	Slot9Addr(a3),a0					; A0 -> pointer to slot queue element
+				_DisposPtr									; take out the trash
+
+	; have allocated pointer to globals in A3
+@error2			movea.l	a3,a0								; gotta have it
+				_DisposPtr									; gotta get rid of it
+
+	; indicate initialization error
+@error1			move.w	#immgInitError,d0					; bad...
+				bra.s	@exit
+				
+			ENDWITH
+				
+				
+;_______________________________________________________________________
+;
+; Routine:	Slot 9 handler
+;
+; Inputs:	a1 = pointer to a count buffer
+;
+; Outputs:	d0 = 0 if interrupt not handled, 1 if interrupt handled
+;
+; Trashes:	a0
+;
+; Function:	a simple slot 9 interrupt handler.  The reason this routine
+; is necessary is twofold:
+; 1.  There is a bug in PrimeTime that sets the VIA2 port A data register
+;		bit that signifies a slot 9 interrupt has occurred when the modem
+;		signals an interrupt on level 3.
+; 2.  There is a bug in the interrupt handler for the Elan card that leaves
+;		the interrupt mask bits in the processor status register (SR) set
+;		to mask level 4 or 6, which, in combination with above bug, causes
+;		the slot manager slot interrupt code to go into an infinite loop under
+;		the following circumstance: 
+;			The processor is handling a level 2 interrupt for the Elan card, 
+;			and while it is in the Elan interrupt service routine, a modem 
+;			interrupt comes in, setting the VIA2 port A data register bit.
+;			The Elan interrupt routine exits, but leaves the SR mask set to 
+;			4 (or 6).  The slot manager, wanting to make sure that all slot
+;			interrupts have been handled, reads the VIA2 port A data register,
+;			which indicates that a slot 9 interrupt is requested.  The slot 9
+;			interrupt handler is entered.  If the handler for slot 9 does not
+;			lower the SR mask to 2 (to allow the real level 3 interrupt to occur
+;			and be serviced), an infinite loop results.
+;_______________________________________________________________________
+
+		ALIGN	2
+Slot9Handler
+			add.l	#1,(a1)					; bump counter of how many times in this routine
+			move	sr,d0					; get the status register to check for interrupt mask
+			andi.w	#statMaskBits,d0		; mask off interrupt mask information
+			cmpi.w	#level3Bits,d0			; check for int mask > 2
+			blo.s	@noProblem				; no problem with interrupt mask
+			move	sr,d0					; save the status register
+			swap	d0						; put saved SR in high word
+			move	sr,d0					; get SR to lower mask
+			andi.w	#~statMaskBits,d0		; clear all status mask bits
+			ori.w	#level2Bits,d0			; make interrupt mask level 2
+			move	d0,sr					; lower priority mask temporarily
+			swap	d0						; get the saved sr -- the level 3 interrupt should occur here!
+			move	d0,sr					; restore interrupt mask level
+@noProblem	move.l	VIA2RBVOSS,a0			; get via2 base address
+			move.b	vBufA(a0),d0			; read via 2 data register
+			andi.b	#(1<<v2IRQ1),d0			; mask off slot 9 interrupt bit (will be zero if interrupt not handled, 1 if handled)
+			rts
+
+		ALIGN	2
+
+
+
+;----------------------------------------------------------------------------------------
+; mdmTearDown3615
+; 
+; Entry:	a1 = pointer to modem primitives globals
+;
+; Exit:		d0 = no error
+;			
+; Trashes:	none
+;
+; Deallocates everything that the set up routine allocated and sets PrimeTime so that
+; no modem interrupts are generated.
+;----------------------------------------------------------------------------------------
+
+mdmTearDown3615
+			WITH immg3615Rec
+
+		; make sure BIOS does not generate level three interrupts
+
+				move.b	BIOS_Config2+BIOSAddr,d0			; get BIOS config 2 reg contents
+				bclr.l	#bBIOSENETIRQLVL,d0					; set irq level to level 2
+				bclr.l	#bBIOSIOCSTime,d0					; set IO_CS_Time to not be asserted on writes
+				move.b	d0,BIOS_Config2+BIOSAddr			; put byte into configuration reg
+				
+		; remove slot 9 interrupt handler
+		
+				move.l	Slot9Addr(a1),a0					; A0 -> pointer to slot queue element
+				move.l	#OptHackSlotNum,d0					; remove the handler from slot 9
+				_SIntRemove									; get rid of it if it is there
+		
+		; deallocate slot queue element
+		
+				move.l	Slot9Addr(a1),a0					; A0 -> pointer to slot queue element
+				_DisposPtr
+				
+		; deallocate private storage for modem primitives
+
+				movea.l	a1,a0								; A0 -> pointer to private storage
+				_DisposPtr
+				
+				moveq	#noErr,d0							; no error
+
+@exit			rts
+				
+			ENDWITH
+				
+				
+
+;----------------------------------------------------------------------------------------
+; mdmName3615
+; 
+; Entry:	a0 = pointer to string buffer
+;			a1 = pointer to modem primitives globals
+;
+; Exit:		d0 = no error
+;			a0 = pointer to null terminated string
+;			
+; Trashes:	A1
+;
+; Returns the name of the modem.
+;----------------------------------------------------------------------------------------
+
+mdmName3615
+				move.l	a0,-(sp)							; save pointer
+				
+				movea.l	a0,a1								; destination
+				lea		@modemName,a0						; source (skip over length byte)
+@loop			move.b	(a0)+,(a1)+							; copy one byte
+				bne.s	@loop								; keep copying until null terminal byte is copied
+				
+				movea.l	(sp)+,a0							; return modem name in A0
+				moveq	#noErr,d0							; no error
+
+@exit			rts
+
+@modemName		dc.b	'Express Modem'
+				dc.b	0
+				
+			ALIGN 2				
+				
+;----------------------------------------------------------------------------------------
+; mdmSndVol3615
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Returns immgInvalidSelector error, since the express modem on Optimus does not currently
+; support relative sound volume control.  This routine returns an error so that when software 
+; becomes available that can take advantage of sound volume, it can check the return
+; result from this function to determine if the desired behavior has taken place.
+;----------------------------------------------------------------------------------------
+
+mdmSndVol3615
+		WITH immg3615Rec
+			move.w	#immgInvalidSelector,d0
+			rts
+		ENDWITH
+		
+		
+
+;----------------------------------------------------------------------------------------
+; mdmSndHW3615
+; 
+; Entry:	a0 = modem manager param block pointer
+;			a1 = modem primitives global pointer
+;
+; Exit:		d0 = result code
+;
+; Trashes:	none
+;
+; Returns immgInvalidSelector error, since the express modem on Optimus does not currently
+; support system sound hardware arbitration.  This routine returns an error so that if software 
+; becomes available that arbitrates for the hardware, it can check the return
+; result from this function to determine if the desired behavior has taken place.
+;----------------------------------------------------------------------------------------
+
+mdmSndHW3615
+		WITH immg3615Rec
+			move.w	#immgInvalidSelector,d0
+			rts
+		ENDWITH
+
+;----------------------------------------------------------------------------------------
+; GetLenCount
+; 
+; Entry:	d3.w = command for count
+;			a1 = pointer to count table
+;
+; Exit:		d1.b = count
+;			condition codes set on d1.b
+;
+; Trashes:	a1
+;
+; Looks up count for command in d3 in table.
+;----------------------------------------------------------------------------------------
+
+GetLenCount
+@saveRegs			REG		d3/a0							; registers to save
+
+			movem.l	@saveRegs,-(sp)							; save registers
+			clr.w	d1										; clear out the low word
+
+			lea		@RangeTable,a0							; A0 -> pointer to range table
+@checkLoop	move.b	(a0)+,d1								; D1 -> normalizing byte
+			beq.s	@noCount								; no more ranges, no count...
+			sub.b	d1,d3									; normalize d3 to range
+			bmi.s	@noCount								; if less than, no count
+			move.b	(a0)+,d1								; D1 -> range size
+			cmp.b	d1,d3									; check if d3 is in range
+			blt.s	@lookup									; yep, go look it up
+			adda.w	d1,a1									; increment table pointer to next range
+			bra.s	@checkLoop								; nope, continue checking...
+			
+@lookup		move.b	(a1,d3.w),d1							; D1 -> count
+
+@exit		movem.l	(sp)+,@saveRegs							; restore registers
+			rts
+
+@noCount	move.b	#$ff,d1									; D1 -> no count
+			bra.s	@exit
+
+@RangeTable
+			dc.b	$50,$10									; cmd range $50-$5f
+			dc.b	$20,$10									; cmd range $70-$7f
+			dc.b	$30,$10									; cmd range $a0-$af
+			dc.w	0
+
+;_______________________________________________________________________________________
+;
+;	This table is used to determine if the 680x0 needs to send a count byte to the modem.
+;	A positive value means that the count is known by both sides, and so it is not sent.
+;	A negative value means that the command can send variable amounts of data, so the
+;	count byte specified in the modem manager param block needs to be sent.
+;
+;	Unused commands will be marked as expecting the count to be sent so that commands
+;	may be added without having to change the ROM.
+
+cmdCounts	DC.B	 1						; [$50] Set Internal Modem Control Bits
+			DC.B	 0						; [$51] Clear FIFOs
+			DC.B	 2						; [$52] Set FIFO Interrupt Marks
+			DC.B	 2						; [$53] Set FIFO Sizes
+			DC.B	-1						; [$54] Write Data to Modem
+			DC.B	 1						; [$55] Set Data Mode
+			DC.B	 3						; [$56] Set Flow Control Mode							<H55>
+			DC.B	 1						; [$57] Set DAA control lines							<H54>
+			DC.B	 0						; [$58] Read Internal Modem Status
+			DC.B	 1						; [$59] Get DAA Identification							<H55>
+			DC.B	 0						; [$5A] Get FIFO Counts
+			DC.B	 0						; [$5B] Get Maximum FIFO Sizes
+			DC.B	 0						; [$5C] Read Data From Modem
+			DC.B	-1						; [$5D] General Purpose modem command (modem dependent)	<H58>
+			DC.B	-1						; [$5E] -
+			DC.B	-1						; [$5F] -
+
+			DC.B	 1						; [$70] Set One-Second Interrupt
+			DC.B	 1						; [$71] Modem Interrupt Control
+			DC.B	 1						; [$72] Set Modem Interrupt
+			DC.B	-1						; [$73] -
+			DC.B	-1						; [$74] -
+			DC.B	-1						; [$75] -
+			DC.B	-1						; [$76] -
+			DC.B	-1						; [$77] -
+			DC.B	 0						; [$78] Read Interrupt Flag Register.
+			DC.B	 0						; [$79] Read Modem Interrupt Data
+			DC.B	-1						; [$7A] -
+			DC.B	-1						; [$7B] -
+			DC.B	-1						; [$7C] -
+			DC.B	-1						; [$7D] -
+			DC.B	 4						; [$7E] Enter Shutdown Mode
+			DC.B	 4						; [$7F] Enter Sleep Mode
+
+			DC.B	 2						; [$A0] Write Modem Register
+			DC.B	 2						; [$A1] Clear Modem Register Bits
+			DC.B	 2						; [$A2] Set Modem Register Bits
+			DC.B	 4						; [$A3] Write DSP RAM
+			DC.B	-1						; [$A4] Set Filter Coefficients
+			DC.B	 0						; [$A5] Reset Modem
+			DC.B	-1						; [$A6] -
+			DC.B	-1						; [$A7] -
+			DC.B	 1						; [$A8] Read Modem Register
+			DC.B	 1						; [$A9] Send Break
+			DC.B	 3						; [$AA] Dial Digit
+			DC.B	 2						; [$AB] Read DSP RAM
+			DC.B	-1						; [$AC] -
+			DC.B	-1						; [$AD] -
+			DC.B	-1						; [$AE] -
+			DC.B	-1						; [$AF] -
+
+
+;  This table is used to determine how the 680x0 needs to handle the reply:
+;
+;	=0:	no reply should be expected.
+;	=1: only a reply byte will be sent (this is a special case for a couple of commands)
+;	<0:	a reply is expected and the modem will send a count byte.
+;	>1:	a reply is expected and the modem will not send a count byte,
+;		but the count to return in the modem manager param block will be (value-1).
+;
+;	Unused commands in the range $x8 to $xF will be marked as expecting a reply (with count)
+;	so that commands may be added without having to change the ROM.
+
+replyCounts	DC.B	 0						; [$50] Set Internal Modem Control Bits
+			DC.B	 0						; [$51] Clear FIFOs
+			DC.B	 0						; [$52] Set FIFO Interrupt Marks
+			DC.B	 0						; [$53] Set FIFO Sizes
+			DC.B	 0						; [$54] Write Data to Modem
+			DC.B	 0						; [$55] Set Data Mode
+			DC.B	 0						; [$56] Set Flow Control Mode
+			DC.B	 0						; [$57] Set DAA control lines							<H54>
+			DC.B	 1+1					; [$58] Read Internal Modem Status
+			DC.B	 0						; [$59] Get DAA Identification							<H55>
+			DC.B	 2+1					; [$5A] Get FIFO Counts
+			DC.B	 2+1					; [$5B] Get Maximum FIFO Sizes
+			DC.B	-1						; [$5C] Read Data From Modem
+			DC.B	-1						; [$5D] General Purpose modem command (modem dependent)	<H58>
+			DC.B	-1						; [$5E] -
+			DC.B	-1						; [$5F] -
+
+			DC.B	 0						; [$70] Set One-Second Interrupt
+			DC.B	 0						; [$71] Modem Interrupt Control
+			DC.B	 0						; [$72] Set Modem Interrupt
+			DC.B	 0						; [$73] -
+			DC.B	 0						; [$74] -
+			DC.B	 0						; [$75] -
+			DC.B	 0						; [$76] -
+			DC.B	 0						; [$77] -
+			DC.B	-1						; [$78] Read Interrupt Flag Register.
+			DC.B	-1						; [$79] Read Modem Interrupt Data
+			DC.B	-1						; [$7A] -
+			DC.B	-1						; [$7B] -
+			DC.B	-1						; [$7C] -
+			DC.B	-1						; [$7D] -
+			DC.B	 0+1					; [$7E] Enter Shutdown Mode
+			DC.B	 0+1					; [$7F] Enter Sleep Mode
+
+			DC.B	 0						; [$A0] Write Modem Register
+			DC.B	 0						; [$A1] Clear Modem Register Bits
+			DC.B	 0						; [$A2] Set Modem Register Bits
+			DC.B	 0						; [$A3] Write DSP RAM
+			DC.B	 0						; [$A4] Set Filter Coefficients
+			DC.B	 0						; [$A5] Reset Modem
+			DC.B	 0						; [$A6] -
+			DC.B	 0						; [$A7] -
+			DC.B	 1+1					; [$A8] Read Modem Register
+			DC.B	 0						; [$A9] Send Break
+			DC.B	 0						; [$AA] Dial Digit
+			DC.B	 0						; [$AB] Read DSP RAM
+			DC.B	-1						; [$AC] -
+			DC.B	-1						; [$AD] -
+			DC.B	-1						; [$AE] -
+			DC.B	-1						; [$AF] -
+
+;••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••
+;••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••
+;	END OPTIMUS MODEM PRIMITIVES
+;••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••
+;••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••
+
+
+			End

@@ -1,0 +1,1417 @@
+;
+;	File:		SonyIOP.a
+;
+;	Contains:	3.5" Floppy / HD-20 Disk Driver (for machines with an IOP)
+;
+;	Written by:	Gary G. Davidian	08-Sep-87
+;
+;	Copyright:	© 1987-1993 by Apple Computer, Inc., all rights reserved.
+;
+;   This file is used in these builds: Mac32
+;
+;	Change History (most recent first):
+;
+;	   <SM6>	 5/19/93	GMR		Modified the icon control calls to get the info from universal
+;									tables, instead of the driver.
+;	   <SM5>	12/14/92	RC		Restore Pre-PDM D2 with Horror roll in
+;	   <SM3>	 12/9/92	rab		Fixed a bug I introduced rolling in IOPRcvCallFromIOPPatch. Left
+;									out branch to @postEvent if DiskInsert was allowed.
+;	   <SM2>	 12/7/92	rab		Roll in Horror changes. Comments follow…
+;		 <2>	  4/2/91	BG		Add changes to cause floppies not to work when running on an
+;									Eclipse and the keyswitch is set to SECURE.
+; ———————————————————————————————————————————————————————————————————————————————————————
+;	  Pre-SuperMario ROM comments begin here.
+; ———————————————————————————————————————————————————————————————————————————————————————
+;		 <2>	 1/21/91	SWC		Checked out and in to build a BBS header (had an EASE-style
+;									comment header).
+;	   <2.8>	12/11/89	GGD		NEEDED FOR ZONE-5 Added support for the Disk Duplicator and the
+;									GetRawDataCC call for copy protection support. Mode the control
+;									and status dispatching tables more easily patchable. Modified
+;									Prime and Control to jump through existing vectors to allow for
+;									easier patching. Optimized a few routines for space to get all
+;									of this to fit in the overpatch area.
+;	   <2.7>	 11/2/89	GGD		NEEDED FOR ZONE-5 Change MaxDriveNumber from 15 to 4 to be more
+;									compatible with the Mac IIci.
+;	   <2.6>	 7/12/89	GGD		Added conditionals around the overpatch padding so that it can
+;									be easily located.
+;	   <2.5>	 6/23/89	GGD		Removed updating of IOResult in Open call, since no pointer to
+;									the IOPB was around, and it was trashing a pointer in SonyVars.
+;									Added some padding in preparation for the F19 overpatch. Needed
+;									for AURORA and F19 ROMs.
+;	   <2.4>	 5/23/89	GGD		Commented out duplicate equates. Modified to co-exist with
+;									standard Sony driver to support universal ROM. Re-named
+;									conflicting labels. Now uses ICON information from SonyIcon,
+;									instead of including them here.
+;	   <2.3>	 4/29/89	GGD		No changes to this file, entire Sony Driver is checked out and
+;									in as a group.
+;	   <2.2>	 2/21/89	GGD		Fixed assembly error, branch displacement didn't reach.
+;	   <2.1>	 2/21/89	GGD		Fixed GetFormatList call to return offLinErr if disk is not in
+;									drive, or format has not been determined yet, to be compatible
+;									with non-IOP Sony Driver. Return paramErr if format list space
+;									is empty.
+;	   <2.0>	 2/19/89	GGD		No changes except version number, to be in sync with the rest of
+;									the Sony Driver files.
+;	   <1.1>	11/11/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.0>	 10/7/88	rwh		new to EASE today
+;	  <xxxx>	 6/13/88	GGD		Modified to use the new interface to the IOPMgr
+;	  <xxxx>	  9/8/87	GGD		Created today.
+;
+;_______________________________________________________________________
+;
+;  This module implements the 680XX side of the SONY Driver for CPUs that
+;  have a Input / Output Processor (IOP) (called a PIC by HW) based SWIM driver.
+;  It receives requests by way of the Device Manager, and translates them
+;  into the appropriate messages to be passed to the IOP based SWIM driver
+;  by way of the IOP Manager.
+;_______________________________________________________________________
+
+			TITLE	'SONY Driver - 3.5" / HD-20 Disk Driver'
+
+			BLANKS	ON
+			STRING	ASIS
+			MACHINE	MC68020
+			PRINT	NOMDIR
+
+;	There is some software that depends upon things not documented in
+;	Inside Macintosh, so we will mark those changes that were made
+;	to assure compatibility with un-documented features, by using
+;	the following conditional assembly switch
+
+Compatibility	equ		1		; include changes needed for compatibility
+
+			macro
+			assert	&boolExpr
+			if	not(&Eval(&boolExpr)) then
+			aerror	&concat('Assertion Failed - ',&boolExpr)
+			endif
+			endm
+			TITLE	'SONY Driver - IOP Message Formats'
+
+SwimMsgNumber		equ		2		; message number used for xmt and rcv msgs
+
+;	HOST -> IOP Request encodings
+
+xmtReqInitialize	equ		$01				; Initialize Driver
+xmtReqShutDown		equ		$02				; Shut Down driver
+xmtReqStartPolling	equ		$03				; Start Polling Drives
+xmtReqStopPolling	equ		$04				; Stop Polling Drives
+xmtReqSetHFSTagAddr	equ		$05				; Set HFS tag host address
+xmtReqDriveStatus	equ		$06				; Drive Status
+xmtReqEject			equ		$07				; Eject
+xmtReqFormat		equ		$08				; Format disk
+xmtReqFormatVerify	equ		$09				; Verify disk formatting
+xmtReqWrite			equ		$0A				; Write blocks to disk
+xmtReqRead			equ		$0B				; Read blocks from disk
+xmtReqReadVerify	equ		$0C				; Read and compare blocks from disk
+xmtReqCacheControl	equ		$0D				; track cache control
+xmtReqTagBufferControl	equ	$0E				; tag buffer control
+xmtReqGetIcon		equ		$0F				; get media or drive Icon 
+xmtReqDiskDupInfo	equ 	$10 			; get Disk Duplicator information			<2.8>
+xmtReqGetRawData	equ		$11				; Read RAW disk data (for copy protection)	<2.8>
+
+;	IOP -> HOST Request encodings
+
+rcvReqDiskInserted	equ		$01				; Disk Inserted event
+rcvReqDiskEjected	equ		$02				; Disk Ejected event
+rcvReqDiskStatusChanged	equ	$03				; Disk Status Changed
+
+
+;	HOST <-> IOP Message Formats
+
+SwimIopMsg		record	0,increment
+ReqKind			ds.b	1	; Kind of request
+DriveNumber		ds.b	1	; Drive number
+ErrorCode		ds.w	1	; returned error code
+
+DriveKinds		equ		4	; head of list of existing drives kinds
+
+				org		4	; additional parameters for some calls
+AdditionalParam	ds.l	1	; control / status csParam (only first 4 bytes passed)
+
+				org		4	; drive status parameters
+DriveStatus		ds.b	0	; start of data for drive status control call
+Track			ds.w	1	; current track location
+WriteProtected	ds.b	1	; bit7=1=write protected
+DiskInPlace		ds.b	1	; 0 = no disk place, 1 or 2 = disk in place
+Installed		ds.b	1	; 0 = don't know, 1=installed, $FF=not installed
+Sides			ds.b	1	; bit7=0=single sided, bit7=1=double sided
+; drive queue element is not returned from IOP
+TwoSidedFormat	ds.b	1	; $FF=2-sided disk, $00=1-sided disk
+NewInterface	ds.b	1	; $00=old drive interface (400K), $FF=new (800K and later)
+DiskErrors		ds.w	1	; disk error count
+
+DriveInfo		ds.b	0	; start of data for drive info control call
+				ds.b	2	; unused for now
+DriveAttributes	ds.b	1	; disk drive attributes
+DriveType		ds.b	1	; type of disk drive
+
+ExtDriveStatus	ds.b	0	; start of data for extended drive status control call
+MfmDrive		ds.b	1	; $FF=SuperDrive, otherwise zero
+MfmDisk			ds.b	1	; $FF=MFM disk in drive, otherwise zero
+MfmFormat		ds.b	1	; $FF=1440K, $00=720K
+DiskController	ds.b	1	; $FF=SWIM, $00=IWM
+
+CurrentFormat	ds.w	1	; bit mask of current format
+FormatsAllowed	ds.w	1	; bit mask of allowable formats
+
+FixedDiskSize	ds.l	1	; size of current drive, if fixed media drive. (HD-20)
+
+IconFlags		ds.b	1	; bit 0 - call for Media Icon, bit 1 - call for Drive Icon
+				ds.b	1	; (1 spare byte left)
+
+				org		4	; data transfer parameters
+BufferAddr		ds.l	1	; main CPU ram address
+BlockNumber		ds.l	1	; disk starting block number
+BlockCount		ds.l	1	; number of blocks to transfer
+MfsTagData		ds.b	12	; MFS Tag Data
+
+				org		4	; format parameters												<2.8> start
+FormatKind		ds.w	1	; index into list of possible formats, to select desired format
+HdrFmtKind		ds.b	1	; format byte to write in sector headers (0=use default)
+SectInterleave	ds.b	1	; interleave factor (0=use default)
+FmtDataAddr		ds.l	1	; ptr to buffer of sector data to write while formatting (0=no buffer)
+FmtTagAddr		ds.l	1	; ptr to buffer of sector tags to write while formatting (0=no buffer)
+
+				org		4	; disk duplicator info parameters
+DupVersion		ds.w	1	; disk duplicator version number
+*HdrFmtKind		ds.b	1	; format byte read from last sector headers
+
+				org		4	; disk duplicator info parameters
+RawClockAddr	ds.l	1 	; Buffer for packed MFM clock bits
+RawDataAddr		ds.l	1 	; Buffer for RAW data bytes
+RawByteCount	ds.l	1 	; Number of RAW bytes to read
+RawSearchMode	ds.w	1 	; RAW Read search mode
+RawCylinder		ds.w	1 	; RAW Read cylinder number
+RawHead			ds.b	1 	; RAW Read head number
+RawSector		ds.b	1 	; RAW Read sector number										<2.8> end
+
+				ds.b	MaxIOPMsgLen-*	; fill out the message
+SwimIopMsgSize	equ		*
+				endr
+			TITLE	'SONY Driver - Global Data and Equates'
+
+
+;	Driver Control codes.
+
+;killCode		equ		1		; KillIO code			(in SysEqu.a)
+;verifyCC		equ		5		; 'verify' control code
+;formatCC		equ		6		; 'format' control code
+;ejectCode		equ		7		; control call eject code	(in SysEqu.a)
+;tgBuffCode		equ		8		; set tag buffer code		(in SysEqu.a)
+;TCacheCC		equ		9		; 'track cache' control
+;iconCC			equ		21		; 'get icon' control code
+;iconLogCC		equ		22		; 'get logical icon' code
+;infoCC			equ		23		; 'get drive info' code
+;FmtCopyCC		equ		$5343	;  one-pass format/copy/verify for disk duplicator			<2.8>
+;GetRawDataCC	equ		18244	; 'get raw track data' code									<2.8>
+
+TotalControlCalls equ	11		; 11 currently defined
+MaxControlCalls	equ	TotalControlCalls+4	; allow 4 extra for expansion
+
+
+;	Driver Status codes.
+
+;FmtLstCode		equ		6		; Returns a list of disk formats
+;drvStsCode		equ		8		; status code for drive status	(in SysEqu.a)
+;MFMStsCode		equ		10		; 'Get MFM status' status code
+;DupVerSts		equ		$4456	;disk duplicator version supported (to match features)		<2.8>
+;FmtByteSts		equ		$5343	;return address header format byte							<2.8>
+
+TotalStatusCalls equ	5		; 5 currently defined
+MaxStatusCalls	equ	TotalStatusCalls+4	; allow 4 extra for expansion
+
+
+;	Driver Reference Numbers
+
+SonyRefNum		equ		SonyRfN	; driver refnum for floppy disk drives
+HD20RefNum		equ		DCDRfN	; driver refnum for HD-20 disk drives
+
+
+;	Disk Drive Kinds
+
+noDriveKind			equ		0	; no drive connected
+unknownDriveKind	equ		1	; unspecified drive kind
+SSGCRDriveKind		equ		2	; single sided 400K GCR disk drive
+DSGCRDriveKind		equ		3	; double sided 400K/800K GCR disk drive
+DSMFMGCRDriveKind	equ		4	; double sided 400K/800K GCR, 720K, 1440K MFM disk drive
+HD20DriveKind		equ		7	; HD20 20MB hard disk
+
+RemovableDrives	equ		(1<<SSGCRDriveKind)+\
+						(1<<DSGCRDriveKind)+\
+						(1<<DSMFMGCRDriveKind)+\
+						(1<<5)+\		; for possible future expansion
+						(1<<6)+\		; for possible future expansion
+						(1<<8)+\		; for possible future expansion
+						(1<<9)+\		; for possible future expansion
+						(1<<10)+\		; for possible future expansion
+						(1<<11)			; for possible future expansion
+FixedDrives		equ		(1<<HD20DriveKind)+\
+						(1<<12)+\		; for possible future expansion
+						(1<<13)+\		; for possible future expansion
+						(1<<14)+\		; for possible future expansion
+						(1<<15)			; for possible future expansion
+MissingDrives	equ		$FFFF-RemovableDrives-FixedDrives
+
+;	Storage Allocation
+
+			if		Compatibility then
+;	The BLESSER calls the sony driver for drive status using a drive num that might not be
+;	a sony drive number (like 8, which it got from the file system from the first SCSI drive)
+;	The Mac IIci return an error for drives above 4 (2 floppy, 2 DCD). The BLESSER is in error
+;	by calling the wrong driver, and also because it doesn't check the drive installed field
+;	in the status that is returned.  In any case, this is being change to match the Mac IIci
+;	exactly, in cause it might cause other compatibility problems.
+MaxDriveNumber	equ		4				; support logical drive numbers in range 0..4	<2.7>
+			else
+MaxDriveNumber	equ		15				; support logical drive numbers in range 0..15
+			endif
+MaxDrives		equ		6				; support up to 6 physical disk drives
+
+DriverVars		record	0,decrement		; global variables used by driver
+DCEpointer		ds.l	1				; pointer to device control entry
+MediaIconPtr	ds.l	1				; pointer to Media Icon							<2.4>
+Drive1PhysIcon	ds.l	1				; pointer to Physical Drive Icon for drive 1	<2.4>
+Drive2PhysIcon	ds.l	1				; pointer to Physical Drive Icon for drive 2	<2.4>
+xmtReq			ds		IOPRequestInfo	; parameter block for CPU to IOP requests
+xmtMsg			ds		SwimIopMsg		; copy of CPU to IOP message
+xmtWaiterPC		ds.l	1				; PC of xmt msg completion routine
+rcvReq			ds		IOPRequestInfo	; parameter block for IOP to CPU requests
+rcvMsg			ds		SwimIopMsg		; copy of IOP to CPU message
+
+				ds.b	MaxControlCalls*8
+				ds.w	1				; default error if not found (ControlErr)
+				ds.w	1				; number of Control Calls defined - 1			<2.8>
+ControlCallInfo	ds.l	1				; pointer to control call dispatching table		<2.8>
+
+				ds.b	MaxStatusCalls*8
+				ds.w	1				; default error if not found (StatusErr)
+				ds.w	1				; number of Status Calls defined - 1			<2.8>
+StatusCallInfo	ds.l	1				; pointer to status call dispatching table		<2.8>
+
+IconBufferSize	equ		((32*32)/8)*2+32 ; room for Icon data, mask, and name string
+IconBuffer		ds.b	IconBufferSize
+
+ErrorCodeSave	ds.w	1				; temp storeage for error code in Prime
+DriverVarsSize	equ		0-*				; size of global variables used by driver
+				endr
+
+PerDriveInfo	record	0,increment		; drive specific variables
+WriteProtected	ds.b	1				; bit7=1=write protected
+DiskInPlace		ds.b	1				; 0 = no disk place, 1 or 2 = disk in place
+Installed		ds.b	1				; 0 = don't know, 1=installed, $FF=not installed
+Sides			ds.b	1				; bit7=0=single sided, bit7=1=double sided
+DriveQElement	ds.b	dQDrvSz2+2
+PerDriveInfoSize equ	*				; size of drive specific variables
+				endr
+
+DriveInfos		record	0,increment		; drive specific variables for all drives
+DriveInfoPtrs	ds.l	MaxDriveNumber+1 ; 0 based list of pointers to PerDriveInfo
+FirstDriveInfo	ds.b	MaxDrives*PerDriveInfo.PerDriveInfoSize
+DriveInfosSize	equ		*				; size of all drive specific variables
+				endr
+
+			with	DriverVars,DriveInfos
+			TITLE	'SONY Driver - Open processing'
+
+;_______________________________________________________________________
+;
+;  Routine:		IopDiskOpen
+;  Inputs:		A0 - pointer to I/O ParamBlock
+;				A1 - pointer to Device Control Entry (DCE)
+;  Outputs:		D0 - Result Code (noErr/openErr)
+;  Destroys:	
+;  Calls:		none
+;  Called by:	Device Manager
+;
+;  Function:	Driver initialization routine
+;
+;_______________________________________________________________________
+
+IopDiskOpen									; all regs saved by Device Manager
+			move.l	#DriverVarsSize+DriveInfosSize,d0
+			_NewPtr	,SYS,CLEAR				; allocate memory for globals
+			adda.w	#DriverVarsSize,a0		; DriverVars are negative to the pointer
+			move.l	a0,SonyVars				; and keep pointer in low memory
+			move.l	a1,DCEpointer(a0)		; save a copy of the DCE pointer
+			move.b	#Version,DCtlQueue+1(a1) ; put our version number in
+			movea.l	a0,a1					; a1 <- SonyVars
+
+;	Initialize the ICON pointers
+
+			move.l	UnivInfoPtr,a2					;											<SM6>
+			adda.l	ProductInfo.IconInfoPtr(a2),a2	; point to icon info table for this machine	<SM6>
+			move.l	0(a2),d0				; offset to media icon						<2.4>
+			bsr.s	@getIconPtr				; get the icon pointer						<2.4>
+			move.l	a3,MediaIconPtr(a1)		; save it									<2.4>
+			move.l	4(a2),d0				; offset to primary drive icon				<2.4>
+			bsr.s	@getIconPtr				; get the icon pointer						<2.4>
+			move.l	a3,Drive1PhysIcon(a1)	; save it									<2.4>
+			move.l	14(a2),d0				; offset to secondary drive icon			<2.4>
+			bsr.s	@getIconPtr				; get the icon pointer						<2.4>
+			move.l	a3,Drive2PhysIcon(a1)	; save it									<2.4>
+			bra.s	@IconsDone				; done with ICON stuff						<2.4>
+
+@getIconPtr									;											<2.4>
+			lea		(a2,d0.l),a3			; assume relative to table					<2.4>
+			bclr.l	#0,d0					; test & clear 'use ROM table' bit			<2.4>
+			beq.s	@IconPtrOK				; branch if should use current table		<2.4>
+			move.l	UnivInfoPtr,a3			;											<SM6>
+			adda.l	ProductInfo.IconInfoPtr(a3),a3	; point to icon info table in ROM	<SM6>
+			adda.l	d0,a3					; add in relative offset					<2.4>
+@IconPtrOK	rts								; ptr to icon is in a3 now					<2.4>
+
+@IconsDone									;											<2.4>
+
+;	Initialize the IOPMsgInfo parameter block for rcv messages
+
+			with	IOPRequestInfo
+			lea		rcvReq.irIOPNumber(a1),a0	; point into the param block
+			assert	irRequestKind=(irIOPNumber+1)
+			move.w	#(SwimIopNum<<8)+\		; irIOPNumber := SwimIopNum
+					(irWaitRcvMessage<<0),(a0)+	; irRequestKind := irWaitRcvMessage
+			assert	irMsgNumber=(irRequestKind+1)
+			assert	irMessageLen=(irMsgNumber+1)
+			assert	irReplyLen=(irMessageLen+1)
+			assert	irReqActive=(irReplyLen+1)
+			move.l	#(SwimMsgNumber<<24)+\	; irMsgNumber := SwimMsgNumber
+					(SwimIopMsg.SwimIopMsgSize<<16)+\	; irMessageLen := SwimIopMsgSize
+					(SwimIopMsg.SwimIopMsgSize<<8)+\	; irReplyLen := SwimIopMsgSize
+					(0<<0),(a0)+			; irReqActive := 0
+			lea		rcvMsg(a1),a2			; message and reply buffer
+			assert	irMessagePtr=(irReqActive+1)
+			move.l	a2,(a0)+				; irMessagePtr := rcvMsg
+			assert	irReplyPtr=(irMessagePtr+4)
+			move.l	a2,(a0)+				; irReplyPtr := rcvMsg
+			lea		ReceivedCallFromIop,a2	; handler for rcv msg arrival
+			assert	irHandler=(irReplyPtr+4)
+			move.l	a2,(a0)+				; irHandler := ReceivedCallFromIop
+			lea		rcvReq(a1),a0			; prepare to issue the request
+			_IOPMsgRequest					; wait for receive messages
+			bne.w	@ErrorReturn			; in case IOP didn't initialize
+			endwith
+
+;	Initialize the IOPMsgInfo parameter block for xmt messages
+
+			with	IOPRequestInfo
+			lea		xmtReq.irIOPNumber(a1),a0	; point into the param block
+			assert	irRequestKind=(irIOPNumber+1)
+			move.w	#(SwimIopNum<<8)+\		; irIOPNumber := SwimIopNum
+					(irSendXmtMessage<<0),(a0)+	; irRequestKind := irSendXmtMessage
+			assert	irMsgNumber=(irRequestKind+1)
+			assert	irMessageLen=(irMsgNumber+1)
+			assert	irReplyLen=(irMessageLen+1)
+			assert	irReqActive=(irReplyLen+1)
+			move.l	#(SwimMsgNumber<<24)+\	; irMsgNumber := SwimMsgNumber
+					(SwimIopMsg.SwimIopMsgSize<<16)+\	; irMessageLen := SwimIopMsgSize
+					(SwimIopMsg.SwimIopMsgSize<<8)+\	; irReplyLen := SwimIopMsgSize
+					(0<<0),(a0)+			; irReqActive := 0
+			lea		xmtMsg(a1),a2			; message and reply buffer
+			assert	irMessagePtr=(irReqActive+1)
+			move.l	a2,(a0)+				; irMessagePtr := xmtMsg
+			assert	irReplyPtr=(irMessagePtr+4)
+			move.l	a2,(a0)+				; irReplyPtr := xmtMsg
+			lea		IOPCallReturned,a2		; handler for xmt msg completion
+			assert	irHandler=(irReplyPtr+4)
+			move.l	a2,(a0)+				; irHandler := IOPCallReturned
+			endwith
+
+			move.b	#xmtReqInitialize,XmtMsg.ReqKind(a1)	; setup init request
+			bsr.w	@CallIOPsync			; initialize the IOP SWIM driver
+
+;	Install the vectors for Prime and Control											<2.8>
+
+			lea		jtIopDiskPrime,a2		; get the routine address					<2.8>
+			move.l	a2,JDiskPrime			; install the vector						<2.8>
+			lea		jtIopDiskControl,a2		; get the routine address					<2.8>
+			move.l	a2,JControl				; install the vector						<2.8>
+
+;	initialize the Control and Status Call Info tables
+
+			lea		ControlCallInfo+4(a1),a2; a2 <- address of table in globals			<2.8>
+			lea		ControlDecode,a3		; a3 <- address of table in ROM
+			moveq.l	#controlErr,d0			; d0 <- default error code
+			moveq.l	#TotalControlCalls-1,d1	; d1 <- loop counter
+			bsr.w	@InstallCallInfo		; install the ControlCallInfo
+
+			lea		StatusCallInfo+4(a1),a2	; a2 <- address of table in globals			<2.8>
+			lea		StatusDecode,a3			; a3 <- address of table in ROM
+			moveq.l	#statusErr,d0			; d0 <- default error code
+			moveq.l	#TotalStatusCalls-1,d1	; d1 <- loop counter
+			bsr.s	@InstallCallInfo		; install the StatusCallInfo
+
+;	assign drive numbers, and add drive queue elements to the drive queue
+
+			with	PerDriveInfo
+			lea		FirstDriveInfo(a1),a2	; a2 <- pointer to PerDriveInfo for drive
+			lea		DriveInfoPtrs(a1),a3	; a3 <- pointer to DriveInfoPtrs list entry
+			lea		xmtMsg.DriveKinds(a1),a4; a4 <- pointer to returned drive kinds
+			moveq.l	#0,d1					; d1 <- logical drive number/loop counter
+			moveq.l	#MaxDrives,d2			; d2 <- physical drives available to allocate
+			moveq.l	#MissingDrives,d3		; d3 <- bit mask of missing drive types
+			move.w	#RemovableDrives,d4		; d4 <- bit mask of removable drive types
+
+@AddDriveLoop
+			move.b	(a4)+,d5				; d5 <- the drive kind
+			btst.l	d5,d3					; check for missing drive
+			bne.s	@AddDriveNext			; if missing drive, skip install
+
+			move.l	a2,(a3)					; install pointer to per drive info
+			move.b	#1,Installed(a2)		; indicate that drive is installed
+			moveq.l	#SonyRefNum,d0			; d0 <- driver RefNum in low 16 bits
+			btst.l	d5,d4					; check for removable drive kind
+			bne.s	@AddTheDrive			; if removable drive, ready to install
+
+			moveq.l	#HD20RefNum,d0			; d0 <- driver RefNum in low 16 bits
+			move.w	#1,DriveQElement+qType(a2)	; fixed drives have extended drive sizes
+			movea.l	UTableBase,a0
+			move.l	(-1-SonyRefNum)*4(a0),\
+					(-1-HD20RefNum)*4(a0)	; use a different RefNum for Fixed Drives
+
+@AddTheDrive
+			swap	d0						; prepare to insert drive number
+			move.w	d1,d0					; setup logical drive number for _AddDrive
+			swap	d0						; d0 <- drive number in high 16 bits
+			lea		DriveQElement(a2),a0	; a0 <- pointer to Drive Queue Element
+			_AddDrive						; add the drive to the drive queue
+			adda.w	#PerDriveInfoSize,a2	; point to next PerDriveInfo
+@AddDriveNext
+			addq.l	#4,a3					; point to next DriveInfoPtr
+			addq.w	#1,d1					; increment logical drive number
+			cmpi.w	#MaxDriveNumber,d1		; check for all drives done
+			bls.s	@AddDriveLoop			; loop through all logical drive numbers
+@AddDriveExit
+			endwith
+
+			move.b	#xmtReqSetHFSTagAddr,\
+					xmtMsg.ReqKind(a1)		; setup HFS Tag buffer address
+			move.l	#HFSTagData,xmtMsg.BufferAddr(a1)	; pass the address
+			bsr.s	@CallIOPsync			; tell the IOP the address of HFSTagData
+
+			move.b	#xmtReqStartPolling,\
+					xmtMsg.ReqKind(a1)		; setup StartPolling request
+			bsr.s	@CallIOPsync			; tell the IOP to start polling the drives
+
+			moveq.l	#noErr,d0				; return No Error status
+@ErrorReturn
+			rts								; all done
+
+
+@InstallCallInfo
+			move.l	a2,-4(a2)				; save the pointer to the table (for patching)	<2.8>
+			move.w	d1,(a2)+				; install the loop counter
+			move.w	d0,(a2)+				; install the default error code
+@CallInfoLoop
+			move.l	(a3)+,(a2)+				; install csCode, IOProutine, Flags
+			lea		SonyHeader,a4			; get driver base address
+			adda.w	(a3)+,a4				; convert relative addr to absolute
+			move.l	a4,(a2)+				; install routine address
+			dbra	d1,@CallInfoLoop		; process the whole table
+			rts								; all done
+
+
+;	the OPEN call must run synchronously, so we must loop waiting for the IOP call to complete
+@CallIOPsync
+			pea		@waitLoop				; return into wait loop after sending msg
+			bsr.w	CallIOPRoutine			; send the request to the IOP
+			rts								; null waiter routine
+@waitLoop	tst.l	xmtWaiterPC(a1)			; see if still waiting
+			bne.s	@waitLoop				; wait until waiter runs
+			rts
+			TITLE	'SONY Driver - Close processing'
+
+;_______________________________________________________________________
+;
+;  Routine:		IopDiskClose
+;  Inputs:		A0 - pointer to I/O ParamBlock
+;				A1 - pointer to Device Control Entry (DCE)
+;  Outputs:		D0 - Result Code (closErr)
+;  Destroys:	
+;  Calls:		none
+;  Called by:	Device Manager
+;
+;  Function:	Driver shutdown routine
+;
+;_______________________________________________________________________
+
+IopDiskClose								; all regs saved by Device Manager
+			moveq.l	#closErr,d0				; return Close Error status
+			rts								; not closable at present
+			TITLE	'SONY Driver - Read / Write processing'
+
+;_______________________________________________________________________
+;
+;  Routine:		IopDiskPrime
+;  Inputs:		A0 - pointer to I/O ParamBlock
+;				A1 - pointer to Device Control Entry (DCE)
+;  Outputs:		D0 - Result Code
+;  Destroys:	
+;  Calls:		IODone
+;  Called by:	Device Manager
+;
+;  Function:	Driver Read/Write routines
+;
+;_______________________________________________________________________
+
+IopDiskPrime								; all regs saved by Device Manager
+			move.l	JDiskPrime,-(sp)		;									<2.8>
+			rts								;									<2.8>
+jtIopDiskPrime								;									<2.8>
+			movea.l	a1,a2					; a2 <- pointer to DCE
+			movea.l	SonyVars,a1				; a1 <- pointer to globals
+			lea		xmtMsg(a1),a3			; a3 <- pointer fields in xmtMsg
+
+			bsr.w	CheckIfSecure			; • test for keyswitch SECUREd		<SM2>
+			bne.s	@1						; • IF SECURE THEN					<T13><SM2>
+			moveq	#ioErr,d0				; •   fail with an *ioErr*			<SM2>
+			bra		DiskIODone				; • ENDIF							<SM2>
+
+@1			moveq.l	#xmtReqWrite,d0			; assume write request
+			cmpi.b	#aRdCmd,ioTrap+1(a0)	; check for read
+			bne.s	@gotReqKind				; if not read, must be a write
+			moveq.l	#xmtReqRead,d0			; must be read request
+			btst.b	#6,IOPosMode+1(a0)		; test for verify mode
+			beq.s	@gotReqKind				; if just plain read, no verify
+			moveq.l	#xmtReqReadVerify,d0	; read with verify request
+@gotReqKind
+			assert	SwimIopMsg.ReqKind=0
+			move.b	d0,(a3)+				; setup IOP request Kind
+
+			moveq.l	#NSDrvErr,d0			; assume Bad drive number
+			move.w	IODrvNum(a0),d1			; get the drive number
+			cmpi.w	#MaxDriveNumber,d1		; see if way out of range
+			bhi.w	@PrimeError				; if invalid drive number
+			assert	SwimIopMsg.DriveNumber=SwimIopMsg.ReqKind+1
+			move.b	d1,(a3)+				; setup IOP request Drive Number
+
+			assert	SwimIopMsg.ErrorCode=SwimIopMsg.DriveNumber+1
+			clr.w	(a3)+					; clear error code
+
+			assert	SwimIopMsg.BufferAddr=SwimIopMsg.ErrorCode+2
+			move.l	ioBuffer(a0),(a3)+		; setup buffer address
+
+			moveq.l	#ParamErr,d0			; assume parameter error
+			moveq.l	#9,d1					; shift amount for divide by 512
+
+			move.l	dCtlPosition(a2),d2		; get byte position
+			ror.l	d1,d2					; convert to block number
+			assert	SwimIopMsg.BlockNumber=SwimIopMsg.BufferAddr+4
+			move.l	d2,(a3)+				; setup block number
+			rol.l	d1,d2					; convert back to byte position
+			andi.w	#$01FF,d2				; test for mod 512
+			bne.s	@PrimeError				; if error in dCtlPosition parameter
+
+			move.l	ioByteCount(a0),d2		; get byte count
+			ror.l	d1,d2					; convert to block count
+			assert	SwimIopMsg.BlockCount=SwimIopMsg.BlockNumber+4
+			move.l	d2,(a3)+				; setup block count
+			rol.l	d1,d2					; convert back to byte count
+			andi.w	#$01FF,d2				; test for mod 512
+			bne.s	@PrimeError				; if error in byte count parameter
+
+			assert	SwimIopMsg.MfsTagData=SwimIopMsg.BlockCount+4
+			lea		TagData+2,a2			; point to tag data
+			move.l	(a2)+,(a3)+				; copy 12 bytes of MFS Tag data
+			move.l	(a2)+,(a3)+
+			move.l	(a2)+,(a3)+
+
+			bsr.w	CallIOPRoutine			; call the IOP routine
+
+			lea		xmtMsg.MfsTagData(a1),a0 ; point to returned tag data
+			lea	TagData+2,a2				; point to tag data
+			move.l	(a0)+,(a2)+				; copy 12 bytes of MFS Tag data
+			move.l	(a0)+,(a2)+
+			move.l	(a0)+,(a2)+
+
+;	if the disk has not been accessed before now, update the status to
+;	correctly reflect disk format, etc.
+
+			clr.l	d1						; zero extend the drive number
+			move.b	xmtMsg.DriveNumber(a1),d1	; get the drive number
+			move.l	DriveInfoPtrs(a1,d1.w*4),d2	; get drive info pointer
+			beq.s	@StatusOK				; if no drive info for this drive
+
+			movea.l	d2,a3					; a3 <- real per drive info
+			cmpi.b	#2,PerDriveInfo.DiskInPlace(a3)	; check for HasBeenAccessed
+			beq.s	@StatusOK				; if status valid (has been accessed)
+
+			move.w	xmtMsg.ErrorCode(a1),ErrorCodeSave(a1)	; save read error code
+
+			move.b	#xmtReqDriveStatus,xmtMsg.ReqKind(a1)	; request Drive status
+			bsr.w	CallIOPRoutine			; call the IOP for Drive Status
+			bsr.w	UpdateXmtDriveStatus	; update the drive status
+
+			move.w	ErrorCodeSave(a1),xmtMsg.ErrorCode(a1)	; restore read error code
+
+@StatusOK	move.w	xmtMsg.ErrorCode(a1),d0	; get returned error code
+			bne.s	@PrimeError				; if I/O error
+		
+			movea.l	DCEPointer(a1),a2		; get DCE pointer
+			movea.l	DCtlQHead(a2),a0		; get IO param block pointer
+			move.l	ioByteCount(a0),d1		; get byte count
+			move.l	d1,ioNumDone(a0)		; all byte done
+			add.l	d1,dCtlPosition(a2)		; update position pointer
+
+@PrimeError	bra.w	DiskIODone				; return through IODone
+			TITLE	'SONY Driver - Decode table for Status Calls'
+
+;	Flags used in decode tables
+
+CheckDriveNum		equ		7
+CheckDriveExists	equ		6
+MakeIOPcall			equ		5
+
+
+;	Decode table for Status Calls (gets copied into RAM for patching)
+
+StatusDecode	dc.w	FmtLstCode			; Get Format List status call
+				dc.b	xmtReqDriveStatus
+				dc.b	(1<<CheckDriveNum)+\
+						(1<<CheckDriveExists)+\
+						(1<<MakeIOPcall)
+				dc.w	IopGetFormatList-SonyHeader
+
+				dc.w	drvStsCode			; Drive Status call
+				dc.b	xmtReqDriveStatus
+				dc.b	(1<<CheckDriveNum)+\
+						(0<<CheckDriveExists)+\
+						(1<<MakeIOPcall)
+				dc.w	IopDriveStatus-SonyHeader
+
+				dc.w	MFMStsCode			; MFM Status call
+				dc.b	xmtReqDriveStatus
+				dc.b	(1<<CheckDriveNum)+\
+						(0<<CheckDriveExists)+\
+						(1<<MakeIOPcall)
+				dc.w	IopMFMStatus-SonyHeader
+
+				dc.w	DupVerSts			; duplicator version status call			<2.8>
+				dc.b	xmtReqDiskDupInfo
+				dc.b	(0<<CheckDriveNum)+\
+						(0<<CheckDriveExists)+\
+						(1<<MakeIOPcall)
+				dc.w	IopDupVersion-SonyHeader
+
+				dc.w	FmtByteSts			; get format byte status call				<2.8>
+				dc.b	xmtReqDiskDupInfo
+				dc.b	(0<<CheckDriveNum)+\
+						(0<<CheckDriveExists)+\
+						(1<<MakeIOPcall)
+				dc.w	IopGetFmtByte-SonyHeader
+
+				assert	(*-StatusDecode)=(TotalStatusCalls*6)
+			TITLE	'SONY Driver - Decode table for Control Calls'
+
+;	Decode table for Control Calls (gets copied into RAM for patching)
+
+ControlDecode	dc.w	killCode			; KillIO control call
+				dc.b	0					; no IOP routine
+				dc.b	(0<<CheckDriveNum)+\
+						(0<<CheckDriveExists)+\
+						(0<<MakeIOPcall)
+				dc.w	IopCtlKillIO-SonyHeader
+
+				dc.w	VerifyCC			; Verify control call
+				dc.b	xmtReqFormatVerify
+				dc.b	(1<<CheckDriveNum)+\
+						(1<<CheckDriveExists)+\
+						(1<<MakeIOPcall)
+				dc.w	IopCtlVerify-SonyHeader
+
+				dc.w	FormatCC			; Format control call
+				dc.b	xmtReqFormat
+				dc.b	(1<<CheckDriveNum)+\
+						(1<<CheckDriveExists)+\
+						(0<<MakeIOPcall)	;											<2.8>
+				dc.w	IopCtlFormat-SonyHeader
+
+				dc.w	EjectCode			; Eject control call
+				dc.b	xmtReqEject
+				dc.b	(1<<CheckDriveNum)+\
+						(1<<CheckDriveExists)+\
+						(1<<MakeIOPcall)
+				dc.w	IopCtlEject-SonyHeader
+
+				dc.w	tgBuffCode			; Set Tag Buffer control call
+				dc.b	xmtReqTagBufferControl
+				dc.b	(0<<CheckDriveNum)+\
+						(0<<CheckDriveExists)+\
+						(1<<MakeIOPcall)
+				dc.w	IopCtlTagBuf-SonyHeader
+
+				dc.w	TCacheCC			; Track Cache control call
+				dc.b	xmtReqCacheControl
+				dc.b	(0<<CheckDriveNum)+\
+						(0<<CheckDriveExists)+\
+						(1<<MakeIOPcall)
+				dc.w	IopCtlTrkCache-SonyHeader
+
+				dc.w	IconCC				; Physical Drive Icon control call
+				dc.b	xmtReqDriveStatus
+				dc.b	(1<<CheckDriveNum)+\
+						(1<<CheckDriveExists)+\
+						(1<<MakeIOPcall)
+				dc.w	IopCtlPhysIcon-SonyHeader
+
+				dc.w	IconLogCC			; Disk Media Icon control call
+				dc.b	xmtReqDriveStatus
+				dc.b	(1<<CheckDriveNum)+\
+						(1<<CheckDriveExists)+\
+						(1<<MakeIOPcall)
+				dc.w	IopCtlLogIcon-SonyHeader
+
+				dc.w	InfoCC				; Get Drive Info control call
+				dc.b	xmtReqDriveStatus
+				dc.b	(1<<CheckDriveNum)+\
+						(1<<CheckDriveExists)+\
+						(1<<MakeIOPcall)
+				dc.w	IopCtlDrvInfo-SonyHeader
+
+				dc.w	FmtCopyCC			; Format and copy control call					<2.8>
+				dc.b	xmtReqFormat
+				dc.b	(1<<CheckDriveNum)+\
+						(1<<CheckDriveExists)+\
+						(0<<MakeIOPcall)
+				dc.w	IopCtlFmtCopy-SonyHeader
+
+				dc.w	GetRawDataCC		; Format and copy control call					<2.8>
+				dc.b	xmtReqGetRawData
+				dc.b	(1<<CheckDriveNum)+\
+						(1<<CheckDriveExists)+\
+						(0<<MakeIOPcall)
+				dc.w	IopCtlGetRawData-SonyHeader
+
+				assert	(*-ControlDecode)=(TotalControlCalls*6)
+			TITLE	'SONY Driver - Control / Status processing'
+
+;_______________________________________________________________________
+;
+;  Routine:		IopDiskControl / IopDiskStatus
+;  Inputs:		A0 - pointer to I/O ParamBlock
+;				A1 - pointer to Device Control Entry (DCE)
+;  Outputs:		D0 - Result Code
+;  Destroys:	
+;  Calls:		IODone
+;  Called by:	Device Manager
+;
+;  Function:	Driver Control routines
+;
+;_______________________________________________________________________
+
+IopDiskControl								; all regs saved by Device Manager
+			move.l	JControl,-(sp)			;									<2.8>
+			rts								;									<2.8>
+jtIopDiskControl							;									<2.8>
+			movea.w	#ControlCallInfo,a2		; offset of decode table
+			bra.s	HandleControlStatus		; join common code
+
+
+IopDiskStatus								; all regs saved by Device Manager
+			movea.w	#StatusCallInfo,a2		; offset of decode table
+*			bra.s	HandleControlStatus		; join common code (fall into it)
+
+HandleControlStatus
+			movea.l	SonyVars,a1				; get pointer to globals			<SM2>
+
+			cmpi.w	#EjectCode,csCode(a0)	; • check for Eject requests		<SM2>
+			beq.s	@OkToDoIt				; • allow eject calls always		<SM2>
+			bsr.w	CheckIfSecure			; • are we SECUREd?					<SM2>
+			bne.s	@OkToDoIt				; • IF SECURED THEN					<T13><SM2>
+			moveq	#ioErr,d0				; •   fail with an *ioErr*			<SM2>
+			bra		DiskIODone				; •   exit to error exit			<SM2>
+@OkToDoIt									; ELSE								<SM2>
+			movea.l	(a1,a2.l),a2			;   get pointer to table			<SM2>
+			move.w	(a2)+,d1				;   d1 <- loop counter				<SM2>
+			move.w	(a2)+,d0				;   d0 <- default error code		<SM2>
+			move.w	csCode(a0),d2			;   d2 <- csCode to search for		<SM2>
+@SearchLoop	cmp.w	(a2),d2					; check for a match
+			addq.l	#8,a2					; point to next table entry
+			dbeq	d1,@SearchLoop			; search through all table entries
+			bne.s	DiskIODone				; illegal csCode, return with error
+			moveq.l	#NoErr,d0				; default to no error
+			movea.l	-(a2),a3				; get address of routine
+			move.w	IODrvNum(a0),d1			; get the drive number
+			move.b	-(a2),d2				; get flags
+			assert	CheckDriveNum=7			; flag is in sign bit
+			bpl.s	@DriveNumInRange		; if flag to check drive num is not set
+			cmpi.w	#MaxDriveNumber,d1		; see if way out of range
+			bls.s	@DriveNumInRange		; if valid drive number
+			moveq.l	#NSDrvErr,d0			; Bad drive number
+			bra.s	DiskIODone				; drive num out of range, return with error
+@DriveNumInRange
+			assert	CheckDriveExists=CheckDriveNum-1 ; next flag is CheckDriveExists
+			add.b	d2,d2					; test next flag
+			bpl.s	@DriveExists			; if flag to check drive exists is not set
+			tst.l	DriveInfoPtrs(a1,d1.w*4); test to see if it exists
+			bne.s	@DriveExists			; if valid drive
+			moveq.l	#NoDriveErr,d0			; non-existent drive error
+			bra.s	DiskIODone				; drive doesn't exists, return with error
+@DriveExists
+			move.b	d1,xmtMsg.DriveNumber(a1); setup IOP request Drive Number
+			move.b	-(a2),xmtMsg.ReqKind(a1); setup IOP request Kind
+			move.l	csParam(a0),xmtMsg.AdditionalParam(a1)
+			assert	MakeIOPcall=CheckDriveExists-1 ; next flag is MakeIOPcall
+			add.b	d2,d2					; test next flag
+			bpl.s	@DontCallIOP			; if call to IOP not needed
+			move.l	a3,-(sp)				; when IOP call returns, jump into the routine
+			bra.w	CallIOPRoutine			; call the IOP routine
+
+@DontCallIOP
+			jmp	(a3)						; jump into the routine
+
+
+DiskIODone	move.l	JIODone,-(sp)			; prepare to return to IODone
+			movea.l	DCEPointer(a1),a1		; a1 <- DCE (param to IODone)
+			ext.l	d0						; check for errors
+			beq.s	@noError				; if no error
+			move.w	d0,DskErr				; save error in low memory global DskErr
+@noError	rts								; return to IODone
+			eject
+
+
+IopCtlKillIO
+			moveq.l	#controlErr,d0			; we don't support KillIO
+			bra.s	DiskIODone				; return with error
+
+
+IopCtlFormat
+			lea		xmtMsg.HdrFmtKind(a1),a2; pointer to message for copying		<2.8>
+			assert	xmtMsg.SectInterleave=xmtMsg.HdrFmtKind+1	;					<2.8>
+			clr.w	(a2)+					; use default hdr format byte and interleave	<2.8>
+			assert	xmtMsg.FmtDataAddr=xmtMsg.SectInterleave+1	;					<2.8>
+			clr.l	(a2)+					; no sector data supplied				<2.8>
+			assert	xmtMsg.FmtTagAddr=xmtMsg.FmtDataAddr+4	;						<2.8>
+			clr.l	(a2)+					; no sector tags supplied				<2.8>
+			bsr.w	CallIOPRoutine			; format the disk						<2.8>
+IopCtlEject
+			bsr.w	UpdateXmtDriveStatus	; update the drive info
+IopCtlVerify
+IopCtlTagBuf
+IopCtlTrkCache
+IopCtlDone									;										<2.8>
+			move.w	xmtMsg.ErrorCode(a1),d0	; get the returned error code (or noErr)
+			bra.s	DiskIODone				; return through IODone
+
+
+IopCtlPhysIcon
+			bsr.w	UpdateXmtDriveStatus	; update the drive info
+			movea.l	Drive1PhysIcon(a1),a3	; return primary drive Icon
+			btst.b	#3,xmtMsg.DriveAttributes(a1)	; test for secondary
+			beq.s	@gotDefault				; if it was primary
+			movea.l	Drive2PhysIcon(a1),a3	; return secondary drive Icon
+@gotDefault	move.w	#1,xmtMsg.BlockNumber(a1)	; request drive icon info
+			btst.b	#1,xmtMsg.IconFlags(a1)	; see if needs call for drive Icon
+			bra.s	IconCommon				; join common code
+
+
+IopCtlLogIcon
+			bsr.w	UpdateXmtDriveStatus	; update the drive info
+			movea.l	MediaIconPtr(a1),a3		; return media Icon
+			clr.w	xmtMsg.BlockNumber(a1)	; request media icon info
+			btst.b	#0,xmtMsg.IconFlags(a1)	; see if needs call for media Icon
+IconCommon	bne.s	@callForIcon			; if not valid, ask IOP for the Icon
+			move.l	a3,(a0)					; return pointer to Icon
+			bra.s	DiskIODone				; return
+
+@callForIcon
+			lea		IconBuffer(a1),a3		; get pointer to IconData
+			move.l	a3,(a0)					; return pointer to Icon
+			move.l	a3,xmtMsg.BufferAddr(a1); pass Icon buffer address
+			move.w	#IconBufferSize,xmtMsg.BlockCount(a1)	; pass max size
+			move.b	#xmtReqGetIcon,xmtMsg.ReqKind(a1)
+			bsr.w	CallIOPRoutine			; get the Icon
+			bra.s	IopCtlDone				; get the error code (or noErr) and return	<2.8>
+		
+
+IopCtlDrvInfo
+			bsr.w	UpdateXmtDriveStatus	; update the drive info						<2.2>
+			move.l	SwimIopMsg.DriveInfo(a2),(a0)
+			bra.w	DiskIODone				; return
+
+
+;_______________________________________________________________________				<2.8>
+;
+; Routine:	IopCtlFmtCopy
+;
+; Inputs:	A0 -- pointer to user's parameter block
+;					csParam+ 0: format type (1=400K, 2=800K, 3=720K, 1=1440K[HD])
+;					csParam+ 2: pointer to user data buffer
+;					csParam+ 6: pointer to tag data buffer
+;					csParam+10: format byte ($02=Mac 400K, $22=Mac 800K, $24=Apple II 800K)
+;					csParam+11: if ≠0 then also verify each track
+;			A1 -- pointer to SonyVars
+;			D1 -- offset to drive's private variables
+;
+; Outputs:	D0 -- result code (0 if correctly formatted)
+;
+; Function:	Formats, copies [and verifies] each track on a disk in one
+;			pass for the Apple 3.5" Floppy Disk Duplicator program.
+;_______________________________________________________________________
+
+IopCtlFmtCopy
+			lea		xmtMsg.HdrFmtKind(a1),a2; pointer to message for copying
+			move.b	csParam+10(a0),(a2)+	; setup hdr format byte
+
+			assert	xmtMsg.SectInterleave=xmtMsg.HdrFmtKind+1
+			clr.b	(a2)+					; use default interleave
+
+			assert	xmtMsg.FmtDataAddr=xmtMsg.SectInterleave+1
+			move.l	csParam+2(a0),(a2)+		; setup sector data ptr
+
+			assert	xmtMsg.FmtTagAddr=xmtMsg.FmtDataAddr+4
+			move.l	csParam+6(a0),(a2)+		; setup sector tags ptr
+			bsr.w	CallIOPRoutine			; format the disk using supplied data
+			bsr.w	UpdateXmtDriveStatus	; update the drive info
+			move.w	xmtMsg.ErrorCode(a1),d0	; get the returned error code (or noErr)
+			bne.s	@done					; die on format errors
+
+			tst.b	11(a0)					; see if verify needed
+			beq.s	@done					; if not, return with success
+
+			move.l	xmtMsg.FixedDiskSize(a1),xmtMsg.BlockCount(a1)	; setup the disk size in blocks
+			move.b	#xmtReqReadVerify,xmtMsg.ReqKind(a1); setup the request
+			move.l	2(a0),xmtMsg.BufferAddr(a1)	; setup buffer address
+			clr.l	xmtMsg.BlockNumber(a1)	; setup starting block number
+			bsr.w	CallIOPRoutine			; verify the data buffer
+			move.w	xmtMsg.ErrorCode(a1),ErrorCodeSave(a1)	; save verify error code
+
+			move.b	#xmtReqDriveStatus,xmtMsg.ReqKind(a1)		; setup the request
+			bsr.w	CallIOPRoutine			; get the status buffer
+			move.w	ErrorCodeSave(a1),d0	; get the verify error code
+			bne.s	@done					; die on errors
+			clr.l	d1						; zero extend the drive number
+			move.b	xmtMsg.DriveNumber(a1),d1	; get the drive number
+			movea.l	DriveInfoPtrs(a1,d1.w*4),a2	; get drive info pointer
+			moveq.l	#dataVerErr,d0				; default to data verify error
+			move.w	PerDriveInfo.DriveQElement+dQDrvSz2(a2),d1	; get the old error count
+			cmp.w	xmtMsg.DiskErrors(a1),d1	; see if any new soft errors
+			bne.s	@done					; die on errors
+
+			moveq.l	#noErr,d0				; report success
+@done		bra.s	ToDiskIODone			; return with success
+
+
+;_______________________________________________________________________				<2.8>
+;
+; Routine:	IopCtlGetRawData
+;
+; Inputs:	A0 -- pointer to user's parameter block
+;					csParam+ 0: pointer to user Clock Bits Buffer
+;					csParam+ 4: pointer to user data buffer
+;					csParam+ 8: byte count in
+;					csParam+12: byte count out
+;					csParam+16: search mode
+;					csParam+18: track
+;					csParam+20: side
+;					csParam+21: sector
+;			A1 -- pointer to SonyVars
+;
+; Outputs:	D0 -- result code (0 if correctly formatted)
+;
+; Function:	reads raw data bytes from the disk, used for copy protection support
+;_______________________________________________________________________
+
+IopCtlGetRawData
+			lea		xmtMsg.RawClockAddr(a1),a2	; pointer to message for copying
+			lea		csParam(a0),a0				; pointer to params
+			move.l	(a0)+,(a2)+				; setup RawClockAddr
+
+			assert	xmtMsg.RawDataAddr=xmtMsg.RawClockAddr+4
+			move.l	(a0)+,(a2)+				; setup RawDataAddr
+
+			assert	xmtMsg.RawByteCount=xmtMsg.RawDataAddr+4
+			move.l	(a0)+,(a2)+				; setup RawByteCount
+
+			clr.l	(a0)+					; clear numDone by default
+
+			assert	xmtMsg.RawSearchMode=xmtMsg.RawByteCount+4
+			assert	xmtMsg.RawCylinder=xmtMsg.RawSearchMode+2
+			move.l	(a0)+,(a2)+				; setup RawSearchMode and RawCylinder
+
+			assert	xmtMsg.RawHead=xmtMsg.RawCylinder+2
+			assert	xmtMsg.RawSector=xmtMsg.RawHead+1
+			move.w	(a0)+,(a2)+				; setup RawHead and RawSector
+
+			bsr.w	CallIOPRoutine			; get the raw data
+			move.w	xmtMsg.ErrorCode(a1),d0	; get the returned error code (or noErr)
+			bne.s	@done					; die on errors
+			move.l	xmtMsg.RawByteCount(a1),csParam+12(a0)	; return the number of bytes read
+@done										; return with success
+ToDiskIODone
+			bra.w	DiskIODone
+
+
+IopGetFormatList
+			bsr.w	UpdateXmtDriveStatus	; update the drive info						<2.8>
+			moveq.l	#offLinErr,d0			; default error in case no disk in place.	<2.1>
+			cmpi.b	#2,SwimIopMsg.DiskInPlace(a2)	; see if disk is online and clamped	<2.1>
+			blt.s	ToDiskIODone			; if no disk, or format unknown, offLinErr	<2.1><2.8>
+			moveq.l	#paramErr,d0			; default error incase no entries allowed.	<2.1>
+			move.w	(a0)+,d2				; d2 <- max list size						<2.1>
+			ble.s	ToDiskIODone			; no room to return anything				<2.1><2.8>
+			move.w	SwimIopMsg.FormatsAllowed(a2),d0; get allowable formats
+			move.w	SwimIopMsg.CurrentFormat(a2),d1	; get current format
+			movea.l	(a0),a2					; a2 <- pointer to result list
+			lea		IopDiskFmtTbl,a3		; a3 <- pointer to list template
+			clr.w	-(a0)					; returned list size := 0
+			moveq.l	#0,d3					; d3 <- bit index into lists
+@loop		bclr.l	d3,d0					; test and clear allowable format bit
+			beq.s	@next					; bit wasn't set, try next
+			move.l	(a3,d3.w*8),(a2)+		; copy disk size
+			move.l	4(a3,d3.w*8),(a2)+		; copy attributes
+			bclr.l	d3,d1					; test and clear current format bit
+			beq.s	@currentDone			; if not the current format
+			bset.b	#6,-4(a2)				; set the 'is current format' bit
+			tst.w	d3						; was this the fixed disk format?
+			bne.s	@currentDone			; if not, don't adjust size
+			move.l	xmtMsg.FixedDiskSize(a1),-8(a2)	; return the fixed disk size
+@currentDone
+			addq.w	#1,(a0)					; increment result list count
+			subq.w	#1,d2					; decrement space left
+			ble.s	@done					; if result list is now full
+@next		addq.w	#1,d3					; increment template list / bit index
+			tst.w	d0						; see if all formats found
+			bne.s	@loop					; loop through remaining list
+@done		moveq.l	#noErr,d0				; return good status
+			bra.s	ToDiskIODone			; return									<2.8>
+
+
+IopDriveStatus
+			bsr.s	UpdateXmtDriveStatus	; update the drive info
+			addq.l	#SwimIopMsg.DriveStatus,a2	; point to status from IOP
+			addq.l	#PerDriveInfo.DriveQElement,a3	; point to drive queue element
+			move.w	(a2)+,(a0)+				; copy track
+			move.l	(a2)+,(a0)+				; copy writeProt, diskInPlace, installed, sides
+			move.l	(a3)+,(a0)+				; copy qLink
+			move.l	(a3)+,(a0)+				; copy qType, dQDrive
+			move.l	(a3)+,(a0)+				; copy dQRefNum, dQFSID
+			move.l	(a2)+,(a0)+				; copy twoSideFmt, reserved, diskErrs
+			bra.s	ToDiskIODone			; return									<2.8>
+
+
+IopMFMStatus
+			bsr.s	UpdateXmtDriveStatus	; update the drive info
+			move.l	SwimIopMsg.ExtDriveStatus(a2),(a0)
+			bra.s	ToDiskIODone			; return									<2.8>
+
+
+;_______________________________________________________________________				<2.8>
+;
+; Routine:	IopDupVersion
+;
+;  Inputs:		A0 - pointer to I/O ParamBlock
+;				A1 - pointer to SonyVars
+;
+;  Outputs:		D0 -- result code
+;
+; Function:	Returns the duplicator version that this driver supports.
+;			This is so that common features are properly matched.
+;_______________________________________________________________________
+
+IopDupVersion
+			move.w	xmtMsg.DupVersion(a1),csParam(a0)	; get the current version
+			bra.w	IopCtlDone				; get the error code (or noErr) and return
+
+
+;_______________________________________________________________________				<2.8>
+;
+; Routine:	IopGetFmtByte
+;
+;  Inputs:		A0 - pointer to I/O ParamBlock
+;				A1 - pointer to SonyVars
+;
+;  Outputs:		D0 -- result code
+;
+; Function:	Returns the format byte from the last address field read so
+;			that we can determine what the interleave is for 800K disks.
+;			This call can also be used to determine if the RAM-based
+;			Disk Duplicator version of the driver is installed.
+;_______________________________________________________________________
+
+IopGetFmtByte
+			move.b	xmtMsg.HdrFmtKind(a1),csParam(a0)	; get the format byte
+			bra.w	IopCtlDone				; get the error code (or noErr) and return
+
+
+;_______________________________________________________________________
+;
+;  Routine:		UpdateXmtDriveStatus, UpdateDriveStatus
+;  Inputs:		A1 - pointer to SonyVars
+;				A2 - pointer to status message buffer
+;  Outputs:		A0 - pointer to csParam field of current IO request
+;				A3 - pointer to PerDriveInfo for desired drive
+;				D0 - default error code (noErr)
+;				D1 - drive number from status message (zero extended to long)
+;  Destroys:	D2, D3
+;  Calls:		none
+;  Called by:	ctlFormat, ctlEject, ctlPhysIcon, ctlLogIcon, ctlDrvInfo,
+;				GetFormatList, DriveStatus, MFMStatus, ReceivedCallFromIop
+;
+;  Function:	Locates and updates the PerDriveInfo record based upon the
+;				information in the status message buffer.
+;
+;_______________________________________________________________________
+
+
+UpdateXmtDriveStatus
+			lea		xmtMsg(a1),a2			; point to the returned status
+UpdateDriveStatus
+			clr.l	d1						; zero extend the drive number
+			move.b	SwimIopMsg.DriveNumber(a2),d1	; get the drive number
+			lea		nullPerDriveInfo,a3		; a3 <- per drive info for nonexistent drives
+			move.l	DriveInfoPtrs(a1,d1.w*4),d2	; get drive info pointer
+			beq.s	@done					; if no drive info for this drive
+
+			movea.l	d2,a3					; a3 <- real per drive info
+
+			assert	SwimIopMsg.DiskInPlace=SwimIopMsg.WriteProtected+1
+			assert	PerDriveInfo.DiskInPlace=PerDriveInfo.WriteProtected+1
+
+			assert	SwimIopMsg.Installed=SwimIopMsg.DiskInPlace+1
+			assert	PerDriveInfo.Installed=PerDriveInfo.DiskInPlace+1
+
+			assert	SwimIopMsg.Sides=SwimIopMsg.Installed+1
+			assert	PerDriveInfo.Sides=PerDriveInfo.Installed+1
+
+			move.l	SwimIopMsg.WriteProtected(a2),\
+					PerDriveInfo.WriteProtected(a3)	; update flags in DriveQueueElement
+
+			if		Compatibility then
+;	the SONY driver uses the 4 bytes of the drive queue element that is
+;	supposed to contain the drive size, to store TwoSidedFormat, NewInterface,
+;	and DiskErrors information.  This is not documented in Inside Macintosh
+;	(although it is documented as being returned by Status csCode 8).
+;	for compatibility with software (like DiskFirstAid) which looks directly
+;	at the DQElement to check TwoSided, we will update this field.
+
+			assert	SwimIopMsg.NewInterface=SwimIopMsg.TwoSidedFormat+1
+			assert	SwimIopMsg.DiskErrors=SwimIopMsg.NewInterface+1
+
+			move.l	SwimIopMsg.TwoSidedFormat(a2),\
+					PerDriveInfo.DriveQElement+dQDrvSz(a3)	; insert info into drive queue
+
+			endif
+
+			cmpi.w	#1,PerDriveInfo.DriveQElement+qType(a3)
+			bne.s	@done					; if not entended drive queue element
+
+			move.l	SwimIopMsg.FixedDiskSize(a2),d3
+			swap	d3
+			move.l	d3,PerDriveInfo.DriveQElement+dQDrvSz(a3)
+
+@done		movea.l	DCEPointer(a1),a0		; get DCE pointer
+			movea.l	DCtlQHead(a0),a0		; get IO param block pointer
+			lea		csParam(a0),a0			; a0 <- csParam pointer
+			moveq.l	#noErr,d0				; d0 <- default error code (noErr)
+			rts
+
+
+;  The information for each possible disk format is an 8-byte record:
+;	Byte 0-3:	disk capacity in blocks
+;				(is [#tracks][#heads][#sectors][#bytes/sector])
+;	       4:	bit 7=1: number of tracks, sides, sectors is valid
+;			    6=1: current disk has this format
+;			    5=0: reserved for future expansion, should be zero
+;			    4=0: single density, =1: double density
+;			    0-3: number of heads (or zero if don't care)
+;	       5:	number of sectors (or zero if don't care)
+;	     6-7:	number of tracks (or zero if don't care)
+
+IopDiskFmtTbl
+			dc.l	38965					; HD-20
+			dc.b	(%0100<<4)+0,0,0,0		;  THS invalid, current disk has this format
+
+			dc.l	400*2					; 400K GCR
+			dc.b	(%1000<<4)+1			;  THS valid, SD, 1 head
+			dc.b	10						;  10 sectors (average)
+			dc.w	80						;  80 tracks
+
+			dc.l	800*2					; 800K GCR
+			dc.b	(%1000<<4)+2			;  THS valid, SD, 2 heads
+			dc.b	10						;  10 sectors (average)
+			dc.w	80						;  80 tracks
+
+			dc.l	720*2					; 720K (1M) MFM
+			dc.b	(%1000<<4)+2			;  THS valid, SD, 2 heads
+			dc.b	9						;  9 sectors
+			dc.w	80						;  80 tracks
+
+			dc.l	1440*2					; 1440K (2M) MFM
+			dc.b	(%1001<<4)+2			;  THS valid, DD, 2 heads
+			dc.b	18						;  9 sectors
+			dc.w	80						;  80 tracks
+
+
+nullPerDriveInfo
+			dcb.b	PerDriveInfo.PerDriveInfoSize,0
+			TITLE	'SONY Driver - IOP call processing'
+
+;_______________________________________________________________________
+;
+;  Routine:		CallIOPRoutine
+;  Inputs:		A1 - pointer to SonyVars
+;  Outputs:		A0 - pointer to IOPB for current call						<2.8>
+;				A1 - pointer to SonyVars
+;  Destroys:	all other registers are destroyed across the async call
+;  Calls:		_IOPMsgAccess
+;  Called by:	DiskOpen, DiskPrime, DiskControl, DiskStatus
+;
+;  Function:	Asynchronously calls a IOP based driver routine, and returns
+;				to the caller when the routine completes.  The message parameter
+;				block is sent to the IOP and copied back when the call completes
+;				It will return immediatly to the callers-caller while the
+;				async operation immediatly to the callers-caller while the
+;				async operation is in progress.
+;
+;_______________________________________________________________________
+
+CallIOPRoutine
+			move.l	(sp)+,xmtWaiterPC(a1)	; save waiter address
+			lea		xmtReq(a1),a0			; a0 <- pointer to IOPRequestInfo param block
+			_IOPMsgRequest					; send the message to the IOP
+			rts								; return to callers caller
+
+IOPCallReturned								; a0 <- pointer to IOPRequestInfo on entry
+			lea		-xmtReq(a0),a1			; a1 <- SonyVars
+			move.l	xmtWaiterPC(a1),-(sp)	; prepare to return to waiter
+			clr.l	xmtWaiterPC(a1)			; indicate nobody waiting
+			movea.l	DCEPointer(a1),a2		; get DCE pointer
+			movea.l	DCtlQHead(a2),a0		; get IO param block pointer	<2.8>
+			rts								; return to the waiting routine	<2.8>
+
+
+;_______________________________________________________________________
+;
+;  Routine:		ReceivedCallFromIop
+;  Inputs:		A1 - pointer to SonyVars
+;  Outputs:		none
+;  Destroys:	
+;  Calls:		_IOPMsgAccess, _PostEvent, UpdateDriveStatus
+;  Called by:	IOPManager
+;
+;  Function:	Handles status change messages sent from the IOP based
+;				driver.  Posts DiskInserted or DiskEject events if the
+;				message indicates that the corresponding events were
+;				detected by the IOP based driver.
+;
+;_______________________________________________________________________
+
+			with	IOPRequestInfo
+ReceivedCallFromIop							; registers a0-a3/d0-d3 preserved by interrupt
+											; a0 <- pointer to IOPRequestInfo on entry
+			lea		-rcvReq(a0),a1			; a1 <- SonyVars
+			lea		rcvMsg(a1),a2			; a2 <- rcvMsg
+
+			move.w	#noErr,SwimIopMsg.ErrorCode(a2)	; assume no error
+			move.b	SwimIopMsg.ReqKind(a2),d2	; get request kind
+
+			cmpi.b	#rcvReqDiskInserted,d2	; was it an insertion event?				<SM2>
+			bne.s	@1						; • no - it's either eject or bogus			<SM2>
+
+;	Check if we're SECUREd																<SM2>
+;
+;	If we're SECUREd.  Fake the drive queue out by calling UpdateDriveStatus.			<SM2>
+;	This will cause things like DiskInPlace in the drive queue to be set				<SM2>
+;	even if the disk is not mounted.  That will allow the EJECT call that				<SM2>
+;	will get posted to occur.															<SM2>
+
+			bsr		CheckIfSecure			; • see if we have a keyswitch and it's SECUREd<SM2>
+			bne.s	@OkToDoIt				; • IF SECURE THEN							<T13><SM2>
+
+			bsr		UpdateDriveStatus		; •   fake out drive queue					<SM2>
+			move.b	#rcvReqDiskEjected,d2	; •   force D2 to contain an eject request	<SM2>
+			bra.s	@1						; •   and exit to caller					<SM2>
+;											; • ELSE									<SM2>
+@OkToDoIt	moveq.l	#0,d0					;     upper d0 <- 0, disk inserted			<SM2>
+			beq.s	@postEvent				; branch if DiskInsertEvt AND we're allowing it <SM3>
+
+@1			moveq.l	#-1,d0					; upper d0 <- -1, disk ejected				<SM2>
+			cmpi.b	#rcvReqDiskEjected,d2	; was it an Ejected event?
+			bne.s	@updateStatus			; if not disk ejected request
+
+@postEvent	movea.w	#DiskInsertEvt,a0		; a0 <- event type
+			clr.w	d0						; zero extend drive number
+			move.b	SwimIopMsg.DriveNumber(a2),d0	; insert drive number into message
+			_PostEvent						; post the insert/eject
+			move.w	d0,SwimIopMsg.ErrorCode(a2)	; return the error, if any
+			bne.s	@sendReply				; don't update status if error found
+
+@updateStatus
+			bsr.w	UpdateDriveStatus		; update status based upon status change info
+@sendReply	lea		rcvReq(a1),a0			; a0 <- rcvReq
+			move.b	#irSendRcvReply,irRequestKind(a0)
+			_IOPMsgRequest					; send the reply back to the IOP
+			rts
+			endwith
+			endwith
+
+; -----------------------------------------------------------------------------				<SM2> begin
+;
+;	*****************
+;	* CheckIfSecure *
+;	*****************
+;
+;	This routine returns (via CCR) whether or not we have a keyswitch, and if
+;	so, whether it is in the SECURE position.
+;
+;	NOTE:  the KeyswitchSecure position value is 0 = SECURE, 1 = ON.						<T13>
+;
+;	Input:		None
+;	Output:		CCR.Z	NE	... if not a keyswitch or keyswitch NOT in secure position
+;						EQ	... if you have a keyswitch an it IS in the SECURE position
+;	Trashes:	D0
+
+CheckIfSecure
+			bsr.s	CheckForCabooseKeyswitch; universalized check for keyswitches			<T16>
+			beq.s	@secured				; IF NOT aKeyswitch THEN						<T13>
+			rts								;   return to caller with CCR.Z = NE			<T13>
+@secured									; ENDIF
+			move.l	a1,d0					; temporarily save A1
+			movea.l	VIA2,a1					; retrieve VIA2 location
+			bsr		ReadSecureBit			; call the routine. returns same value as BTST	<Z18>
+			movea.l	d0,a1					; restore A1
+			rts								; return to caller
+
+;_______________________________________________________________________								<T16> thru next <T16>
+;
+;  Routine:		CheckForCabooseKeyswitch
+;
+;  Desc:		Check whether or not we have an Caboose-style keyswitch.
+;
+;  Returns:		CCR.Z		EQ		If you have a Caboose-style keyswitch
+;							NE		If you don't.
+;_______________________________________________________________________
+
+			EXPORT	CheckForCabooseKeyswitch		; in case someone like SonyPatches.a wants it
+CheckForCabooseKeyswitch
+			move.l	d0,-(sp)						; save a handy working register
+			move.l	#KeyswMask,d0					; get isolation mask ready
+			and.l	UnivROMFlags,d0					; grab keyswitch bits in UnivROMFlags
+			sub.l	#KeyswCaboose,d0				; and check if we're a Caboose keyswitch
+			movem.l	(sp)+,d0						; restore D1 (MOVEM doesn't reset CCR)
+			rts										; return to caller with CCR set						<T16>
+
+;_______________________________________________________________________
+;
+;  Routine:		ReadSecureBit
+;
+;  Desc:		This reads the v2Keyswitch bit in VIA2.vBufB and returns
+;				its value.  The handy by-product of this routine is that
+;				it also regenerates sound interrupts that may have been
+;				pending that this routine would have cleared because it
+;				reads vBufB.
+;
+;  Returns:		CCR.Z		EQ		If v2Keyswitch == 0	(keyswitch == SECURE)
+;							NE		If v2Keyswitch == 1	(keyswitch != SECURE)
+;
+;	Trashes:	None.
+;_______________________________________________________________________
+
+ReadSecureBit
+			movem.l	d0/a1,-(sp)						; save D0/A1 on the stack so we can use em
+			move.b	vBufB(a1),d0					; read VIA2, clearing interrupts (GAG).
+			bsr.w	ReGenSoundInt					; regenerate possible pending sound interrupts
+			btst	#v2Keyswitch,d0					; BTST the bit we're interested in
+			movem.l	(sp)+,d0/a1						; restore (ab)used temp. registers
+			rts										;										<Z18><H7><SM2> end
+

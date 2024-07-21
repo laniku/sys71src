@@ -1,0 +1,295 @@
+;__________________________________________________________________________________________________
+;
+;	File:		NewProto.a
+;
+;	Contains:	This is the socket listener for the new boot protocol. It handles packet reception.
+;				This works as follows:
+;
+;					Call readrest to get packet, check size.
+;					Push parameters and call C routine to handle the world
+;
+;				The whole listener works at interrupt time under tight time constraints. We want
+;				to assure that the workstation is not the gating factor in image throughput.
+;
+;				This listener assumes that it has been initialized before being called for the first
+;				time. This includes setting up the buffers, reception bitmaps, and our pointer to them.
+;
+;	Written by:	Patrick Dyson
+;
+;	Copyright © 1989, 1992 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 11/5/92	SWC		Changed ATalkEqu.a->AppleTalk.a.
+;		 <3>	12/28/89	SWC		Fixed the header and set tabs to 4.
+;		 <2>	12/19/89	PD		Adding to bbs
+;	   <1.0>	10/30/89	PWD		Adding to EASE
+;__________________________________________________________________________________________________
+
+			PRINT	OFF
+			INCLUDE	'AppleTalk.a'						; AppleTalk equates
+			INCLUDE	'Traps.a'
+			INCLUDE	'ATBootEqu.a'						; boot driver equates
+			PRINT	ON
+
+;
+; void	BootStorage(Ptr a)
+;
+BootStorage	PROC	EXPORT
+
+			MOVE.L	(SP)+, A0							; return address
+			MOVE.L	(SP)+, BootStore					; save passed pointer there
+			JMP		(A0)
+			ENDP
+
+BootListen	PROC	EXPORT
+			IMPORT	CheckBitmap
+			IMPORT	SetBitmap
+			IMPORT	getImageBuffer
+			IMPORT	BufferPtr
+			IMPORT	GoListener
+			IMPORT	CLISTENER
+
+			MOVEM.L	D4-D7, -(SP)						; save some work registers
+			CMP.B	#BootDDPType,DDPType-DDPHSzLong(A3)	; make sure this is our ddp type
+			BNE.S	@trash								; nope, just ignore pkt!
+
+			CMP.W	#minPktSize, D1						; make sure that we have at least enough
+			BMI.S	@trash								; punt if not
+;
+; Pick up our globals pointer
+;
+			MOVE.L	BootStore, A5						; should point to our globals
+;
+; Pick up the source address (net)(node)(socket) in D2.L
+;
+			CMP.B	#shortDDP,ToRHA+LAPType(A2)			; is this a short DDP hdr?
+			BNE.S	@long								; branch for long header
+
+			MOVE.B	ToRHA+LAPSrcAdr(A2),D2				; stuff source node ID
+			SWAP	D2
+			MOVE	sysNetNum(A2),D2					; use our built in net num for shorts
+
+			BRA.S	@10			; all done - go clean up
+
+@long		MOVE.B	DDPSrcNode-DDPHSzLong(A3),D2		; 'from' node ID
+			SWAP	D2
+			MOVE	DDPSrcNet-DDPHSzLong(A3),D2 		; 'from' xtend net ID
+
+@10			SWAP	D2									; should be net<xx><node>
+			LSL.W	#8, D2								; up a byte net<node><xx>
+			MOVE.B	DDPSrcSkt-DDPHSzLong(A3),D2			; 'from' skt num net<node><skt>
+;
+; Get next couple of bytes of the packet...
+;
+			MOVEQ.L	#minPktSize,D3						; count to read
+			SUB.L	D3, SP								; make space for header
+			MOVE.L	SP, A3								; point for readpacket
+			JSR		(A4)								; readpacket
+;
+			MOVE	(SP)+, D0							; pop type and version
+			MOVE.L	(SP)+, D5							; (either OSID or imageID) and
+														; the block number or first two bytes of user data
+			SWAP	D5
+; now we have:
+; D0.W	<type><version>
+; if it is an image data packet
+; D5.L	<Block #><imageID.W>
+;	-or-
+; if it is a user record reply
+; D5.L	<UserData.W><imageID.W>
+;	-or-
+; if it is a user record update reply
+; D5.L	<UserData.W><result>
+
+			TST		D3									; was there an error
+			BNE		@gohome								; punt iff so
+			MOVE.B	D0,D3								; pick up version
+			CMP.B	#packetVersion,D3					; is it one we can deal with?
+			BGT.S	@trash								; nope
+			LSR.W	#8, D0								; the type into the low byte
+			CMP.B	#rbImageData, D0					; is this one image data (most often.. )
+			BNE.S	@doUserReply						; nope
+;
+; We have an image data packet
+;
+			CMP.L	server_addr(A5), D2					; is this from a reasonable place?
+			BNE.S	@trash
+			CMP.W	bootImageID(A5), D5					; is this for us?
+			BNE.S	@trash
+			SWAP	D5									; get block number in low word
+			CMP.W	lastBlockNo(A5), D5					; is the block number in range?
+			BGT.S	@trash
+
+			MOVE.L	bitmapBase(A5),A3					; get the image bitmap
+			MOVE.L	A3,D6								; save for setbitmap (being hopeful)
+			MOVE.W	D5,D0								; make D0 block number
+			BSR		CheckBitmap							; have we received this one already?
+			BEQ.S	@wantit								; branch if not
+			MOVE.L	#-1,D0								; indicate we didn't want this one
+			MOVE.L	A5, D7								; set up to pass globals pointer
+			JSR		GoListener							; tell the C Glue
+
+@trash		MOVEM.L	(SP)+, D4-D7						; restore work registers
+			MOVEQ	#0,D3								; indicate we don't want this one
+			JMP	2(A4)									; let MPP do the work
+
+@wantit		MOVE.L	imageBuffer(A5),D0					; pick up image buffer area
+			BEQ.S	@trash								; punt iff nil
+			MOVE.L	D0,A3
+			MOVE.W	D5,D0								; D5.W block ID from above
+			BSR		getImageBuffer						; returns buffer base address in A3
+
+			MOVE	blockSize(A5),D3					; pick up blocksize
+			MOVE.L	A5, D7								; save across readrest
+
+			JSR		2(A4)								; call readrest (puts image data directly in buffer )
+			BNE.S	@gohome								; punt if error.
+
+			TST		D3									; > 0 if short packet
+			BGT.S	@gohome
+;
+; We have read in the packet, now we do the protocol stuff (clear timers, set bitmap)
+;
+			MOVE.L	D6,A0								; base address saved from above
+			MOVE.W	D5, D0								; D5 is the block number
+			JSR		SetBitmap
+
+			CLR.L	D0									; 0 if a good packet & we kept it
+			JSR		GoListener
+			BRA.S	@gohome
+
+@doUserReply
+; D0.W		; type
+; D3.B		; the version
+; if it is a user record reply
+; D5.L		<UserData.W><imageID.W>
+;	-or-
+; if it is a user record update reply
+; D5.L		<UserData.W><result>
+; D2		; the source address
+; A5		; our globals
+;
+; At this point, we have read the first six bytes of the packet and partially digested them.
+			CMP.B	#rbUserRecordAck, D0				; is this a user record update ack?
+			BEQ.S	@doRecordAck						; deal with it
+
+			CMP		#-1, bootImageID(A5)				; do we already have a user record?
+			BNE.S	@trash								; then ignore this one
+
+			CMP.B	#rbUserReply, D0					; is this a cool packet?
+			BNE.S	@trash								; nope
+			LEA		readPacketArea(A5), A3				; point to read area
+;
+; restore the packet that we have already read, then read the rest in
+;
+			MOVE.B	D0, (A3)+							; pop the command
+			MOVE.B	D3, (A3)+							; and the version
+			SWAP	D5									; make it <imageID.W><UserData.W>
+			MOVE.L	D5, (A3)+							; the osID (machine ID)
+														; and the first two bytes of userdata
+
+			MOVE.L	#ddpMaxData, D3						; get whole packet
+			MOVE.L	A5, D7								; save A5 across readrest
+
+			JSR		2(A4)								; call readrest (count in D3)
+			BNE.S	@gohome								; punt if error
+
+			MOVE.L	D7, -(SP)							; push globals pointer
+			MOVE.L	D2, -(SP)							; push source address
+			JSR		CLISTENER
+			LEA		8(SP),SP							; clean up stack
+
+@doRecordAck
+@gohome	MOVEM.L	(SP)+, D4-D7							; restore work registers
+			RTS											; cruise...
+
+
+			ENDP
+
+GoListener	PROC	EXPORT
+			IMPORT	DOIMAGEDATA
+			MOVE.L	D0, -(SP)							; push good/bad packet flag
+			MOVE.L	D7, -(SP)							; push globals
+;			MOVE.L	D4, -(SP)							; block number (already long extended)
+			JSR		DOIMAGEDATA							; do that protocol thing
+			LEA		8(SP),SP							; clean up stack
+			RTS
+			ENDP
+
+;-----------------------------------------------------------------------------------
+; procedure CheckBitmap
+;
+;	On entry :
+;	A3 -> bitmap base address
+;	D0.W -> bit number to check (true if zero), corresponds to block number
+;
+;	A5 -> globals
+;
+;	On Exit
+;	Z bit set if bitmap bit set (already received packet)
+;
+;	ALL REGISTERS PRESERVED
+;
+
+CheckBitmap	PROC	EXPORT
+			MOVEM.L	D1, -(SP)							; save those registers
+			MOVE.W	D0,D1								; copy bit number for index
+			LSR.W	#3,D0								; make a byte index
+			BTST.B	D1,($0,A3,D0.W)						; check that bit! (D1 modulo 8)
+			MOVEM.L	(SP)+,D1							; restore that D1 (ccr's NOT set)
+			RTS
+			ENDP
+
+;-----------------------------------------------------------------------------------
+; procedure SetBitmap
+;
+;	On entry :
+;	A0 -> bitmap base address
+;	D0 -> bit number to set, corresponds to block number
+;
+;	On Exit
+;
+;	Trashes D0, D1
+;
+
+SetBitmap	PROC	EXPORT
+			MOVE.W	D0,D1								; copy bit number for index
+			LSR.W	#3,D0								; make a byte index
+			BSET.B	D1,($0,A0,D0.W)						; check that bit! (D1 modulo 8)
+			RTS
+			ENDP
+
+;-----------------------------------------------------------------------------------
+; procedure getImageBuffer
+;
+;	On Entry:
+;	A3 -> image buffer base address
+;	D0.W -> block number to return base address of
+;
+;	A5 -> globals
+;
+;	On Exit
+;	A3 -> base address of buffer
+;
+;	ALL REGISTERS PRESERVED except A3
+;
+
+getImageBuffer	PROC	EXPORT
+			MOVE.L	D0, -(SP)
+			MULU	blockSize(A5), D0					; pick up blocksize, make offset
+
+			ADD.L	D0, A3								; make into an address
+
+			MOVE.L	(SP)+, D0							; restore D0
+			RTS
+			ENDP
+
+BufferPtr	PROC	EXPORT
+
+dude		DC.L	0									; to store our globals off of
+
+			ENDP
+
+
+			END

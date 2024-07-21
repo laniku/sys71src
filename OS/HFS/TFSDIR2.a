@@ -1,0 +1,683 @@
+;
+;	File:		TFSDIR2.a
+;
+;	Contains:	This file contains file-level routines which use filenames.
+;
+;	Copyright:	© 1983-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM4>	 8/27/93	BH		Removed <SM3>. The flushing stuff is now in CmdDone.
+;	   <SM3>	  8/3/93	BH		Flushing critical volume info when changed for a volume in a
+;									manual-eject drive.
+;	   <SM2>	 5/21/92	kc		Append "Trap" to the name of ReName to avoid name conflict with
+;									the glue.
+;	   <SM1>	 4/1/92		kc		Roll in FixVolumeRenames patch from FileMgrPatches.a.
+;									Rolled in the Disappearing Folder patch.
+;									Rolled in RenameCheckVolNameLength in FileMgrPatches.a.
+;									¥ Pre-SuperMario comments follow ¥
+;		 <2>	 9/12/91	JSM		Add a header.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				 1/14/87	BB		Fixed FileDelete to return "paramErr" error rather than the file
+;									system internal error "FSDSIntErr" if attempting to delete the
+;									root directory. NOTE: this is not patched for the Mac+ or MAUI.
+;				 4/15/86	PWD		Fix rename bug when renameing an external volume.
+;				 1/13/86	LAK		After Renaming MFS volume with SetVolName, take the exit which
+;									sets D0=0. This incorporates the patch in ROM75Fix.
+;				 10/6/85	PWD		Changed to use new SetVolName routine throughout (move to
+;									TFSVol).
+;				 10/1/85	LAK		Don't worry about adjusting internal errors - done by CmdDone.
+;				 9/21/85	LAK		Fixed bug in above.
+;				 9/20/85	PWD		Changed Rename to allow source vol. spec by VRefNum only.
+;				 9/20/85	LAK		Call TrashFBlocks when deleting a file.
+;				  9/5/85	LAK		Don't allow rename for locked files.
+;				 8/28/85	LAK		New today.
+;				 8/28/85	LAK		Added CkDirBusy, Gt1stWDCB, GtNxtWDCB, Gt1stWDVMatch,
+;									GtNxtWDVMatch subroutines. Refuse to delete a directory which
+;									has an open WDCB.
+;				 6/20/85	PWD		Changed to use new system CNode equates
+;				 6/19/85	PWD		Changed internal errors to FSDSIntErr instead of IOErr.
+;				 4/25/85	PWD		Changed to convert internal error codes to IOErr.
+;				 3/10/85	PWD		Split off MFS-specific code into MFSDir2. Added code to deal
+;									specifically with TFS volumes.
+;				 8/29/83	LAK		Changed ReName to update affected FCBs FCBFlPos (rename may
+;									cause a directory entry to migrate).
+;				 4/20/83	LAK		Minor change to CkFileBusy.
+;				  2/8/83	LAK		Fixed rename bug (A5 trash)
+;				 1/16/83	LAK		Added latest changes; cosmetic and documentation updates.
+;
+
+;_______________________________________________________________________
+;
+; External Routines:	 FileDelete,ReName,TFMove
+;
+; Internal Routines:	 CkFileBusy, CkDirBusy, Gt1stWDCB, GtNxtWDCB,
+;							Gt1stWDVMatch, GtNxtWDVMatch
+;
+;_______________________________________________________________________
+
+;_______________________________________________________________________
+;
+; Routine:		Gt1stWDCB,GtNxtWDCB
+;
+; Arguments:	  A1.L (input)	-- FCB start pointer (GtNxtFCB)
+;				  D1.W (input)	-- offset to current FCB (GtNxtFCB)
+;				  A1.L (output) -- unchanged
+;				  D1.W (output) -- offset to next WDCB
+;				  CCR set so that BCS will not br when past last WDCB
+; Called By:	Gt1stWDMatch,GtNxtWDMatch
+; Function: 	Scan through the WDCBs.
+;
+; Routine:		Gt1stWDVMatch,GtNxtWDVMatch
+;
+; Arguments:	  A1.L (input)	-- WDCB start pointer (GtNxtWDMatch)
+;				  D1.W (input)	-- offset to current FCB (GtNxtWDMatch)
+;				  A2.L (input)	-- VCB pointer to match against
+;				  A1.L (output) -- WDCB start pointer
+;				  D1.W (output) -- offset to next WDCB on same volume
+;				  CCR set so that BNE will not br when past last WDCB
+; Called By:	CkDirBusy
+; Function: 	Scan through the WDCBs which match a certain volume.
+;
+; Modification History:
+; <28Aug85>  LAK  New today.
+;_______________________________________________________________________
+
+
+			BLANKS		ON
+			STRING		ASIS
+
+Gt1stWDCB	MOVE.L	WDCBSPtr,A1 		; get WDCB ptr							<28Aug85>
+			MOVEQ	#2,D1				; index to first FCB					<28Aug85>
+			RTS 						;										<28Aug85>
+
+GtNxtWDCB	ADD.W	#WDCBLen,D1 		; go to next FCB						<28Aug85>
+			CMP.W	(A1),D1 			; reached the end yet?					<28Aug85>
+			RTS 						; let the caller test (BCS if not)		<28Aug85>
+
+Gt1stWDVMatch
+			BSR.S	Gt1stWDCB			;										<28Aug85>
+
+gt1stLoop	CMP.L	WDVCBPtr(A1,D1),A2	; on the same volume?					<28Aug85>
+			BEQ.S	gtNxtRTS			;										<28Aug85>
+
+GtNxtWDVMatch
+			BSR.S	GtNxtWDCB			;										<28Aug85>
+			BCS.S	gt1stLoop			; loop thru them all					<28Aug85>
+			MOVE	#0,CCR				; clear Z bit							<28Aug85>
+
+gtNxtRTS	RTS 						; BEQ for match, BNE at end . . .		<28Aug85>
+
+
+;_______________________________________________________________________
+;
+; Routine:		CkDirBusy
+; Arguments:	  A0.L (input)	-- IO parameter block ptr
+;				  A2.L (input)	-- VCB pointer
+;				  A5.L (input)	-- file directory entry pointer
+;				  D0.W (output) -- result code (0 if file not open)
+;				  D1.W (output) -- WDCB index if directory busy
+;				  All other registers are preserved.
+; Calls:		Gt1stWDCB,GtNxtWDCB
+; Called by:	FileDelete
+; Function: 	Searches WDCB buffer to see if the directory is
+;				currently open.
+;
+; Modification History:
+; <28Aug85>  LAK  New today.
+;_______________________________________________________________________
+
+CkDirBusy
+			MOVEM.L D2/A1,-(SP) 		; Preserve A1/D2						<28Aug85>
+			MOVE.L	dirDirID(A5),D2 	; Get dir number from TFS cat. entry	<28Aug85>
+
+; scan through the WDCBs and look for a match of directory number and same volume
+
+			BSR.S	Gt1stWDVMatch		; get first WDCB for this volume		<28Aug85>
+@0			BNE.S	@1					; br if no match						<28Aug85>
+			CMP.L	WDDirID(A1,D1),D2	; for the same directory?				<28Aug85>
+			BEQ.S	@3					; br if so - error						<28Aug85>
+			BSR.S	GtNxtWDVMatch		; try the next							<28Aug85>
+			BRA.S	@0					; and loop								<28Aug85>
+
+@1			MOVEQ	#0,D0				; not busy . . .						<28Aug85>
+@2			MOVEM.L (SP)+,D2/A1 		; restore A1/D2 						<28Aug85>
+			RTS 						;										<28Aug85>
+
+@3			MOVE.W	D1,IORefnum(A0) 	; note the refnum of WDCB entry 		<28Aug85>
+			MOVEQ	#FBsyErr,D0 		; directory is busy 					<28Aug85>
+			BRA.S	@2					;										<28Aug85>
+
+;_______________________________________________________________________
+;
+; Routine:		CkFileBusy
+; Arguments:	  A0.L (input)	-- IO parameter block ptr
+;				  A2.L (input)	-- VCB pointer
+;				  A5.L (input)	-- file directory entry pointer
+;				  D0.W (output) -- result code (0 if file not open)
+;				  D1.W (output) -- FCB index if file busy
+;				  D2.L (output) -- FilFLNum(A5)
+;				  All other registers are preserved.
+; Calls:		Gt1stFCB,GtNxtFCB
+; Called by:	FileDelete,MFSDelete,GetFileInfo,GetMFlInfo
+; Function: 	Searches FCB buffer to see if the file directory entry
+;				   pointed to by A5 is already open.
+;
+; Modification History:
+; 10 Dec 82  LAK  New today.
+; 16 Jan 83  LAK  Now calls procs to search thru FCBs.
+; 20 Apr 83  LAK  Changed to return refnum of entry found when file is
+;				   found to be busy already.
+; 29 Aug 83  LAK  Changed to use Gt1stMatch instead of Gt1stFCB, GtNxtFCB.
+;				  Now returns file number in D2 (no one uses it tho).
+; 10 Mar 85  PWD  Changed to check volume sigword and handle (possibly) different
+;				  file descriptor data structures to find file number.
+;_______________________________________________________________________
+
+CkFileBusy
+			MOVE.L	A1,-(SP)			; Preserve A1
+			MOVE.L	FilFLNum(A5),D2 	; Get file number from TFS cat. entry
+			BSR 	TFSVCBTst			; Are we dealing with a TFS volume? 	<01Oct85>
+			BEQ.S	@0					; If TFS, handle TFS catalog entries
+			MOVE.L	FlFlNum(A5),D2		; get the file number from MFS dir. entry
+
+; scan through the FCBs and look for a match of file number and same volume
+
+@0			BSR 	Gt1stMatch
+			BEQ.S	@2					; fail if any match
+			MOVEQ	#0,D0
+
+@1			MOVE.L	(SP)+,A1			; restore A1
+			RTS
+
+@2			MOVE.W	D1,IORefnum(A0) 	; note the refnum of fcb entry
+			MOVEQ	#FBsyErr,D0 		; file is busy
+			BRA.S	@1
+
+;_______________________________________________________________________
+;
+; Routine:		FileDelete
+;
+; (c) 1983 Apple Computer, Inc.
+;
+; Arguments:	  A0.L (input)	-- pointer to I/O parameter block; uses:
+;							   IOFileName,IOFileType
+;				  D0.W (output) -- error code
+;				  This call may be executed asynchronously.
+; Calls:		FSQueue,DtrmVol,CVFlgs,FndFilName,CkFileBusy,DAlBlks,RemovEntry,
+;				  CmdDone
+; Function: 	Delete a file.	The file is removed from
+;				the directory and its blocks are freed up (both resource and
+;				normal fork blocks are deallocated). The entry is zeroed and
+;				any following entries are moved down.  All blocks associated
+;				with the file are marked free in the block map and the VCB
+;				info is marked dirty.
+;
+;  Modification History:
+;  09 Dec 82  LAK  Redid for new file data structures.
+;  10 Dec 82  LAK  Broke out routine to search FCBs by filenum (share it
+;					with GetFileInfo).
+;  14 Dec 82  LAK  Removed undelete scheme.
+;  16 Jan 83  LAK  Modified RemovEntry for new directory format (no entry
+;					length); updated documentation.
+;  04 Jun 83  LAK  No longer calls DtrmVol (this is done by FndFilName) since
+;					case of write-protected diskette is a low-percentage hit.
+;					Uses CkFilMod subroutine to save code.
+;	9 May 85  PWD  CkFlMod no longer checks for file entry, so directories can
+;				   be deleted at last.	Directories with files still in them
+;				   cause a FBsyErr.
+;	9-Aug-85  PWD  Changed to leave VCB file/directory count up to CMDeleteCN
+;	<28Aug85> LAK  Don't delete a directory if there's a WDCB open for it.
+;	<14Jan87> BB   Fixed FileDelete to return "paramErr" error rather than the file
+;					system internal error "FSDSIntErr" if attempting to delete
+;					the root directory.  NOTE: this is not patched for the  Mac+
+;					or MAUI.
+;_______________________________________________________________________
+
+FileDelete:
+			BSR 	FSQueue 			; queue it up
+			BSR 	CkFilMod			; find File and check if we can mod vol.
+;
+; If we've made it this far without being derailed into CmdDone, the volume is
+; writable and we know the file exists: now see if file is locked or is busy.
+;
+			BSR 	TFSVCBTst			; Are we dealing with a TFS volume? 	<01Oct85>
+			BNE 	MFSDelete			; If not, leave it to the MFS code.
+
+			MOVEQ	#FLckdErr,D0		; assume locked
+			BTST	#FilWrtFlag,FilFlags(A5) ; well, is it?
+			BNE.S	FDelExit			; br if so
+
+			BCLR	#DirCN,HFSFlags 	; Assume it's not a directory
+			CMP.B	#CMDirCN,cdrType(A5); Is the CNode a directory?
+			BNE.S	@1					; Nope.
+			BSET	#DirCN,HFSFlags 	; Otherwise, set a flag for future reference
+			BSR.S	CkDirBusy			; Is the directory busy?
+			BRA.S	@2					; br to check
+
+@1			CMP.B	#cdrFilRec,cdrType(A5) ; Is this a file?
+			BNE.S	DeleteIt			; If not, it won't be open
+			MOVE.L	D2,-(A6)			; Save D2 across CkFileBusy call
+			BSR.S	CkFileBusy			; Check if the file is busy?
+			MOVE.L	(A6)+,D2			; restore D2
+			TST.W	D0					; busy?
+
+@2			BNE.S	FDelExit			; exit if busy . . .
+
+; Free up the space previously occupied by the file's contents:
+
+DeleteIt	BSR 	PushCName			; Create a copy of the string on the stack:
+			MOVE.L	D2,-(A6)			; Save D2 for use as 'scratch'
+			MOVE.L	D7,D2				; Catalog hint
+			CMP.B	#CMFilCN,cdrType(A5); Is this a file?
+			BNE.S	@0					; If not, it doesn't occupy any real space
+
+			MOVE.L	FilFLNum(A5),D0 	; Get file number from TFS cat. entry		<20Sep85>
+			JSR 	TrashFBlocks		; Trash all file blocks (pass A2,D0)		<20Sep85>
+
+			MOVE.L	D6,D0				; DirID from FindFilName					<21Sep85>
+			JSR 	DeallocFile 		; Free disk space occupied by file
+			BNE.S	FDelExit			; Punt on errors
+
+; Restore parent ID and remove the file from the catalog:
+
+@0			MOVE.L	D6,D0				; Parent directory ID
+			JSR 	CMDeleteCN			; Delete the catalog node
+			MOVE.L	(A6)+,D2			; Restore rounded string length again
+			BSR 	PopCName			; Remove CName from A6 stack again
+
+			CMP.W	#CMNotEmpty,D0		; Was the directory non-empty?
+			BNE.S	@1					; No - something else went wrong		<14Jan87>
+			MOVEQ	#FBsyErr,D0 		; Recycle a nice error code
+			BRA.S	FDelExit			; exit FileDelete						<14Jan87>
+@1			CMP.W	#CMRootCN,D0		; attempt to delete the root directory?	<14Jan87>
+			BNE.S	FDelExit			; no, exit FileDelete					<14Jan87>
+			MOVEQ	#paramErr,D0 		; yes, return illegal param error code	<14Jan87>
+			
+FDelExit	BRA 	CmdDone
+
+;_______________________________________________________________________
+;
+; Routine:		ReName
+; Arguments:	  A0 (input)  -- pointer to parameter block:
+;				  D0 (output) -- error code
+; Calls:		FSQueue,DtrmVol,FndFilName,CVFlgs,RemovEntry,FndFilSpc,
+;				 GtEntryLen,CmdDone
+; Function: 	Rename a file or a volume.	For files, the directory is
+;				first searched for the target name (to make sure we don't
+;				get two files with the same name).	If not found, the directory
+;				is then searched for the real file (using the source name);
+;				the entry is copied onto the stack and removed from the directory
+;				block.	FndFilSpc is used to find space for the changed entry.
+;
+;
+; Modification History:
+; 09 Dec 82  LAK  Changed to use a new rename algorithm; updated for new
+;				   file system data structures.
+; 16 Jan 83  LAK  Updated for final data structures.
+; 05 Jun 83  LAK  Added change to allow rename of a file to itself (for case
+;				   changes).
+; 29 Aug 83  LAK  Fixed bug: rename now updates FCBs for the renamed file (opened
+;				   files may be renamed) to point to correct directory block.
+; 19 Jun 85  PWD  Added quick fix for renaming files with same name on TFS
+;					volumes: changed to NOP instead of calling CMRenameCN
+;  9-Aug-85  PWD  Reverted to calling CMRenameCN for case changes.
+;
+; Test: no more room in directory case	. . .
+;		renaming a volume
+;		renaming both file and volume with 0-length name.
+;_______________________________________________________________________
+
+ReNameTrap:
+			BSR 	FSQueue 			; what a queue command!
+
+			MOVE.L	IONewName(A0),D2	; check out the new name
+			BSR 	DtrmV2				; find what volume the new name is on
+			BNE 	RNmVol				; br if error (may want to rename vol)
+			TST.W	D2					; check name length
+			BEQ 	RNmVol1 			; if zero, may be volume-conflict rename
+
+			MOVE.L	A2,A1				; save volume for the destination name
+			MOVE.W	D3,D7				; save vol specified indication
+			MOVEM.L D2/A4,FSTemp8		; save dest name ptr and length
+
+			BSR 	DtrmV3				; det vol source name is on
+			BNE.S	RNmExit 			; exit if we can't determine volume
+
+			CMPA.L	A1,A2				; are the names on the same volume?
+			BEQ.S	NmOK				; if so, life may be beautiful
+			TST.W	D7					; otherwise, if dest didn't specify volume,
+			BEQ.S	NmOK				; it's ok (just use source's volume)
+
+BadNewNam	MOVEQ	#BdNamErr,D0		; names are on different vols
+RNmExit 	CMP.W	#BTExists,D0		; B*-Tree error?
+			BNE.S	@5					;
+			MOVEQ	#dupFNErr,D0		; If entry exists, give better error code
+@5			BRA 	CmdDone 			; that's all folks.
+
+NmOK		BSR 	CVFlgs				; is the volume locked/write protected?
+			BNE.S	RNmExit 			; exit if so
+
+			BSR 	TFSVCBTst			; Are we dealing with a TFS volume?	<01Oct85>
+			BNE 	MFSRename			; If not, different rules apply
+
+			BSR 	FndFilName			; search directory for the source file
+			BNE.S	RNmExit 			; if not around, bummers
+
+			MOVEQ	#FLckdErr,D0		; assume locked 					<05Sep85>
+			BTST	#FilWrtFlag,FilFlags(A5) ; well, is it? 				<05Sep85>
+			BNE.S	RNmExit 			; br if so							<05Sep85>
+
+			MOVE.L	D6,D4				; Save source DirID
+			MOVE.L	D7,D5				; and corresponding catalog hint
+			MOVEM.L D2/D4-D5/A4,-(A6)	; Save source file name and length
+			MOVE.L	IOFileName(A0),-(A6); Save source file spec.
+			MOVE.L	IONewName(A0),D2	; Get full new name
+			MOVE.L	D2,IOFileName(A0)	; Try it out for a name
+			BSR 	FndFilName			; Look for the new file
+			MOVEM.L D2/A4,FSTemp8		; save dest name ptr and length
+			MOVE.L	(A6)+,IOFileName(A0); Restore original file name
+			MOVEM.L (A6)+,D2/D4-D5/A4	; Restore source name and length
+			TST.W	D0					; Re-check result from FndFilName
+			BNE.S	@10 				; Error is expected
+;
+; The destination exists: before giving up completely, though, check if perhaps
+; the new file name is the same as the old (though perhaps with slighly more
+; pleasing case, for instance):
+;
+			MOVE.L	A0,-(SP)			; preserve parameter block pointer
+			MOVEM.L D2/A4,-(A6) 		;
+			MOVE.W	D2,D0				; source name length
+			MOVE.L	A4,A0				; source name ptr
+			SWAP	D0
+			MOVEM.L FSTemp8,D2/A4		; Retrieve dest. name and length
+			MOVE.W	D2,D0				; new name length
+			MOVE.L	A4,A1				; new name ptr
+			_CmpString					; see if it's a case of the same name
+			MOVEM.L (A6)+,D2/A4 		; Recover source name, length
+			MOVEA.L (SP)+,A0
+			BNE.S	@5					; br if not
+
+			CMP.L	D4,D6				; Source and dest. DirID identical?
+			BEQ.S	@30 				; If they are, this is a duplicate
+;
+; We weren't changing the case of an existing filename:
+;
+@5			MOVEQ	#DupFNErr,D0		; duplicate file name if found
+@10 		CMP.W	#FNFErr,D0			; file should not have been found
+			BNE.S	RNmExit 			; else exit for ext fs, vol offline errs
+;
+; A final check: did the attempt to find the destination file end in the
+; same directory?
+;
+@20 		CMP.L	D4,D6				; Compare source and dest. dirs, resp.
+			BNE 	BadNewNam			; If they differ, we'd be in trouble
+										; (leave data on A6 stack)
+;
+; OK, all seems well so far, rename the CNode as requested:
+;
+@30 		BSR 	PushCName			; Set up source name string on A6 stack
+			MOVE.L	D2,-(SP)			; Save rounded source name length
+			MOVEA.L A0,A1				; Stash it for now
+
+			MOVEM.L FSTemp8,D2/A4		; Retrieve dest. name and length
+			BSR 	PushCName			; set up source name on A6 stack
+			MOVE.L	(SP)+,-(A6) 		; Save rounded source length more permanently
+			MOVE.L	D2,-(A6)			; Save rounded dest. length, too
+
+			EXG 	A0,A1				; Put them in their proper order
+			MOVE.L	D4,D0				; Source DirID
+			MOVE.L	D5,D2				; Source Catalog hint
+										; ( From RenameCheckVolNameLength )				<SM1>
+			CMP.L	#FSRtParID,d0		; Renamed an entry in root's parent [root]?		<SM1>
+			BEQ.S	@checkName 			; If so, go update vol. name					<SM1>
+			CMP.L	#FSRtDirID,d0		; Finally, check for rear entries				<SM1>
+			BNE.S	@noProblem 			; If it's not this, we're all set.				<SM1>
+			MOVE.L	a0, -4(sp)			; test by storing onto live stack				<SM1>
+			BNE.S	@noProblem 			; non-zero entries here are not for us			<SM1>
+										;												<SM1>
+@checkName	CMP.B	#VCBMaxNam,(a1)		; max volume name is 27 characters				<SM1>
+			BLS.S	@noProblem			;												<SM1>
+										;												<SM1>
+@badName	MOVEQ.L	#bdNamErr,d0		; Don't change vol. name if new 				<SM1>
+			Bra.S	@70 				; name is longer than 27 characters				<SM1>
+										;												<SM1>
+@noProblem	JSR 	CMRenameCN			; Update the catalog							<SM1>
+			MOVE.L	D2,D7				; New catalog hint
+			TST.W	D0					; Error on Rename?
+			BNE.S	@70 				; Don't change vol. name on errors
+			CMP.L	#FSRtParID,D4		; Renamed an entry in root's parent [root]?
+			BEQ.S	@50 				; If so, go update vol. name
+			CMP.L	#FSRtDirID,D4		; Finally, check for rear entries
+			BNE.S	@70 				; If it's not this, we're all set.
+			TST.L	4(A6)				; Check rounded source length
+			BGT.S	@70 				; Non-null source name length: no dice.
+
+@50 		BSR 	SetVolName			; Update the volume name
+			MOVEQ	#0,D0				; If we're here, all is well
+			MOVEQ	#FSRtParID,D6		; Make this case easier to spot...
+
+@70 		MOVE.L	(A6)+,D2			; Restore the rounded dest. string length
+			MOVE.L	(A6)+,-(SP) 		; Relocate the rounded source length
+			BSR 	PopCName			; Remove dest. name string
+			MOVE.L	(SP)+,D2			; Recover rounded source length
+			BSR 	PopCName			; Remove source string from A6 stack
+
+			TST.W	D0					; Did an error occur on the rename?
+			BNE 	RNmExit 			; If so, punt.
+			CMPI.L	#FSRtParID,D6		; Working with the root directory?
+			BEQ		RNmExit 			; Yes - we're all set.
+;
+; Finally, update any FCBs for the file if it's currently open:
+;
+			MOVEM.L FSTemp8,D2/A4		; Retrieve dest. name and length
+			BSR 	PushCName			; set up source name on A6 stack
+			MOVE.L	D2,-(A6)			; Save rounded dest. length, too
+			MOVE.L	D6,D0				; Set up DirID
+			MOVE.L	D7,D2				; Recover catalog hint
+			JSR 	CMGetCN 			; Look up the Catalog entry
+			MOVE.L	(A6)+,D2			; Recover rounded string length
+			BSR 	PopCName			; Remove name from A6 stack
+			TST.W	D0					; So how DID the lookup go?
+			BNE 	RNmExit 			; Punt on errors
+			CMPI.B	#cdrDirRec,cdrType(A1)	; Is it a directory?			<SM1>
+			BEQ		RNmExit 			; Hey! we shouldn't even be here...	<SM1>
+			MOVE.B	D2,D3				; Save dest. name length
+			MOVEA.L A1,A5				; Stash the catalog entry pointer
+			MOVEA.L A4,A0				; Point to source CName
+
+			MOVE.L	FilFlNum(A5),D2 	; Pick out the file number
+			BSR 	Gt1stMatch			; Find the first file with a matching FlNum
+			BNE 	RNmExit 			; If there are none, we're all set
+
+@100		MOVE.L	D7,FCBCatPos(A1,D1) ; Set new catalog hint (may have changed)
+			LEA 	FCBCName(A1,D1),A1	; Point to CName to be filled in
+			MOVE.B	D3,(A1)+			; Store CName length
+			MOVEQ	#0,D0				; make sure high word is clear			<29Aug85>
+			MOVE.B	D3,D0				; Set up for block move
+			_BlockMove					; Copy in the name
+			MOVEA.L FCBsPtr,A1			; Restore A1 to its former glory
+			BSR 	GtNxtMatch			; And look for the next FCB
+			BEQ.S	@100				; If found, do it all again
+
+RNmExOK 	MOVEQ	#0,D0				; no errors
+RNmEx1		BRA		RNmExit
+
+; User is trying to rename a volume.  Give it a try . . .
+
+RNmVol		CMP.W	#NSVErr,D0			; make sure it's no-such-vol error
+			BNE.S	RNmEx1
+			TST.W	D2					; name length should be zero
+			BNE		BadNewNam
+
+RNmVol1 	CMP.W	#VCBMaxNam,d3		; is the proposed name too long?			<SM1>
+			BHI.S	BadNewNam			; > 27 is too long (FixVolumeRenames case 1)<SM1>
+
+			TST.W	D3					; volume name should be non-zero
+			BEQ.S	RNmEx1				; br if nil
+
+			BSR 	DtrmV3				; check source volume					<20Sep85>
+			BNE.S	RNmEx1				; exit if no such volume
+			BSR 	CVFlgs				; see if can do.
+			BNE.S	RNmEx1				; br if no modification allowed
+
+;			TST.W	VCBDrvNum(A2)		; make sure it's on-line, too
+;			BEQ.S	RNmEx1				; exit if not . . .
+
+
+            CMPI.W  #$4244,VCBSigWord(A2); HFS volume?						<15APR86> PWD
+            BEQ.S   @50                 ; Yes - make sure it's not ext. FS	<15APR86> PWD
+            TST.W   VCBDrvNum(A2)       ; Volume on-line?					<15APR86> PWD
+            BEQ.S   RNmEx1				; No - just forget it				<15APR86> PWD
+            BRA.S   @70                 ; Yes - go and rename it			<15APR86> PWD
+
+@50         BSR     ExtOffLinCk         ; Our file system, on-line volume?	<15APR86> PWD
+            BNE.S   RNmEx1				; If not, get out now				<15APR86> PWD
+@70										;									<15APR86> PWD
+
+
+
+
+			MOVE.L	IONewName(A0),A1	; get new name pointer
+			BSR 	SetVolName			; Change the volume name (blows D0) 	<13Jan86>
+
+			BSR 	TFSVCBTst			; Are we dealing with a TFS volume? 	<01Oct85>
+			BNE.S 	RNmExOK 			; If not, we're all set (exit D0=0)     <13Jan86>
+;
+; For Turbo volumes, the name of the root is maintained with the volume name:
+;
+			MOVEQ	#0,D2				; No catalog hint for rename
+			MOVEQ	#FSRtDirID,D0		; Root directory
+			MOVEA.L D2,A0				; Nil CName pointer
+			LEA 	VCBVN(A2),A1		; Point at new name
+			JSR 	CMRenameCN			; Rename the catalog root directory
+			BRA 	RNmExit 			; we're done (and hopefully OK)
+
+;_______________________________________________________________________
+;
+; Routine:		TFMove
+; Arguments:	  A0 (input)  -- pointer to parameter block:
+;				  D0 (output) -- error code
+; Calls:		FSQueue,DtrmVol,FndFilName,CVFlgs,RemovEntry,FndFilSpc,
+;				 GtEntryLen,CmdDone
+; Function: 	Move a Cnode into a different directory
+;
+; Modification History:
+
+;	13 Mar 85  PWD	New today
+;	 6-Aug-85  PWD	Fixed to call external file system for ext. fs volumes.
+;	 7-Aug-85  PWD	Fixed to handle CMExists errors (generate DupFNErr)
+;	 9-Aug-85  PWD	Changed to let CMMoveCN take care of updating VCB
+;					file/directory count fields.
+;	22-Aug-85  PWD	Fixed bug in dest. vol. determination by saving old FileName Ptr
+;_______________________________________________________________________
+
+TFMove:
+			BSR 	FSQueue 			; Wait our turn
+			MOVE.L	ioFileName(A0),-(A6); Save filename pointer 			<22Aug85>
+			MOVE.L	IONewName(A0),ioFileName(A0) ; Use new file name		<22Aug85>
+			BSR 	DtrmV3				; To check dest. volume
+			MOVE.L	(A6)+,ioFileName(A0); Restore original file name		<22Aug85>
+			MOVE.L	A2,A1				; Save destination volume
+			MOVE.W	D3,D7				; Save volume spec'd indication
+			BSR 	DtrmV3				; det vol source name is on
+			BNE.S	MvExit				; exit if we can't determine volume
+			CMP.L	A1,A2				; are the names on the same volume?
+			BEQ.S	MvNmOK				; if so, things are still OK
+			TST.W	D7					; otherwise, if dest didn't specify a volume,
+			BEQ.S	MvNmOK				; it's ok: use source vol. as real default
+
+BadMvName	MOVEQ	#BdNamErr,D0		; Return bad name error
+MvExit		BRA 	CmdDone 			; And terminate this I/O operation.
+
+MvNmOK		BSR 	CVFlgs				; is the volume locked/write protected?
+			BNE.S	MvExit				; exit if so
+			BSR 	ExtOffLinCk 		; Check if vol is on-line, and ours
+			BNE.S	MvExit				; Punt if it's not
+
+			MOVEQ	#ParamErr,D0		; Assume all won't be well
+			BSR 	TFSVCBTst			; Are we dealing with a TFS volume? 	<01Oct85>
+			BNE.S 	MvExit				; If not, none of this makes sense
+
+			BSR 	FndFilName			; search directory for the source CNode
+			BNE.S	MvExit				; if not around, bummers
+
+			MOVEQ	#0,D3				; Assume it's not a file for now
+			CMP.B	#CDRFilRec,CDRType(A5) ; Is CNode a file?
+			BNE.S	@0					; If not, there's no file number to use later
+			MOVE.L	filFlNum(A5),D3 	; Save file number
+
+@0			MOVE.L	D6,D4				; Save source DirID
+			MOVE.L	D7,D5				; and corresponding catalog hint
+			MOVEM.L D2/A4,FSTemp8		  ; Save source file name and length
+			MOVE.L	IOFileName(A0),-(A6); Save source file spec.
+			MOVE.L	IODirID(A0),-(A6)	; Save source DirID
+			MOVE.L	IONewName(A0),IOFileName(A0) ; Get full new name
+			MOVE.L	IONewDirID(A0),IODirID(A0) ; And new DirID spec
+			MOVEM.L D3-D5,-(A6) 		; Save shelter registers across FndFilName
+			BSR 	FndFilName			; Look for the new file
+			MOVEM.L (A6)+,D3-D5 		; Restore copies of source DirID and hint
+			MOVE.L	(A6)+,IODirID(A0)	; Restore original DirID
+			MOVE.L	(A6)+,IOFileName(A0); Restore original file name
+			TST.W	D0					; Re-check result from FndFilName
+			BEQ.S	@1					; No error: check if CNode = directory
+;
+; There is one error expected from FndFilName: BdNamErr, which is returned for
+; zero-length file names.  Normally, this is uncool, but here we may be able
+; to make do with just the DirID:
+;
+			CMP.W	#BdNamErr,D0		; Was error as expected?
+			BNE.S 	MvExit				; Nope - pass it unchanged
+			TST.W	D2					; Check name length
+			BNE.S 	BadMvName			; If non-zero, it really IS bad news
+			BRA.S	@2
+
+@1			CMP.B	#CDRDirRec,CDRType(A5) ; Was CNode found a directory?
+			BNE.S 	BadMvName			; If not, that's trouble
+			MOVE.L	DIRDirID(A5),D6 	; Get this directory's ID
+			MOVEQ	#0,D7				; Hint is lost in the shuffle
+
+@2			MOVEM.L FSTemp8,D2/A4		; Retrieve source name and length
+			CMP.L	D4,D6				; Source and dest. DirID identical?
+			BEQ.S	MvExOK				; If so, we're all set now
+
+; OK, all seems well so far, move the CNode as requested:
+
+			BSR 	PushCName			; Set up dest. name string on A6 stack
+			MOVE.L	D2,-(A6)			; Push rounded D2
+			MOVE.L	D3,-(A6)			; Save file number
+			MOVE.L	D4,D0				; Source DirID
+			MOVE.L	D5,D2				; Source Catalog hint
+			MOVE.L	D6,D1				; Destination DirID
+			MOVE.L	D7,D3				; Destination catalog hint
+			SUBA.L	A1,A1				; Dest. is fully specified by dirID
+			JSR 	CMMoveCN			; Update the catalog
+			MOVE.L	D2,D7				; Stash the new catalog hint
+
+			MOVE.L	(A6)+,D3			; Restore file number
+			MOVE.L	(A6)+,D2			; Restore the rounded dest. string length
+			BSR 	PopCName			; Remove source name string
+			TST.W	D0					; So how DID the move go?
+			BEQ.S	@10 				; If EQ, fine.
+			CMP.W	#CMExists,D0		; Just a duplication of effort here?
+			BNE.S	@3					; If not, that's REAL BAD news.
+			MOVEQ	#DupFNErr,D0		; Say it in words intelligble to the user
+@3			BRA 	MvExit				; And PUNT.
+
+; Finally, update any FCBs for the file if it's currently open:
+
+@10 		MOVE.L	D3,D2				; Set the file number to search for
+			BEQ.S	MvExOK				; If it wasn't a file, don't bother looking
+			BSR 	Gt1stMatch			; Find the first file with a matching FlNum
+			BNE.S 	MvExOK				; If there are none, we're all set
+
+@20 		MOVE.L	D7,FCBCatPos(A1,D1) ; Update catalog hint
+			MOVE.L	D6,FCBDirID(A1,D1)	; Set up the new DirID
+			BSR 	GtNxtMatch			; And look for the next FCB
+			BEQ.S	@20
+
+MvExOK		MOVEQ	#0,D0				; no errors
+MvEx1		BRA		MvExit
+

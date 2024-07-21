@@ -1,0 +1,754 @@
+;
+;	File:		InternalMacros.a
+;
+;	Contains:	generally useful macros
+;
+;	Written by:	Darin Adler
+;
+;	Copyright:	© 1989-1990, 1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <2>	 3/24/92	PN		<kc> Fix bug in endPreviousWith (changed WithModule to
+;									endWithModule).
+;		 <6>	 1/30/91	gbm		sab, #38: Change the ‘already including this file’ variable to
+;									all uppercase (for security reasons)
+;		 <5>	 9/25/90	KIP		(really dba) DT.W now works on lists of items
+;		 <4>	  6/8/90	dba		change so that debug switch defaults to 0
+;		 <2>	 4/17/90	dba		change nil and false and true to defaults
+;	   <1.1>	11/14/89	dba		fixed Symbol and added scott’s cool ideas from Finder to it
+;	   <1.0>	  6/2/89	prp		Initial release. Folder Manager now part of Alias Manager.
+;				  6/2/89	dba		rolled into system; fixed bug in linkFrame macro
+;				  5/6/89	dba		new today
+;
+;	To Do:
+;		optimize for non-68000 assemblies
+;		keep a stack of saved register sets
+;
+
+	IF &TYPE('__INCLUDINGINTERNALMACROS__') = 'UNDEFINED' THEN
+__INCLUDINGINTERNALMACROS__	SET	1
+
+; do an equ if the symbol is not already defined
+
+		macro
+&symbol	default		&value
+
+	if &type(&symbol) = 'UNDEFINED' then
+		&symbol: equ &value
+	endif
+
+		endm
+
+; a few symbols
+
+	nil: default 0
+	false: default 0
+	true: default 1
+	DEBUG: default false
+
+; assert that a condition is true
+
+		macro
+		assert &condition
+
+	if &eval(&condition) = false then
+		aerror 'assert: failed'
+	endif
+
+		endm
+
+; end a record and declare a size field
+
+		macro
+		endrsize
+
+	org
+	size: equ *
+	endr
+
+		endm
+
+; push something onto the stack
+
+		macro
+		push.&size	&operand
+
+	move.&size &operand,-(sp)
+
+		endm
+
+; pop something off of the stack
+
+		macro
+		pop.&size	&operand
+
+	move.&size (sp)+,&operand
+
+		endm
+
+; reserve space on the stack
+
+		macro
+		rsrv.&size	&number
+	lcla &bytes
+	lclc &sizeLetter
+
+	; calculate the default size is 1
+
+	if &number = '' then
+		&bytes: seta 1
+	else
+		&bytes: seta &eval(&number)
+	endif
+
+	; the size letter is required
+
+	&sizeLetter: setc &upCase(&size)
+	if &sizeLetter = 'L' then
+		&bytes: seta 4 * &bytes
+	elseif &sizeLetter = 'W' then
+		&bytes: seta 2 * &bytes
+	elseif &sizeLetter = 'B' then
+		&bytes: seta (&bytes + 1) and (~1)	; round up to a word, since this is the stack
+	else
+		aerror &concat('rsrv: bad size letter: ',&size)
+	endif
+
+	; assembler optimization does the rest
+
+	if &bytes < 0 then
+		aerror &concat('rsrv: negative byte count: ', &bytes)
+	elseif &bytes and 1 then
+		aerror &concat('rsrv: odd byte count: ', &bytes)
+	else
+		sub.l #&bytes,sp
+	endif
+
+		endm
+
+; free space from the stack
+
+		macro
+		free.&size	&number
+	lcla &bytes
+	lclc &sizeLetter
+
+	; calculate the default size is 1
+
+	if &number = '' then
+		&bytes: seta 1
+	else
+		&bytes: seta &eval(&number)
+	endif
+
+	; the size letter is required
+
+	&sizeLetter: setc &upCase(&size)
+	if &sizeLetter = 'L' then
+		&bytes: seta 4 * &bytes
+	elseif &sizeLetter = 'W' then
+		&bytes: seta 2 * &bytes
+	elseif &sizeLetter = 'B' then
+		&bytes: seta (&bytes + 1) and (~1)	; round up to a word, since this is the stack
+	else
+		aerror &concat('free: bad size letter: ',&size)
+	endif
+
+	; assembler optimization does the rest
+
+	if &bytes < 0 then
+		aerror &concat('free: negative byte count: ', &bytes)
+	elseif &bytes and 1 then
+		aerror &concat('free: odd byte count: ', &bytes)
+	else
+		add.l #&bytes,sp
+	endif
+
+		endm
+
+; move condition codes
+
+		macro
+		moveccr		&destination
+
+	move.w sr,&destination
+
+		endm
+
+; save some registers on the stack, possibly changing the condition codes
+
+		macro
+		save		&registers,&preserve==0
+	gblc &savedRegisters
+	gbla &port
+
+	if &savedRegisters <> '' then
+		aerror 'save: two without an intervening restore'
+	endif
+
+	&port: seta false
+	if &registers = '' then
+		&savedRegisters: setc 'none'
+	elseif &upCase(&registers) = 'THEPORT' then
+		&savedRegisters: setc 'none'
+		&port: seta true
+	else
+		if &upCase(&subStr(&registers, &len(&registers) - 7, 8)) = '/THEPORT' then
+			&savedRegisters: setc &subStr(&registers, 1, &len(&registers) - 8)
+			&port: seta 1
+		else
+			&savedRegisters: setc &registers
+		endif
+
+		if &subStr(&type(&savedRegisters), 1, 5) = 'REG A' then
+			move.l &savedRegisters,-(sp)
+		elseif &subStr(&type(&savedRegisters), 1, 4) = 'REG ' then
+			if &preserve then
+				movem.l &savedRegisters,-(sp)
+			else
+				move.l &savedRegisters,-(sp)
+			endif
+		else
+			movem.l &savedRegisters,-(sp)
+		endif
+	endif
+
+	if &port then
+		rsrv.l
+		movem.l d0-d2/a0-a1,-(sp)
+
+		if &preserve then
+			moveccr -(sp)
+			pea 2+5*4(sp)
+		else
+			pea 5*4(sp)
+		endif
+
+		_GetPort
+
+		if &preserve then
+			move.w (sp)+,ccr
+		endif
+
+		movem.l (sp)+,d0-d2/a0-a1
+	endif
+
+	if DEBUG then
+		pea ('save')
+	endif
+
+		endm
+
+; restore some registers saved by a save macro
+
+		macro
+		restore		&preserve==0
+	gblc &savedRegisters
+	gbla &port
+
+	if &savedRegisters = '' then
+		aerror 'restore: without save'
+	else
+		if DEBUG then
+			if &preserve then
+				moveccr -(sp)
+				cmp.l #('save'),2(sp)
+			else
+				cmp.l #('save'),(sp)+
+			endif
+
+			beq.s @goodSave
+			_Debugger
+			@goodSave:
+
+			if &preserve then
+				move.w (sp)+,ccr
+				free.l
+			endif
+		endif
+
+;	*** handle case where register is already saved
+
+		if &port then
+			movem.l d0-d2/a0-a1,-(sp)
+
+			if &preserve then
+				moveccr -(sp)
+				move.l 2+5*4(sp),-(sp)
+			else
+				move.l 5*4(sp),-(sp)
+			endif
+
+			_SetPort
+
+			if &preserve then
+				move.w (sp)+,ccr
+			endif
+
+			movem.l (sp)+,d0-d2/a0-a1
+			free.l
+		endif
+
+		if &savedRegisters <> 'none' then
+			if &subStr(&type(&savedRegisters), 1, 5) = 'REG A' then
+				move.l (sp)+,&savedRegisters
+			elseif &subStr(&type(&savedRegisters), 1, 4) = 'REG ' then
+				if &preserve then
+					movem.l (sp)+,&savedRegisters
+				else
+					move.l (sp)+,&savedRegisters
+				endif
+			else
+				movem.l (sp)+,&savedRegisters
+			endif
+		endif
+		&savedRegisters: setc ''
+	endif
+
+		endm
+
+; pad a piece of memory to blockSize items (item is either bytes, words, or longs)
+
+		macro
+		pad.&size	&blockSize,&startLabel,&itemValue==0
+	lcla &padItems
+	lclc &sizeLetter
+
+	&padItems: seta &eval(&blockSize) - (* - &eval(&startLabel))
+
+	&sizeLetter setc &upCase(&sizeLetter)
+	if &sizeLetter = '' then
+		&sizeLetter: setc 'B'
+	elseif &sizeLetter = 'B' then
+	elseif &sizeLetter = 'W' then
+		&padItems: seta &padItems div 2
+	elseif &sizeLetter = 'L' then
+		&padItems: seta &padItems div 4
+	else
+		aerror &concat('pad: cannot handle unknown item length: ',&size)
+	endif
+
+	if &padItems < 0 then
+		aerror 'pad: cannot pad a block bigger than the block size'
+	elseif &padItems > 0 then
+		dcb.&itemtype &padItems,&itemValue
+	endif
+
+		endm
+
+; create a jump table starting with the label and having a given prefix
+
+		macro
+&name	Table		&prefix,&base
+	lclc &tableName
+	gblc &tablePrefix,&tableBase
+
+	if &name = '' then
+		&tableName: setc '@table'
+	else
+		&tableName: setc &name
+	endif
+
+	&tablePrefix: setc &prefix
+
+	if &base = '' then
+		&tableBase: setc &tableName
+	elseif &upCase(&base) = 'ABSOLUTE' then
+		&tableBase: setc ''
+	else
+		&tableBase: setc &base
+	endif
+
+	&tableName:
+
+		endm
+
+; create a jump table entry
+
+		macro
+		dt.&size
+	gblc &tablePrefix,&tableBase
+	lcla &index
+
+	&index: seta 0
+	while &index < &nbr(&syslist) do
+		&index: seta &index + 1
+		if &tableBase = '' then
+			dc.&size &concat(&tablePrefix, &syslist[&index])
+		else
+			dc.&size &concat(&tablePrefix, &syslist[&index], '-', &tableBase)
+		endif
+	endwhile
+
+		endm
+
+; end the with from a previous stack frame (never called directly)
+
+		macro
+		endPreviousWith
+	gblc &frameState,&endWithModule
+
+		if &sysMod = &endWithModule then
+			endwith
+		endif
+		&frameState: setc ''
+
+		endm
+
+; declare some results in a stack frame
+
+		macro
+		resultsStackFrame	&frame
+	gblc &frameName,&frameState,&endWithModule
+
+	if &frameState = 'needEndWith' then
+		endPreviousWith
+	endif
+
+	if &frameState = '' then
+		if &frame = '' then
+			&frameName: setc 'StackFrame'
+		else
+			&frameName: setc &frame
+		endif
+		&frameName: record {savedA6},decr
+		&frameState: setc 'results'
+	elseif &frameState = 'results'
+		aerror 'resultsStackFrame: two without intervening endStackFrame'
+	else
+		aerror 'resultsStackFrame: must come before parameters and locals'
+	endif
+
+		endm
+
+; declare some parameters in a stack frame
+
+		macro
+		parametersStackFrame	&frame
+	gblc &frameName,&frameState,&endWithModule
+
+	if &frameState = 'needEndWith' then
+		endPreviousWith
+	endif
+
+	if &frameState = '' then
+		resultsStackFrame	&frame
+	endif
+
+	if &frameState = 'results' then
+		belowParameters: equ *
+		&frameState: setc 'parameters'
+	elseif &frameState = 'parameters' then
+		aerror 'parametersStackFrame: two without intervening endStackFrame'
+	else
+		aerror 'parametersStackFrame: must come before locals'
+	endif
+
+		endm
+
+; declare some locals in a stack frame
+
+		macro
+		localsStackFrame	&frame
+	gblc &frameState
+
+	if &frameState = 'needEndWith' then
+		endPreviousWith
+	endif
+
+	if &frameState = '' then
+		resultsStackFrame	&frame
+	endif
+
+	if &frameState = 'results' then
+		parametersStackFrame
+	endif
+
+	if &frameState = 'parameters' then
+		org
+		parametersSize: equ belowParameters - *
+		returnAddress: ds.l 1
+		savedA6: ds.l 1
+		&frameState: setc 'locals'
+	else
+		aerror 'localsStackFrame: two without intervening endStackFrame'
+	endif
+
+		endm
+
+; end a stack frame
+
+		macro
+		endStackFrame
+	gblc &frameName,&frameState
+
+	if &frameState = 'results' then
+		parametersStackFrame
+	endif
+
+	if &frameState = 'parameters' then
+		localsStackFrame
+	endif
+
+	if &frameState = 'locals' then
+		org
+		align
+		localsSize: equ *
+		endr
+		&frameState: setc 'needWith'
+	else
+		aerror 'endStackFrame: without results or parameters or locals'
+	endif
+
+		endm
+
+; use instead of a link or for debugging
+
+		macro
+		linkFrame	&size
+	gblc &linkState,&frameName,&frameState,&endWithModule
+
+	if &linkState = '' then
+		if &frameState = 'needWith' then
+			with &frameName
+			&frameState: setc 'needEndWith'
+			&endWithModule: setc &sysMod
+			link a6,#localsSize
+			if &size ≠ '' then
+				aerror 'linkFrame: specified frame and a specific size'
+			endif
+			&linkState: setc 'needUnlink'
+		elseif &size = '' then
+			if DEBUG then
+				link a6,#0
+				unlk a6
+			endif
+			&linkState: setc 'needFakeUnlink'
+		else
+			link a6,#&size
+			&linkState: setc 'needUnlink'
+		endif
+
+		if DEBUG then
+			pea ('link')
+		endif
+	else
+		aerror 'linkFrame: missing unlinkFrame'
+	endif
+
+		endm
+
+; use for any kind of unlink
+
+		macro
+		unlinkFrame	&preserve==0
+	gblc &linkState
+
+	if DEBUG then
+		if &preserve then
+			moveccr -(sp)
+			cmp.l #('link'),2(sp)
+		else
+			cmp.l #('link'),(sp)+
+		endif
+
+		beq.s @goodUnlink
+		_Debugger
+		@goodUnlink:
+
+		if &preserve then
+			move.w (sp)+,ccr
+			free.l
+		endif
+	endif
+
+	if &linkState = 'needUnlink' then
+		unlk a6
+		&linkState: setc ''
+	elseif &linkState = 'needFakeUnlink' then
+		if DEBUG then
+			bra.s @skipUnlink
+			unlk a6
+			@skipUnlink:
+		endif
+		&linkState: setc ''
+	else
+		aerror 'unlinkFrame: missing linkFrame'
+	endif
+
+		endm
+
+; fake rts for debugging only
+
+		macro
+		noReturn
+	gblc &linkState
+
+	if &linkState ≠ '' then
+		unlinkFrame
+	endif
+
+	if DEBUG then
+		bra.s @skipReturn
+		rts
+		@skipReturn:
+	endif
+
+		endm
+
+; rts
+
+		macro
+		return		&size
+	gblc &linkState,&frameState
+	lcla &bytes
+
+	if &linkState ≠ '' then
+		unlinkFrame
+	endif
+
+	if &size = '' then
+		if &frameState = '' then
+			&bytes: seta 0
+		else
+			&bytes: seta parametersSize
+		endif
+	elseif &subStr(&size, 1, 1) = '#' then
+		&bytes: seta &strToInt(&subStr(&size, 2, &len(&size) - 1))
+	else
+		aerror 'return: bad size'
+	endif
+
+	if &bytes = 0 then
+		rts
+	elseif &bytes = 4 then
+		move.l (sp)+,(sp)
+		rts
+	else
+		move.l (sp)+,a0
+		free.b &bytes
+		jmp (a0)
+	endif
+
+		endm
+
+; debugging symbol
+
+		macro
+		symbol		&routineName=&SysMod,&size=0
+	lclc &name, &oldString
+
+	if DEBUG then
+		if &routineName[1:1] = '''' then
+			&name: setc &eval(&routineName)
+		else
+			&name: setc &routineName
+		endif
+
+		&oldString: setc &setting('string')
+		string asis
+		if &len(&name) < 32 then
+			dc.b &len(&name)+$80,'&name'
+		else
+			dc.b $80,&len(&name),'&name'
+		endif
+		string &oldString
+		align
+		dc.w &size
+	endif
+
+		endm
+
+; composite macros for even shorter use
+
+		macro
+		linkSave	&registers
+
+	linkFrame
+	save &registers
+
+		endm
+
+		macro
+		restoreUnlinkReturn
+
+	restore
+	unlinkFrame
+	return
+	symbol
+
+		endm
+
+	
+		macro
+		getCaseState
+
+	gblc	&savedCaseState
+	&savedCaseState:	SETC	&SETTING('CASE')
+		
+		endm
+		
+		macro
+		restoreCaseState
+		
+	gblc	&savedCaseState
+	CASE	&savedCaseState
+		
+		endm
+
+asmNeedsDSWorkaround	default		true
+
+	if asmNeedsDSWorkaround then
+
+		macro
+&label:	dsWorkaround &recordName
+
+		lclc &savedCaseState
+		lclc &upperCaseLabel
+
+		&savedCaseState: setc &setting('CASE')
+		if &savedCaseState = 'ON' then
+			&label: ds.b &recordName
+		else
+			case on
+			&upperCaseLabel: setc &upcase(&label)
+			&upperCaseLabel: ds.b &recordName
+			case &savedCaseState
+		endif
+
+		endm
+
+		macro
+&label:	equWorkaround &someName
+
+		lclc &savedCaseState
+		lclc &upperCaseLabel
+
+		&savedCaseState: setc &setting('CASE')
+		if &savedCaseState = 'ON' then
+			&label: ds.b &someName
+		else
+			case on
+			&upperCaseLabel: setc &upcase(&label)
+			&upperCaseLabel: ds.b &someName
+			case &savedCaseState
+		endif
+
+		endm
+		
+	else
+
+		macro
+&label:	dsWorkaround &recordName
+		&label: ds.b &recordName
+		endm
+
+		macro
+&label:	equWorkaround &someName
+		&label: ds.b &someName
+		endm
+
+	endif
+
+	ENDIF	; ...already included 

@@ -1,0 +1,1661 @@
+;
+;	File:		ClockPRAMPrimitives.a
+;
+;	Contains:	low-level routines for accessing the realtime clock and parameter RAM
+;
+;	Written by:	Steve Christensen 
+;
+;	Copyright:	й 1991-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;   This file is used in these builds: ROM
+;
+;	Change History (most recent first):
+;
+;	  <SM14>	12/13/93	PN		Roll in KAOs and Horror changes to support Malcom and AJ
+;									machines.
+;	  <SM13>	 6/23/93	RC		Go back to the Ludwig roll-in since PDM reallly needs this code
+;									from Cyclone - stay tuned for further fixes/changes from Kurt
+;	  <SM12>	 6/21/93	kc		Roll out SM10 so that Quadras would wake up with the right time.
+;	  <SM11>	 6/14/93	kc		Roll in Ludwig.
+;	   <LW3>	 1/14/93	GS		(RBM)  Fix the occassional hang at boot.  When outputing from
+;									the VIA to Cuda, the interrupt will occur prior to the rising
+;									edge of CB1.  Delay long enough for the edge to occur before
+;									acknowledging the shift register interrupt.
+;	  <SM10>	 5/20/93	RM		EgretReadTime should not call _EgretDispatch. The lowmem global
+;									'Time' is self correcting for Egret/Caboose/Cuda. The one second
+;									interrupt handler for Egret / Caboose / Cuda maintains the
+;									lowmem global 'Time' in a self correcting manner.  This routine
+;									need only return the lowmem 'Time'.  A call to _EgretDispatch
+;									will cause the AutoPoll timer within Egret / Caboose / Cuda to
+;									reset, resulting in deferring ADB auto polling.  If an
+;									application calls ReadTime in a tight loop, ADB polling could be
+;									deferred indefinitely (making the mouse/keyboard appear to hang
+;									or respond intermittently).  Since 'Time' is self correcting,
+;									the routine just returns 'Time' as the result placed into
+;									'GetParam'.
+;	   <SM9>	12/11/92	fau		Backed out <SM8> cause it broke Cyclone.
+;	   <SM8>	12/10/92	GS		This patch bypasses the physical read of Egret Chip when reading
+;									the time. The time is automatically updated in the background,
+;									therefore the low mem global always reflects the accurate time.
+;									This patch pertains to all Egret Chip based firmware in
+;									Egret8/9, Caboose, and Cuda.
+;	   <SM7>	11/30/92	SWC		Rolled in the rest of the Horror changes, except for HcMac code.
+;									Added the build conditionals back in.
+;		<H6>	  9/3/92	SWC		Fixed a couple of bugs in the RTC-based routines (you mean no
+;									one had any problems until now?). Thanks, Helder.
+;	   <SM6>	10/21/92	fau		Cleaned up a MMCExists that was there from Pandora's timeframe:
+;									comment P5.  Cuda works now, so we don't need to bypass stuff.
+;	   <SM5>	 6/26/92	GS		(RBM)  Rewrite of 'CudaRdXByte' & 'CudaWrXByte' to avoid looking
+;									for collisions. This is possible because a 'SyncAck' cycle
+;									occurs immediately after 'InitVias' and disables all
+;									asynchronous message sources within Cuda. These routines are
+;									being used after the Cuda manager is installed which will cause
+;									a loss of data from Cuda so I also made the routine dispatch to
+;									a trap based function using the Cuda manager once the Cuda
+;									manager is installed. This is not a particularly clean
+;									implementation and needs to be looked at further!!!
+;	   <SM4>	 5/28/92	kc		Add ClkNoMem.
+;	   <SM3>	 5/25/92	RB		Removed a forCyclone conditional. This WAS the last one left. A
+;									check for MMC is used instead to skip over RTCClkNoMem.
+;	   <SM2>	 5/21/92	RB		Making changes for Cyclone. Original comments below: <P6>
+;									2/10/92 GS Changed the PRAM IOPrimitives to use the full word of
+;									a register to set up the address to R/W. <P5> 1/30/92 RMP
+;									Temporarly disabled RTCClock read/write PRAM since Cuda isn't
+;									working (I know it doesn't make sense but it's 2:13 in the
+;									morning). <P4> 1/16/92 GS Updated the PRAMIO routine to use a
+;									full word as the address to Read/Write <P4> 1/16/92 GS Update
+;									VIA control bit var names. <P3> 1/16/92 GS Update to include the
+;									new file CudaMgr Clock and PRAM routines. <P2> 01/14/92 jmp
+;									(SWC,H5) Fixed PMgrWrXByte (registers were getting trashed).
+;		 <1>	 5/17/92	kc		first checked in
+;	   <SM0>	  5/2/92	kc		Roll in Horror. Comments follow:
+;		<H5>	 1/13/92	SWC		Fixed PMgrWrXByte (registers were getting trashed).
+;		<H4>	11/25/91	CCH		Used standardized equates for VIA pins.
+;		<H3>	 11/7/91	SWC		Re-wrote the Egret code. It was working on an emulator but
+;									stopped working when the Mac was running stand-alone. Converted
+;									existing implementations to use a "standard" PramIO routine that
+;									calls implementation specific read/write PRAM byte routines so
+;									there's one less routine to write for new PRAM models that can
+;									use it.
+;		<H2>	 11/6/91	SWC		Re-wrote PMGRXPRamIO to fix problems too numerous to mention.
+;		<H1>	10/15/91	SWC		Adding this file into the build.
+
+
+			PRINT	OFF
+			LOAD	'StandardEqu.d'
+			INCLUDE	'HardwarePrivateEqu.a'
+			INCLUDE	'UniversalEqu.a'
+		IF hasPwrControls THEN
+			INCLUDE	'PowerPrivEqu.a'
+		ENDIF
+		IF hasEgret THEN
+			INCLUDE	'EgretEqu.a'
+		ENDIF
+			INCLUDE	'IOPrimitiveEqu.a'
+			PRINT	ON
+			PRINT	NOMDIR
+			MACHINE	MC68020
+
+
+
+ClockPRAMPrimitives	PROC	EXPORT
+
+;╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤
+;
+;	Clock/PRAM primitives vector table
+;
+;	Tables pointed to by the universal ProductInfo record (ClockPRAMPtr) for low-level
+;	clock and PRAM routines dependent on the hardware.  There should be a table for each
+;	supported ProductInfo.  Note that if a machine has a combination of the "standard"
+;	PRAM and clock models, it should have a machine-specific table added below
+
+
+		IF hasVIAClock THEN
+			EXPORT	RTCClockPRAM
+			DC.W	0									; flags
+			DC.W	(RTCTableEnd-RTCClockPRAM)/4		; number of entries
+RTCClockPRAM
+			DC.L	RTCInitHW-RTCClockPRAM				; initialize the hardware (RAM-less)
+			DC.L	RTCWrProtOff-RTCClockPRAM			; write-enable PRAM (RAM-less)
+			DC.L	RTCWrProtOn-RTCClockPRAM			; write-protect PRAM (RAM-less)
+			DC.L	RTCRdXByte-RTCClockPRAM				; read PRAM byte (RAM-less)
+			DC.L	RTCWrXByte-RTCClockPRAM				; write PRAM byte (RAM-less)
+			DC.L	StandardXPramIO-RTCClockPRAM		; read/write PRAM byte[s] (no traps)		<H3>
+			DC.L	RTCXParam-RTCClockPRAM				; read/write PRAM byte[s] (trap-based)
+			DC.L	RTCReadTime-RTCClockPRAM			; read the clock (uses RAM)
+			DC.L	RTCWriteTime-RTCClockPRAM			; write to the clock (uses RAM)
+RTCTableEnd
+		ENDIF
+
+
+		IF hasPwrControls THEN
+			EXPORT	PMGRClockPRAM
+			DC.W	0									; flags
+			DC.W	(PMGRTableEnd-PMGRClockPRAM)/4		; number of entries
+PMGRClockPRAM
+			DC.L	0									; not used
+			DC.L	0									; not used
+			DC.L	0									; not used
+			DC.L	PMGRRdXByte-PMGRClockPRAM			; read PRAM byte (RAM-less)
+			DC.L	PMGRWrXByte-PMGRClockPRAM			; write PRAM byte (RAM-less)
+			DC.L	StandardXPramIO-PMGRClockPRAM		; read/write PRAM byte[s] (no traps)		<H3>
+			DC.L	PMGRXParam-PMGRClockPRAM			; read/write PRAM byte[s] (trap-based)
+			DC.L	PMGRReadTime-PMGRClockPRAM			; read the clock (uses RAM)
+			DC.L	PMGRWriteTime-PMGRClockPRAM			; write to the clock (uses RAM)
+PMGRTableEnd
+		ENDIF
+
+
+		IF hasEgret THEN
+			EXPORT	EgretClockPRAM
+			DC.W	0									; flags
+			DC.W	(EgretTableEnd-EgretClockPRAM)/4	; number of entries
+EgretClockPRAM
+			DC.L	0									; not used
+			DC.L	0									; not used
+			DC.L	0									; not used
+			DC.L	EgretRdXByte-EgretClockPRAM			; read PRAM byte (RAM-less)
+			DC.L	EgretWrXByte-EgretClockPRAM			; write PRAM byte (RAM-less)
+			DC.L	StandardXPramIO-EgretClockPRAM		; read/write PRAM byte[s] (no traps)		<H3>
+			DC.L	EgretXParam-EgretClockPRAM			; read/write PRAM byte[s] (trap-based)
+			DC.L	EgretReadTime-EgretClockPRAM		; read the clock (uses RAM)
+			DC.L	EgretWriteTime-EgretClockPRAM		; write to the clock (uses RAM)
+EgretTableEnd
+
+			EXPORT	CudaClockPRAM
+			DC.W	0									; flags
+			DC.W	(CudaTableEnd-CudaClockPRAM)/4		; number of entries
+CudaClockPRAM
+			DC.L	0									; not used
+			DC.L	0									; not used
+			DC.L	0									; not used
+			DC.L	CudaRdXByte-CudaClockPRAM			; read PRAM byte (RAM-less)
+			DC.L	CudaWrXByte-CudaClockPRAM			; write PRAM byte (RAM-less)
+			DC.L	StandardXPramIO-CudaClockPRAM		; read/write PRAM byte[s] (no traps)		<H5>
+			DC.L	EgretXParam-CudaClockPRAM			; read/write PRAM byte[s] (trap-based)
+			DC.L	EgretReadTime-CudaClockPRAM			; read the clock (uses RAM)
+			DC.L	EgretWriteTime-CudaClockPRAM		; write to the clock (uses RAM)
+CudaTableEnd
+		ENDIF
+
+
+		IF hasProtectedPRAM THEN
+			EXPORT	NoPRAMClockPRAM
+			DC.W	0									; flags
+			DC.W	(NoPRAMTableEnd-NoPRAMClockPRAM)/4	; number of entries
+NoPRAMClockPRAM
+			DC.L	0									; not used
+			DC.L	0									; not used
+			DC.L	0									; not used
+			DC.L	NoPRAMRdXByte-NoPRAMClockPRAM		; read PRAM byte (RAM-less)
+			DC.L	NoPRAMWrXByte-NoPRAMClockPRAM		; write PRAM byte (RAM-less)
+			DC.L	NoPRAMXPramIO-NoPRAMClockPRAM		; read/write PRAM byte[s] (no traps)
+			DC.L	NoPRAMXParam-NoPRAMClockPRAM		; read/write PRAM byte[s] (trap-based)
+			DC.L	NoPRAMReadTime-NoPRAMClockPRAM		; read the clock (uses RAM)
+			DC.L	NoPRAMWriteTime-NoPRAMClockPRAM		; write to the clock (uses RAM)
+NoPRAMTableEnd
+		ENDIF
+
+
+
+		IF hasVIAClock | hasPwrControls | hasEgret | hasPowerMgr THEN	;							<H3>
+;________________________________________________________________________________________
+;
+; Routine:	StandardXPramIO
+;
+; Inputs:	A0	-	pointer to table of base addresses
+;			A1	-	pointer to ProductInfo record for this machine
+;			A3	-	pointer to PRAM I/O buffer
+;			D1	-	flags indicating which external features are valid
+;			D3	-	[r/w (bit 31)][number of PRAM bytes to read/write][starting PRAM address]
+;
+; Outputs:	none
+;
+; Trashes:	A0,A1,A2,A3,D0,D1,D2,D3
+;
+; Function:	Reads/writes byte[s] from paramter RAM before traps are set up.  This calls
+;			the implementation-specific RdXByte and WrXByte routines to read or write
+;			each PRAM byte.
+;________________________________________________________________________________________
+
+			IMPORT	ClkWPOff,RdXByte,WrXByte
+
+StandardXPramIO
+			MOVEM.L	D7/A4-A6,-(SP)
+
+			MOVEA.L	DecoderInfo.VIA1Addr(A0),A2	; get VIA 1's base address
+
+			BCLR	#31,D3					; read or write?
+			BEQ.S	@StartRead				; -> read
+
+			;BigBSR6	ClkWPOff,A5				; write-enable PRAM
+			BRA.S	@StartWrite
+
+@WriteLoop	
+			MOVE	SR,-(SP)				; save the status register
+			ORI		#$0700,SR				; and disable all interrupts
+			BigBSR6	ClkWPOff,A5				; write-enable PRAM
+			SWAP	D3						; get the PRAM address
+			MOVE.W	D3,D1					; move entire address into D1
+			MOVE.B	(A3)+,D2				;  and a data byte from the caller's buffer
+			MOVE.L	A3,D7					; (save the buffer pointer)
+			BigBSR6	WrXByte,A5				; write a byte to PRAM
+			MOVEA.L	D7,A3					; (restore the buffer pointer)
+			ADDQ.W	#1,D3					; next byte
+			MOVE	(SP)+,SR				; restore the status register
+			bsr.l	StdXPRAM2Patch			; call the patch
+@StartWrite	
+			SWAP	D3						; get the count
+			DBRA	D3,@WriteLoop			; -> keep looping until done
+			MOVEA.L	A1,A6					; point to this machine's product info
+			ADDA.L	ProductInfo.ClockPRAMPtr(A6),A6	;  and get the address of its clock/PRAM table
+			MOVE.L	4*cpWrProtOn(A6),D0		; get the offset to the write-protect routine
+			BEQ.S	@Done					; -> it's not supported for this implementation
+			;ADDA.L	D0,A6					; calculate the routine's address
+			;LEA		@Done,A5				; (simulate a BSR5)
+			;JMP		(A6)					;  and call it to turn on PRAM write-protect
+			bra.s	@Done					; we're done
+
+@ReadLoop	SWAP	D3						; get the PRAM address
+			MOVE.W	D3,D1					; move entire address into D1
+			MOVE.L	A3,D7					; (save the buffer pointer)
+			BigBSR6	RdXByte,A5				; read a byte from PRAM
+			MOVEA.L	D7,A3					; (restore the buffer pointer)
+			MOVE.B	D1,(A3)+				;  and save it in the caller's buffer
+			ADDQ.W	#1,D3					; next byte
+@StartRead	SWAP	D3						; get the count
+			DBRA	D3,@ReadLoop			; -> keep looping until done
+
+@Done		MOVEM.L	(SP)+,D7/A4-A6
+			RTS
+		ENDIF
+
+
+
+		IF hasVIAClock THEN
+;еееееееееееееееееееееееееееееееееееееееее RTC ееееееееееееееееееееееееееееееееееееееееее
+
+			IMPORT	ReadTime
+
+;________________________________________________________________________________________
+;
+; Routine:	RTCReadTime
+;
+; Inputs:	none
+;
+; Outputs:	D0	-	result code
+;			"GetParam" contains the 32-bit time value read from the clock
+;
+; Trashes:	A0,A2,A3,D1,D2,D4,D5, 8 bytes at "GetParam"
+;
+; Function:	reads the time from the realtime clock
+;________________________________________________________________________________________
+
+RTCReadTime	MOVEM.L	A5/A6,-(SP)
+			MOVEA.L	VIA,A2					; get the VIA 1 base address for RTCClkNoMem
+
+			MOVEQ	#2-1,D4					; try reading twice in case the time rolls over
+@RetryLoop	MOVEQ	#$9D-256,D5				; command to read the high byte of the time
+			LEA		GetParam,A0				; use clock utility storage
+			MOVEA.L	A0,A3					;  and save a copy for later
+
+@ReadLoop	MOVE.B	D5,D1					; get the command into D1
+			BSR5	RTCClkNoMem				; read a byte of the time
+			MOVE.B	D1,(A0)+				;  and save it
+			SUBQ.B	#4,D5					; next byte
+			BMI.S	@ReadLoop				; -> keep looping until all 8 bytes are read
+
+			MOVE.L	(A3)+,D0				; do the two reads of the time match?
+			SUB.L	(A3)+,D0
+			DBEQ	D4,@RetryLoop			; -> keep looping if not, or for two tries
+			BEQ.S	@Done					; -> no error
+
+			MOVEQ	#ClkRdErr,D0			; note the problem
+@Done		MOVEM.L	(SP)+,A5/A6
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	RTCWriteTime
+;
+; Inputs:	"Time" contains the 32-bit value to write to the clock
+;
+; Outputs:	D0	-	result code
+;
+; Trashes:	A0,D1,D2,D3,D4,D5
+;
+; Function:	writes a new time value to the realtime clock
+;________________________________________________________________________________________
+
+RTCWriteTime
+			MOVEM.L	D6/A2/A5/A6,-(SP)
+			MOVEA.L	VIA,A2					; get the VIA 1 base address for RTCClkNoMem
+
+			BSR5	RTCWrProtOff			; write-enable the clock chip
+
+			MOVEQ	#2-1,D5					; give it two tries
+			MOVE.L	Time,D3					; get the time to write
+
+@RetryLoop	MOVEQ	#$01,D6					; command to write the low byte of the time
+			MOVEQ	#4-1,D4
+@WriteLoop	MOVE.L	D3,D1					; put the byte to write into the upper word
+			SWAP	D1
+			MOVE.B	D6,D1					;  and the command in the lower word
+			BSR5	RTCClkNoMem				; write a byte of the time
+			ADDQ.B	#4,D6					; address the next register
+			ROR.L	#8,D3					; get the next byte
+			DBRA	D4,@WriteLoop
+
+			BIGJSR	ReadTime,A0				; read the time to verify it was written correctly
+			BNE.S	@Done
+			CMP.L	Time,D3 				; do they match?
+			DBEQ	D5,@RetryLoop			; -> keep looping if not, or for two tries
+			BEQ.S	@Done					; -> they match so we're done
+			MOVEQ	#ClkWrErr,D0			; note the error
+
+@Done		MOVE.L	D0,D3					; save the result code
+			BSR5	RTCWrProtOn				; turn write-protect back on							<H6>
+			MOVE.L	D3,D0					; restore the result code
+			MOVEM.L	(SP)+,D6/A2/A5/A6
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	RTCXParam
+;
+; Inputs:	A0	-	pointer to user's buffer
+;			D0	-	[number of bytes to transfer][starting PRAM address]
+;			D1	-	bit 12: 1=read, 0=write
+;
+; Outputs:	D0	-	result code
+;
+; Trashes:	A0,A1,A2,A3,D1,D2,D3
+;
+; Function:	reads/writes byte[s] from RTC-based paramter RAM
+;________________________________________________________________________________________
+
+RTCXParam	MOVEA.L	A0,A3					; get the pointer to the caller's buffer
+			MOVEA.L	UnivInfoPtr,A1			; point to the ProductInfo table						<H3>
+			MOVEA.L	A1,A0					;  and to the decoder table								<H3>
+			ADDA.L	ProductInfo.DecoderInfoPtr(A0),A0
+			MOVE.L	D0,D3					; get the starting PRAM address and count
+			BTST	#12,D1					; is it a read or write?
+			BNE.S	@ItsRead
+			BSET	#31,D3					; mark it as a write
+
+@ItsRead	BSR.S	StandardXPramIO			; go transfer the PRAM bytes							<H3>
+
+			MOVEQ	#0,D0					; always return "no error"
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	RTCRdXByte
+;
+; Inputs:	D1	-	address of PRAM byte to read
+;			A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A3	-	return address
+;
+; Outputs:	D1	-	byte read from PRAM
+;
+; Trashes:	D0,D2,A5,A6
+;
+; Function:	reads a byte from RTC-based PRAM without using RAM
+;________________________________________________________________________________________
+
+RTCRdXByte	ANDI.W	#$00FF,D1				;  [oooo oooo 7654 3210]
+			ASL.W	#3,D1					;  [oooo o765 4321 0ooo]
+			ROR.B	#1,D1					;  [oooo o765 o432 10oo]
+			ROR.W	#8,D1					;  [o432 10oo oooo o765]
+			ORI.B	#$B8,D1					;  [o432 10oo ioii i765]
+
+			BSR5	RTCClkNoMem				; read the PRAM byte
+
+			ANDI.W	#$00FF,D1				; zero-extend the byte
+			JMP		(A3)
+
+
+;________________________________________________________________________________________
+;
+; Routine:	RTCWrXByte
+;
+; Inputs:	D1	-	address of PRAM byte to write
+;			D2	-	byte to write to PRAM
+;			A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A3	-	return address
+;
+; Outputs:	none
+;
+; Trashes:	D0,D1,D2,A5,A6
+;
+; Function:	writes a byte to RTC-based PRAM without using RAM
+;________________________________________________________________________________________
+
+RTCWrXByte	SWAP	D1						; copy the byte to write
+			MOVE.B	D2,D1					;  to the upper word of D1
+			SWAP	D1
+
+			ANDI.W	#$00FF,D1				;  [oooo oooo 7654 3210]
+			ASL.W	#3,D1					;  [oooo o765 4321 0ooo]
+			ROR.B	#1,D1					;  [oooo o765 o432 10oo]
+			ROR.W	#8,D1					;  [o432 10oo oooo o765]
+			ORI.B	#$38,D1					;  [o432 10oo ooii i765]
+
+			MOVEA.L	A3,A5					; (fake out the return address)
+			BRA.S	RTCClkNoMem				; write the PRAM byte
+
+
+;________________________________________________________________________________________
+;
+; Routine:	RTCInitHW
+;
+; Inputs:	A1	-	pointer to ProductInfo record for this machine
+;			A6	-	return address (BSR6)
+;
+; Outputs:	none
+;
+; Trashes:	D0,D1,D2,A0,A2,A5,A6
+;
+; Function:	initializes the RTC by taking it out of test mode
+;________________________________________________________________________________________
+
+RTCInitHW	MOVEA.L	A6,A0					; save the return address
+			MOVEA.L	A1,A2					; point to the decoder info
+			ADDA.L	ProductInfo.DecoderInfoPtr(A2),A2
+			MOVEA.L	DecoderInfo.VIA1Addr(A2),A2	; get VIA 1's base address							<H6>
+
+			BSR5	RTCWrProtOff			; write-enable the clock chip
+
+			MOVEQ	#(0<<16)+($31<<0),D1 	; write zero to test bit in clock chip
+			BSR5	RTCClkNoMem
+
+			MOVEA.L	A0,A5					; restore the return address
+
+
+;________________________________________________________________________________________
+;
+; Routine:	RTCWrProtOn						[RTC utility routine]
+;
+; Inputs:	A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A5	-	return address (BSR5)
+;
+; Outputs:	none
+;
+; Trashes:	D0,D1,D2,A6
+;
+; Function:	write-protects RTC-based PRAM when we're done modifying it
+;________________________________________________________________________________________
+
+RTCWrProtOn	MOVE.L	#($D5<<16)+($35<<0),D1 	; use 'set write protect' command
+			BRA.S	RTCClkNoMem				; write it to the clock chip
+
+
+;________________________________________________________________________________________
+;
+; Routine:	RTCWrProtOff					[RTC utility routine]
+;
+; Inputs:	A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A5	-	return address (BSR5)
+;
+; Outputs:	none
+;
+; Trashes:	D0,D1,D2,A6
+;
+; Function:	write-enables RTC-based PRAM so we can write bytes to it
+;________________________________________________________________________________________
+
+RTCWrProtOff
+			MOVE.L	#($55<<16)+($35<<0),D1 	; use 'reset write protect' command
+*			BRA.S	RTCClkNoMem				; write it to the clock chip
+
+
+;________________________________________________________________________________________
+;
+; Routine:	RTCClkNoMem						[RTC utility routine]
+;
+; Inputs:	D1	-	[x] [byte to write] [<extended command>] [command (bit 7: 1=read, 0=write)]
+;			A2	-	VIA1 base address
+;			A5	-	return address (BSR5)
+;
+; Outputs:	D1	-	data byte read
+;
+; Trashes:	D0,D1,D2,A6
+;
+; Function:	reads or writes one 8-bit clock register
+;________________________________________________________________________________________
+
+RTCClkNoMem	MOVE	SR,D2					; save the SR
+			ORI		#HiIntMask,SR			;  and disable interrupts
+			SWAP	D2
+
+			MOVE.B	D1,D2					; save a copy of the command
+
+			BCLR	#vRTCEnb,vBufB(A2)		; enable the clock
+
+			MOVEQ	#$78,D0					; mask off the code bits
+			AND.B	D1,D0
+			CMPI.B	#$38,D0					; is this an extended command?
+			BNE.S	@NotExtended			; -> nope
+
+			BSR6	SendToClk				; send the first command byte
+			LSR.W	#8,D1					; move the second command byte into position
+
+@NotExtended
+			TST.B	D2						; is this a read or write command?
+			BMI.S	@ItsRead				; -> read
+
+			BSR6	SendToClk				; send the command byte
+			SWAP	D1						; get the data byte
+			BSR6	SendToClk				;  and send it
+			BRA.S	@Done
+
+@ItsRead	BSR6	SendToClk				; send the command byte
+			BSR6	ReadFrClk				;  and read the data byte
+
+@Done		BSET	#vRTCEnb,vBufB(A2)		; disable the clock
+			SWAP	D2
+			MOVE	D2,SR					; re-enable interrupts
+			RTS5
+
+
+;________________________________________________________________________________________
+;
+; Routine:	SendToClk						[RTC utility routine]
+;
+; Inputs:	D1	-	command/data byte to write to RTC
+;			A2	-	VIA1 base address
+;			A6	-	return address (BSR6)
+;
+; Outputs:	none
+;
+; Trashes:	D0,D1
+;
+; Function:	writes a command or data byte to the RTC (assumes interrupts masked to $2700)
+;________________________________________________________________________________________
+
+SendToClk	MOVEQ	#8-1,D0					; shifting out 8 bits
+	
+@ShiftLoop	SWAP	D0						; save the count
+			MOVE.B	vBufB(A2),D0			; get the VIA register's contents
+			ROR.B	#1,D0					; shift the bits to position the RTC data bit (bit 0)
+			ADDX.B	D1,D1					; shift the next data bit into the extend bit
+			ADDX.B	D0,D0					; shift the data bit from the extend bit to the RTC data bit
+			MOVE.B	D0,VBufB(A2)			; stuff it back into the VIA register
+			BCLR	#vRTCClk,vBufB(A2)		;  and clock the bit out
+			BSET	#vRTCClk,vBufB(A2)
+			SWAP	D0						; get the bit counter back
+			DBRA	D0,@ShiftLoop			; -> keep looping until all bits are shifted out
+			RTS6
+
+
+;________________________________________________________________________________________
+;
+; Routine:	ReadFrClk						[RTC utility routine]
+;
+; Inputs:	A2	-	VIA1 base address
+;			A6	-	return address (BSR6)
+;
+; Outputs:	D1	-	data byte read from RTC
+;
+; Trashes:	D0
+;
+; Function:	reads a data byte from the RTC (assumes interrupts masked to $2700)
+;________________________________________________________________________________________
+
+ReadFrClk	BCLR	#vRTCData,vDirB(A2)   	; set the RTC data bit's direction to input
+			MOVEQ	#1,D1					; initialize the result with a flag bit
+
+@ShiftLoop	BCLR	#vRTCClk,vBufB(A2)		; clock the next bit in
+			BSET	#vRTCClk,vBufB(A2)
+			MOVE.B	vBufB(A2),D0			; read the register
+			LSR.B	#vRTCData+1,D0			; shift the RTC data bit into the carry/X
+			ADDX.B	D1,D1					; shift in the new bit towards the msb
+			BCC.S	@ShiftLoop				; -> keep looping until the flag bit shifts out
+
+			BSET	#vRTCData,vDirB(A2)   	; restore the RTC data bit's direction to output
+			RTS6
+
+
+		ENDIF								; {hasVIAClock}
+
+
+
+		IF hasPwrControls THEN
+;еееееееееееееееееееееееееееееееееееее Power Manager ееееееееееееееееееееееееееееееееееее
+			WITH	PMCommandRec
+
+			IMPORT	USTPmgrSendCommand, USTPMgrSendByte, USTPMGRRecvByte
+
+;________________________________________________________________________________________
+;
+; Routine:	PMGRReadTime
+;
+; Inputs:	none
+;
+; Outputs:	D0	-	result code
+;			"GetParam" contains the 32-bit time value read from the clock
+;
+; Trashes:	A0
+;
+; Function:	reads the time from the realtime clock
+;________________________________________________________________________________________
+
+PMGRReadTime
+			PEA		GetParam				;  pmRBuffer
+			MOVE.L	(SP),-(SP)				;  pmSBuffer (not used)
+			CLR.W	-(SP)					;  pmLength = 0
+			MOVE.W	#TimeRead,-(SP)			;  pmCommand = read time
+			MOVE.L	SP,A0					; point to the parameter block
+			_PmgrOp							; read the time
+			LEA		pmRBuffer+4(SP),SP		; clean up the stack
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	PMGRWriteTime
+;
+; Inputs:	"Time" contains 32-bit quantity to write to clock
+;
+; Outputs:	D0	-	result code
+;
+; Trashes:	A0
+;
+; Function:	writes a new time value to the realtime clock
+;________________________________________________________________________________________
+
+PMGRWriteTime
+			PEA		Time					;  pmRBuffer (not used)
+			MOVE.L	(SP),-(SP)				;  pmSBuffer
+			MOVE.W	#4,-(SP)				;  pmLength = 4 bytes of time
+			MOVE.W	#TimeWrite,-(SP)		;  pmCommand = write time
+			MOVE.L	SP,A0					; point to the parameter block
+			_PmgrOp							; read the time
+			LEA		pmRBuffer+4(SP),SP		; clean up the stack
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	PMGRXParam
+;
+; Inputs:	A0	-	pointer to user's buffer
+;			D0	-	[number of bytes to transfer][starting PRAM address]
+;			D1	-	bit 12: 1=read, 0=write
+;
+; Outputs:	D0	-	result code
+;
+; Trashes:	A0,A1,A2,D1,D2,D3
+;
+; Function:	reads/writes byte[s] from PMGR-based parameter RAM
+;________________________________________________________________________________________
+
+PMGRXParam	MOVEA.L	SP,A2					; point to the current top of stack
+			MOVE.L	D0,D2					; 
+			SWAP	D2						; D2.L=[starting PRAM address][count]
+			ADDQ.W	#2+1,D2					; make space on the stack for a buffer and 2 parameter bytes
+			BCLR	#0,D2					;  and round up to the next word
+			SUBA.W	D2,SP
+			MOVEA.L	SP,A1
+
+			MOVE.L	A0,-(SP)				;  pmRBuffer
+			MOVE.L	A1,-(SP)				;  pmSBuffer
+
+			MOVE.B	D0,(A1)+				; put the PRAM address
+			SWAP	D0
+			MOVE.B	D0,(A1)+				;  and count at the start of the send buffer
+
+			MOVEQ	#xPramRead,D3			; assume it's a read
+			MOVEQ	#2,D2					; 
+			BTST	#12,D1					; is this a write command?
+			BNE.S	@NoWrBuffer				; -> no
+			MOVEQ	#xPramWrite,D3
+			ADD.W	D0,D2					; adjust the count to include the bytes to be written
+			BRA.S	@StartCopy
+@CopyLoop	MOVE.B	(A0)+,(A1)+				; copy the write buffer into the stack buffer
+@StartCopy	DBRA	D0,@CopyLoop
+
+@NoWrBuffer	MOVE.W	D2,-(SP)				;  pmLength
+			MOVE.W	D3,-(SP)				;  pmCommand
+			MOVEA.L	SP,A0
+			_PMgrOp							; have the PMGR read/write PRAM
+
+			MOVEA.L	A2,SP					; restore the stack pointer
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	PMGRWrXByte
+;
+; Inputs:	D1	-	address of PRAM byte to write
+;			D2	-	byte to write to PRAM
+;			A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A3	-	return address
+;
+; Outputs:	none
+;
+; Trashes:	A0,A3,A4,A5,A6,D0,D1,D2
+;
+; Function:	writes a byte to PMGR-based PRAM without using RAM
+;________________________________________________________________________________________
+
+PMGRWrXByte	MOVEA.L	A3,A4					; save the return address
+
+			EXG		D3,D1					; save D3 in D1, put PRAM address in the upper word of D3
+			SWAP	D3
+			EXG		D4,D2					; save D4 in D2, put data byte in the upper word of D4
+			SWAP	D4
+			MOVE.L	D6,D0					; save D6
+
+			MOVE.W	#(xPramWrite<<0)|\		; pmCommand
+					 (-1<<8),D3				; pmLength = -1 (just send command byte)
+
+			MOVEA.L	A1,A0					; point to the decoder table
+			ADDA.L	ProductInfo.DecoderInfoPtr(A0),A0
+			BigBSR6	USTPmgrSendCommand,A5	; send the command to the PMGR
+			BNE.S	@PMgrDone				; -> error
+
+			MOVE.B	#3,D3					; send pmLength = 3 (address, count, data)
+			BigBSR5	USTPMgrSendByte,A6
+			BNE.S	@PMgrDone				; -> error
+
+			SWAP	D3						; send the PRAM address
+			BigBSR5	USTPMgrSendByte,A6
+			BNE.S	@PMgrDone				; -> error
+
+			MOVEQ	#1,D3					; send the PRAM byte count
+			BigBSR5	USTPMgrSendByte,A6
+			BNE.S	@PMgrDone				; -> error
+
+			MOVE.L	D4,D3					; send the PRAM data byte
+			SWAP	D3
+			BigBSR5	USTPMgrSendByte,A6
+
+@PMgrDone	MOVE.L	D1,D3					; restore registers
+			MOVE.L	D2,D4
+			MOVE.L	D0,D6
+			JMP		(A4)
+
+
+;________________________________________________________________________________________
+;
+; Routine:	PMGRRdXByte
+;
+; Inputs:	D1	-	address of PRAM byte to read
+;			A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A3	-	return address
+;
+; Outputs:	D1	-	byte read from PRAM
+;
+; Trashes:	A0,A3,A4,A5,A6,D0,D2
+;
+; Function:	reads a byte from PMGR-based PRAM without using RAM
+;________________________________________________________________________________________
+
+PMGRRdXByte	MOVEA.L	A3,A4					; save the return address
+
+			EXG		D3,D1					; save D3 in D1, put command/data bytes in D3
+			MOVE.L	D4,D0					; save other registers
+			MOVE.L	D6,D2
+
+			ANDI.L	#$000000FF,D3			; mask the PRAM address and build the command:
+			ORI.L	#(xPramRead<<16)|\		;  pmCommand
+					 (2<<24)|\				;  pmLength
+					 (1<<8),D3				;  count = 1 byte
+			SWAP	D3						; D1.L=[count][addr][pmLength][pmCommand]
+
+			MOVEA.L	A1,A0					; point to the decoder table
+			ADDA.L	ProductInfo.DecoderInfoPtr(A0),A0
+			BigBSR6	USTPmgrSendCommand,A5	; send the command to the PMGR
+			BNE.S	@PMgrError				; -> error
+
+			BigBSR5	USTPMGRRecvByte,A6		; read a byte back
+			BNE.S	@PMgrError				; -> error
+			CMPI.B	#xPramRead,D3			; is it the reply byte?
+			BNE.S	@NoReplyByte			; -> no, new protocol
+
+			BigBSR5	USTPMGRRecvByte,A6		; read the count byte
+			BNE.S	@PMgrError				; -> error
+@NoReplyByte
+			BigBSR5	USTPMGRRecvByte,A6		; read the PRAM byte
+			BEQ.S	@PMgrDone				; -> got it
+
+@PMgrError	MOVEQ	#0,D3					; return a zero if an error occurs
+@PMgrDone	EXG		D1,D3					; restore D3, return PRAM byte in D1
+			MOVE.L	D0,D4					; restore other registers
+			MOVE.L	D2,D6
+
+			TST.B	D1						; set up the CCR if anybody cares
+			JMP		(A4)
+
+
+			ENDWITH							; {PMgrRec}
+		ENDIF								; {hasPwrControls}
+
+
+
+		IF hasEgret THEN
+;еееееееееееееееееееееееееееееееееееееееее Egret ееееееееееееееееееееееееееееееееееееееее
+			WITH	EgretPB
+
+;________________________________________________________________________________________
+;
+; Routine:	EgretReadTime
+;
+;	The one second interrupt handler for Egret/Caboose/Cuda maintains the lowmem global		<sm10>
+;	'Time' in a self correcting manner.  This routine need only return the lowmem 'Time'.
+;	A call to _EgretDispatch will cause the AutoPoll timer within Egret/Caboose/Cuda to
+;	reset, resulting in deferring ADB auto polling.  If an application calls ReadTime
+;	in a tight loop, ADB polling could be deferred indefinitely (making the mouse/keyboard
+;	appear to hang or respond intermittently).  Since 'Time' is self correcting, the
+;	routine just returns 'Time' as the result placed into 'GetParam'.
+;
+; Inputs:	none
+;
+; Outputs:	D0	-	result code
+;			"GetParam" contains the 32-bit time value read from the clock
+;
+; Trashes:	A0
+;
+; Function:	reads the time from the realtime clock
+;________________________________________________________________________________________
+
+EgretReadTime
+			clr.l	d0						; result code = noErr					<sm10>
+			move.l	Time,GetParam			; return current time					<sm10>
+;			CLR.L	-(SP)					;  pbCompletion = nil					<sm12>
+;			LEA		pbCmdType-pbCompletion(SP),SP ; 								<sm12>
+;			MOVE.W	#(pseudopkt<<8)+\		;  pbCmdType = pseudo type				<sm12>
+;					 (RdTime<<0),(SP)		;  pbCmd = read time					<sm12>
+;			MOVEA.L	SP,A0					; point to the parameter block			<sm12>
+;			_EgretDispatch					; call Egret to read the time			<sm12>
+;			MOVE.L	pbParam(A0),GetParam	; move the time into a temporary buffer	<sm12>
+;			LEA		EgretPBSize(SP),SP		; clean up the stack					<sm12>
+
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	EgretWriteTime
+;
+; Inputs:	"Time" contains 32-bit quantity to write to clock
+;
+; Outputs:	D0	-	result code
+;
+; Trashes:	A0
+;
+; Function:	writes a new time value to the realtime clock
+;________________________________________________________________________________________
+
+EgretWriteTime
+			CLR.L	-(SP)					;  pbCompletion = nil
+			LEA		pbParam-pbCompletion(SP),SP
+			MOVE.L	Time,(SP)				;  pbParam = current time
+
+			MOVE.W	#(pseudopkt<<8)+\		;  pbCmdType = pseudo type
+					+(WrTime<<0),-(SP)		;  pbCmd = write time
+			MOVEA.L	SP,A0					; point to the parameter block
+			_EgretDispatch					; call Egret to read the time
+			LEA		EgretPBSize(SP),SP		; clean up the stack
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	EgretXParam
+;
+; Inputs:	A0	-	pointer to user's buffer
+;			D0	-	[number of bytes to transfer][starting PRAM address]
+;			D1	-	bit 12: 1=read, 0=write
+;
+; Outputs:	D0	-	result code
+;
+; Trashes:	A0
+;
+; Function:	reads/writes byte[s] from Egret-based parameter RAM
+;________________________________________________________________________________________
+
+EgretXParam	CLR.L	-(SP)					;  pbCompletion = nil
+			SUBQ.W	#pbCompletion-pbBufPtr,SP
+			MOVE.L	A0,(SP)					;  pbBufPtr = pointer to user's buffer
+			SWAP	D0
+			MOVE.W	D0,-(SP)				;  pbByteCnt = number of PRAM bytes to read/write
+			SUBQ.W	#pbByteCnt-pbParam,SP
+			SWAP	D0
+			ADDI.W	#$0100,D0				;е convert PRAM address to 6805 address (temporary?)
+			MOVE.W	D0,(SP)					;  pbParam = starting PRAM address
+			MOVE.W	#(pseudopkt<<8)+\		;  pbCmdType = pseudo type
+					 (Rd6805Addr<<0),-(SP)	;  pbCmd = read PRAM
+			BTST	#12,D1					; is this a write command?
+			BNE.S	@NotWrite				; -> no
+			MOVE.W	#(pseudopkt<<8)+\		;  pbCmdType = pseudo type
+					 (Wr6805Addr<<0),(SP)	;  pbCmd = write PRAM
+@NotWrite	MOVEA.L	SP,A0					; point to the parameter block
+			_EgretDispatch					; call Egret to read/write PRAM
+			LEA		EgretPBSize(SP),SP		; clean up the stack
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	EgretWrXByte
+;
+; Inputs:	D1	-	address of PRAM byte to write
+;			D2	-	byte to write to PRAM
+;			A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A3	-	return address
+;
+; Outputs:	none
+;
+; Trashes:	D0,D1,D2,A5,A6
+;
+; Function:	writes a byte to Egret-based PRAM without using RAM
+;________________________________________________________________________________________
+
+EgretWrXByte
+			SWAP	D1
+			MOVE.B	D2,D1					; save the byte to send
+			SWAP	D1
+			BSET	#15,D1					; mark this as a write
+			;  fall into EgretRdXByte
+
+;________________________________________________________________________________________
+;
+; Routine:	EgretRdXByte
+;
+; Inputs:	D1	-	address of PRAM byte to read
+;			A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A3	-	return address
+;
+; Outputs:	D1	-	byte read from PRAM
+;
+; Trashes:	D0,D2,A5,A6
+;
+; Function:	reads a byte from Egret-based PRAM without using RAM
+;________________________________________________________________________________________
+
+EgretRdXByte
+			BCLR	#vSysSesbit,vBufB(A2)	; pending transaction?
+			BEQ.S	@NotPending				; -> no
+			BSR5	EgretDelay				; wait a bit
+			BCLR	#vViaFullBit,vBufB(A2)	; de-assert VIA full
+			BSR5	EgretDelay				; wait some more
+			BRA.S	@NotPending
+
+@Abort		BSR6	EgretReadByte			; too many bytes being returned so
+			BEQ.S	@Abort					;  keep throwing them out until there are no more,
+			BRA.S	@Reset					; then start over
+
+@DisposePacket
+			BSR5	EgretDelay				; wait for the interrupt to occur
+			TST.B	vSR(A2)					;  then read the ATTN byte to clear the interrupt
+
+@Reset		BCLR	#vSysSesbit,vBufB(A2)	; turn off SYS session
+			BCLR	#vViaFullBit,vBufB(A2)	;  and de-assert VIA full
+			BCLR	#SRdir,vACR(A2)			; define shift direction = FROM Egret
+			BSR5	EgretDelay				; wait
+			BRA.S	@CheckXCVR
+
+@ThrowAway	BSET	#vSysSesbit,vBufB(A2)	; set SYS session
+			BSR6	EgretReadByte			; read a byte to throw away
+@CheckXCVR	BTST	#vXcvrSesBit,vBufB(A2)	; is XCVR session asserted (active low)?
+			BEQ.S	@ThrowAway				; -> yes, throw away the byte
+			BSR5	EgretDelay				; wait
+
+@NotPending	ORI.B	#ACRMode++(1<<SRdir),vACR(A2)	; set VIA shift register to shift out with external clock
+			BTST	#vXcvrSesBit,vBufB(A2)	; is XCVR session asserted (active low)?
+			BEQ.S	@DisposePacket			; -> yes, dispose of the packet
+
+			BSET	#vSysSesbit,vBufB(A2)	; assert sys session signal
+			MOVEQ	#pseudopkt,D0			; packet type
+			BSR6	EgretSendByte
+			BMI.S	@Reset					; -> Egret's hung, so try to reset
+
+			BTST	#vXcvrSesBit,vBufB(A2)	; is XCVR session asserted (active low)?
+			BEQ.S	@Reset					; -> yes, throw out the packet
+
+			MOVEQ	#rdPram,D0				; assume we're doing a read
+			TST.W	D1						; are we?
+			BPL.S	@SendCmd
+			MOVEQ	#wrPram,D0				; no, we're writing
+@SendCmd	BSR6	EgretSendByte			; send the command byte
+			MOVEQ	#0,D0
+			BSR6	EgretSendByte			; send the MSB of the PRAM address
+			MOVE.B	D1,D0
+			BSR6	EgretSendByte			; send the LSB of the PRAM address
+			TST.W	D1						; are we writing?
+			BPL.S	@SendDone
+			MOVE.L	D1,D0					; yes, get the data byte
+			SWAP	D0
+			BSR6	EgretSendByte			;  and send it
+
+@SendDone	BCLR	#SRdir,vACR(A2)			; define shift direction = FROM Egret
+			BCLR	#vSysSesbit,vBufB(A2)	; turn off SYS session
+
+@WaitForIRQ	BTST	#ifSR,vIFR(A2)			; wait for shift to complete
+			BEQ.S	@WaitForIRQ
+			BTST	#vXcvrSesBit,vBufB(A2)	; is XCVR session asserted (active low)?
+			BNE.S	@WaitForIRQ				; -> no, keep polling until it is
+
+			TST.B	vSR(A2)					; read the ATTN byte to clear the interrupt
+			BSR5	EgretDelay				; wait
+			BSET	#vSysSesbit,vBufB(A2)	; assert sys session again
+
+			BSR6	EgretReadByte			; read the response packet type
+			BNE.S	@Reset					; -> XCVR session turned off early, so try again
+
+			BSR6	EgretReadByte			; read the response packet flag
+			BNE.S	@Reset					; -> XCVR session turned off early, so try again
+
+			TST.W	D1						; is this a read or write?
+			BPL.S	@FinishRead				; -> read
+
+			BSR6	EgretReadByte			; read the "command was" byte
+			BEQ.S	@Abort					; -> XCVR session is still on, so try again
+			CMPI.B	#wrPram,D0				; is this the correct packet?
+			BNE.S	@Reset					; -> no, try again
+
+			BCLR	#vSysSesbit,vBufB(A2)	; turn off SYS session
+			BCLR	#vViaFullBit,vBufB(A2)	;  and de-assert VIA full
+			BSR5	EgretDelay				; delay to let Egret see the lines change state
+			JMP		(A3)
+
+
+@FinishRead	BSR6	EgretReadByte			; read the "command was" byte
+			BNE.S	@Reset					; -> XCVR session turned off early, so try again
+			SUBQ.B	#rdPram,D0				; is this the correct packet?
+			BNE.S	@Reset					; -> no, try again
+
+			BSR6	EgretReadByte			; read the PRAM data byte
+			BCLR	#vSysSesbit,vBufB(A2)	; turn off SYS session
+
+@Wait4XCVR	BTST	#vXcvrSesBit,vBufB(A2)	; wait for XCVR session to turn off
+			BEQ.S	@Wait4XCVR
+			BCLR	#vViaFullBit,vBufB(A2)	; de-assert VIA full
+
+			BSR5	EgretDelay				; delay to let Egret see the lines change state
+			MOVE.B	D0,D1					; return the byte in D1
+			JMP		(A3)
+
+
+;________________________________________________________________________________________
+;
+; Routine:	EgretSendByte					[Egret utility routine]
+;
+; Inputs:	D0	-	byte to send to Egret
+;			A2	-	VIA1 base address
+;			A6	-	return address (BSR6)
+;
+; Outputs:	none
+;
+; Trashes:	D2,A5
+;
+; Function:	sends a byte to Egret
+;________________________________________________________________________________________
+
+EgretSendByte
+			MOVEA.L	A6,A5					; save the return address
+			MOVE.B	D0,vSR(A2)				; load byte into shift register
+			BSET	#vViaFullBit,vBufB(A2)	; indicate shift register is full
+			MOVE.W	#32767,D0				; set a 42msec timeout
+@Wait4Shift	BTST	#ifSR,vIFR(A2)			; wait for shift to complete
+			DBNE	D0,@Wait4Shift
+			BEQ.S	EgretSendTO				; -> timed out
+			TST.B	vSR(A2)					; clear the interrupt
+			BCLR	#vViaFullBit,vBufB(A2)	; then negate VIA full bit
+
+;  delay a bit so Egret can keep up...
+
+EgretDelay	MOVEQ	#104,D2					; delay 125╡s minimum (we actually delay 134╡sec)
+@wait		TST.B	(A2)					; sync to VIA clock (about 1.28╡sec/access)
+			DBRA	D2,@wait				; delay at least 100 us (very rough)
+EgretSendTO	TST.W	D0						; set CCR: BMI if send timeout, BPL if OK
+			RTS5
+
+
+;________________________________________________________________________________________
+;
+; Routine:	EgretReadByte					[Egret utility routine]
+;
+; Inputs:	A2	-	VIA1 base address
+;			A6	-	return address (BSR6)
+;
+; Outputs:	D0	-	byte read
+;
+; Trashes:	D2,A5
+;
+; Function:	reads a byte from Egret
+;________________________________________________________________________________________
+
+EgretReadByte
+			BCLR	#vViaFullBit,vBufB(A2)	; de-assert VIA full
+@Wait4Shift	BTST	#ifSR,vIFR(A2)			; wait for shift to complete
+			BEQ.S	@Wait4Shift
+			BSET	#vViaFullBit,vBufB(A2)	; acknowlege byte
+			MOVE.B	vSR(A2),D0				; read the byte
+			BSR5	EgretDelay				; give Egret time to see it
+			BTST	#vXcvrSesBit,vBufB(A2)	; return with the state of XCVR session
+			RTS6
+
+
+;________________________________________________________________________________________
+;
+; Routine:	CudaRdXByte
+;
+; Inputs:	D1	-	address of PRAM byte to read
+;			A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A3	-	return address
+;
+; Outputs:	D1	-	byte read from PRAM
+;
+; Trashes:	D0,D2,A5,A6
+;
+; Function:	reads a byte from Egret-based PRAM without using RAM
+;
+;			This routine can only be executed after a SyncAck cycle.  The SyncAck cycle,
+;			which is executed immediately after InitVia will disable all asynchronous
+;			message sources within Cuda.  This allows the following routine to be written
+;			without regard to detecting collisions between command packets and response
+;			packets.  AT NO TIME SHOULD AN ASYNCHRONOUS MESSAGE SOURCE BE ENABLED PRIOR
+;			TO USE OF THIS ROUTINE.  ASYNCHRONOUS MESSAGE SOURCES SHOULD ONLY BE ENABLED
+;			AFTER THE CUDA MANAGER HAS BEEN INSTALLED.
+;________________________________________________________________________________________
+
+CudaRdXByte	cmp.l	#$8000,sp						; is there any stack yet?
+			ble.s	@5								; no, use register based
+			cmp.w	#0,EgretBase
+			bne.s	@5
+			movec	VBR,d2							; get the contents of VBR
+			tst.l	d2								; check for zero
+			bne.s	@5
+
+;	This code allows the low level routines to be used after the Cuda manager is installed
+;	by constructing a parameter block on the stack and issuing a call to CudaDispatch.  This
+;	is absolutely necessary because the low level routines do not detect collisions which can
+;	occur once the Cuda manager is installed.  Further, it is almost impossible to determine
+;	how to to synchronize Cuda after an asynchronous re-boot has occurred.
+
+			movem.l	a0-a6/d0/d2-d7,-(sp)
+			suba.l	#EgretPBSize,sp					; make room on the stack for Cuda parameter block
+			move.b	#pseudoPkt,pbCmdType(sp)		; set packet type
+			move.b	#RdPram,pbCmd(sp)				; set packet command
+			move.w	d1,pbParam(sp)					; set pram address
+			move.w	#1,pbByteCnt(sp)				; 1 byte to send
+			move.l	sp,pbBufPtr(sp)
+			add.l	#pbParam+2,pbBufPtr(sp)			; point to our data buffer
+			move.b	#0,pbFlags(sp)
+			move.w	#0,pbResult(sp)
+			move.l	#0,pbCompletion(sp)				; execute synchronously
+			move.l	sp,a0							; parameter block in a0
+			_EgretDispatch							; (this is actually the Cuda A-Trap)
+			move.w	pbParam+2(sp),d1				; get pram data
+			adda.l	#EgretPBSize,sp					; remove parameter block from stack
+			movem.l	(sp)+,a0-a6/d0/d2-d7
+			jmp 	(a3)
+
+;
+;	The following code is executed only when the Cuda manager is not installed.
+;	AT NO TIME SHOULD AN ASYNCHRONOUS MESSAGE SOURCE BE ENABLED PRIOR TO USE OF THIS ROUTINE.
+;	ASYNCHRONOUS MESSAGE SOURCES SHOULD ONLY BE ENABLED AFTER THE CUDA MANAGER HAS BEEN INSTALLED.
+;
+@5
+			ori.b	#ACRmode,vacr(a2)				; else initialize via mode
+			bset.b	#SRdir,vACR(a2)					; set output mode
+			move.b	#pseudopkt,vSR(a2)				; send packet type & clear any pending shift irq
+			bclr.b	#TIP,vBufB(a2)					; start the transaction
+@10 			
+			btst.b	#ifSR,vIFR(a2)					; Wait for shift register IRQ to indicate byte was read
+			beq.s	@10
+			
+;________________________________________________________________________________________________
+;	When outputing from the VIA to Cuda, the interrupt will occur prior to the rising edge
+;	of CB1.  Delay long enough for the edge to occur before acknowledging the shift
+;	register interrupt.	(R. Montagne	1/11/93)
+;________________________________________________________________________________________________
+			moveq	#10,d2							; delay for 10╡S min.							<LW3><VIA rbm>
+@m7dly												;												<LW3><VIA rbm>
+			tst.b	vBufB(a1)						; hardware access is 1.2╡S						<LW3><VIA rbm>
+			sub.b	#1,d2							; can only trash low byte						<LW3><VIA rbm>
+			bne.s	@m7dly							; wait long enough for CB1 to rise (10╡S delay)	<LW3><VIA rbm>
+			tst.b	vSR(a2) 						; Clear the shift register IRQ
+
+			moveq	#rdpram,d2						; Send the command byte
+			BSR6	CudaWriteByte
+			move.l	d1,d2
+			lsr.l	#8,d2							; Send PRAM address MSB
+			BSR6	CudaWriteByte
+			move.l	d1,d2							; Send PRAM address LSB
+			BSR6	CudaWriteByte
+
+			bclr.b	#SRdir,vACR(a2)					; Define direction FROM Cuda
+			btst.b	#SRdir,vACR(a2)
+@69up
+			bne.s	@69up
+			
+			ori.b	#((1<<vCudaTIP)|\
+				(1<<vCudaByteAck)),vBufB(a2)		; terminate current command transaction
+@Wait4Attn
+			btst.b	#ifSR,vIFR(a2)					; Wait for attention IRQ
+			beq.s	@Wait4Attn
+			tst.b	vSR(a2)							; Read attn byte from VIA (clears IRQ)
+			
+			bclr.b	#vCudaTIP,vBufB(a2)				; assert TIP to begin response transaction
+	
+			BSR6	CudaReadByte					; Read a byte - response packet type
+			BSR6	CudaReadByte					; next byte - response packet flag
+			BSR6	CudaReadByte					; next byte - "cmd was" byte
+			BSR6	CudaReadByte					; finally!	PRAM data in d2
+			
+			ori.b	#((1<<vCudaTIP)|\
+				(1<<vCudaByteAck)),vBufB(a2)		; terminate current response transaction
+@Wait4CudaDone
+			btst.b	#vCudaTReq,vBufB(a2)			; Wait for TReq to negate
+			beq.s	@Wait4CudaDone
+@Wait4IdleIRQ 		
+			btst.b	#ifSR,vIFR(a2)					; Wait for idle state IRQ
+			beq.s	@Wait4IdleIRQ
+			tst.b	vSR(a2) 						; Read idle state byte (clears IRQ)
+			move.l	d2,d1							; return data in d1
+			jmp 	(a3)							; return to caller
+
+
+;________________________________________________________________________________________
+;
+; Routine:	CudaWrXByte
+;
+; Inputs:	D1	-	address of PRAM byte to write
+;			D2	-	byte to write to PRAM
+;			A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A3	-	return address
+;
+; Outputs:	none
+;
+; Trashes:	D0,D1,D2,A5,A6
+;
+; Function:	writes a byte to Egret-based PRAM without using RAM
+;
+;			This routine can only be executed after a SyncAck cycle.  The SyncAck cycle,
+;			which is executed immediately after InitVia will disable all asynchronous
+;			message sources within Cuda.  This allows the following routine to be written
+;			without regard to detecting collisions between command packets and response
+;			packets.  AT NO TIME SHOULD AN ASYNCHRONOUS MESSAGE SOURCE BE ENABLED PRIOR
+;			TO USE OF THIS ROUTINE.  ASYNCHRONOUS MESSAGE SOURCES SHOULD ONLY BE ENABLED
+;			AFTER THE CUDA MANAGER HAS BEEN INSTALLED.
+;________________________________________________________________________________________
+
+CudaWrXByte	cmp.l	#$8000,sp						; is there any stack yet?							<SM5>(rbm)<2> begin {
+			ble.s	@5								; no, use register based
+			cmp.w	#0,EgretBase
+			bne.s	@5
+			movec	vbr,d5							; get a copy of VBR
+			tst.l	d5								; is it zero?
+			bne.s	@5
+
+;	This code allows the low level routines to be used after the Cuda manager is installed
+;	by constructing a parameter block on the stack and issuing a call to CudaDispatch.  This
+;	is absolutely necessary because the low level routines do not detect collisions which can
+;	occur once the Cuda manager is installed.  Further, it is almost impossible to determine
+;	how to to synchronize Cuda after an asynchronous re-boot has occurred.
+
+			movem.l	a0-a6/d0/d3-d7,-(sp)
+			suba.l	#EgretPBSize,sp					; make room on the stack for Cuda parameter block
+			move.b	#pseudoPkt,pbCmdType(sp)		; set packet type
+			move.b	#WrPram,pbCmd(sp)				; set packet command
+			move.w	d1,pbParam(sp)					; set pram address
+			move.w	d2,pbParam+2(sp)				; set pram data
+			move.w	#1,pbByteCnt(sp)				; 1 byte to send
+			move.l	sp,pbBufPtr(sp)
+			add.l	#pbParam+2,pbBufPtr(sp)			; point to our data buffer
+			move.b	#0,pbFlags(sp)
+			move.w	#0,pbResult(sp)
+			move.l	#0,pbCompletion(sp)				; execute synchronously
+			move.l	sp,a0							; parameter block in a0
+			_EgretDispatch							; (this is actually the Cuda A-Trap)
+			adda.l	#EgretPBSize,sp					; remove parameter block from stack
+			movem.l	(sp)+,a0-a6/d0/d3-d7
+			jmp 	(a3)
+
+;	The following code is executed only when the Cuda manager is not installed.
+;	AT NO TIME SHOULD AN ASYNCHRONOUS MESSAGE SOURCE BE ENABLED PRIOR TO USE OF THIS ROUTINE.
+;	ASYNCHRONOUS MESSAGE SOURCES SHOULD ONLY BE ENABLED AFTER THE CUDA MANAGER HAS BEEN INSTALLED.
+
+@5			move.l	d2,d5							; Save the write data
+
+			ori.b	#ACRmode,vacr(a2)				; else initialize via mode
+			bset.b	#SRdir,vACR(a2)					; set output mode
+			move.b	#pseudopkt,vSR(a2)				; send packet type & clear any pending shift irq
+			bclr.b	#TIP,vBufB(a2)					; start the transaction
+@10 			
+			btst.b	#ifSR,vIFR(a2)					; Wait for shift register IRQ to indicate byte was read
+			beq.s	@10
+;________________________________________________________________________________________________
+;	When outputing from the VIA to Cuda, the interrupt will occur prior to the rising edge
+;	of CB1.  Delay long enough for the edge to occur before acknowledging the shift
+;	register interrupt.	(R. Montagne	1/11/93)
+;________________________________________________________________________________________________
+			move.b	#10,d2							; mode 7 interrupt occurs at falling edge CB1	<LW3><VIA rbm>
+@m7dly												;												<LW3><VIA rbm>
+			tst.b	vBufB(a1)						; hardware access is 1.2╡S						<LW3><VIA rbm>
+			sub.b	#1,d2							; can only trash low byte						<LW3><VIA rbm>
+			bne.s	@m7dly							; wait long enough for CB1 to rise (10╡S delay)	<LW3><VIA rbm>
+			tst.b	vSR(a2) 						; Clear the shift register IRQ
+
+	 		moveq	#wrpram,d2						; Send the command byte
+			BSR6	CudaWriteByte
+			move.l	d1,d2
+			lsr.l	#8,d2							; Send PRAM address MSB
+			BSR6	CudaWriteByte
+			move.l	d1,d2							; Send PRAM address LSB
+			BSR6	CudaWriteByte
+			move.l	d5,d2							; Send the write data
+			BSR6	CudaWriteByte
+	
+			bclr.b	#SRdir,vACR(a2)					; Define direction FROM Cuda
+			
+			ori.b	#((1<<vCudaTIP)|\
+					(1<<vCudaByteAck)),vBufB(a2)	; terminate current transaction
+			
+@40 		btst.b	#ifSR,vIFR(a2)					; Wait for attention byte shift register IRQ
+			beq.s	@40
+	
+			btst.b	#vCudaTReq,vBufB(a2)			; Is TReq asserted? (active low)
+			bne.s	@40 							; continue polling if TReq is not asserted
+			
+			tst.b	vSR(a2) 						; Read attn byte from VIA (clears IRQ)
+			bclr.b	#vCudaTIP,vBufB(a2)				; assert TIP to begin response transaction
+@20 			
+			btst.b	#ifSR,vIFR(a2)					; Wait for shift register IRQ to indicate byte was read
+			beq.s	@20
+			tst.b	vSR(a2) 						; Clear the shift register IRQ
+
+			ori.b	#((1<<vCudaTIP)|\
+					(1<<vCudaByteAck)),vBufB(a2)	; terminate the response transaction
+			
+@41 		btst.b	#ifSR,vIFR(a2)					; Wait for idle state IRQ
+			beq.s	@41
+			tst.b	vSR(a2) 						; Read idle state byte (clears IRQ)
+			jmp 	(a3)
+			
+;---------------------------------------------------------------------------
+
+			EXPORT	CudaWriteByte
+CudaWriteByte
+			move.b	d2,vSR(a2)					; Put data in VIA data reg
+			eori.b	#1<<vCudaByteAck,vBufB(a2)	; indicate data moved into VIA
+@10 			
+			btst.b	#ifSR,vIFR(a2)				; Wait for shift register IRQ to indicate byte was read
+			beq.s	@10
+;________________________________________________________________________________________________
+;	When outputing from the VIA to Cuda, the interrupt will occur prior to the rising edge
+;	of CB1.  Delay long enough for the edge to occur before acknowledging the shift
+;	register interrupt.	(R. Montagne	1/11/93)
+;________________________________________________________________________________________________
+			move.b	#10,d2						; mode 7 interrupt occurs at falling edge CB1	<LW3><VIA rbm>
+@m7dly											;												<LW3><VIA rbm>
+			tst.b	vBufB(a1)					; hardware access is 1.2╡S						<LW3><VIA rbm>
+			sub.b	#1,d2						; can only trash low byte						<LW3><VIA rbm>
+			bne.s	@m7dly						; wait long enough for CB1 to rise (10╡S delay)	<LW3><VIA rbm>
+			tst.b	vSR(a2) 					; Clear the shift register IRQ
+			RTS6
+
+;---------------------------------------------------------------------------
+
+			EXPORT	CudaReadByte
+CudaReadByte
+			btst.b	#ifSR,vIFR(a2)				; Wait for IRQ
+			beq.s	CudaReadByte
+			move.b	vSR(a2),d2					; Read data from VIA (clears IRQ)
+			and.w	#$00FF,d2					; isolate the byte
+			eori.b	#1<<vCudaByteAck,vBufB(a2)	; handshake the byte
+			btst.b	#vCudaTReq,vBufB(a2)		; Return with state of TReq Session				<SM5>(rbm)<2> end }
+			RTS6
+
+
+			ENDWITH							; {EgretPB}
+		ENDIF								; {hasEgret}
+
+
+
+		IF hasProtectedPRAM THEN
+; ееееееееееееееееееееееее PRAM in VRAM, clock is someplace else ееееееееееееееееееееееее
+			WITH	ProductInfo, VideoInfo
+
+;________________________________________________________________________________________
+;
+; Routine:	NoPRAMReadTime
+;
+; Inputs:	none
+;
+; Outputs:	D0	-	result code
+;			"GetParam" contains the 32-bit time value read from the clock
+;
+; Trashes:	TBD
+;
+; Function:	Would read the time from the clock if we knew what kind it was.  This routine
+;			is provided as an aid to the person who has to code for this case.
+;________________________________________________________________________________________
+
+NoPRAMReadTime
+			MOVEQ	#dsCoreErr,D0			; just die so we know something didn't happen
+			_SysError
+			MOVEQ	#clkRdErr,D0			;  and leave this as a clue to why
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	NoPRAMWriteTime
+;
+; Inputs:	"Time" contains 32-bit quantity to write to clock
+;
+; Outputs:	D0	-	result code
+;
+; Trashes:	TBD
+;
+; Function:	Would write the time to the clock if we knew what kind it was.  This routine
+;			is provided as an aid to the person who has to code for this case.
+;________________________________________________________________________________________
+
+NoPRAMWriteTime
+			MOVEQ	#dsCoreErr,D0			; just die so we know something didn't happen
+			_SysError
+			MOVEQ	#clkWrErr,D0			;  and leave this as a clue to why
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	NoPRAMXParam
+;
+; Inputs:	A0	-	pointer to user's buffer
+;			D0	-	[number of bytes to transfer][starting PRAM address]
+;			D1	-	bit 12: 1=read, 0=write
+;
+; Outputs:	D0	-	result code
+;
+; Trashes:	A0,A1,A2,D1,D2,D3
+;
+; Function:	reads/writes byte[s] from parameter RAM that hides in unused video RAM
+;			(assumes that traps and the MMU are set up)
+;________________________________________________________________________________________
+
+NoPRAMXParam
+			MOVEA.L	A0,A2					; save the pointer to the user's buffer,
+			MOVE.L	D0,D3					;  and the starting PRAM address and count
+
+			MOVEQ	#true32b,D0				; switch into 32-bit addressing mode
+			_SwapMMUMode
+
+			MOVEA.L	UnivInfoPtr,A1			; point to this machine's product info,
+			ADDA.L	VideoInfoPtr(A1),A1		;  which leads to video info,
+			MOVEA.L	VRAMPhysAddr(A1),A1		;   which leads to the base address of video,
+			LEA		-256(A1),A1				;    which leads to PRAM in unused video memory
+			ADD.W	D3,A1					; index into start of desired PRAM
+			SWAP 	D3						; get the number of bytes to transfer
+			BTST	#12,D1					; is it a write?
+			BNE.S	@StartCopy				; -> no
+			EXG		A1,A2					; yes, exchange source and destination pointers
+			BRA.S	@StartCopy
+			
+@CopyPRAM	MOVE.B	(A1)+,(A2)+				; move the bytes
+@StartCopy	DBRA	D3,@CopyPRAM
+
+			_SwapMMUMode					; restore the addressing mode
+			MOVEQ	#0,D0					; never an error
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	NoPRAMXPramIO
+;
+; Inputs:	A0 -- pointer to table of base addresses
+;			A1 -- pointer to ProductInfo record for this machine
+;			A3 -- pointer to PRAM I/O buffer
+;			D1 -- flags indicating which external features are valid
+;			D3 -- [r/w (bit 31)][number of PRAM bytes to read/write][starting PRAM address]
+;
+; Outputs:	none
+;
+; Trashes:	A2,A3,D3
+;
+; Function:	reads/writes byte[s] from parameter RAM that hides in unused video RAM
+;			before traps (or the MMU) are set up
+;________________________________________________________________________________________
+
+NoPRAMXPramIO
+			MOVEA.L	A1,A2					; point to this machine's product info,
+			ADDA.L	VideoInfoPtr(A2),A2		;  which leads to video info,
+			MOVEA.L	VRAMPhysAddr(A2),A2		;   which leads to the base address of video,
+			LEA		-256(A2),A2				;    which leads to PRAM in unused video memory
+			ADD.W	D3,A2					; index into start of desired PRAM
+			SWAP 	D3						; get the number of bytes to transfer
+			BCLR	#15,D3					; is it a write?
+			BEQ.S	@StartCopy				; -> no
+			EXG		A2,A3					; yes, exchange source and destination pointers
+			BRA.S	@StartCopy
+			
+@CopyPRAM	MOVE.B	(A2)+,(A3)+				; move the bytes
+@StartCopy	DBRA	D3,@CopyPRAM
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	NoPRAMRdXByte
+;
+; Inputs:	D1	-	address of PRAM byte to read
+;			A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A3	-	return address
+;
+; Outputs:	D1	-	byte read from PRAM
+;
+; Trashes:	A0,D0
+;
+; Function:	reads a byte from parameter RAM that hides in unused video RAM without using RAM
+;________________________________________________________________________________________
+
+NoPRAMRdXByte
+			MOVEA.L	A1,A0					; point to this machine's product info,
+			ADDA.L	VideoInfoPtr(A0),A0		;  which leads to video info,
+			MOVEA.L	VRAMPhysAddr(A0),A0		;   which leads to the base address of video,
+			LEA		-256(A0),A0				;    which leads to PRAM in unused video memory
+			MOVEQ	#0,D0
+			MOVE.B	D1,D0					; zero-extend the byte number to make an index
+			MOVE.B	0(A0,D0),D1				;  and get the byte
+			JMP		(A3)
+
+
+;________________________________________________________________________________________
+;
+; Routine:	NoPRAMWrXByte
+;
+; Inputs:	D1	-	address of PRAM byte to write
+;			D2	-	byte to write to PRAM
+;			A1	-	pointer to ProductInfo record for this machine
+;			A2	-	VIA1 base address
+;			A3	-	return address
+;
+; Outputs:	none
+;
+; Trashes:	A0,D0
+;
+; Function:	writes a byte to parameter RAM that hides in unused video RAM without using RAM
+;________________________________________________________________________________________
+
+NoPRAMWrXByte
+			MOVEA.L	A1,A0					; point to this machine's product info,
+			ADDA.L	VideoInfoPtr(A0),A0		;  which leads to video info,
+			MOVEA.L	VRAMPhysAddr(A0),A0		;   which leads to the base address of video,
+			LEA		-256(A0),A0				;    which leads to PRAM in unused video memory
+			MOVEQ	#0,D0
+			MOVE.B	D1,D0					; zero-extend the byte number to make an index
+			MOVE.B	D2,0(A0,D0)				;  and write the byte
+			JMP		(A3)
+
+
+			ENDWITH							; {ProductInfo, VideoInfo}
+		ENDIF								; {hasProtectedPRAM}
+
+
+; ееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееееее
+
+
+;________________________________________________________________________________________
+;
+; Routine:	ClkNoMem
+;
+; Inputs:	A1	-	VIA 1 base address
+;			A5	-	return address (BSR5)
+;			D1	-	clock chip command byte (bit 7: 0=write, 1=read)
+;			D2	-	data byte to write
+;
+; Outputs:	D2	-	data byte read
+;
+; Trashes:	A0,A1,A5,A6,D1,D3
+;
+; Function:	support for the jClkNoMem vector (do we still need this?)
+;________________________________________________________________________________________
+
+			EXPORT	ClkNoMem
+ClkNoMem	RTS5
+;________________________________________________________________________________________			<H9>thru next <H9>
+; These patches change the behavior of StandardXPramIO so that during a multi-byte
+; write to PRAM, interrupts are disabled and re-enabled around the write of each byte,
+; and the RTC is write-enabled and then write-protected again during the time that
+; interrupts are off.  This fixes a problem where the Reliability Manager's interrupt
+; task, which calls this routine to write to PRAM every 5 minutes, interrupts during
+; this loop, resulting in PRAM being left write-protected; when control returns to the
+; foreground, remaining bytes to be written to PRAM don't get written.
+;
+; Monte Benaresh - 7/2/93
+;________________________________________________________________________________________
+
+StdXPRAM2Patch								; patch for StandardXPramIO
+			MOVEA.L	A1,A6					; point to this machine's product info
+			ADDA.L	ProductInfo.ClockPRAMPtr(A6),A6	;  and get the address of its clock/PRAM table
+			MOVE.L	4*cpWrProtOn(A6),D0		; get the offset to the write-protect routine
+			BEQ.S	@Done					; -> it's not supported for this implementation
+			ADDA.L	D0,A6					; calculate the routine's address
+			movea.l	(sp)+,A5				; simulate a BSR5 which returns to our caller
+			JMP		(A6)					; and call it to turn on PRAM write-protect
+@Done
+			rts								;														<H9>
+
+			END

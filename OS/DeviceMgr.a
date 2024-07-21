@@ -1,0 +1,1611 @@
+;
+;	File:		DeviceMgr.a
+;
+;	Contains:	This module contains the core routines that form the kernel of the
+; 				I/O system.	These include OPEN, CLOSE, READ, CONTROL, STATUS, KILLIO,
+; 				DRVRINSTALL, and DRVRREMOVE.  They receive control from the core routine
+; 				dispatcher and pass control to the file system or I/O drivers.
+;
+;	Written by:	Andy Hertzfeld
+;
+;	Copyright:	© 1981-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM8>	10/29/92	SWC		Changed SlotEqu.a->Slots.a.
+;	   <SM7>	10/26/92	CSS		Change some branch short instructions to branches.  Plus
+;									removed cache flushes from this file and put them in the
+;									file manager (TFSRFN1.a).
+;	   <SM6>	 5/21/92	kc		Append "Trap" to the names of
+;									Control,Status,KillIO,AddDrive,Enqueue and Dequeue to avoid name
+;									conflict with the glue.
+;	   <SM5>	 5/17/92	kc		Remove "WITH PmgrRec."
+;	   <SM4>	 4/14/92	kc		Remove the ClosePatch rolled in revision <SM2>
+;	   <SM3>	  4/7/92	RB		Rolled in OpenIgnorePatch from DeviceMgrPatches.a in Terror. It
+;									clears the result code after calling UpdateSRT from the Slot
+;									Mgr, in the Open call.
+;	   <SM2>	 2/13/92	PN		Roll in ClosePatch from FileMgrPatches.a.
+;	   <SM1>						• Pre-SuperMario comments follow •
+;		<13>	12/30/91	RB		OOps, I accidentally commented out a label...
+;		<12>	12/30/91	RB		Updated to reflect Terror. Got rid of the 040 cache flush code
+;									since it is supposed to be done by the file system.
+;		<11>	10/18/91	JSM		Get rid of all the stupid conditionals.
+;		<10>	 10/1/91	JSM		Commented out code that used eclipseDebug.
+;		 <9>	 9/30/91	JSM		Don’t use is32BitClean conditional, all future ROMs will be.
+;		 <8>	 8/29/91	JSM		Cleanup header.
+;		 <7>	 6/12/91	LN		Changed #include 'HardwareEqu.a' to 'HardwarePrivateEqu.a'
+;		 <6>	 3/13/91	bbm		&CCH; fix hard instruction cpusha to a call to jCacheFlush
+;		 <5>	 9/18/90	BG		Removed EclipseNOPs and modified <4> to not be conditionalized
+;									for EclipseDebug. Left the conditionalization in -Write- but it
+;									will need to be fixed correctly sometime soon.
+;		 <4>	 6/18/90	CCH		Added a cache flush in the postcompletion routine and some NOPs
+;									for 68040 machines.
+;		 <3>	 3/29/90	MSH		Add universal run time test of IdleUpdate call.
+;		 <2>	 3/20/90	PWD		Fix to Open to check FSFCBLen before calling the file system.
+;									This fixes a crash if an open @boot time doesn't find the driver
+;									in the rom resource map or slots.
+;	   <2.1>	 11/1/89	MSH		Rolling in changes from HcMac Reality sources: Pmgr equates now
+;									record based.
+;	   <2.0>	 8/22/89	SES		Removed references to nFiles. Changed include DeclRomEqu.a to
+;									RomEqu.a.
+;	   <1.9>	 6/12/89	djw		Removed special case of setting slot zero video base in open
+;	   <1.8>	 6/11/89	GGD		Get Slot zero video ram base from rom tables.
+;	   <1.7>	 5/29/89	GGD		Added runtime test to support slot zero only if RBV exists.
+;	   <1.6>	  5/1/89	CSL		one more ,Sys for another Recoverhandle
+;	   <1.5>	 4/28/89	CSL		Fixed vGoDriver, ,Sys required for calling recoverhandle
+;	   <1.4>	 2/20/89	rwh		more feature-based conditional changes. Also re-spelled some
+;	   <1.3>	 2/17/89	CSL		made IOCore 32 bit friendly, soon be optimized using memory
+;									manager vector.
+;	   <1.2>	 1/30/89	GGD		Added unconditional call to CacheFlush in _Read, to allow better
+;									support for 68020/030s in the 68000 ROMs. Changed several
+;									on-NuMac|on-MvMac to has-SlotMgr conditional.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.4>	 11/7/88	djw		Special case slot zero to set dCtlDevBase field in OPEN
+;	  <•1.3>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.2>	  9/8/88	MSH		New, improved method for Idle/Sleep support.
+;	   <1.1>	 4/18/88	CSL		Add support for sleep and idle in READ & WRITE
+;	   <1.1>	 4/18/88	CSL		Support Sleep and Idle for HcMac in READ & WRITE.
+;	   <1.0>	 2/10/88	BBM		Adding file for the first time into EASE…
+;	  <C950>	 11/8/87	DAF		Added slot driver version test to Open (rolled in from patches)
+;	  <C914>	10/29/87	rwh		Port to Modern Victorian
+;	  <C883>	 9/10/87	CSL		Do _stripaddress for address masking
+;	  <C887>	  9/9/87	GWN		SDM 32-bit mode fix: Use sFindBigDevBase or sFindDevBase to
+;									determine the device base.
+;	  <C805>	 2/12/87	RDC		Added copyright notice, hooks to various routines
+;	  <C787>	 2/11/87	GWN		If no slot driver, then go to FSOpen.
+;	  <C750>	  2/3/87	GWN		Cleaned up the UT grow code.
+;	  <C668>	 1/22/87	bbm		added a vector to flush the cache in Read.
+;	  <C671>	 1/22/87	GWN		cleared field before _sUpdateSRT.
+;	  <C657>	 1/20/87	GWN		Renamed sDetDevBase to sFindDevBase.
+;	  <C632>	 1/14/87	DAF		Fixed Open to correctly look for drivers
+;	  <C620>	 1/13/87	GWN		Use ioFlags+1 in isSlotDrvr and made some code review changes.
+;	  <C600>	  1/7/87	GWN		Made changes for slot booting. Changed the parameter block for
+;									_Open.
+;	  <C540>	12/18/86	JSP		added test of D0 after stripaddress in routine MpUnitNum.
+;	  <C542>	12/18/86	GWN		Using _sUpdateSRT to update the SRT.
+;	  <C539>	12/17/86	GWN		removed spDrvrType.
+;	  <C537>	12/16/86	GWN		Bug: ioDevice(An) loaded using wrong address register.
+;	  <C523>	12/14/86	GWN		Added support for booting from slots (ioDevice & dctlExtDev).
+;									Also added code to allow UT to grow in increments of 5 entries.
+;	  <C521>	12/13/86	DAF		Adjusted Open to look in systemFile first, then slotROM, then
+;									ROMResources (until we kill the TFB1K card)
+;	  <C504>	12/11/86	GWN		Replaced _sFindsRsrcList with _sRsrcInfo.
+;	  <C482>	 12/4/86	bbm		The code to flush the cache in read needed to be set in
+;									conditionals for on-NuMac.
+;	  <C456>	11/22/86	bbm		moved the code to flush the cache into blockmove, loadseg,
+;									unloadseg, and read. this might improve performance.
+;	  <C334>	11/21/86	JSP		Added address stripping within IODone for dce pointer passed in.
+;									Also cleaned up some usage of stripping off top eight bytes for
+;									address soundness. All changes are conditionally assembled since
+;									Alladin ROM is frozen and we don't to affect their checksum!
+;	  <C331>	 11/2/86	RDC		Added fix for new equ name for slot mgr flag
+;	  <C226>	10/10/86	GWN		Added code to update the Slot Resource table at Open and Close
+;									time.
+;	  <C206>	 10/9/86	bbm		Modified to mpw aincludes.
+;	  <C169>	 9/29/86	JTC		Leaving in pseudo-RecoverHandle (two of them) and one
+;									StripAddress to gain speed during interrupt processing. Thus,
+;									this code is NOT 32-bit friendly.
+;	  <C169>	 9/25/86	JTC		32-bit support through HLock, HUnlock, etc.
+;	  <C133>	 8/29/86	GWN		Changed Open to support slot drivers. Extended DCE for slots.
+;									DCE is initialized with Slot, Id and DeviceBase. Also, Open's
+;									parameter block has been extended to pass more parameters for
+;									slots and in general. The new parameters are ioMix, ioFlags,
+;									ioSlot, ioId and ioDevice. Finally, since an extra A-register
+;									was used in open, many movem's were changed since routines can
+;									exit anywhere (For example close exits via open).
+;	   <C54>	 6/24/86	WRL		Changed access to ROMBase to make it survive a 32 bit value.
+;				 2/19/86	BBM		Made some modifications to work under MPW
+;				 1/13/86	LAK		Incorporated ROM75Fix patch to IODone.
+;				 11/1/85	LAK		Only check IOPermssn (not IOFileType) for $40 at Open to discern
+;									OpenDeskAcc calls (allows passing IOFileType=1 to MacVision).
+;									GetNamedResource 'ResNotFound' errors in ResErr passed to File
+;									System
+;				 10/4/85	LAK		Only refuse to close if CloseErr is passed back (compatibility
+;									reasons - print code was often passing back an error causing it
+;									to screw up later). Driver is marked open before call to driver
+;									open routine and marked closed if open fails (some drivers like
+;									to call close on themselves on error conditions and expect to be
+;									called: they won't be if they look closed). If GetNamedRes fails
+;									at open due to other than ResNotFnd errors (e.g., memfullerr),
+;									no longer goes on to file system (used to result in an FNFErr).
+;				 7/24/85	RDC		Changed interrupt masking to use equates Added separate include
+;									statement for HWequ (no longer in systlqk.sym)
+;				 7/10/85	LAK		Set up ROMMapInsert before GetNamedResource and GetResInfo in
+;									Open.
+;				 6/27/85	LAK		Minor change to mark driver open AFTER the GoDriver Open call
+;									instead of before.
+;				 5/20/85	LAK		Open now calls GetResInfo with nils for name and type var
+;									params; calls DrvrInstall ,LOCK if driver has 'needs lock' bit
+;									set in it. DrvrInstall looks at new 'asyncTrpBit' and reserves
+;									mem low for the DCE if it's set ('LOCK' bit). Adjusted Async
+;									driver to use it.
+;				  5/5/85	JTC		Change to return long error code in D0. Summary <05Jun85> Fetch,
+;									Stash: Aren't dispatched, so don't really care, but an extend
+;									added for consistency. PostCompletion: extended for consistency.
+;									IODone: passes through whatever it's sent in D0. Read, Write,
+;									Control, Status, Close: changed in IORWCS and GoDriver to extend
+;									to long. KillIO: already long. DrvrInstall, DrvrRemove: extend
+;									to long.
+;				  5/2/85	LAK		Very very minor PostCompletion change: turn positive result
+;									codes to 0 instead of negating them (just to be consistent).
+;				  4/9/85	LAK		Very minor tweak to close (treat only negative numbers as error
+;									codes).
+;				 3/19/85	LAK		Call driver-open for desk accessories even if they are already
+;									opened (they are used to this). Quick fix added to KillIO to
+;									avoid driver call if it's not Open or enabled for Control calls.
+;				 3/14/85	LAK		Made all positive Open driver call D0 values = successful Open.
+;									This should break fewer drivers.
+;				  3/6/85	LAK		Return D0 error code for AddDrive.
+;				 2/20/85	LAK		Don't compact heap before lock of driver which needs lock (why
+;									pay the performance penalty? driver should have locked bit set
+;									in res attrib anyway, and won't help for ROM-based drivers. .
+;									.). Now do a ReservMem before allocating new DCEs which should
+;									help here. Open gets special IOPermission field for OpenDeskAcc
+;									Opens and now doesn't pass on to file system for these. Open
+;									checks non-deskmgr Opens for a period prefix and goes
+;									immediately to File System if none; searches currently installed
+;									drivers first before trying Resources and won't blast a
+;									currently opened driver. Close fail leaves driver looking open.
+;									Open fail leaves driver looking closed. Open, Close, Read,
+;									Write, Control, and Status now return all results in IOResult
+;									field as well as in D0. Rather than checking the top request to
+;									see if it's immediate (it wouldn't be queued if it was), we just
+;									check for no request in queue (this still isn't the whole
+;									solution).
+;				  2/8/85	LAK		Deref DCE ptr after heap compact . . .
+;				 1/31/85	LAK		Removed fake RTE's for 68010/68020 support.
+;				 1/30/85	LAK		Added AddDrive routine (used to be in Sony driver).
+;				 1/29/85	LAK		Put in RAM patches.
+;				  9/5/83	LAK		Changed IODone to run completion routines at level it is called
+;									at.
+;				 8/26/83	LAK		Changed to save only A1 over completion routine call to speed up
+;									async IODone's: completion routine is responsible for preserving
+;									A4-A6 and D4-D7 . . . the other registers are saved at the
+;									interrupt level.
+;				 8/23/83	LAK		RWCS now checks for driver open before it will dispatch.
+;				 8/17/83	LAK		Removed set up of lomem var CurIOTrap; IODone now is smart
+;									enough to look at IOTrap and do the RTS itself.
+;				 8/15/83	LAK		Added FSIODneTbl for initialization.
+;				 8/12/83	LAK		Open search thru ROM-based drivers only searches thru unit 9 now
+;									(last ROM-based driver).
+;				  8/8/83	LAK		made changes (mostly for code savings) as per 17 July
+;									walkthrough.
+;				 7/15/83	LAK		changed to store trap in IOCmd instead of code.
+;				 6/29/83	AJH		made ram-based driver ID mapping NOT instead of NEG
+;				 6/28/83	AJH		fixed bug in string compare for ROM-based driver open
+;				 6/26/83	AJH		made it save trap in low memory for drivers use
+;				 6/24/83	AJH		made "noQueue" control calls enter at DoImedIO instead of
+;									GoDriver
+;				 6/23/83	AJH		added "NoQueue" bit to IO traps; made open install drivers
+;									simplified DrvrInstall
+;				 6/17/83	AJH		made it compact heap before locking down opened driver
+;				 6/16/83	LAK		changed Open and DrvrInstall to use UnitNtryCnt lomem var
+;									instead of UnitEntries equate.
+;				 6/15/83	AJH		made it use symbolic deep shit alert
+;				 5/25/83	LAK		changed interface to new string compare.
+;				 4/27/83	LAK		modified changes. added fix for GoDriver out-of-mem error.
+;				 4/26/83	AJH		optimized IODone path for ROM drivers intercepted status call 1
+;									to return DCE handle implemented KillIO
+;				 3/10/83	LAK		fixed bug in close (wasn't saving registers it restored).
+;				 2/22/83	LAK		moved CmpString from here to SysUtil; made all routines here
+;									preserve regs as per Pascal regsave conventions.
+;				 1/23/83	LAK		Adapted for new equate files.
+;				 1/21/83	LAK		modified for new I/O parameter blocks
+;				 1/12/83	LAK		modified to use OS string compare proc
+;				  1/3/83	AJH		changed over to new resource manager
+;				12/17/82	LAK		integrated with Andy's IOCore (resources!)
+;				12/16/82	LAK		when calling completion routine, param blk ptr is now passed in
+;									A0, D0 result code is tested. changed IOResult to be positive
+;									when "in progress", negative or zero when done.
+;				 12/2/82	LAK		changed IO positioning to be same as file systems; removed
+;									references to FileControl, FileStatus (needs corresponding file
+;									system changes)
+;				11/15/82	LAK		now calls completion routines at IODone
+;				  9/5/82	LAK		added InstallDriver, RemoveDriver; Included Object Manager;
+;									debugged this and previous changes
+;				 8/19/82	LAK		removed ring buffer stuff and PEEK modified Fetch and STASH to
+;									be simpler changed Status, Control to be asynchronous changed to
+;									support new Unit Table and Device Control Entry formats position
+;									parameters for read and write calls are now evaluated when the
+;									prime routine is called (instead of when the command is
+;									received) made string-compare case insensitive (pretty much)
+;				11/16/81	AJH		integrated file system
+;				11/15/81	AJH		made READ and WRITE look at async bit
+;				 11/2/81	AJH		moved UNITABLE to heap
+;				10/20/81	bmw		fetch advances pointer after getting byte
+;				10/15/81	bmw		random bugfixes
+;				10/14/81	AJH		changed fetch,stash,read,write,aread,awrite to for the new way
+;									of doing things; added IODONE
+;				10/11/81	bmw		separate synchronous from asnychronous symbolic offsets,
+;									doasynch, dowasynch bugfix; control, status bugfix, consolidated
+;									dispatching to driver routines
+;				 10/5/81	bmw		add deferred completion routines
+;				 10/2/81	bmw		close bugfix
+;				 10/1/81	bmw		make control, status give user's a0 to driver
+;				 9/29/81	bmw		make goprime clear d0
+;				 9/18/81	bmw		fetch bugfix
+;				 9/15/81	AJH		Changed structure of FETCH/NEXTFETCH
+;				 7/17/81	AJH		Added asynchronous I/O stuff
+;
+
+			BLANKS	ON
+			STRING	ASIS
+
+			LOAD		'StandardEqu.d'
+			INCLUDE		'HardwarePrivateEqu.a'
+			INCLUDE		'UniversalEqu.a'
+
+			INCLUDE	'Slots.a'
+			INCLUDE	'ROMEqu.a'
+
+
+IOCore		PROC	EXPORT	
+
+			EXPORT	Read,Write
+			EXPORT	ControlTrap,StatusTrap,Open,Close,KillIOTrap
+			EXPORT	Fetch,Stash,IODone,FSIODneTbl
+			EXPORT	DrvrInstall,DrvrRemove
+			EXPORT	AddDriveTrap
+			EXPORT	vGoDriver,vWaitUntil,vSyncWait
+
+			IMPORT	EnqueueTrap,DequeueTrap,InitQueue
+			IMPORT	FileRead,FileWrite
+			IMPORT	FileOpen,FileClose
+
+FSIODneTbl
+			DC.W	Fetch-FSIODneTbl
+			DC.W	Stash-FSIODneTbl
+			DC.W	IODone-FSIODneTbl
+
+;______________________________________________________________________
+;
+; Ext Routine:	  Fetch
+; Arguments:		A1 (input)	--	pointer to device control entry
+;					D0 (output) --	requested byte- bit 15 = 1 if last byte
+;					all other registers are preserved
+;
+; Function: 	  Used to fetch the next byte from user buffer for
+;				  output I/O requests.	The last character is returned with
+;				  bit 15 set; the driver should output the last byte
+;				  and then jump to IODone.
+;______________________________________________________________________
+
+Fetch		BCLR	#15,D0				; set Fetch flag
+
+FetchStash	MOVEM.L D1/A2-A3,-(SP)		; save relevant registers
+			MOVE.L	DCtlQHead(A1),D1	; get pointer to request
+			BEQ.S	IOCoreErr			; trap if there is no request
+			MOVE.L	D1,A3
+			MOVE.L	IONumDone(A3),D1	; get buffer pointer
+			MOVE.L	IOBuffer(A3),A2 	; get pointer to buffer
+			BCLR	#15,D0				; fetch or stash?
+			BNE.S	StashOne			; branch for Stash
+
+			MOVE.B	0(A2,D1.L),D0		; fetch it!
+			BRA.S	FinishFS
+
+StashOne	MOVE.B	D0,0(A2,D1.L)		; stash it!
+
+FinishFS	ADDQ.L	#1,D1				; compute new count
+			MOVE.L	D1,IONumDone(A3)	; update the count
+			CMP.L	IOByteCount(A3),D1	; if this doesn't finish the request
+			BLT.S	FSDone				; then continue on
+			BSET	#15,D0				; hi bit on indicates no more
+
+FSDone
+			;;;; TST.W	 D0 				 ; set condition codes						<05Jun85>
+			EXT.L	D0					; make it long and test 						<05Jun85>
+
+			MOVEM.L (SP)+,D1/A2-A3
+			RTS
+
+IOCoreErr	MOVEQ	#DSIOCoreErr,D0 	; deep shit IOCore error
+			_SysError					; invoke deep shit
+
+;______________________________________________________________________
+;
+; Ext Routine:	  Stash
+; Arguments:		A1 (input)	--	pointer to device control entry
+;					D0 (input)	--	byte to stash
+;					D0 (output) --	bit 15 = 1 if I/O request finished
+;					all other registers are preserved
+;
+; Function: 	  Used to store the next input byte into user buffer (for
+;				  input I/O requests).	The driver should jump to
+;				  IODone after the last byte.
+;______________________________________________________________________
+
+Stash		BSET	#15,D0				; set Stash flag
+			BRA.S	FetchStash			; go share code with Fetch
+
+;______________________________________________________________________
+;
+; Ext Routine:	  IODone
+; Arguments:		A1 (input)	--	pointer to device control entry
+;					D0 (input)	--	I/O result code
+;
+; Function: 	  IODone is a utility routine that is JMPed to by drivers when
+;				  they have processed all the info in an IO Control Block (for
+;				  read, write, control, and status calls).
+;				  Condition codes are preserved (why?).
+;
+; Modification History:
+;  16 Dec 82  LAK  When calling completion routine, now passes A0=param blk ptr,
+;					D0=result code (CCR set on this)
+;______________________________________________________________________
+
+IOOK		MOVEQ	#0,D0				; no error
+IODone
+			MOVE.W	D0,-(SP)			; preserve D0 across IODone 				   <13Jan86>
+
+										; Since the dce is dereferenced, we
+										;   must make sure that it is a valid
+										;   32-bit address.  The only way that
+										;   we can do so is to assume it is in 
+										;   the lower 16 Megabytes of memory and
+										;   remove the memory manager crap in the
+										;   upper byte.
+			MOVE.L	D0,-(SP)			; save d0 through the trap
+			MOVE.L	A1,D0				; modify dce pointer for valid
+										;     32 bit address
+			_StripAddress				; mask off the top eight bits of d0
+			MOVE.L	D0,A1				; restore a1.
+			MOVE.L	(SP)+,D0			; restore d0 for routine.
+			
+			BSR.S	@1					;											   <13Jan86>
+			MOVE.W	(SP)+,D0			;											   <13Jan86>
+			RTS 						;											   <13Jan86>
+
+@1			MOVE.L	DCtlQHead(A1), D1	; is there a request?
+			BEQ.S	DeActImed			; br if not
+
+			MOVE	SR,-(SP)			; save interrupt state
+			MOVE	SR,D1				; remember SR state
+			ORI 	#HiIntMask,SR		;												<24Jul85>
+			BSR.S	DeActDrvr			; deactivate driver
+
+; delete the current request from the queue and post any completion routines
+
+			BSR.S	PostCompletion		; dequeue and post the completion routine
+			ORI 	#HiIntMask,SR		; disable interrupts							<24Jul85>
+			TST.L	DCtlQHead(A1)		; any more pending requests?
+			BNE 	GoIO				; if so, go relaunch the driver					<SM7> CSS 
+			MOVE.W	(SP)+, SR			; otherwise, re-enable interrupts and return
+			RTS
+
+; Routine to mark a driver inactive and then
+; unlock the driver and its DCE if we're allowed to.
+; Nowadays, use mem mgr routines rather than bset/bclr and let				<C169>
+; RecoverHandle compute a DCE handle given its pointer.  Be careful
+; to preserve D0, an error code, across these calls.
+DeActDrvr	BCLR	#DrvrActive,DCtlFlags+1(A1) ; mark as inactive
+DeActImed
+			BTST	#DNeedLock,DCtlFlags(A1) ;does it have to stay locked?
+			BNE.S	IORTS7					; exit if so (note that all rom-based
+											; drivers have this bit set . . .)
+			
+			MOVEA.L	DCtlDriver(A1),A0		; get handle to the driver
+
+			MOVE.L	D0,-(SP)				; save result code across traps	<C169>			
+			_HUnlock						;								<C169>
+			MOVEA.L	A1,A0					; A0 <- DCE ptr					<C169>
+			_RecoverHandle ,Sys				; A0 <- handle					<v1.5>
+			_HUnlock						;								<C169>
+			MOVE.L	(SP)+,D0				; restore result code			<C169>
+			
+IORTS7		RTS
+
+;______________________________________________________________________
+;
+; Routine:		  PostCompletion
+; Arguments:		A1 (input)	--	pointer to Device Control Entry for driver
+;					D0 (input)	--	error code to post in IOResult
+;					D1 (input)	--	interrupt state to call completion routine at
+;					A1 is preserved; D0-D3, A0, A2-A3 may be trashed by
+;					  completion routine.
+; Called By:	  IODone, KillIO
+;
+; Function: 	  PostCompletion dequeues the current request, posts the
+;				  result code as specified by A0 and runs the completion
+;				  routine if neccessary.  It should be called with
+;				  interrupts disabled. D0 contains the error code.
+;
+;______________________________________________________________________
+
+PostCompletion									; <13> rb
+
+			MOVE.L	DCtlQHead(A1),A0	; A0 -> current request
+			CMP.W	#IOQType,QType(A0)	; it better be an I/O queue element
+			BNE.S	IOCoreErr			;  or else die
+
+			MOVE.L	QLink(A0),DCtlQHead(A1) ; get next request, if any
+			BNE.S	@0					; branch if queue not empty
+			CLR.L	DCtlQTail(A1)		; clear tail ptr, too
+
+@0			MOVE	D1,SR				; restore interrupt state except for KillIO
+			MOVE.W	D0,IOResult(A0) 	; post error code
+			BLE.S	@1					; make sure it's negative or zero
+			CLR.W	IOResult(A0)		; all positive values are cool			<02May85>
+
+@1			MOVE.L	IOCompletion(A0),D1 ; is there a completion routine?
+			BEQ.S	@2					; skip if there's not
+
+			MOVE.L	A1,-(SP)			; save A1 over call
+			MOVE.L	D1,A1				; get the completion routine address
+
+			;;;; TST.W	 D0 				 ; test result code 				<05Jun85>
+			EXT.L	D0					; make it long and test 				<05Jun85>
+
+			JSR 	(A1)				; call it
+			MOVE.L	(SP)+,A1			; restore A1
+@2
+			RTS
+;______________________________________________________________________
+;
+; Routine:		  DoAsyncIO
+; Arguments:		A0 (input)	--	pointer to I/O command parameter block
+;					A1 (input)	--	pointer to Device Control Entry for driver
+;					D0 (output) --	error code
+;					pascal regsave conventions are observed
+; Called By:	  IORWCS (br's here for async, bsr's for sync)
+;
+; Function: 	  This core routine allows asynchronous calls to drivers.
+;				  It does this by building an I/O queue element (in the
+;				  caller's memory space), queueing it up and calling
+;				  the driver.
+;
+;______________________________________________________________________
+
+DoAsyncIO	MOVE.L	A1,D1				; save device control entry pointer
+			LEA 	DCtlQueue(A1),A1	; get pointer to driver's queue
+
+			MOVE	SR,-(SP)			; only allow level 3
+			ORI 	#HiIntMask,SR		; interrupts for debugging						<24Jul85>
+
+			JSR 	EnqueueTrap			; queue up the request
+			MOVE.L	D1,A1				; restore A1
+
+GoIO		BSET	#DrvrActive,DCtlFlags+1(A1) ; is it active?
+			BEQ.S	@1					; if not, just call it
+
+; The driver is busy so we're done for now.  We'll get to it when the driver
+; calls the IODone routine.
+
+			MOVEQ	#0,D0				; no errors
+			MOVE.W	(SP)+, SR			; re-enable interrupts and return
+			RTS
+
+; The driver was inactive so set things up and kick it off
+
+@1			MOVE	(SP)+,SR			; restore interrupt state
+			MOVE.L	DCtlQHead(A1),A0	; get pointer to request
+DoImedIO
+			MOVEQ	#DrvrCtl,D1 		; control routine offset within driver
+			CMP.B	#ACtlCmd,IOTrap+1(A0) ; is it control, tho?
+			BEQ.S	GoDriver			; do it, if so
+			MOVEQ	#DrvrStatus,D1		; status routine offset within driver
+			CMP.B	#AStsCmd,IOTrap+1(A0) ; is it status, tho?
+			BEQ.S	GoDriver
+
+; it must be read or write . . .
+
+			TST.L	IOByteCount(A0) 	; if nothing to do, don't bother
+			BEQ.S	IOOK				; and just say its done (IO drivers
+										;  usually assume a non-zero count)
+			MOVE.W	IOPosMode(A0),D0	; get positioning mode
+			MOVE.L	IOPosOffset(A0),D1	; get position offset
+			ROXR.B	#2,D0				; get pos bits into carry, sign
+			BPL.S	@2					; 0,2 do nothing
+			BCC.S	@1					; 1 is absolute (rel to beginning)
+
+			ADD.L	DCtlPosition(A1),D1 ; mode 3: relative to current position
+@1			MOVE.L	D1,DCtlPosition(A1) ; mode 1: relative to beginning
+										; posmode0 and 2 are no-ops
+
+@2			MOVEQ	#DrvrPrime,D1		; we want to call the prime routine
+
+;______________________________________________________________________
+;
+; Routine:		  GoDriver
+; Arguments:		A1 (input)	--	pointer to Device Control Entry for driver
+;					D1 (input)	--	offset to appropriate driver routine
+;					D3-D7, A1-A6 are preserved over driver call.
+; Called By:	  GoIO(IODone), DoImedIO(IORWCS), Open, Close, KillIO,
+;					DoAsyncIO(Read,Write,Control,Status)
+;
+; Function: 	  General method to call a driver's routine.  calls the
+;				  driver's routine with D0 clear and A0 and A1 containing
+;				  what they contained on entry...
+;
+;______________________________________________________________________
+			
+GoDriver	MOVE.L	jGoDriver,-(SP)		; get jump vector						<C805>
+			RTS							; and go to it							<C805>
+
+vGoDriver	MOVE.L	DCtlDriver(A1),D0	; if the unit doesn't have a driver,	<C805>
+			BNE.S	@0					;  then complain
+
+; If the entry in the unit table is nil, the requested driver doesn't exist.
+; Flag the error and return to user.
+
+			MOVEQ	#UnitEmptyErr,D0
+			MOVE.W	D0,IOResult(A0) 	; post the error
+			RTS
+
+@0			MOVEM.L D3-D7/A1-A6,-(SP)	; save regs over driver call
+			MOVE.L	D0,A2				; get the handle or ptr
+			BTST	#DRAMBased,DCtlFlags+1(A1) ; ptr or handle?
+			BEQ.S	@2					; if ROMBased, we have it
+
+			; Slow but 32-bit friendly way is to set A3 to the handle of data at A1 after locking
+			; that data.  A0 is preserved.
+			MOVEA.L	A0,A3				; save A0 across lock of handle of A1		<C169>
+			MOVEA.L	A1,A0				; A1 = ptr to handle data to lock			<C169>
+			_RecoverHandle ,Sys			; A0 <- driver handle						<C169>
+			_HLock						;											<v1.6>
+			EXG		A0,A3				; A3 <- (locked) handle; A0 <- old value	<C169>
+
+			TST.L	(A2)				; driver been purged?
+			BNE.S	@1					; br if not
+			MOVE.L	A2,-(SP)			; push driver handle
+			_LoadResource				; load the driver (preserves A0 A1 D1)
+			MOVE.W	ResErr,D0			; did we get it?
+			BNE.S	GoError 			; if not, we're in trouble
+@1
+			EXG		A0,A2				; save A0 across lock				<C169>
+			_HLock						; lock driver before calling		<C169>
+			EXG		A0,A2				; restore A0, A2 to original vals	<C169>
+			
+;<put @2 here if ROM-res has handle also . . . maybe just use need's lock?>
+
+			; Slow but 32-bit friendly way to deref and strip a handle		<C169>
+			MOVE.L	(A2),D0				; D0 <- driver ptr					<C169>
+			_StripAddress				;									<C169>
+			MOVEA.L	D0,A2				; replacing handle with cool ptr	<C169>
+				
+@2			MOVE.W	0(A2,D1.W),D1		; to the desired routine
+			MOVEQ	#0,D0				; assume no errors
+			JSR 	0(A2,D1.W)			; call it with A0=param ptr, A1=DCE ptr
+			BRA.S	RegExit 			; and return, successful
+
+; The loadResource wasn't successful, so set IOResult to the error code
+; and return to user.
+
+GoError 	MOVE.W	D0,IOResult(A0) 	; post the error
+
+RegExit
+			EXT.L	D0					; extend error code from ResErr or desired routine	<05Jun85>
+
+			MOVEM.L (SP)+,D3-D7/A1-A6	; restore regs
+			RTS 						;
+
+
+;______________________________________________________________________
+;
+; Routine:		  MapUnit
+; Arguments:		D2 (input)	--	unit RefNum
+;					A1 (output) --	pointer to Device Control Entry
+;					A2 (output) --	handle of DCE memory block
+; Called By:	  Open, Close, IORWCS, Status, KillIO
+;
+; Function: 	  Maps an I/O RefNum to a Device Control Entry pointer; only
+;				  I/O driver RefNums are mapped. Z-bit = 1 if purged.
+;______________________________________________________________________
+
+
+MapUnit 	NOT.W	D2					; bitwise complement to get unitnum
+			BMI.S	BadUnit
+			CMP.W	UnitNtryCnt,D2		; is it in range?
+			BGE.S	BadUnit 			; skip if its not
+
+			ASL.W	#2,D2				; multiply by four
+			MOVE.L	UTableBase,A1		; get address of unit table
+			MOVE.L	0(A1,D2.W),D2		; add in the offset
+			BEQ.S	BadUnit 			; branch if there is no driver installed
+
+			MOVE.L	D2,A2				; DCE handle
+			MOVE.L	(A2),D2 			; dereference handle
+			BEQ.S	IOCoreErr			; syserror if purged (DCE should never be)
+			MOVE.L	D2,A1				; pointer to Device Control Entry
+			RTS
+
+BadUnit 	MOVE.L	D5, A0				; restore parameter blk ptr
+			MOVEM.L (SP)+,D0/D3-D5/A2-A4  ; restore regs and pop return address  <C133/29Aug86>
+										; into D0!!
+			MOVEQ	#BadUnitErr,D0		; flag the error
+			MOVE.W	D0, IOResult(A0)	; also return in IOResult
+			RTS
+
+;______________________________________________________________________
+;
+; Routine:		IsSlotDrvr
+; Arguments:	D5 (input)		--	pointer to io parameter block.
+;				CCR (output)	--	zero flag set if for a slot device, clear otherwise.
+; Called By:	Open
+; Function: 	Test to see if the call is for a slot device or a motherboard device.
+; Destroys:		A4.
+;______________________________________________________________________
+
+IsSlotDrvr	MOVEM.L	D0,-(SP)					; Save D0
+
+			MOVE.L	D5,A4						; A4 <- pointer to io parameter block.
+			BTST.B	#HFSBit-8,IOTrap(A4)		; Is this an extended parameter block call? 
+			BEQ		@NotSlot					; br if not.
+
+			BTST	#fMulti,ioFlags+1(A4)		; does this extended parameter block use ioSEBlkPtr?	<C620>
+			BNE.S	@IsSlot						; br if does (must be a slot device if it is using ioSEBlkPtr).
+
+;	Test both slot and sRsrc id for zero.  If both zero, then assume this is
+;	not a slot driver.  This fixes a problem with opening the .ENET driver on
+;	both slot zero and in the system disk.
+
+@10			TST.W	ioSlot(A4)					; ioSlot is valid since fMulti flag is clear. If slot = 0 then  <12> rb
+			BEQ		@NotSlot					;   not a slot driver.
+
+
+;  Set the Status.
+@IsSlot		MOVEQ	#0,D0						; Is a slot driver (Set CCR).
+			BRA.S	@End
+			
+@NotSlot	MOVEQ	#-1,D0						; not a slot driver (Set CCR).
+			
+			
+;  Done.
+@End		MOVEM.L	(SP)+,D0					; Restore D0.
+			RTS
+
+
+;______________________________________________________________________					<C600>
+;																						<C600>
+; Routine:		SetUpspBlk																<C600>
+; Arguments:	D5 (input)	--	pointer to io parameter block.							<C600>
+;				A4 (input)	--	pointer to SDM parameter block.							<C600>
+; 				A0 (output)	--	pointer to io parameter block.							<C600>
+; Called By:	Open																	<C600>
+; Function: 	Set up the spBlock parameters.											<C600>
+; Destroys:		D0																		<C600>
+;______________________________________________________________________					<C600>
+			WITH	spBlock,seBlock
+
+SetUpspBlk	MOVE.L	D5,A0						; restore the io parameter block ptr.
+
+			MOVE.L	ioFileName(A0),spIOFileName(A4)
+
+			MOVE.W	ioFlags(A0),D0				; does this extended parameter block use ioSEBlkPtr?<C600>
+			BTST.L	#fMulti,D0
+			BEQ.S	@10							; br if not.
+
+			MOVE.L	A0,D0						; save the io parameter block ptr.
+			MOVE.L	ioSEBlkPtr(A0),A0			; A0 <- pointer to the seBlock.
+			MOVE.L	A0,spsExecPBlk(A4)			; Set spsExecPBlk.
+			MOVE.B	seSlot(A0),spSlot(A4)		; The slot.
+			MOVE.B	sesRsrcId(A0),spId(A4) 		; The sResource Id.
+			MOVE.B	seDevice(A0),spExtDev(A4) 	; The External device.
+			MOVE.L	D0,A0						; restore the io parameter block ptr.
+			BRA.S	@End						;
+			
+@10			MOVE.B	ioSlot(A0),spSlot(A4)		; The slot.
+			MOVE.B	ioId(A0),spId(A4) 			; The sResource Id.
+			CLR.B	spExtDev(A4)			 	; Default to External device of 0.
+
+			
+;  Done.
+@End		RTS
+			ENDWITH
+
+;______________________________________________________________________
+;
+; Ext Routine:	  Open
+; Arguments:		A0 (input)	--	pointer to Open parameter block
+;					D0 (output) --	error code
+;					D1 (input)	--	OS Call trap word
+;
+; Function: 	  We look up the input filename in the object manager data
+;				  structure (for ram-based drivers) and indirect thru the
+;				  Unit Table (for rom-based drivers); if an I/O driver is
+;				  installed, we make a synchronous call to that I/O driver,
+;				  and return the proper unit number as the refnum;
+;				  otherwise we let the file system take care of it.
+;
+;______________________________________________________________________
+
+; It wasn't found in the device table so let the file system deal with it
+
+ToFSOpen	MOVE.L	D5,A0				; restore parameter block pointer
+			MOVE.W	IOTrap(A0),D1		; restore D1
+			MOVEM.L (SP)+,D3-D5/A2-A4	; restore regs								<C133/29Aug86>
+			CMP.B	#$40,IOPermssn(A0)	; is it from OpenDeskAcc??					<01Nov85>
+			BEQ.S	@1					; br if so (won't be in the file system . . .)
+			
+			tst.w	FSFCBLen			; Do we have a file system?					<PWD/21Mar90>
+			bmi.s 	@1					; br if not									<PWD/21Mar90>
+
+			JMP 	FileOpen			; needs D1 and A0 unharmed
+@1			MOVEQ	#OpenErr, D0		; return generic OpenErr to DeskMgr
+			BRA 	OpenExit			; exit, setting IOResult
+
+Open		MOVEM.L D3-D5/A2-A4,-(SP)	; observe pascal regsave conventions		<C133/29Aug86>
+			MOVE.L	A0,D5				; save parameter block pointer
+			MOVE.W	D1,IOTrap(A0)		; and D1
+
+			MOVE.W	IOFileType(A0), D2	; save for desk acc check
+			MOVE.L	IOFileName(A0), A0	; point A0 to input filename for search of installed drivers
+			MOVEQ	#0,D1				; clear high bytes
+			MOVE.B	(A0)+,D1			; IOFileName length
+
+			CMP.B	#$40,D2 			; is it from OpenDeskAcc??					<01Nov85>
+			BEQ		NonSlotDrvr			; br if so (acc names should start with a null, but often don't)
+			CMP.B	#'.',(A0)			; does name start with a period?
+			BNE.S	ToFSOpen			; must be for the file system if not a
+										;  deskmgr call or driver name is not prefixed with period
+
+
+			BSR.S	IsSlotDrvr					; is this a slot device?			<C600>
+			BNE		NonSlotDrvr					; branch if not.					<C600>
+
+; ---------+++++++++++  Begin Slot Driver  +++++++++++---------						<C133/29Aug86>
+
+			WITH 	spBlock, seBlock
+			
+; Initialize the SDM parameter block
+SlotDrvr	SUB.L	#spBlockSize,SP				; Allocate parameter block for slot manager
+			MOVE.L	SP,A4						; Save pointer to spBlock.				
+
+			BSR		SetUpspBlk					; Set up some of the SDM parameters.	<C600>
+
+
+; First search for the driver among those already installed . . .
+			MOVE.W	UnitNtryCnt, D2 			; number of units to check
+			SUB.W	#BgnSlotUnit,D2				; adjust for # of slot unit entries.
+			MOVEQ	#BgnSlotRef,D4				; init refnum index
+
+			MOVE.L	UTableBase, A3				; get address of the unit I/O table
+			MOVEQ	#BgnSlotUnit,D0				; adjust to beginning of slot unit entries.
+			LSL.L	#2,D0
+			ADD.L	D0,A3						; A3 <- ptr to unit table, beginning at slot DCE's.
+												; REPEAT
+@Repeat		MOVE.L	(A3)+,D0					;   get next Device Control Entry handle
+			BEQ.S	@Until						;   branch if no entry installed
+			MOVE.L	D0,A2						;   prepare to de-reference it.
+			MOVE.L	(A2),D0 					;   de-reference it.
+			BNE.S	@10							;   branch if ok					<C750>
+			CLR.L	-(A3)						;	Clear the bad UT entry.			<C750>
+			BRA.S	@Repeat						;	Continue at top of loop			<C750>
+
+@10			MOVE.L	D0,A1						;   A1 <- ptr to DCE				<C750>
+			
+			MOVE.B	dCtlSlot(A1),D0				;   do the slot numbers match?
+			CMP.B	spSlot(A4),D0		
+			BNE.S	@Until						;     if not then continue search.
+
+			MOVE.B	dCtlSlotId(A1),D0			;   do the sResource Id's match?
+			CMP.B	spId(A4),D0					
+			BNE.S	@Until						;     if not then continue search.	<C523>
+			
+			MOVE.B	dCtlExtDev(A1),D0			;   do the Device Id's match?		<C523>
+			CMP.B	spExtDev(A4),D0				;									<C523><C537>
+			BEQ.S	DCEFound					;     if yes then DCE is found.		<C523>
+			
+@Until		SUBQ	#1,D4						;   bump refnum index
+			SUBQ.W	#1,D2						;   next unit table entry
+			BGT.S	@Repeat						;   continue searching.
+												; UNTIL (proper DCE is found) OR (unit table entries are exhausted)
+			BRA.S	LookInRsrc					; not installed, begin looking for driver in resources.
+			
+; DCE was among the installed slot drivers, but is the driver still installed?
+DCEFound	MOVE.L	dctlDriver(A1),D0			; D0 <- handle to the driver
+			BEQ.S	BadDCE						; if driver handle is nil then there is no driver.
+			MOVE.L	D0,A1
+			MOVE.L	(A1),D0						; D0 <- ptr to the driver
+			BNE		OldDrvr						; if driver ptr is not nil then driver is already here, goto DrvrLock.
+
+BadDCE		MOVE.L	A2,A0						; if no driver, then purge the DCE, and reload and install the driver.
+			_DisposPtr							;   dispose of DCE
+			MOVE.L	#0,-(A3)					;   clear unit table entry
+
+; It wasn't among the installed slot drivers, so check resources . . .
+LookInRsrc	SUBQ	#4,SP						; make room for result
+			MOVE.L	#'DRVR',-(SP)				; push resource class DRVR
+			MOVE.L	spIOFileName(A4),-(SP)		; push name pointer
+			MOVE.W	#MapTrue,ROMMapInsert		; in case it's in sys ROM 				<C632/14Jan87> DAF
+			_GetNamedResource					; search resource files first (blows A0, D1??)
+			MOVE.L	(SP)+,D3					; did it find one? D3 <- handle to driver.
+
+; get the slot driver too...					; <C950/08Nov87> DAF
+
+LookInSlot	MOVE.L	A4,A0						; set A0 for use by the slot manager.
+			_sGetDriver							; get the slot driver
+			BEQ.S	@1							; continue if no error				<C950/08Nov87> DAF
+			
+			TST.L	D3							; was there a resource drvr?		<C950/08Nov87> DAF
+			BNE.S	DetRefNum					; yes, only from disk, so continue	<C950/08Nov87> DAF
+			BRA		DrvrBad						; branch if driver not found		<C950/08Nov87> DAF
+			
+@1			MOVE.L	spResult(A0),A3				; get the handle to the driver		<C950/08Nov87> DAF
+			MOVE.L	(A3),A1						; get the pointer to the driver		<C950/08Nov87> DAF
+			CLR.L	D0							; for upcoming add					<C950/08Nov87> DAF
+			MOVE.B	drvrName(A1),D0				; get the driver name length		<C950/08Nov87> DAF
+			ADDQ	#2,D0						; Adjust offset to version field	<C950/08Nov87> DAF
+			BCLR	#0,D0						; Adjust to word alignment			<C950/08Nov87> DAF
+			MOVE.W	drvrName(A1,D0.W),D0		; Get the sDriver version number	<C950/08Nov87> DAF
+
+;
+; compare DRVR resource version with sDrvr version, being careful to test if the 
+;	drivers were really present.  Iff the DRVR version is greater, use it, else
+;	use the slot drvr, or finally, no driver available, return error				<C950/08Nov87> DAF
+;
+
+			TST.L	D3							; is there a resource driver?		<C950/08Nov87> DAF
+			BEQ.S	@UseSlot					; if no system driver, use sDrvr	<C950/08Nov87> DAF
+			MOVE.L	D3,A0						; get handle in an A-reg			<C950/08Nov87> DAF
+			MOVE.L	(A0),A0						; get pointer						<C950/08Nov87> DAF
+			CLR.L	D2							; for upcoming add					<C950/08Nov87> DAF
+			MOVE.B	drvrName(A0),D2				; get the driver name length		<C950/08Nov87> DAF
+			ADDQ	#2,D2						; Adjust offset to version field.	<C950/08Nov87> DAF
+			BCLR	#0,D2						; Adjust alignment.					<C950/08Nov87> DAF
+			CMP.W	drvrName(A0,D2.W),D0		; Compare versions with sDrvr		<C950/08Nov87> DAF
+			BGE.S	@UseSlot					; if sDrvr ≥ drvr, then use sDrvr	<C950/08Nov87> DAF
+			
+			MOVE.L	A3,A0						; get rid of slot driver			<C950/08Nov87> DAF
+			_DisposHandle						;									<C950/08Nov87> DAF
+			MOVE.L	D3,-(SP)					; we need to detach the resource!	<C950/08Nov87> DAF
+			_DetachResource						;									<C950/08Nov87> DAF
+			BRA.S	DetRefNum
+
+@UseSlot			
+			MOVE.L	D3,-(SP)					; push the resource handle			<C950/08Nov87> DAF
+			_ReleaseResource					; we're using the sDrvr, so dump the system drvr <C950/08Nov87> DAF
+			MOVE.L	A3,D3						; slotDrvr handl in A3				<C950/08Nov87> DAF
+
+; Driver was loaded from resource file or slot, now determine the reference number.
+; 	Reference num will be related to the first available entry in the unit table.
+DetRefNum	
+												; <C334>
+			MOVE.L	D0,-(SP)					; save d0 on the stack
+			MOVE.L	D3,D0						; move address to strip
+			_StripAddress						; yank off the top byte...extraneous memory manager stuff.
+			MOVE.L	D0,D3						; restore to proper register
+			MOVE.L	(SP)+,D0					; restore d0
+			
+@10			MOVEQ	#BgnSlotRef,D4				; init refnum index
+			MOVE.W	UnitNtryCnt,D2 				; number of units to check
+			SUB.W	#BgnSlotUnit,D2				; adjust for # of slot unit entries.
+
+			MOVE.L	UTableBase, A3				; get address of the unit I/O table
+			MOVEQ	#BgnSlotUnit,D0				; adjust to beginning of slot unit entries.
+			LSL.L	#2,D0
+			ADD.L	D0,A3						; A3 <- ptr to unit table, beginning at slot DCE's.
+												; REPEAT
+@Repeat 	TST.L	(A3)+						;   Test next Device Control Entry handle	<C750>
+			BEQ		DrvrSet						;   branch if empty unit entry is found, D4 = RefNum			
+			SUBQ	#1,D4						;   bump refnum index
+			SUBQ.W	#1,D2						;   next unit table entry
+@Until		BGT.S	@Repeat						; UNTIL (empty unit entry is found) OR (end of unit table is reached)
+
+			CMP.W	#MaxUTEntries,UnitNtryCnt	; Check to see if UT is full.	<C523>
+			BGE.S	UTFull						; branch if full.				<C523>
+
+			MOVE.W	UnitNtryCnt,D0				; Get ready to see if UT can grow.		<C750>
+			ADD.W	#4,D0						; Increase size by 4. (Use an even number so no space is wasted)	<C750>
+			CMP.W	#MaxUTEntries,D0			; Is it full?							<C750>
+			BGT.S	UTFull						; Branch if full.						<C750>
+			MOVE.W	D0,UnitNtryCnt				; Not full, so let it grow.				<C750>
+			BRA.S	DrvrSet						; We are all set to install the driver.	<C750>
+			
+UTFull		MOVE.L	D3,A0						; dispose of the driver, there are no more entries available in theunit table.
+			_DisposHandle
+			MOVE.W	#UnitTblFullErr,D0			; Error, No more unit entries are available.
+			ADD.L	#spBlockSize,SP				; deallocate spBlock.			<C620>
+			BRA		OpenEnd						;								<C620>
+
+DrvrBad		ADD.L	#spBlockSize,SP				; deallocate spBlock
+			BRA		ToFSOpen					; go to FSOpen.					<C787>
+
+DrvrSet		ADD.L	#spBlockSize,SP				; deallocate spBlock
+			BRA		InstallDrvr
+			
+OldDrvr		ADD.L	#spBlockSize,SP				; deallocate spBlock
+			BRA		DrvrLock					; if driver ptr is not nil then driver is already here, goto DrvrLock.
+
+			ENDWITH
+
+
+; ---------+++++++++++  Begin Non-Slot Driver  +++++++++++---------
+
+; First search for the driver among those already installed . . .
+
+NonSlotDrvr	MOVE.L	UTableBase, A3		; get address of the unit I/O table
+			MOVE.W	UnitNtryCnt, D2 	; number of units to check
+			MOVEQ	#-1,D4				; init refnum index
+
+CkInstLoop
+			MOVE.L	(A3)+,D0			; get next Device Control Entry handle
+			BEQ.S	NextEntry			; branch if no entry installed
+			MOVE.L	D0,A2				; DCE handle
+			MOVE.L	(A2),D0 			; dereference handle
+			BEQ.S	NextEntry			; branch if null
+			MOVE.L	D0,A1				; A1 -> Device Control Entry
+
+			BTST	#DRAMBased,DCtlFlags+1(A1) ; ROM-based?
+			MOVE.L	DCtlDriver(A1), A1	; driver ptr/handle
+			BEQ.S	@1					; br if ROM-based (A1 is a pointer)
+			MOVE.L	A1, D0				; be clean and check for 0 handle
+			BEQ.S	NextEntry			; skip if so
+			MOVE.L	(A1), A1			; deref handle
+@1			MOVE.L	A1, D0				; is driver ptr nil?
+			BEQ.S	NextEntry			; br if so
+
+			LEA 	DrvrName(A1),A1 	; point A1 to driver name
+			MOVE.L	D1, D0				; A0 points to input filename, D1 is name length
+			SWAP	D0
+			MOVE.B	(A1)+, D0			; string 2 length
+			CMP.B	D0, D1				; are lengths the same?
+			BNE.S	NextEntry			; br if not (names shouldn't match if not)
+			_CmpString
+			BEQ 	DrvrLock			; branch if they matched (D4=refnum,
+										;  A2=DCE handle, D5=IO param blk ptr)
+NextEntry	SUBQ	#1,D4				; bump refnum index
+			SUBQ.W	#1,D2				; next unit table entry
+			BGT.S	CkInstLoop			; continue searching through all drivers
+
+; It wasn't among the installed drivers/desk accessories, so go check resources . . .
+
+			SUBQ	#4,SP				; make room for result
+			MOVE.L	#'DRVR',-(SP)		; push resource class DRVR
+			MOVE.L	D5,A0				; restore parameter block pointer
+			MOVE.L	IOFileName(A0),-(SP) ; push name pointer
+			MOVE.W	#MapTrue,ROMMapInsert ; in case it's in ROM . . .           <10Jul85>
+			_GetNamedResource			; search resource manager first (blows A0, D1??)
+			MOVE.L	(SP)+,D3			; did it find one?
+			BNE.S	gotDrvr 			; br if so								<04Oct85>
+
+			MOVE.W	ResErr, D0			; pass on the error code				<04Oct85>
+			BEQ.S	ToFSOpen			; br if ResNotFound . . .				<04Oct85>
+			CMP.W	#ResNotFound,D0 	;										<01Nov85>
+			BEQ.S	ToFSOpen			; br if ResNotFound . . .				<01Nov85>
+			BRA 	OpenEnd 			; exit open 							<04Oct85>
+
+; Figure out the driver's ID by using GetResInfo.  D3 has driver handle . . .
+
+gotDrvr 	CLR.W	-(SP)				; room for ID
+			MOVE.L	SP,D0				; save ptr
+			MOVE.L	D3,-(SP)			; push driver handle
+			MOVE.L	D0,-(SP)			; ptr to place to stick id
+			CLR.L	-(SP)				; we don't want the type
+			CLR.L	-(SP)				; we don't want the name
+			MOVE.W	#MapTrue,ROMMapInsert ; in case it's in ROM . . .           <10Jul85>
+			_GetResInfo
+			MOVE.W	(SP)+,D4			; get the ID
+			NOT.W	D4					; map into refNumber
+
+; make sure the driver is installed
+
+			MOVE.W	D4,D0				; put refNum in D0
+			BSR 	MpUnitNum			; is it installed?
+			BMI 	OpenEnd 			; if bad, give up
+			BNE.S	DInstalled			; if so, we're cool, continue
+
+InstallDrvr	MOVE.W	D4,D0				; put refNum in D0
+			MOVE.L	D3, A0				; A0 <- handle to driver
+			MOVE.L	(A0), A0			; dereference driver handle			
+			BTST	#DNeedLock,(A0) 	; needs lock?
+			BEQ.S	@0					; br if not
+			DC.W	$A43D				; _DrvrInstall, LOCK
+			BRA.S	@1
+@0			_DrvrInstall				; install it
+@1			BNE 	OpenEnd 			; if bad, give up <<unlock driver here???>>
+
+; Driver is installed, continue.
+
+DInstalled	MOVE	D4,D2				; make sure D2 has the refNum
+			BSR 	MapUnit 			; map it: DCE pointer->A1, DCE handle->A2
+
+			BSET	#DOpened,DCtlFlags+1(A1) ; already opened??
+			BNE		DrvrLock			; br if so (assume it's the same driver??)
+
+			;?? maybe we should check the driver handle to see if it is the same driver:
+			;
+			;	SAME OPENED
+			;
+			;	yes 	yes 	- return ok, don't call driver (unless it's a desk acc)
+			;	yes 	no		- call driver open
+			;	no		yes 	- close and remove old driver?? error??
+			;	no		no		- remove old driver??
+
+			MOVEQ	#$40, D0			; assume DCtlFlags=$40 (DRamBased)
+			MOVE.L	D3, DCtlDriver(A1)	; handle to driver code -> DCE
+			MOVE.L	D3, A0				; get handle in A-reg
+			MOVE.L	(A0), D0			; dereference driver handle
+			_StripAddress				; modify address to be correct
+			MOVE.L	D0,D3				; place in original location
+			MOVE.L	ROMBase,D0			; get start address of ROM				<v1.3>
+			_StripAddress				; clean address if necessary			<v1.3>
+			CMP.L	D0, D3 				; in RAM? <<assumes ROM is above RAM>>	<v1.3>
+			BLO.S	@3					; br if so	(make Jerome happy)			<C54>
+
+			MOVE.L	D3, DCtlDriver(A1)	; keep ptr to driver instead for ROM-based (MAY CHANGE)
+			MOVEQ	#0, D0				; zero DRamBased
+			BRA.S	@5					; branch								<v1.3>
+			
+@3			MOVEQ	#$40, D0			; DCtlFlags=$40 (DRamBased)
+@5			MOVE.L	D3,A0				; driver ptr
+			MOVE.W	(A0)+,DCtlFlags(A1) ; flags from driver -> DCE
+			MOVE.B	D0,DCtlFlags+1(A1)	; DrvrActive and DOpened = 0
+			MOVE.L	(A0)+,DCtlDelay(A1) ; copy DrvrDelay,DrvrEMask
+			MOVE.W	(A0)+,DCtlMenu(A1)	;  and DrvrMenu
+
+			WITH 	spBlock
+			
+; Check For extended parameter block call.
+			BSR.S	IsSlotDrvr					; is this a slot device?			<C600>
+			BNE		DrvrLock					; branch if not.					<C600>
+
+
+; Allocate the SDM parameter block
+			SUB.L	#spBlockSize,SP				; Allocate parameter block for SDM.
+			MOVE.L	SP,A4						; A4 <- pointer to spBlock.	
+
+
+; Set DCE extension fields: dCtlSlotId, dCtlSlot and dCtlDevBase.
+			BSR		SetUpspBlk					; Set up some of the SDM parameters.	<C600>
+
+			MOVE.B	spSlot(A4),dCtlSlot(A1)		; set the dCtlSlot field  
+			MOVE.B	spId(A4),dCtlSlotId(A1)		; set the dCtlSlotId field  
+			MOVE.B	spExtDev(A4),dCtlExtDev(A1)	; set the dCtlSlotId field  			<C523>
+
+			MOVE.L	#0,dCtlDevBase(A1)			; set dCtlDevBase field to nil.						<C620>
+			MOVE.L	A4,A0						; Determine the pointer to the base of the device.	<C620>
+
+			_sFindDevBase						;Find the base address.						<1.9>
+			BNE.S	DCEExtOk					; dCtlDevBase is nil {not a required field}.<1.9>
+			MOVE.L	spResult(A0),dCtlDevBase(A1); set dCtlDevBase field								<C620>
+
+DCEExtOk	ADD.L	#spBlockSize,SP				; deallocate spBlock
+			
+	
+			ENDWITH
+
+; lock down the DCE and the driver code
+
+DrvrLock	MOVE.L	(A2), A1			; deref DCE ptr
+			BTST	#DNeedLock,DCtlFlags(A1) ; need to be locked?
+			BEQ.S	FoundUnit			; if not, don't lock it
+
+			MOVE.L	DCtlDriver(A1),A0	; get driver code handle
+			BTST	#DRamBased, DCtlFlags+1(A1)
+			BEQ.S	@1					; skip driver lock if not RAM-based
+			
+			_HLock						; lock RAM-based driver			<C169>
+@1
+			MOVEA.L	A2,A0				; A0 <- DCE handle				<C169>
+			_HLock						; lock DCE regardless of driver	<C169>
+; we found the unit so call it
+; A1 = DCE pointer and D4 = refnum
+
+FoundUnit	MOVE.L	D5,A0				; restore parameter block pointer
+			MOVE.W	D4,IORefNum(A0) 	; return the refnum
+
+			MOVEQ	#OpenErr,D0 		; assume permissions error
+			MOVE.B	DCtlFlags(A1),D1	; get the driver's permission bits
+			MOVE	D1,D2				; save it
+			OR.B	IOPermssn(A0),D1	; 'or' in open request's permissions
+			EOR.B	D2,D1				; if anything changed it's an error
+			AND.B	#$0003,D1			; only worry about rd, write
+			BNE		OpenEnd 			; branch if permissions error
+
+			BSET	#DOpened,DCtlFlags+1(A1) ; is it already opened?				<04Oct85>
+			BEQ.S	@1					; br if not 								<19Mar85>
+
+			CMP.B	#$40,IOPermssn(A0)	; is it from OpenDeskAcc??					<01Nov85>
+			BNE		OpenOK				; br if not (call desk accs even if open)	<19Mar85>
+
+@1			MOVEQ	#DrvrOpen,D1		; open routine offset within driver 		<19Mar85>
+			BSR 	GoDriver			; call the driver's open routine ??BETTER HAVE A DRIVER??
+										;	(preserves A1 and A2)
+			BPL.S	@UpdateSRT	 		; br if no err (only neg codes are errors)	<04Oct85> <C226/10Oct86>
+
+			MOVE.L	D5,A0				; restore parameter block pointer
+			CLR.W	IORefNum(A0)		; zero the refnum (failed to open)
+			BCLR	#DOpened,DCtlFlags+1(A1) ; mark it closed since we failed		<04Oct85>
+			BRA.S	UnLkStuff			; unlock everything since we failed to open
+
+@UpdateSRT	NOP							;											<C226/10Oct86>
+
+			WITH 	spBlock
+			
+; Check For extended parameter block call.
+			BSR.S	IsSlotDrvr					; is this a slot device?			<C600>
+			BNE		ToUnLkStuff					; branch if not.					<C600>
+
+
+; Allocate the SDM parameter block
+			SUB.L	#spBlockSize,SP				; Allocate parameter block for SDM.
+			MOVE.L	SP,A4						; A4 <- pointer to spBlock.	
+
+
+; Set up the spBlock and update the SRT.
+			BSR		SetUpspBlk					; Set up some of the SDM parameters.	<C600>
+			MOVE.W	D4,spRefNum(A4)				; Reference number	<C542>
+			MOVE.W	#0,spIOReserved(A4)			; Reserved field, Must be zero now.		<C671>
+			EXG.L	A0,A4						; Save A0			<C542>
+			_sUpdateSRT							; update the Slot Resource Table.	<C542>
+			EXG.L	A4,A0						; Restore A0		<C542>
+			MOVEQ.L #0,D0						; ignore slot mgr errors 			<SM3> rb
+
+; Done
+			ADD.L	#spBlockSize,SP				; deallocate spBlock
+
+			ENDWITH
+
+
+
+ToUnLkStuff BTST	#DNeedLock,DCtlFlags(A1) ;does it have to stay locked while open?
+			BNE.S	OpenEnd 			; exit if so
+
+UnLkStuff
+			; From here to OpenEnd, must unlock 0, 1, or 2 handles.  Allowed	<C169>
+			; to trash A0 but not D0=result code.  Use D3 as temp for D0.		<C169>
+			MOVE.L	DCtlDriver(A1),A0	; get handle to the driver
+			BTST	#DRamBased, DCtlFlags+1(A1)
+			BEQ.S	OpenEnd 			; don't unlock drivers or DCEs if ROM-based
+			
+			EXG		D0,D3				; preserve error code					<C169>
+			_HUnlock					; RAM-based drivers						<C169>
+			EXG		D0,D3				; restore error code					<C169>
+			
+			BTST	#DNeedLock,DCtlFlags(A1) ; don't unlock the DCE if it's liable to be locked later
+			BNE.S	OpenEnd 			; br if needs lock
+			
+			MOVEA.L	A2,A0				; A0 <- DCE								<C169>
+			EXG		D0,D3				; preserve error code					<C169>
+			_HUnlock					;										<C169>
+			EXG		D0,D3				; restore error code					<C169>
+			
+OpenEnd
+			MOVE.L	D5,A0				; restore parameter block pointer
+			MOVEM.L (SP)+,D3-D5/A2-A4	; restore regs							<C133/29Aug86>
+
+OpenExit	MOVE.W	D0, IOResult(A0)	; return result here also
+			RTS
+
+OpenOK		MOVEQ	#0,D0				; open was successful (driver already open)
+			BRA.S	OpenEnd
+
+;______________________________________________________________________
+;
+; Ext Routine:	  Close
+; Arguments:		A0 (input)	--	pointer to Close parameter block
+;					D1 (input)	--	OS Call trap word
+;					D0 (output) --	error code
+;
+; Function: 	  If the RefNum is positive, the file system does all the work;
+;				  otherwise, we make a synchronous call to the IO Driver's
+;				  Close routine, after waiting for the driver to finish any
+;				  pending requests.  If the driver is a RAM-based driver, its
+;				  code block is unlocked; the Device Control Entry for the
+;				  driver is always unlocked.
+;______________________________________________________________________
+
+Close		MOVE.W	IORefNum(A0),D2 	; get the refnum
+			BMI.S	IOClose 			; branch if it's for us
+			JMP 	FileClose			; let the file system handle it
+
+IOClose		MOVEM.L D3-D5/A2-A4,-(SP)	; observe pascal regsave conventions		<C133/29Aug86>
+			MOVE.L	A0, D5				; save parameter block ptr
+			BSR 	MapUnit 			; get pointer to DCE in A1, handle in A2
+			BTST	#DOpened,DCtlFlags+1(A1) ; is it open?
+			BEQ.S	OpenOK				; if not, exit ok
+
+WaitUntilDone
+			MOVE.L	jWaitUntil,-(SP)	; get jump vector							<C805>
+			RTS							; and jump to it							<C805>
+			
+vWaitUntil	BTST	#DrvrActive,DCtlFlags+1(A1)	;									<C805>
+			BNE.S	vWaitUntil			; wait until the driver has finished		<C805>
+
+			MOVEQ	#DrvrClose,D1		; close routine offset within driver
+			BSR 	GoDriver			; call the driver's close routine ??BETTER HAVE A DRIVER??
+										; (preserves A1 and A2)
+			CMP.W	#ClosErr,D0 		; failed to close?							<04Oct85>
+			BEQ.S	ToUnLkStuff 		; br if close failed (don't mark it closed) <04Oct85>
+
+			BCLR	#DOpened,DCtlFlags+1(A1) ;flag driver as closed 				<27Jun85>
+
+			WITH 	spBlock
+			
+			TST.B	DCtlSlot(A1)				; br if not a slot device.			<C620>
+			BEQ.S	@1
+			
+; Allocate the SDM parameter block
+			SUB.L	#spBlockSize,SP				; Allocate parameter block for slot manager
+			MOVE.L	SP,A4						; A4 <- pointer to spBlock.	
+
+; Set up the spBlock and update the SRT.
+			MOVE.B	DCtlSlot(A1),spSlot(A4)		; Slot
+			MOVE.B	DCtlSlotId(A1),spId(A4)		; sResource Id
+			MOVE.B	DCtlExtDev(A1),spExtDev(A4)	; External Device	<C523>
+			MOVE.W	#0,spRefNum(A4)				; Reference number	<C542>
+			MOVE.W	#0,spIOReserved(A4)			; Reserved field, Must be zero now.		<C671>
+			EXG.L	A0,A4						; Save A0			<C542>
+			_sUpdateSRT							; A0 contains ptr to spBlock, RefNum = 0 => closed	<C542>
+			EXG.L	A4,A0						; Restore A0		<C542>
+
+; Done
+			ADD.L	#spBlockSize,SP				; deallocate spBlock
+
+			ENDWITH
+
+@1			BRA.S	UnLkStuff			; unlock everything 						<27Jun85>
+
+;______________________________________________________________________
+;
+; Ext Routine:	  Read
+; Arguments:		A0 (input)	--	pointer to Read parameter block
+;					D1 (input)	--	OS Call trap word
+;					D0 (output) --	error code
+;
+; Function: 	  If the read call has the asynchronous flag bit set, it vectors
+;				  to the driver to do the dirty work; otherwise it performs an
+;				  asynchronous read call and polls the I/O control block until
+;				  the I/O has completed.
+;
+;______________________________________________________________________
+
+Read
+			TestFor	SupportsIdle
+			BEQ.S	@notsupported
+			_IdleUpdate					; this is activity, stay at full speed
+@notsupported
+
+			MOVE.W	IORefNum(A0),D2 	; get the refnum
+			BMI.S	IORead				; if <0, its a device call
+			JMP 	FileRead			; let the file system handle it
+
+IORead		MOVEM.L D3-D5/A2-A4,-(SP)	 ; observe pascal regsave conventions  <C133/29Aug86>
+			MOVEQ	#ReadErr,D0 		; not-read-enabled error
+			MOVEQ	#DReadEnable,D4 	; read enable flag bit number
+
+;______________________________________________________________________
+;
+; Routine:		  IORWCS
+; Arguments:		A0 (input)	--	pointer to command parameter block
+;					D0 (input)	--	operation-specific error code
+;					D1 (input)	--	OS Call trap word
+;					D2 (input)	--	the driver's RefNum
+;					D4 (input)	--	flag enable bit for this command
+;					stack has D3-D4, A2 saved on it
+; Called By:	  Read, Write, Control, Status
+;
+; Function: 	  shares code for Read, Write, Control, and Status calls
+;				  to IO Drivers; it maps the RefNum into a Device Control Entry
+;				  pointer in A1, checks that the driver is enabled for such a
+;				  call, and then handles the synchronous or asynchronous calling
+;				  of the driver.  If the NoQueue bit in the trap is set, it
+;				  calls the driver directly without any queuing
+;
+;______________________________________________________________________
+
+IORWCS
+			MOVE.L	A0,D5				; save param blk ptr (in case of MapUnit err)
+			BSR 	MapUnit 			; first, map RefNum into DCE addr in A1
+
+			CMP.B	#AWrCmd,D1			; read or write?
+			BGT.S	RWCSInit			; branch if status or control
+			CLR.L	IONumDone(A0)		; nothing done so far
+
+RWCSInit	MOVE.W	#1,IOResult(A0) 	; set IOResult to "in progress"
+			MOVE.W	D1,IOTrap(A0)		; set up IOCB: mark I/O command type
+			MOVE.W	#IOQType,QType(A0)	; say its an I/O queueing element
+
+			BTST	D4,DCtlFlags(A1)	; is driver enabled for this command?
+			MOVEM.L (SP)+,D3-D5/A2-A4	; (clean up the stack)  <C133/29Aug86>
+			BEQ.S	RWCSDone			; give up if not
+
+			MOVEQ	#NotOpenErr,D0		; assume it's not open
+			BTST	#DOpened,DCtlFlags+1(A1) ; is it open?
+			BEQ.S	RWCSDone			; if not, exit ok
+
+			BTST	#noQueueBit,D1		; no queue bit set?
+			BNE 	DoImedIO			; if so, go right to the driver
+
+			BTST	#asyncTrpBit,D1 	; async bit on?
+			BNE 	DoAsyncIO			; if so, don't wait for completion
+
+			CLR.L	IOCompletion(A0)	; no completion routines for sync calls
+			MOVE.L	A0,-(SP)
+			BSR 	DoAsyncIO
+			MOVE.L	(SP)+,A0
+
+SyncWait	
+			MOVE.L	jSyncWait,-(SP)		; get jump vector							<C805>
+			RTS							; and jump to it							<C805>
+			
+vSyncWait	MOVE.W	IOResult(A0),D0 	; test the sync completion flag				<C805>
+			BGT.S	vSyncWait			;											<C805>
+
+			EXT.L	D0					; want long result							<05Jun85>
+
+RWCSDone	MOVE.W	D0, IOResult(A0)	; (in case driver was never called)
+			RTS
+
+;______________________________________________________________________
+;
+; Ext Routine:	  Write
+; Arguments:		A0 (input)	--	pointer to Write parameter block
+;					D1 (input)	--	OS Call trap word
+;					D0 (output) --	error code
+;
+; Function: 	  If the write call has the asynchronous flag bit set, it vectors
+;				  to the driver to do the dirty work; otherwise it performs an
+;				  asynchronous write call and polls the I/O control block until
+;				  the I/O has completed.
+;
+;______________________________________________________________________
+
+Write		
+			TestFor	SupportsIdle
+			BEQ.S	@notsupported
+			_IdleUpdate					; this is activity, stay at full speed
+@notsupported
+
+			MOVE.W	IORefNum(A0),D2 	; get the refnum
+			BMI.S	IOWrite 			; if <0, it's a device call
+			JMP 	FileWrite			; let the file system handle it
+
+IOWrite 	MOVEM.L D3-D5/A2-A4,-(SP)	; observe pascal regsave conventions  <C133/29Aug86>
+			MOVEQ	#WritErr,D0 		; not-write-enabled error
+			MOVEQ	#DWritEnable,D4 	; write enable flag bit number
+			BRA.S	IORWCS
+
+;______________________________________________________________________
+;
+; Ext Routine:	  Control
+; Arguments:		A0 (input)	--	pointer to Control parameter block
+;
+; Function: 	  Call driver if control is enabled.
+;
+;______________________________________________________________________
+
+ControlTrap	MOVEM.L D3-D5/A2-A4,-(SP)	; observe pascal regsave conventions  <C133/29Aug86>
+			MOVE.W	IORefNum(A0),D2 	; get the refnum
+			MOVEQ	#ControlErr,D0		; not-control-enabled error
+			MOVEQ	#DCtlEnable,D4		; control enable flag bit number
+			BRA.S	IORWCS
+
+;______________________________________________________________________
+;
+; Ext Routine:	  Status
+; Arguments:		A0 (input)	--	pointer to Status parameter block
+;
+; Function: 	  Call driver if status is enabled.
+;
+;  26-Apr-83  AJH  implemented status call 1 -- return DCE handle
+;
+;______________________________________________________________________
+
+StatusTrap	MOVEM.L D3-D5/A2-A4,-(SP)	; observe pascal regsave conventions  <C133/29Aug86>
+			MOVE.W	IORefNum(A0),D2 	; test the sign of the refnum
+			MOVE.L	A0,D5				; save param blk ptr (in case of MapUnit err)
+
+			CMP 	#1,CSCode(A0)		; is it status call 1?
+			BEQ.S	RetDCEHandle		; if so, special case it
+
+			MOVEQ	#StatusErr,D0		; not-status-enabled error
+			MOVEQ	#DStatEnable,D4 	; status enable flag bit number
+			BRA.S	IORWCS
+
+RetDCEHandle
+			BSR 	MapUnit 			; figure out the DCE handle (won't return if badunit #)
+			MOVE.L	A2,CSParam(A0)		; return it as the result
+			BRA 	OpenOK				; restore registers and return
+
+;____________________________________________________________________
+;
+; Ext Routine:	  KillIO
+; Arguments:		A0 (input)	--	pointer to param block w/refNum
+;					D0 (output) --	result code
+;
+; Function: 	  KillIO terminates the current request in progress
+;					for an I/O driver and empties its queue, posting
+;					error codes and running completion routines as
+;					appropriate.
+;______________________________________________________________________
+
+KillIOTrap
+			MOVEM.L D3-D5/A2-A4,-(SP)	; observe pascal regsave conventions  <C133/29Aug86>
+
+			MOVE.W	IORefNum(A0),D2 	; get the refNum
+			MOVE.L	A0,D5				; save param blk ptr (in case of MapUnit err)
+			BSR 	MapUnit 			; derive the DCE pointer
+			MOVE.W	#KillCode,CSCode(A0) ; KillIO maps to control call 1
+
+			MOVE	SR,-(SP)			; preserve current status
+			ORI 	#HiIntMask,SR		; interrupts off for queue manipulation 	<24Jul85>
+
+			MOVEQ	#DrvrCtl,D1 		; control routine offset within driver		<19Mar85>
+			MOVEQ	#ControlErr,D0		; not-control-enabled error 				<19Mar85>
+			MOVEQ	#DCtlEnable,D4		; control enable flag bit number			<19Mar85>
+
+			BTST	D4,DCtlFlags(A1)	; is driver enabled for this command?		<19Mar85>
+			BEQ.S	KillFailed			; give up if not							<19Mar85>
+
+			MOVEQ	#NotOpenErr,D0		; assume it's not open                      <19Mar85>
+			BTST	#DOpened,DCtlFlags+1(A1) ; is it open?							<19Mar85>
+			BEQ.S	KillFailed			; if not, exit ok							<19Mar85>
+
+			BSR 	GoDriver			; call the driver control routine
+			BNE.S	KillFailed			; if that failed, punt
+
+KillLoop	TST.L	DCtlQHead(A1)		; is there a request?
+			BEQ.S	DoneKillIO			; if not, we're done
+			MOVEQ	#AbortErr,D0		; get the "abort" error code
+			MOVE	#($2000+HiIntMask),D1 ; make PostCompletion stay at top level	<24Jul85>
+			BSR 	PostCompletion		; post error code and dequeue
+			BRA.S	KillLoop			; loop until done
+
+DoneKillIO	BSR 	DeActDrvr			; mark it inactive and unlock DCE, driver
+			MOVEQ	#0,D0				; no error
+
+KillFailed	MOVE	(SP)+,SR			; interrupts back on
+			BRA 	OpenEnd 			; restore regs and return to caller
+
+;______________________________________________________________________
+;
+; Ext Routine:	  DrvrInstall
+; Arguments:		D0 (input)	--	Driver Refnum ( -1 thru -65 for common devices,
+;					D0 (output) --	result code, 0=driver installed
+;					A0 (input)	--	pointer to driver to be installed.
+;
+; Function: 	  Used to install a driver.
+;				  A Device Control Entry for the driver is created and its
+;				  handle entered into the specified Unit Table position (-1
+;				  thru -32).
+;
+;				  If the unit number is -4 thru -9, the corresponding
+;				  ROM-based driver will be replaced.
+;
+;______________________________________________________________________
+
+DrvrInstall
+			MOVEM.L A2-A4/D3-D5,-(SP)	; observe Pascal regsave conventions  <C133/29Aug86>
+			MOVE.L	A0,A3				; save name pointer
+			MOVE.L	D0,D3				; save refnum
+			BSR.S	MpUnitNum			; make it a unit num
+			BMI.S	DInstRTS			; exit if bad unit number
+			BNE.S	ClearDCE			; if not nil, reuse it
+
+			BTST	#asyncTrpBit,D1 	; async bit on? (use this for 'lock' indication)
+			BEQ.S	@1					; br if not
+			MOVEQ	#DCtlEntrySize,D0	; get size of device control entry
+			_ResrvMem  ,SYS 			; make room as low as possible (in case it gets locked forever)
+
+@1			MOVEQ	#DCtlEntrySize,D0
+			_NewHandle ,SYS 			; allocate it on system heap
+			BNE.S	DInstRTS			; exit on mem full errors
+
+; clear out the DCE entry
+
+ClearDCE	MOVEQ	#DCtlEntrySize-1,D0 ; get size in bytes
+			MOVE.L	(A0),A1 			; DCE pointer
+@1			CLR.B	(A1)+				; clear a byte
+			DBRA	D0,@1				; loop till cleared
+
+; install it in the table
+
+			MOVE.L	A0,(A2) 			; DCE handle -> Unit I/O Table
+			MOVE.L	(A0),A3 			; DCE pointer
+			BSET	#DRamBased,DCtlFlags+1(A3) ; just set RAM-based until we load it
+			MOVE.W	D3,DCtlRefNum(A3)	; set up the refNum (queue inited to 0s)
+
+DInstOKExit MOVEQ	#0,D0				; no error
+DInstRTS	MOVEM.L (SP)+,A2-A4/D3-D5	; restore regs  <C133/29Aug86>
+			RTS
+
+; routine to map the refNum into a DCE handle/pointer
+
+MpUnitNum	NOT.W	D0					; bitwise complement to get unitnum
+			BMI.S	@1					; br if it was positive
+			CMP.W	UnitNtryCnt,D0		; is it in range?
+			BGE.S	@1					; exit if not
+
+			ASL.W	#2,D0				; multiply by four
+			MOVE.L	UTableBase,A2		; get address of unit table
+			ADD 	D0,A2				; add in the offset
+			MOVE.L	(A2),A0 			; get the old DCE handle
+			MOVE.L	A0,D0				; was it nil?
+
+			_StripAddress				;ensure 32 bit valid address
+			TST.L	D0					;correct the condition codes		<C540>
+
+			RTS 						; return with A2=entry pointer, A0=handle
+
+@1			MOVEQ	#BadUnitErr,D0		; flag the error
+			RTS
+
+;______________________________________________________________________
+;
+; Ext Routine:	  DrvrRemove
+; Arguments:		D0 (input)	--	Driver Refnum (-1 thru -24)
+;					D0 (output) --	result code, 0=driver removed
+;												-1=driver not found
+;
+; Function: 	  Used to remove a driver.	A RAM-based driver is purged from
+;				  the system heap using a ReleaseResource call.  Memory for
+;				  the Device Control Entry for the driver is disposed and the
+;				  driver's close routine is called.
+;________________________________________________________________________
+
+DrvrRemove
+			MOVEM.L A2-A4/D3-D5,-(SP)	; observe Pascal regsave conventions  <C133/29Aug86>
+			BSR.S	MpUnitNum
+			BMI.S	DInstRTS			; exit if error
+			BEQ.S	DInstOKExit 		; exit if entry is empty (already removed)
+
+			MOVE.L	A2,A3				; save entry pointer
+			MOVE.L	D0,A2				; DCE handle
+			MOVE.L	(A2),A1 			; DCE pointer
+
+; A3 = ptr to UnitTable Entry
+; A2 = DCE handle
+; A1 = DCE ptr
+
+			BTST	#DOpened,DCtlFlags+1(A1) ; check if it's Opened
+			BNE.S	RemovErr			; don't remove an opened driver
+			BTST	#DRAMBased,DCtlFlags+1(A1) ; check if it's RAM-based
+			BEQ.S	@1					; branch for ROM-based drivers
+
+			MOVE.L	DCtlDriver(A1),-(SP) ; driver object handle
+			_ReleaseResource			; go remove it
+
+@1			MOVE.L	A2,A0				; deallocate DCE handle
+			_DisposHandle ,SYS			; dispose it on system heap
+			CLR.L	(A3)				; clear Unit Table entry
+			BRA.S	DInstOKExit 		; and exit successfully
+
+RemovErr	MOVEQ	#DRemovErr,D0		;
+			BRA.S	DInstRTS			; restore regs and exit
+
+;______________________________________________________________________
+;
+; Ext Routine:	  AddDrive
+; Arguments:		D0 (input)	--	high word: drive number
+;									low word: driver refnum
+;					   (output) --	error code (0)
+;					A0 (input)	--	Drive Queue element ptr
+;
+; Function: 	  Add a drive to the drive queue.
+;
+; To Do:
+; - adjust drive number if conflict (or replace??)
+;________________________________________________________________________
+
+AddDriveTrap MOVE.L	D0, DQDrive(A0)
+			LEA 	DrvQHdr, A1
+			JSR 	EnqueueTrap			;										<06Mar85>
+			MOVEQ	#0, D0				; return success for now				<06Mar85>
+			RTS 						;										<06Mar85>
+
+			END 
+
+

@@ -1,0 +1,2729 @@
+;
+;	File:		Mace.a
+;
+;	Contains:	Routines to support MACE when coupled with a PSC-style DMA model.  
+;
+;	Written by:	Mark A. Law	,3-March-92
+;
+;	Copyright:	й 1992-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;   This file is used in these builds:  Mac32
+;
+;	Change History (most recent first):
+;
+;	  <SM10>	 7/26/93	mal		Fixed bug where drvr can fail to open if VM on and logical to
+;									physical address mapping of recv buffers are not 1 to 1.  See
+;									GetPkt().
+;	   <SM9>	 6/14/93	kc		Roll in Ludwig.
+;	   <LW9>	 5/14/93	mal		#1084946 Fixed race between xmit interrupt and non-interrupt
+;									rtns. that could result in sending out-of-order packets.
+;	   <LW8>	  5/3/93	mal		#1082628 Fixed race between deferred task and int. hndlr. rtns.
+;									See MaceRecv:@exit for details.
+;	   <LW7>	  5/1/93	mal		#1082434 Changed calling sequence to GetMem/FreeMem (see
+;									MaceEnet.a).  Removed PSC debugging code, we support ONLY most
+;									current PSC, │ upgraded EVT5.
+;	   <LW6>	 3/21/93	mal		Fix last checkin bug in WriteLAF where MACE_MAC_CONFIG must be
+;									saved.
+;	   <LW5>	 3/21/93	mal		Remove Curio A2 support, ie. evt3 support.  Removed use of
+;									_SetIntMask.  Write-once on bug-fixed PSC.
+;	   <LW4>	 3/16/93	chp		Replace references to the obsolete PSCIntTbl lomem with
+;									references to the equivalent field in ExpandMem.
+;	   <LW3>	 2/17/93	mal		Moved receive chain/buffer headers out of unused portion of DMA
+;									buffer and into separate memory block.
+;	   <LW2>	 1/27/93	mal		Added MACEecfg rsrc support. Changed promiscuous mode support to
+;									lower main codepath risk.
+;	   <SM8>	 12/4/92	mal		Turned off debug code; promiscuous change to MaceRecv(); no
+;									longer deliver pkts with overflow error; added RCVCO counter;
+;									improved error handling if TranslateAddress fails.
+;	   <SM7>	11/19/92	mal		Added PSC-bug recv DMA chnl checks; made ResetMace more robust;
+;									chg'd alignment method on recv buffers; added rcv collision cnt;
+;									chg'd MaceHalt to dequeue DT
+;	   <SM6>	11/10/92	mal		Fixed bug in Mace open that could corrupt memory byte off A3;
+;									Corrected reporting of Recv FIFO overflow to
+;									InternalMacRecvError.
+;	   <SM5>	10/30/92	mal		Fixed race cond. between deferred task & int. hndlr to give
+;									better recv perf.; added cmd/stat reg debug cuz of psc hw bug;
+;									disable all ints at end of ResetMace;  call FreeMemory if error
+;									in MaceInit; misc global cleanup; misc comment cleanup.
+;	   <SM4>	10/26/92	mal		Updated to ESD's latest stats equs.
+;	   <SM3>	10/26/92	mal		Fixed some bugs and modified recv/xmit buffer memory allocation
+;									loop in open().
+;	   <SM2>	10/13/92	mal		-perf. improvement: removed all memory indirect preindexed ea's;
+;									-changed status to lw and always deliver to RecvRtn; -added temp
+;									code to handle PSC addr/cnt bug on 33 Mhz evt4.
+;		 <1>	 10/6/92	GDW		New location for ROMLink tool.
+;	   <SM6>	 9/14/92	mal		-Updated SNMP counters; -added temp code to handle all Curio
+;									revs up to B0
+;	   <SM5>	 7/27/92	mal		Added temp code to handle version 1 'ebfr's.
+;	   <SM4>	 7/25/92	mal		Added support for HW's maximum receive buffer configuration.
+;									Fixed xmit path bug where pkts could be sent out of order
+;									(stress).   Fixed recv path bug to ensure correct reg set primed
+;									when only 1 chain available (heavy stress).   Added recv/xmit
+;									bus error handlers.    Improved MACEHALT routine.
+;	   <SM3>	 6/26/92	mal		Expanded # of maceinit parms saved in globals.
+;	   <SM2>	 6/22/92	mal		New drvr to support PSC2's (EVT2) Ethernet DMA receive model.
+;	   <SM1>	 5/21/92	RB		Removed the inclusion of VMCalls.a, got rid of a warning
+;									branch to next instruction and included InternalOnlyEqu.a
+;		<P3>	  5/5/92	mal		Removed some unused global vars
+;		<P2>	 4/30/92	mal		Expanded interface between MaceEnet.a and Mace.a.
+;
+;	To Do:
+;
+;	Notes:		Initial version provides support for Cyclone builtin Ethernet.
+;
+;
+
+			PRINT		OFF
+			INCLUDE 	'SysEqu.a'						; System definitions
+			INCLUDE 	'SysErr.a'						; System errors
+			INCLUDE 	'Traps.a'						; Traps definitions
+			INCLUDE		'GestaltEqu.a'
+			INCLUDE		'InternalOnlyEqu.a'				; lowmem globals
+			INCLUDE		'HardwarePrivateEqu.a'
+			INCLUDE		'UniversalEqu.a'				; lowmem global records
+			INCLUDE 	'ATalkMacros.a' 				; Nifty Macros
+			INCLUDE		'SysPrivateEqu.a'				; ExpandMem defs
+
+; Conditional compile equates
+COUNTERS	EQU			0
+BUFDEBUG	EQU			0
+DEBUG		EQU			0
+SETDEBUG	EQU			0
+SETDEBUGFAIL EQU		0
+SETCSDEBUG 	EQU			0
+SETCSDEBUGFAIL EQU		0
+USEDEFERREDTASK EQU 	1
+PROM		EQU			1
+
+			PRINT		NOGEN,NOMDIR,ON
+			INCLUDE 	'MaceEqu.a' 					; Mace definitions
+			INCLUDE 	'PSCEqu.a' 						; PSC definitions
+			INCLUDE 	'ENETEqu.a' 					; Driver definitions
+			INCLUDE 	'SNMPLAP.a' 					; SNMP definitions
+			EJECT
+
+;_______________________________________ 
+;
+; Misc definitions
+;_______________________________________
+
+OneWdsSz	EQU 		8								; single fragment wds size
+INTLockOut	EQU 		$0700							; SR value to disable ALL interrupts
+DMALockOut	EQU 		$0400							; SR value to disable PSC DMA interrupts
+NeedDefer	EQU			5								; bit indicates VM is running
+	; ееее warning, MaxChns should NOT be set > 64. It could make some calcs in the 
+	; ееее MaceInit rtn overflow the 16 bit low-order word!
+MaxChns		EQU			64								; max number of chains
+OneChn		EQU			1								; one chain, minimum too
+DefChns		EQU			4								; default number of chains
+MaxBufpChn	EQU			1023							; max number of buffers per chain
+DefTxBuffs	EQU			8								; default number of xmit buffers
+DefRxBuffs	EQU			16								; default number of recv buffers
+MinBufpChn	EQU			2								; min number of buffers per chain
+;MACERevA2	EQU			$0941
+MACERevB0	EQU			$0940
+
+MaceVars	RECORD		0								; our variables
+MACEmem		DS.l		1								; ptr to memory block with recv & xmit buffers
+RecvBuffMem	DS.l		1								; aligned recv buffer mem 
+XmitBuffMem	DS.l		1								; aligned xmit buffer mem 
+RecvXmitMemSz DS.l		1								; need size of aligned mem if need to free it 
+ChnDescrMem	DS.l		1								; recv chain descriptor mem 
+MACEBase	DS.l		1								; MACE base address
+PSCBase		DS.l		1								; PSC base address
+DTQE	  	DS.b		dtQElSize						; Deferred task queue element
+DTInstalled	DS.b		1								; flag, non-zero if DT installed
+			DS.b		1								; fill
+MACEChipID  DS.w		1								; MACE revision
+		ALIGN 4
+; еее parms saved from MaceInit call
+RcvRtn		DS.l		1								; users recv rtn
+RcvParm		DS.l		1								; users recv rtn parm
+XmtDnRtn	DS.l		1								; users xmit completion rtn
+XmtDnParm	DS.l		1								; users xmit completion rtn parm
+MCfg		DS.l		1								; ptr to MACE config record
+Dot3StatPtr	DS.l		1								; ptr to 802.3 statistics counters
+LAPMIBStatPtr DS.l		1								; ptr to LAP MIB statistics counters
+OurAddrPtr	DS.l		1								; ptr to ethernet address
+MemMove		DS.l		1								; ptr to fast memory move rtn
+; еее end parms
+; ActRecvSet is REQUIRED since it enables the Recv processing to ensures that recv
+;	pkts are processed IN ORDER.
+ActRecvSet	DS.w		1								; offset to active recv reg set
+; ActXmitSet helps, ie. not necessary, the Xmit DONE processing by pting to the "oldest" reg 
+; 	set that has completed a xmit.  For cases where both sets have a xmit done int, this 
+;	will make available the next set that can perform a xmit, the "oldest".
+; NxtXmitSet is REQUIRED since it enables the Xmit PRIME processing to ensures that xmit
+;	pkts are sent IN ORDER.
+ActXmitSet	DS.w		1								; offset to active xmit reg set
+NxtXmitSet	DS.w		1								; offset to xmit reg set for next xmit
+; еееее WARNING: Do NOT add or delete any parms in this range
+; 				 The offsets between RxChainSet0,RxChainSet1 & 
+;				 TxBuffSet0,TxBuffSet1 MUST be maintained
+CntlRegSetByte 	EQU	$0001								; AND with cntrl reg to get inactive set
+RegSet1Offset	EQU	$10									; Reg Set1 offset from Channel base
+		ALIGN 4
+RxChainSet0	DS.l		1								; Log addr of chain assigned to Set0
+FreeRxChain DS.l		1								; head of free recv chain list
+InUseRxHead	DS.l		1								; head of InUse recv chain list
+InUseRxTail	DS.l		1								; tail of InUse recv chain list
+RxChainSet1	DS.l		1								; Log addr of chain assigned to Set1  
+TxBuffSet0	DS.l		1								; Log addr of buffer assigned to Set0
+FreeXmtBuff	DS.l		1								; head of free xmit buffers list
+InUseTxHead	DS.l		1								; head of InUse xmit buffers list
+InUseTxTail	DS.l		1								; tail of InUse xmit buffers list
+TxBuffSet1	DS.l		1								; Log addr of buffer assigned to Set1 
+; еееее END WARNING
+COLLCnt		DS.l		1								; recv frames with collision error 
+	; Transmit Frame Status Register counters
+XmtStatINV	DS.l		1								; xmit ints with xmit status invalid
+XmtLCOL		DS.l		1								; late collision
+XmtRTRYCnt	DS.l		1								; total number of retries
+	; Interrupt Register counter
+RCVCOCnt	DS.l		1								; *256 to get # collisions on net
+MPCOCnt		DS.l		1								; *256 to get # of missed packets due to
+														; RcvOFLO, receiver disabled, or excessive
+														; receive frame count (RcvFC)
+	;
+RecvBerr	DS.w		1								; recv chnl bus error being processed 
+XmitBerr	DS.w		1								; xmit chnl bus error being processed
+	IF COUNTERS	THEN
+RcvInts		DS.l		1								; # of times MACE int rtn called for a recvint
+PSCIntCnt	DS.l		1								; # of times PSC Int Rtn called 
+MaceIntCnt	DS.l		1								; # of times MACE Int Rtn called 
+MaceRcvCnt	DS.l		1								; # of times Deferred Recv Task called 
+; еееее WARNING: Do NOT add or delete any parms in this range
+; 				 The offsets between RecvSet0Cnt,RecvSet1Cnt; DTprimeSet0,DTprimeSet1; &
+;					XmitSet0Cnt,XmitSet1Cnt MUST be maintained
+RecvSet0Cnt	DS.l		1								; # of recv frames on set 0 
+DTprimeSet0 DS.l		1								; # of times DT primed reg set 0
+XmitSet0Cnt	DS.l		1								; # of xmit frames on set 0 
+NoFreeChains DS.l		1								; # of times no free chains available
+RecvSet1Cnt	DS.l		1								; # of recv frames on set 1 
+DTprimeSet1 DS.l		1								; # of times DT primed reg set 0
+XmitSet1Cnt	DS.l		1								; # of xmit frames on set 1 
+; еееее END WARNING
+XmitRSFull	DS.l		1								; Cnt of RegSets full on MaceXmit, -> InUse 
+InUseXmit	DS.l		1								; Cnt of xmits done from InUse Queue
+InUseXmitD	DS.l		1								; Cnt of xmits removed from InUse Queue 
+XmitPend	DS.l		1								; Cnt of DoWrite calls from MaceXmitDone 
+noDTInstall	DS.l		1								; # of times didn't install deferred task
+														; since it was already installed
+ChnFlushed	DS.l		1								; # of times a chn was flushed
+RecvBerrCnt DS.l		1								; # of bus error's on recv chnl
+XmitBerrCnt DS.l		1								; # of bus error's on xmit chnl
+	ENDIF
+	IF BUFDEBUG	THEN
+RecvBerrAddr DS.l		1								; addr that caused bus error on recv chnl
+RecvBerrCntl DS.w		1								; Cntl reg, look at set byte
+XmitBerrAddr DS.l		1								; addr that caused bus error on xmit chnl
+XmitBerrCntl DS.w		1								; Cntl reg, look at set byte
+XmtDnActive	DS.l		1
+CurrRecv	DS.l		1
+	ENDIF
+	IF SETDEBUG THEN
+hasNewPSC	DS.b		1								; non-zero = new psc, 0 = old psc
+		ALIGN 4
+	ENDIF
+LogAddrFltr DS.b		8								; Copy of MACE Logical Address Filter
+														;  bit order 63-56, 55-48, ... 7-0
+LAFHashTbl	DS.b		64 								; Tbl of counts of number multicasts addresses
+														; that hash to each bit
+MaceVarSz	EQU 		*								; End of variables
+			ENDR
+
+;
+;		Transmit Buffer template
+;		-ensure 1st one is quad-aligned and all the rest will be
+XmitBuff 	Record		0
+Next		DS.l		1								; Ptr to next buffer
+Prev		DS.l		1								; Ptr to previous buffer
+LogBufPtr 	DS.l		1								; Logical address of packet data area
+WDSptr		EQU			*								; Address of 1 entry WDS
+Len 	  	DS.w		1		 						; Packet length
+PhyBufPtr 	DS.l		1								; Physical address of packet data area
+Status 	 	DS.b		1
+			ALIGN		16
+LogBufOff	EQU			LogBufPtr - *					; Offset from packet data area
+														; to Logical address of packet data area
+HdrBufOff	EQU			XmitBuff - *					; Offset from buffer header
+														; to packet data area
+Packet		DS.b		Max_Pkt_Size					; packet data area
+			ALIGN		16
+TxBuffSz	EQU			*
+		  EndR
+;
+;		Receive Buffer template
+;		-ensure 1st one is quad-aligned and all the rest will be
+RecvBuff 	Record		0
+MaceStat 	DS.b		8								; Recv'd pkt status from Mace
+			DS.b		8								; fill, PSC DMAs quad-lw chunks
+Packet		DS.b		Max_Pkt_Size					; packet data area
+			ALIGN		2048
+RxBuffSz	EQU			*
+		  EndR
+
+;
+;		Receive Chain Descriptor template
+;
+RxChnDescr 	Record		0
+NextChn		DS.l		1								; ptr to next chain descr
+PhyChnPtr 	DS.l		1								; Physical address of chain
+LogChnPtr 	DS.l		1								; Logical address of chain
+State		DS.b		1								; state of this chain
+			DS.b		1								; fill
+OnOffSet	EQU			0								; bit 0: 0-not on, 1-on reg set
+Flushed		EQU			1								; bit 1: 0-no flush, 1-flush occurred
+Berred		EQU			2								; bit 2: 0-no berr, 1-berr occurred
+Limit		DS.w		1								; # of buffers in this chain
+Out			DS.w		1								; # of next buffer to drain
+In			DS.w		1								; # of next buffer to be filled with pkt
+														; only valid when chain OFF reg set
+savedLimit	DS.w		1								; only needed after flush done on chain
+RxChnDescrSz	EQU		*
+		  EndR
+
+			EJECT
+
+			STRING		PASCAL
+			MACHINE 	MC68020
+
+MaceData	PROC
+			ENTRY		MaceVarPtr
+MaceVarPtr	Dc.l		1								; Contains ptr to my variables
+			ENDP
+
+
+;________________________________________________________________________
+;	
+; RecoverXmitBuffs - move any xmit buffers from DMA chnl to free queue. 
+;	
+; 	Call: 	A2 - globals	
+;	Return: none
+;
+;________________________________________________________________________
+
+RecoverXmitBuffs	PROC
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL
+
+													; Put transmit buffs back on freelist
+			MoveQ		#0, D0							; reg set 0 offset
+@chgsets	Move.l		TxBuffSet0(A2,D0), D1
+			Beq.s		@nobuff
+			Clr.l		TxBuffSet0(A2,D0)
+			MoveA.l		D1, A0
+			Move.l		FreeXmtBuff(A2), XmitBuff.Next(A0) ; Make us pt to head of freelist
+			Move.l		A0, FreeXmtBuff(A2)				; Make us head of freelist
+@nobuff		BChg		#4, D0
+			Beq.s		@chgsets
+			
+			Rts
+			
+			ENDP
+			
+;________________________________________________________________________
+;	
+; ResetXmitChnl - reset PSC's MACE DMA xmit channel, reset MACE xmit FIFO,
+;					move any xmit buffers from DMA chnl to free queue. 
+;	
+; 	Call: 	A2 - globals	
+;	Return: none
+;
+;________________________________________________________________________
+
+ResetXmitChnl	PROC
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL
+
+													; Reset PSC DMA xmit chnl
+													;  -leaves chnl paused
+													;  -clears set ENABLE's
+			MoveA.l		PSCBase(A2), A0
+			Move		#(1<<SENSE)+(1<<SWRESET), PSC_MACE_XMIT_CNTL(A0) 
+			
+			MoveA.l		MACEBase(A2), A1
+			Move.b		MACE_MAC_CNFG(A1), D0			; get current MACE mac config
+			Move.b		D0, -(SP)						; save it 
+			BClr		#ENXMT, D0
+			Move.b		D0, MACE_MAC_CNFG(A1)			; Disable xmit								
+
+			Move.b		MACE_FIFO_CNFG(A1), D0			; Get current MACE FIFO config
+			OrI.b		#(1<<XMTFWR), D0
+			Move.b		D0, MACE_FIFO_CNFG(A1)			; Reset MACE xmit FIFO
+			
+			Bsr.s		RecoverXmitBuffs
+			
+			Move		#0, ActXmitSet(A2)				; reset offset to active xmit reg set
+			Move		#0, NxtXmitSet(A2)				; reset offset to next reg set to xmit on
+
+			MoveA.l		PSCBase(A2), A0
+			Move		#(1<<PAUSE), PSC_MACE_XMIT_CNTL(A0) ; UnPause the DMA xmit channel			
+			
+			Move.b		(SP)+, D0						; get previous config
+			MoveA.l		MACEBase(A2), A0
+			Move.b		D0, MACE_MAC_CNFG(A0) ; restore config
+
+			Rts
+			
+			ENDP
+			EJECT
+			
+;________________________________________________________________________
+;	
+; Initialize A SINGLE Recv DMA Channel Register Set 
+; 	Call: 
+;  			A1 - Receive Buffer Descriptor address	
+;  			A2 - globals	
+;			A3 - DMA recv chnl base
+;			D4 - offset to reg set
+;	Return: none
+;________________________________________________________________________
+
+InitRecv	PROC
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL,RxChnDescr
+
+			Move		#(1<<IF), CmdStat(A3,D4)		; Clear interrupt 
+
+			Move.l		A1, RxChainSet0(A2,D4)			; Save addr of recv chain descriptor
+
+		IF SETDEBUG THEN
+		  IF not SETDEBUGFAIL THEN
+			Tst.b		hasNewPSC(A2)
+			Beq.s		@a01							; go to old PSC patch
+			Move.l		PhyChnPtr(A1), Addr(A3,D4)		; Set DMA dest addr to phys addr of chain
+			Bra.s		@aaa1
+@a01
+		  ENDIF
+			Move.l		PhyChnPtr(A1), D0
+			And.l		#$FFFFF000, D0					; 2K aligned addr
+@a1			Move.l		PhyChnPtr(A1), Addr(A3,D4)		; Set DMA dest addr to phys addr of chain
+			Move.l		Addr(A3,D4), D1
+			And.l		#$FFFFF000, D1					; 2K aligned addr
+			Cmp.l		D0, D1
+		  IF SETDEBUGFAIL THEN
+		    Beq.s		@aa1
+			_Debugger
+			Bra.s		@a1
+@aa1
+		  ELSE
+			Bne.s		@a1
+@aaa1
+		  ENDIF
+		ELSE
+			Move.l		PhyChnPtr(A1), Addr(A3,D4)		; Set DMA dest addr to phys addr of chain
+		ENDIF
+
+			MoveQ		#0, D0							; init D0
+			Move		savedLimit(A1), Limit(A1)
+			Move		Limit(A1), D0
+
+		IF SETDEBUG THEN
+		  IF not SETDEBUGFAIL THEN
+			Tst.b		hasNewPSC(A2)
+			Beq.s		@a02							; go to old PSC patch
+			Move.l		D0, Cnt(A3,D4)					; Set DMA count to # of segments in chain
+			Bra.s		@aaa2
+@a02
+		  ENDIF
+@a2			Move.l		D0, Cnt(A3,D4)					; Set DMA count to # of segments in chain
+			Move.l		Cnt(A3,D4), D1
+			Cmp.l		D0, D1
+		  IF SETDEBUGFAIL THEN
+		    Beq.s		@aa2
+			_Debugger
+			Bra.s		@a2
+@aa2
+		  ELSE
+			Bne.s		@a2
+@aaa2
+		  ENDIF
+		ELSE
+			Move.l		D0, Cnt(A3,D4)					; Set DMA count to # of segments in chain
+		ENDIF
+
+			Move		#0, Out(A1)						; Initialize Out
+		IF BUFDEBUG	THEN
+			Move		#0, In(A1)						; Initialize In
+		ENDIF
+			Move.b		#(1<<OnOffSet), State(A1) 		; Set chain's state to ON reg set and
+														;  clear flush indication
+
+		IF SETCSDEBUG THEN
+		  IF not SETCSDEBUGFAIL THEN
+			Tst.b		hasNewPSC(A2)
+			Beq.s		@a03							; go to old PSC patch
+			Move		#(1<<SENSE)+(1<<IE)+(1<<ENABLED), CmdStat(A3,D4) 
+			Bra.s		@aaa3
+@a03
+		  ENDIF
+@a3			Move		#(1<<SENSE)+(1<<IE), CmdStat(A3,D4) 
+			Move		CmdStat(A3,D4), D0
+			BTst		#IE, D0
+		  IF SETCSDEBUGFAIL THEN
+			Bne.s		@aa3
+			_Debugger
+			Bra.s		@a3
+@aa3			
+		  ELSE
+		  	Beq.s		@a3
+		  ENDIF
+			Move		#(1<<SENSE)+(1<<ENABLED), CmdStat(A3,D4) 
+@aaa3
+		ELSE
+			Move		#(1<<SENSE)+(1<<IE)+(1<<ENABLED), CmdStat(A3,D4) 
+		ENDIF
+
+			Rts
+			
+			ENDP
+			EJECT
+
+;________________________________________________________________________
+;
+; InitRecvChl - Initialize BOTH Recv DMA Channel Register Sets 
+; 	Call: 	A2 - globals	
+;	Return: none
+;
+;________________________________________________________________________
+
+InitRecvChl PROC
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL,RxChnDescr
+
+			MoveM.l		A3/D4, -(SP)
+			MoveQ		#0, D4							; init reg set offset
+			MoveA.l		PSCBase(A2), A3
+			Lea			PSC_MACE_RECV(A3), A3				; A3-> Mace Recv DMA channel
+													
+@initset	Move.l		FreeRxChain(A2), D0				; Dequeue next available recv chain
+			Beq.s		@nocando						; none available, leave
+			MoveA.l		D0, A1
+			Move.l		NextChn(A1), FreeRxChain(A2)
+			Clr.l		NextChn(A1)
+
+		IF SETDEBUG THEN
+			Bsr			InitRecv						; Prime Register Set
+		ELSE
+			Bsr.s		InitRecv						; Prime Register Set
+		ENDIF
+
+			BChg		#4, D4							; Toggle reg sets
+			Beq.s		@initset						; if D2 was $0 (set 0), init set 1
+@nocando
+			MoveM.l		(SP)+, A3/D4
+			Rts
+			
+			ENDP
+			EJECT
+
+;________________________________________________________________________
+;
+; PrimeRecv - Prime reg set with chain from free queue
+;
+;  Call: 
+;			A2 - our variables
+;			A3 - Receive DMA Channel Reg Set base address
+;			D4 - Register set offset
+;
+;  Return: 	none
+;
+;  Notes:
+;		-can trash C scratch regs: A0-A1,D0-D2
+;________________________________________________________________________
+
+PrimeRecv	PROC
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL,RxChnDescr
+			MoveA.l		RxChainSet0(A2,D4), A0			; get active chain descriptor ptr
+	IF BUFDEBUG	THEN
+			Move.l		A0, D1
+			Bne.s		@noprob
+			_Debugger
+@noprob
+	ENDIF											
+			Clr.l		RxChainSet0(A2,D4)				; indicate no chain on reg set
+			BClr		#OnOffSet, State(A0)			; indicate this chain NOT on reg set
+;
+; Put this recv chain on InUse queue
+;
+			Move.l		InUseRxTail(A2), D1				; Something on the queue?
+			Bne.s		@61								; Yes
+													; Empty queue
+			Move.l		A0, InUseRxTail(A2)				; Point tail at us
+			Move.l		A0, InUseRxHead(A2)				; Point head at us
+			Bra.s		@62
+@61													; Items on queue
+			Move.l		D1, A1							; Get tail
+			Move.l		A0, NextChn(A1)					; Put on end of queue
+			Move.l		A0, InUseRxTail(A2)				; Make tail pt to us
+@62			
+			Clr.l		NextChn(A0)
+;
+; Setup offset to active chain for DT. Since all buffers in chain are full or we flushed,
+; PSC will have switched to other reg set.
+;
+			BChg		#4, D4							; toggle reg set offset
+			Move		D4, ActRecvSet(A2)				; chg offset to active reg set
+			BChg		#4, D4							; toggle back reg set offset
+
+			Tst.b		RecvBerr(A2)					; are we're processing buserror?
+			Bne.s		@bye							; yes, leave
+			
+;		
+; Dequeue next available recv chain
+;
+			Move.l		FreeRxChain(A2), D1
+	IF COUNTERS THEN
+			Bne.s		@getfreechain
+			AddQ.l		#1, NoFreeChains(A2)			; no chains available
+			Bra.s		@bye
+@getfreechain
+	ELSE
+			Beq.s		@bye							; no chains available
+	ENDIF
+			MoveA.l		D1, A1							; A1->addr of recv chain descriptor
+			Move.l		NextChn(A1), FreeRxChain(A2) 	; Dequeue from free list
+			Clr.l		NextChn(A1)
+			
+			Bsr			InitRecv						; prime reg set with this chain
+
+@bye		Rts											; leave
+		
+			ENDP
+			EJECT
+
+;________________________________________________________________________
+;
+; ResetMACE - Reset PSC & MACE FIFOs and disable recv & xmit paths and reset MACE
+;
+;	Call:	A2 - drvr vars
+;
+;	Return: none
+;
+;	Destroys:	A1,D0,D1
+;
+;________________________________________________________________________
+
+ResetMACE	PROC	EXPORT		
+			WITH	MACERegs,MaceVars,PSC_DMA_CHNL
+
+; reset & disable MACE -> PSC receive path
+			MoveA.l		MACEBase(A2), A0				; A0-> base address of MACE regs
+			MoveA.l		PSCBase(A2), A1					; A1-> base address of PSC regs
+
+			Move.b		#0, MACE_MAC_CNFG(A0)			; Disable MACE recv, xmit, et. al.
+			
+			Move.b		MACE_FIFO_CNFG(A0), D0			; Get current FIFO config
+			OrI.b		#(1<<RCVFWR), D0				; Keep current FIFO's watermarks
+			Move.b		D0, MACE_FIFO_CNFG(A0)			; Reset MACE recv FIFO
+			
+			Move		#(1<<SENSE)+(1<<SWRESET), PSC_MACE_RECV_CNTL(A1) ; Reset recv chnl
+			Move		#(1<<CIE), PSC_MACE_RECV_CNTL(A1) ; Clear channel int enable
+			Move		#(1<<IE)+(1<<IF), MACE_RECV_CMDSTAT0(A1) ; Clear set int & int enable
+			Move		#(1<<IE)+(1<<IF), MACE_RECV_CMDSTAT1(A1) ; Clear set int & int enable
+			
+; reset & disable PSC -> MACE transmit path
+			Move		#(1<<SENSE)+(1<<SWRESET), PSC_MACE_XMIT_CNTL(A1) ; Reset xmit chnl
+			Move		#(1<<CIE), PSC_MACE_XMIT_CNTL(A1) ; Clear channel int enable
+			Move		#(1<<IE)+(1<<IF), MACE_XMIT_CMDSTAT0(A1) ; Clear set int & int enable
+			Move		#(1<<IE)+(1<<IF), MACE_XMIT_CMDSTAT1(A1) ; Clear set int & int enable
+
+
+			Move.b		MACE_FIFO_CNFG(A0), D0			; Get current FIFO config
+			OrI.b		#(1<<XMTFWR), D0				; Keep current FIFO's watermarks
+			Move.b		D0, MACE_FIFO_CNFG(A0)			; Reset MACE xmit FIFO
+
+; Reset MACE 
+			Move.b		#(1<<MACERESET), MACE_BIU_CNFG(A0) ; reset MACE
+@wait		Move.b		MACE_BIU_CNFG(A0), D0
+			BTst		#MACERESET, D0
+			Bne.s		@wait							; loop until reset complete
+			
+			Move.b		#0, MACE_MAC_CNFG(A0)			; make sure MACE disabled
+			Move.b		#MaceIntMask, MACE_INT_MSK(A0) 	; Disable all MACE ints.
+
+			
+			Rts
+			
+			ENDP
+			EJECT
+
+;________________________________________________________________________
+;
+; FreeMACEMem - free all memory
+;
+;	Call:	A2 - our globals
+;
+;	Return: none
+;
+;	Destroys:	A0
+;
+;________________________________________________________________________
+
+FreeMACEMem	PROC		
+
+			IMPORT	FreeMemory
+			WITH	MaceVars,FreeMem
+
+			Tst.l 		MaceVarPtr						; Mace var pointer
+			Beq.s		@57 							; no mem allocated
+
+			Tst.l		MACEmem(A2)
+			Beq.s		@55 							; DMA buffer mem not allocated
+			
+			Sub.l		#FreeMemSz, SP					; room for parms
+			Move.l		MACEmem(A2), memptr(SP)			; ptr to memmgr blk to free
+			Move.l		RecvBuffMem(A2), memptra(SP) 	; ptr to mem to unlock
+			Move.l		RecvXmitMemSz(A2), memptrasz(SP)	; size of mem to unlock
+			Move.l		#(1<<Locked)+(1<<Contig)+(1<<CacheOff), memoptions(SP) ; specify options
+			Lea			FreeMemory, A0
+			Jsr			(A0)							; free DMA buffer memory
+			Add.l		#FreeMemSz, SP					; pop parms
+@55
+			Tst.l		ChnDescrMem(A2)
+			Beq.s		@56 							; Chain Descriptor buffer mem not allocated
+			Sub.l		#FreeMemSz, SP					; room for parms
+			Move.l		ChnDescrMem(A2), memptr(SP)		; ptr to memmgr blk to free
+			Move.l		#0, memoptions(SP) 				; specify options
+			Lea			FreeMemory, A0
+			Jsr			(A0)							; free MACE var memory
+			Add.l		#FreeMemSz, SP					; pop parms
+@56
+			Sub.l		#FreeMemSz, SP					; room for parms
+			Lea			MaceVarPtr, A0
+			Move.l		(A0), memptr(SP)				; ptr to memmgr blk to free
+			Clr.l		(A0)							; Clear MaceVarPtr contents
+			Move.l		#0, memoptions(SP) 				; specify options
+			Lea			FreeMemory, A0
+			Jsr			(A0)							; free MACE var memory
+			Add.l		#FreeMemSz, SP					; pop parms
+@57			
+			Rts
+			
+			ENDWITH
+			ENDP
+			EJECT
+
+
+;________________________________________________________________________
+;
+; MACEHalt - HALT the MACE, remove interrupt handlers, free all memory
+;
+;	Call:	none
+;
+;	Return: none
+;
+;	Destroys:	A1,D0,D1
+;
+;________________________________________________________________________
+
+MACEHalt	PROC	EXPORT		
+
+			WITH	MACERegs,MaceVars,PSC_DMA_CHNL,PSC_INT_TBL
+
+			Move.l		A2, -(SP)						; save regs
+			MoveA.l 	MaceVarPtr, A2					; Get ptr to my vars
+			
+			Move		SR,-(SP)            			; Save interrupt mask level
+			OrI			#DMALockOut, SR					; Disable DMA ints.
+
+			Bsr			ResetMACE
+
+		; Remove PSC DMA handlers for Mace Recv & Xmit channels
+		WITH	ExpandMemRec
+			MoveA.l		([ExpandMem],emDMADispatchGlobals), A0; A0-> PSC Interrupt table ptr
+		ENDWITH
+			MoveQ		#0, D0
+			Move.l		D0, MACE_RECVhndlr(A0)
+			Move.l		D0, MACE_RECVparm(A0)
+			Move.l		D0, MACE_XMIThndlr(A0)
+			Move.l		D0, MACE_XMITparm(A0)
+			
+		; Install Mace Interrupt handler, called at Level 3
+			Move.l		PSCBase(A2), A1					; Base address of PSC
+			Move.b		#(1<<MACE), L3IER(A1)			; Disable MACE interrupts
+			Move.l		D0, MACEhndlr(A0)
+			Move.l		D0, MACEparm(A0)				; MaceVarPtr passed back in A1
+			
+			OrI			#INTLockOut, SR					; Disable ALL ints.
+
+			; If deferred task installed, remove it.
+			Tst.b		DTInstalled(A2)					; is Deferred Task installed?
+			Beq.s		@nodq							; nope
+		IF DEBUG THEN
+			_Debugger
+		ENDIF
+			Lea			DTQE(A2), A0					; get ptr to queue entry
+			LEA			DTQueue, A1						; get ptr to queue
+			_Dequeue									; remove from deferred task queue
+
+@nodq
+			Move		(SP)+, SR            			; Restore SR
+
+; Free MACE buffer and var memory
+; ееее
+; ееее WARNING: upper layer handlers better be done with packets cause we're
+; ееее			freeing the mem the packets are in!
+; ееее
+			Bsr			FreeMACEMem						; Free, and unlock if needed, all mem blks
+			
+			Move.l		(SP)+, A2						; restore regs
+			Rts
+			
+			ENDP
+			EJECT
+
+	IF PROM THEN
+;________________________________________________________________________
+;
+; MACESetProm - put Promiscuous receive routine in global var: RcvRtn
+;		and enable promicuous mode.
+;
+;	Call:	4(SP) - Promiscuous recv routine address
+;
+;	Return: none
+;
+;	Destroys:	A0, A1
+;
+;________________________________________________________________________
+
+MACESetProm	PROC	EXPORT		
+
+			WITH	MACERegs,MaceVars
+
+			MoveA.l 	MaceVarPtr, A1					; Get ptr to my vars
+			
+			Move.l		4(SP), D0		 				; get new recv rtn
+
+			Move		SR,-(SP)            			; Save SR
+			OrI			#INTLockOut, SR           		; disable all ints
+
+			Move.l		D0, RcvRtn(A1) 					; install new recv rtn
+			MoveA.l		MACEBase(A1), A1
+			Move.b		MACE_MAC_CNFG(A1), D0			; get current MACE config
+			OrI.b		#(1<<PROMISC), D0
+			Move.b		D0, MACE_MAC_CNFG(A1) 			; enable MACE promiscous mode
+
+			Move		(SP)+, SR           			; Restore SR
+			Rts
+			
+			ENDP
+	ENDIF
+			EJECT
+			
+;________________________________________________________________________
+;
+; FlushRecvChn - "flushes" a chain from a recv DMA chnl reg set by computing a 
+;					false "limit", then calls PrimeRecv to put chain on InUse
+;					and reprime reg set.
+;
+;	Call:	A2 - drvr vars
+;
+;	Return: none
+;
+;	Destroys:	A0,D0,D1
+;
+;	Notes:	on entry, MACE packet reception MUST BE disabled via MAC Config reg
+;
+;________________________________________________________________________
+
+FlushRecvChn PROC
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL,RxChnDescr
+
+		IF COUNTERS THEN
+			AddQ.l		#1, ChnFlushed(A2)
+		ENDIF
+			MoveM.l		A3/D4, -(SP)					; Save C regs
+
+			Move		ActRecvSet(A2), D4				; offset to active reg set
+			MoveA.l		RxChainSet0(A2,D4), A0			; get ptr to active chain descr
+			BSet		#Flushed, State(A0)				; Indicate flush done on chain
+
+			Tst.b		RecvBerr(A2)					; are we processing a bus error?
+			Beq.s		@noberr							; no
+			BSet		#Berred, State(A0)				; Indicate bus error on chain
+@noberr
+			MoveA.l		PSCBase(A2), A3
+			Lea			PSC_MACE_RECV(A3), A3			; Recv Channel base address
+			Move.l		Cnt(A3,D4), D1					; Get current cnt
+			Move		Limit(A0), D0
+			Sub			D1, D0							; compute temp "flush" limit
+			Move		D0, Limit(A0)					; set temp "flush" limit
+														; pass A3 & D4
+			Bsr			PrimeRecv						; Put chain on InUse and reprime set
+			MoveM.l		(SP)+, A3/D4					; Restore C regs
+			RTS
+
+;________________________________________________________________________
+;
+; FlushRecvRegSet - Reset MACE recv FIFO and flush PSC recv FIFO, 
+;					and reprogram affected register set.
+;
+;	Call:	A2 - drvr vars
+;
+;	Return: none
+;
+;	Destroys:	A1,D0,D1
+;
+;	Notes:	on entry, MACE packet reception MUST BE disabled via MAC Config reg
+;
+;________________________________________________________________________
+
+FlushRecvRegSet	PROC		
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL
+
+														; Reset, ie. flush, MACE Recv FIFO
+;???? AMD question: are there any states where doing this reset will cause an "interesting"
+;   	line chng to the PSC, who may be in the middle of reading the recv fifo?
+			MoveA.l		MACEBase(A2), A1
+			Move.b		MACE_FIFO_CNFG(A1), D0			; Get current FIFO config
+			OrI.b		#(1<<RCVFWR), D0
+			Move.b		D0, MACE_FIFO_CNFG(A1)			; Reset MACE recv FIFO
+
+			Tst.b		RecvBerr(A2)					; are we processing a bus error?
+			Bne.s		@buserr							; yes, don't flush
+			
+			MoveA.l		PSCBase(A2), A1
+			Move		#(1<<SENSE)+(1<<DMAFLUSH), PSC_MACE_RECV_CNTL(A1) ; Flush PSC Recv FIFO
+@chkflush	Move		PSC_MACE_RECV_CNTL(A1), D0
+			BTst		#DMAFLUSH, D0					; Is flush complete?
+			Bne.s		@chkflush						; no
+@buserr			
+			Bsr.s		FlushRecvChn					; flush the chain
+			
+			Tst.b		RecvBerr(A2)					; are we processing a bus error?
+			Bne.s		@buserr1						; yes, don't unpause
+														; UnPause the DMA recv channel
+			MoveA.l		PSCBase(A2), A1
+			Move		#(1<<PAUSE), PSC_MACE_RECV_CNTL(A1) 
+@buserr1			
+			Rts
+			
+			ENDP
+			EJECT
+
+;________________________________________________________________________
+;
+; NormAddr - convert IEEE address to normal format
+;
+;	Call:	D0 bit-inverted address byte from Address Prom
+;
+;	Return: D0 bit-inverted address byte
+;
+;	Destroys:	D1
+;
+;________________________________________________________________________
+
+NormAddr	PROC		EXPORT
+			MoveM.l 	D2,-(SP)
+			Clr.b		D1
+			MoveQ		#7,D2
+@loop
+			Lsl.b		#1,D1							; get ready for next bit
+			Lsr.b		#1,D0							; get a bit from source
+			Bcc.s		@lb 							; non there
+			AddQ.b		#1,D1
+@lb
+			DBra		D2,@loop
+			Move.b		D1,D0							; D0=converted value
+			MoveM.l 	(SP)+,D2
+			Rts
+			
+			ENDP
+			EJECT
+
+;________________________________________________________________________
+;
+; DoCRC - compute Ethernet CRC on address field
+;
+;   Call:
+;       	D1 = first two bytes of address
+;       	D3 = last four bytes of address
+;
+;   Return:
+;			D0 = 6 bit hash into Logical Address Filter
+;
+;	Uses:	D0,D1
+;
+; The CRC-32 of a sequence of bits views that sequence as the co-efficients of a (long!)
+; polynomial.  This polynomial is multiplied by x^32, then divided by the CRC polynomial
+; x^32 + x^26 + x^23 + x^22 + x^16 + x^12 + x^11 + x^10 + x^8 + x^7 + x^5 + x^4 + x^2 +x+1.
+; It is the remainder of this division (of degree <= x^31), considered as a 32 bit sequence,
+; that is the CRC.  In the calculation, the initial value of the "remainder" is all 1's.
+;
+;________________________________________________________________________
+
+CRCPoly 	EQU 		%00000100110000010001110110110111 
+														; Co-efficients after a shift left
+
+DoCRC   	PROC
+			Move.l		D2, -(SP)
+			MoveQ   	#-1,D2      					; D2 = current value of CRC
+			Bsr.s   	@10     						; Compute over D1, address bits 47-32
+			Move.l  	D3,D1   						; D1 = rest to do
+			Swap		D1      						; Get high word of D3 into D1
+			Bsr.s   	@10     						; Compute over D1, address bits 31-16
+			Swap		D1      						; Get low word of D3 into D1
+			Bsr.s   	@10     						; Compute over D1, address bits 15-0
+
+			And 		#%111111, D2     				; Get six hash bits in low byte
+			
+			Move		D2, D0   						
+			Bsr			NormAddr						; D0 = bit inverted hash
+			Lsr.b		#2, D0							; Move 6 msb's to 6 lsb's
+			Move.l		(SP)+, D2
+			Rts											; Exit DoCRC
+			
+;
+; Accumulate the CRC over the low 16 bits of D1 (starting with high byte bit 0!)
+;
+@10 		MoveQ   	#16,D0      					; D0 = no. of bits to do
+			Ror 		#8,D1   						; Do high byte first
+@15 		Lsl.L   	#1,D2   						; Shift CRC, clear low bit, old hi bit in C
+;
+; If (CRC-hi-bit XOR D1-current-bit) = 1, we complement bits specified by the CRC polynomial
+; (this is the equivalent of a subtract operation in the long division process, I think)
+;
+			Bcc.s   	@30     						; Branch if CRC hi bit clear
+			Ror 		#1,D1   						; Shift D1, low bit in C
+			Bcs.s   	@50     						; (1 XOR 1) = 0: don't compl; low bit = 0
+			Bra.s   	@40     						; Go complement
+
+@30 		Ror 		#1,D1   						; Shift D1, high bit in C
+			Bcc.s   	@50     						; (0 XOR 0) = 0: don't compl; low bit = 0
+@40 		Eor.l   	#CRCPoly,D2     				; Complement some bits; set low bit
+@50 		SubQ		#1,D0   						; Decrement count of bits to do
+			Bne.s   	@15     						; Do all 16 bits
+			Rts 										; That's it if done them all
+			
+			ENDP
+			EJECT
+
+;________________________________________________________________________
+;
+; WriteLAF - update MACE Logical Address Filter (LAF) from copy in drvr globals
+;
+;	Call:
+;			A2 -> my variables
+;
+;	Return:
+;			none	
+;
+;	Uses:
+;			A1, D0
+;
+;	The LAF can not be updated while MACE recv is enabled.   Disable MACE pkt
+;	reception.  If frames in MACE Recv FIFO, reset MACE Recv FIFO (possible pkt 
+;	loss), flush PSC recv FIFO, and reprime affected DMA Reg. Set.  Finally,
+;	update the LAF.
+;________________________________________________________________________
+
+WriteLAF	PROC
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL
+			MoveA.l		MACEBase(A2), A1
+
+			Move.b		MACE_MAC_CNFG(A1), -(SP)		; Save current config 
+
+			Move.b		#(1<<ADDRCHG), MACE_ADDR_CNFG(A1) ; Set address change bit
+@wait1		Move.b		MACE_ADDR_CNFG(A1), D0			; wait for MACE to clear it
+			BTst		#ADDRCHG, D0
+			Bne.s		@wait1
+
+			Lea			LogAddrFltr(A2), A0				; A0-> copy of logical address filter
+			Move.b		#(1<<LOGADDR), MACE_ADDR_CNFG(A1) ; Select logical address
+			MoveQ		#7, D0
+@laf		Move.b		(A0,D0.w), MACE_LOG_ADDR(A1) 	; Set appropriate bits in Log. Addr Filter
+			DBra		D0, @laf
+
+			Move.b		(SP)+, MACE_MAC_CNFG(A1) 		; restore MACE mac config
+			RTS
+			
+			ENDP
+			EJECT
+
+;___________________________________________________________________________
+;
+; MaceAddMulti - add a multicast address to the list
+;
+;	Call:
+;			D1 = first two bytes of address
+;			D3 = last four bytes of address
+;
+;	Return:
+;			none
+;
+; 	Computes the hash for this multicast address and increments hash count in 
+;	the Logical Address Filter (LAF) Table.  If hash count now = 1, sets
+;	appropriate bit in the MACE LAF.
+;___________________________________________________________________________
+
+MaceAddMulti	PROC	EXPORT
+			WITH		MACERegs,MaceVars
+			
+			Move.l		A2, -(SP)						; Save used C regs
+			MoveA.l 	MaceVarPtr, A2					; Get ptr to my vars
+
+			Bsr		   	DoCRC   						; D0-> 6 bit hash into LAF
+			AddQ.b		#1, (LAFHashTbl,A2,D0)			; Inc. # of multi's with this hash
+			CmpI.b		#1, (LAFHashTbl,A2,D0)			; Multiaddr hash bit already in LAF?
+			Bhi 		@bye							; yes, do nothing
+
+			Lea			LogAddrFltr(A2), A0				; A0-> copy of log. addr. filter
+			Cmp.b		#31, D0							; Hash > 31?
+			Bhi.s		@b63to32						; yes
+			Move.l		4(A0), D1						; no, get LAF bits 31-0
+			BSet.l		D0, D1							; Is this hash bit already set?
+			Bne			@bye							; yes, nothing to do
+			Move.l		D1, 4(A0)						; Save modified LAF bits 31-0
+			Bra.s		@doit
+		
+@b63to32	Sub.b		#32, D0							; Convert hash for use on LAF bits 63-32
+			Move.l		(A0), D1						; Get LAF bits 63-32
+			BSet.l		D0, D1							; Is this hash bit already set?
+			Bne			@bye							; yes, nothing to do
+			Move.l		D1, (A0)						; Save modified LAF bits 63-32
+
+@doit		Bsr			WriteLAF						; Write the new LAF
+
+@bye		Move.l		(SP)+, A2						; Restore used C regs
+			Rts
+			ENDP
+			EJECT
+			
+;___________________________________________________________________________
+;
+; MaceDelMulti - Delete a multicast address HASH from the LAF
+;
+;	Call:
+;			D1 = first two bytes of address
+;			D3 = last four bytes of address
+;
+;	Return:
+;			none
+;
+; 	Computes the hash for this multicast address and decrements the LAF
+;	Table hash count for the given Multicast address.  If new hash count = 0,
+;	clears appropriate bit in MACE LAF.
+;	Depends on caller to ensure not called for a multicast's hash that hasn't
+;	already been inc'd in LAFHashTbl.
+;___________________________________________________________________________
+
+MaceDelMulti	PROC	EXPORT
+			WITH		MACERegs,MaceVars
+
+			Move.l		A2, -(SP)						; Save used C regs
+			MoveA.l 	MaceVarPtr, A2					; Get ptr to my vars
+
+			Bsr		   	DoCRC   						; D0-> 6 bit hash into LAF
+			SubQ.b		#1, (LAFHashTbl,A2,D0)			; Dec. # of multi's with this hash
+			Bne			@bye							; Do nothing if hash table cnt non-zero
+											
+														; Clear this bit in LAF since no other
+														; multiaddr's hash to this bit
+			Lea			LogAddrFltr(A2), A0				; A0-> copy of log. addr. filter
+			Cmp.b		#31, D0							; Hash > 31?
+			Bhi.s		@b63to32						; yes
+			Move.l		4(A0), D1						; no, get LAF bits 31-0
+			BClr.l		D0, D1							; Clear this hash bit
+	IF DEBUG	THEN
+			Beq			@huh							; if LAFHashTbl correct, D1 should
+	ELSE												;   have D0 bit set!
+			Beq			@bye							; do nothing hash bit already clear!
+	ENDIF
+			Move.l		D1, 4(A0)						; Save modified LAF bits 31-0
+			Bra.s		@doit
+		
+@b63to32	Sub.b		#32, D0							; Convert hash for use on LAF bits 63-32
+			Move.l		(A0), D1						; Get LAF bits 63-32
+			BClr.l		D0, D1							; Clear this hash bit
+	IF DEBUG	THEN
+			Beq			@huh							; if LAFHashTbl correct, D1 should
+	ELSE												;   have D0 bit set!
+			Beq			@bye							; do nothing hash bit already clear!
+	ENDIF
+			Move.l		D1, (A0)						; Save modified LAF bits 63-32
+
+@doit		Bsr			WriteLAF						; Write the new LAF
+
+@bye		Move.l		(SP)+, A2						; Restore used C regs
+			Rts			
+
+	IF DEBUG	THEN
+@huh		_Debugger									; nothing to do 'cause hash bit
+			Bra.s		@bye							; was already clear
+	ENDIF
+
+			ENDP
+			EJECT
+			
+;___________________________________________________________________________
+;
+;	PrimeXmitRS - Prime Reg Set with transmit packet info.  
+;		
+;	Call: 
+;			4(SP) - xmit buffer ptr
+;			A2 - our vars
+;	 
+;	Return: 
+;			If xmit register sets are full, return CC==NE; else, CC==EQ.
+;	Notes:
+;			Called both on normal writes (with level 4 interrupts disabled) 	<LW9>
+;			AND on write completions (interrupt level 4)
+;___________________________________________________________________________
+
+PrimeXmitRS	PROC
+
+XmitPrm		RECORD		4
+XmitPtr		DS.l		1								; Transmit buffer ptr
+ParmSz		EQU			*
+			ENDR
+
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL,LAPMIBStats
+
+			Move.l		XmitPrm.XmitPtr(SP), D1			; D1 - xmit buffer ptr
+
+;			Move		SR,-(SP)            			; Save interrupt mask level		<LW9>
+;			OrI			#DMALockOut, SR					; Disable DMA ints.				<LW9>
+			
+			Move		NxtXmitSet(A2), D2				; get offset to next reg set to xmit on
+			Lea			TxBuffSet0(A2), A1
+			Tst.l		(A1,D2)							; Can we use this reg set?
+			Beq.s		@cont2							; yes
+
+;			Move		(SP)+,SR						; Restore int. mask level		<LW9>
+			MoveQ		#-1, D0							; Set CC's
+			Rts											; Return
+			
+;
+; Initialize Xmit DMA Channel Register Set
+;
+@cont2			
+			MoveA.l		PSCBase(A2), A0
+			Lea			PSC_MACE_XMIT(A0), A0    			; A0-> Xmit DMA Channel base addr
+			
+			Move.l		D1, (A1,D2)						; Indicate (D1) is active buff on reg set
+			MoveA.l		D1, A1							; A1->xmit buffer
+
+		IF SETDEBUG THEN
+		  IF not SETDEBUGFAIL THEN
+			Tst.b		hasNewPSC(A2)
+			Beq.s		@a01							; go to old PSC patch
+			Move.l		XmitBuff.PhyBufPtr(A1), Addr(A0,D2)	; Set DMA dest addr
+			Bra.s		@aaa1
+@a01
+		  ENDIF
+			Move.l		XmitBuff.PhyBufPtr(A1), D0
+			And.l		#$FFFFFFF0, D0					; line aligned addr
+@a1			Move.l		XmitBuff.PhyBufPtr(A1), Addr(A0,D2)	; Set DMA dest addr
+			Move.l		Addr(A0,D2), D1
+			And.l		#$FFFFFFF0, D1					; line aligned addr
+			Cmp.l		D0, D1
+		  IF SETDEBUGFAIL THEN
+		    Beq.s		@aa1
+			_Debugger
+			Bra.s		@a1
+@aa1
+		  ELSE
+			Bne.s		@a1
+@aaa1
+		  ENDIF
+		ELSE
+			Move.l		XmitBuff.PhyBufPtr(A1), Addr(A0,D2)	; Set DMA dest addr
+		ENDIF
+
+			MoveQ		#0, D0
+			Move.w		XmitBuff.Len(A1), D0			; Get DMA byte count (word)
+
+		IF SETDEBUG THEN
+		  IF not SETDEBUGFAIL THEN
+			Tst.b		hasNewPSC(A2)
+			Beq.s		@a02							; go to old PSC patch
+			Move.l		D0, Cnt(A0,D2)					; Set DMA byte count (long)
+			Bra.s		@aaa2
+@a02
+		  ENDIF
+@a2			Move.l		D0, Cnt(A0,D2)					; Set DMA byte count (long)
+			Move.l		Cnt(A0,D2), D1
+			Cmp.l		D0, D1
+		  IF SETDEBUGFAIL THEN
+		    Beq.s		@aa2
+			_Debugger
+			Bra.s		@a2
+@aa2
+		  ELSE
+			Bne.s		@a2
+@aaa2
+		  ENDIF
+		ELSE
+			Move.l		D0, Cnt(A0,D2)					; Set DMA byte count (long)
+		ENDIF
+
+			BTst		#0, XmitBuff.Packet(A1)			; xmiting a multi/bcast?
+			MoveA.l		LAPMIBStatPtr(A2), A1
+			Bne.s		@30
+			AddQ.l		#1, ifOutUcastPkts(A1) 			; inc. non-multi/bcast cntr
+			Bra.s		@31
+@30			AddQ.l		#1, ifOutNUcastPkts(A1) 		; inc. multi/bcast cntr
+@31			Add.l		D0, ifOutOctets(A1)				; inc. sent octet cntr
+
+		IF SETCSDEBUG THEN
+		  IF not SETCSDEBUGFAIL THEN
+			Tst.b		hasNewPSC(A2)
+			Beq.s		@a03							; go to old PSC patch
+			Move		#(1<<SENSE)+(1<<IE)+(1<<ENABLED), CmdStat(A0,D2) 
+			Bra.s		@aaa3
+@a03
+		  ENDIF
+@a3			Move		#(1<<SENSE)+(1<<IE), CmdStat(A0,D2) 
+			Move		CmdStat(A0,D2), D0
+			BTst		#IE, D0
+		  IF SETCSDEBUGFAIL THEN
+			Bne.s		@aa3
+			_Debugger
+			Bra.s		@a3
+@aa3			
+		  ELSE
+		  	Beq.s		@a3
+		  ENDIF
+			Move		#(1<<SENSE)+(1<<ENABLED), CmdStat(A0,D2) 
+@aaa3			
+		ELSE
+			Move		#(1<<SENSE)+(1<<IE)+(1<<ENABLED), CmdStat(A0,D2) 
+		ENDIF
+			
+			BChg		#4, D2							; Toggle reg sets
+			Move		D2, NxtXmitSet(A2)				; save offset to next reg set to xmit on
+;			Move		(SP)+,SR						; Restore int. mask level		<LW9>
+			MoveQ		#0, D0							; Set CC's
+			Rts											; Return
+
+			ENDP
+			EJECT
+
+;___________________________________________________________________________
+;
+;	RecvBusErr - handle bus errors on PSC's MACE DMA receive channel
+;		
+;	Call: 
+;		A2 - our variables
+;		D1 - Receive DMA Channel control register value
+;	 
+;	Return: 
+;		none
+;	Notes:
+;		Should never get called!
+;___________________________________________________________________________
+
+RecvBusErr	PROC
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL,RxChnDescr
+
+			ST			RecvBerr(A2)					; indicate we're processing buserror
+		IF COUNTERS	THEN
+			AddQ.l		#1, RecvBerrCnt(A2)
+		ENDIF
+			MoveA.l		MACEBase(A2), A0
+			Move.b		MACE_MAC_CNFG(A0), D0			; get current config
+			Move.b		D0, -(SP)						; save it 
+			BClr		#ENRCV, D0
+			Move.b		D0, MACE_MAC_CNFG(A0)			; Disable recv
+			
+		IF BUFDEBUG THEN
+			Move		D1, RecvBerrCntl(A2)			; save chnl control reg
+			MoveQ		#0, D0							; assume set 0
+			BTst		#0, D1							; which set had bus error?
+			Beq.s		@set0
+			BChg		#4, D0							; chng to set 1
+@set0		MoveA.l		PSCBase(A2), A0
+			Lea			PSC_MACE_RECV(A0), A0				; A0-> base addr of recv DMA chnl
+			Move.l 		Addr(A0,D0), RecvBerrAddr(A2)	; save addr of bus error
+		ENDIF
+													
+														; Reset MACE FIFO 
+			Bsr			FlushRecvRegSet					; and put chain in InUse (PrimeRecv).
+														; NOTE: PrimeRecv toggles ActRecvSet(A2)
+			Bsr			FlushRecvChn					; put other chain in InUse (PrimeRecv).				
+			
+			MoveA.l		PSCBase(A2), A0
+			Move		#(1<<SENSE)+(1<<SWRESET), PSC_MACE_RECV_CNTL(A0) ; Reset PSC recv chnl
+			
+			Move		#0, ActRecvSet(A2)				; make set 0 active reg set
+
+			Bsr			InitRecvChl						; Initialize the Recv channel
+			
+			MoveA.l		PSCBase(A2), A0
+			Move		#(1<<PAUSE), PSC_MACE_RECV_CNTL(A0) ; UnPause the DMA recv channel			
+			
+			Move.b		(SP)+, D0						; get previous config
+			MoveA.l		MACEBase(A2), A0
+			Move.b		D0, MACE_MAC_CNFG(A0) 			; restore config
+
+			Clr.b		RecvBerr(A2)					; indicate we're DONE processing buserror
+
+			Rts
+			
+			ENDP
+			EJECT
+
+;___________________________________________________________________________
+;
+;	XmitBusErr - handle bus errors on PSC's MACE DMA transmit channel
+;		
+;	Call: 
+;		A0 - PSC base address
+;		A2 - our variables
+;		D1 - Transmit DMA Channel control register value
+;	 
+;	Return: 
+;
+;	Notes:
+;		Should never get called!
+;___________________________________________________________________________
+
+XmitBusErr	PROC
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL,XmitBuff
+
+			ST			XmitBerr(A2)					; indicate we're processing buserror
+
+		IF COUNTERS	THEN
+			AddQ.l		#1, XmitBerrCnt(A2)
+		ENDIF
+		IF BUFDEBUG THEN
+			Move		D1, XmitBerrCntl(A2)			; save chnl control reg
+			MoveQ		#0, D0							; assume set 0
+			BTst		#0, D1							; which set had bus error?
+			Beq.s		@set0
+			BChg		#4, D0							; chng to set 1
+@set0		Lea			PSC_MACE_XMIT(A0), A0			; A0-> base addr of xmit DMA chnl
+			Move.l 		Addr(A0,D0), XmitBerrAddr(A2)	; save addr of bus error
+		ENDIF
+											; Reset PSC's MACE DMA xmit chnl and reset MACE xmit FIFO
+			Bsr			ResetXmitChnl					; and put any xmit buffs on free queue.
+			
+			Clr.b		XmitBerr(A2)					; indicate we're DONE processing buserror
+
+			Rts
+			
+			ENDP
+			EJECT
+
+;___________________________________________________________________________
+;
+;	MaceXmit - Calls PrimeXmitRS to prime Reg Set with transmit packet info.  
+;				If xmit register sets are full, put xmit buffer ptr on tail 
+;				of xmit InUse queue.
+;		
+;	Call: 
+;			4(SP) - WDS ptr
+;	 
+;	Return: 
+;			D0 = error code; nobuff - temporarily out of xmit buffers
+;							 eLenErr - sum of data in WDS > max. pkt size
+;							 noErr - primed reg set with xmit pkt or put pkt
+;										on xmit InUse queue
+;	Notes:
+;			Called both on normal writes AND write completion (interrupt level 4)
+;___________________________________________________________________________
+
+MaceXmit	PROC		EXPORT	
+
+WDSPrm		RECORD		4								; Return address
+WDSPtr		DS.l		1								; Write Data Structure ptr
+ParmSz		EQU			*
+			ENDR
+
+			WITH		MACERegs,MaceVars
+
+			Move.l		WDSPrm.WDSPtr(SP), D2			; Get WDS ptr
+			Move.l		A2, -(SP)						; Save C regs
+
+			MoveA.l 	MaceVarPtr, A2					; Get ptr to my vars
+
+			Move		SR,-(SP)            			; Save interrupt mask level
+			OrI			#DMALockOut, SR					; Disable DMA ints.
+
+			Move.l		FreeXmtBuff(A2),D1				; get a buffer pointer
+			Bne.s		@haveBuff
+
+			Move		(SP)+,SR						; Restore int. mask level
+			MoveA.l		(SP)+, A2						; Restore C regs
+			MoveQ		#nobuff,D0						; Set no xmit buff available error
+			Rts 										; return to caller
+@haveBuff
+			MoveA.l 	D1, A1							; A1->buffer
+	IF BUFDEBUG THEN
+			CmpA.l		XmitBuff.Next(A1), A1			; linked to myself? 
+			Bne.s		@dok1								
+			_Debugger									; yes, oooppppsss!
+@dok1
+			CmpA.l		InUseTxHead(A2), A1				; on Free as well as InUse?
+			Bne.s		@dok2								
+			_Debugger									; yes, oooppppsss!
+@dok2
+	ENDIF
+			Move.l		XmitBuff.Next(A1),FreeXmtBuff(A2) ; unlink buffer from free list
+			Clr.l		XmitBuff.Next(A1)
+			Move		(SP)+,SR						; Restore int. mask level
+;
+; Total the length and make sure it's valid
+;
+			Move.l		A1, -(SP)						; save buffer pointer for later
+
+			Move.l		A4, -(SP)						; save non-interrupt scratch reg.
+			
+			Clr.w		XmitBuff.Len(A1)				; init len
+			Move.l		D2, A4							; A4-> WDS
+@1
+			MoveQ		#0,D0
+			Move.w		(A4), D0						; get this wds entry length
+			Beq.s		@2 								; all done
+			AddQ.w		#6, A4							; inc to next wds entry length
+			Add.w		D0, XmitBuff.Len(A1) 			; sum the length
+			Bra.s		@1								; look for more
+@2
+			Move.w		XmitBuff.Len(A1),D1 			; get single fragment length
+			Sub.w		#EHdrSize,D1					; Subtract out header bytes
+			Cmp.w		#EMaxDataSz,D1					; Check the data's length
+			Bls.s		@cont	 						; Branch if ok
+;		
+; Length error, relink buffer onto free list and return error
+;
+			MoveA.l		(SP)+, A4						; restore non-interrupt scratch reg.
+			MoveA.l		(SP)+, A1						; Pop buff ptr
+
+			Move		SR,-(SP)            			; Save interrupt mask level
+			OrI			#DMALockOut, SR					; Disable DMA ints.
+
+			Move.l		FreeXmtBuff(A2), XmitBuff.Next(A1) ; link buffer back into free list
+			Move.l		A1, FreeXmtBuff(A2)
+
+			Move		(SP)+,SR						; Restore int. mask level
+			MoveA.l		(SP)+, A2						; Restore C regs
+			MoveQ		#eLenErr,D0 					; Set length error
+			Rts											; Return it
+;													
+; Copy WDS data to our Xmit buffer			
+;
+@cont
+			MoveA.l 	XmitBuff.LogBufPtr(A1), A1		; A1->packet data
+			MoveA.l		D2, A4							; A4-> WDS
+@3
+			Move.w		(A4)+, D0						; last WDS entry?
+			Beq.s		@4 								; yes, all done
+			MoveA.l		(A4)+, A0						; get pointer to the data
+														; A0->source, A1->dest, D0=len
+			MoveM.l		A1/D0,-(SP)						; save buff ptr and len
+			Jsr			([MemMove,A2])					; move the data
+			MoveM.l		(SP)+,A1/D0
+			AddA.l		D0, A1							; update buff ptr
+			Bra.s		@3								; look for more
+@4
+			MoveA.l		(SP)+, A4						; restore non-interrupt scratch reg.
+														; (SP) -> Xmit buffer ptr pushed earlier
+
+			MoveA.l		(SP)+, A1						; Pop buff ptr				<LW9>
+			Move		SR,-(SP)            			; Save interrupt mask level	<LW9>
+			OrI			#DMALockOut, SR					; Disable DMA ints.			<LW9>
+			Move.l		A1, -(SP)						; Push buff ptr				<LW9>
+			
+			Jsr			PrimeXmitRS
+			Bne.s		@regsetsfull
+			AddQ		#4, SP							; Strip parms
+			Move		(SP)+, SR						;							<LW9>
+			MoveA.l		(SP)+, A2						; Restore C regs
+			MoveQ		#0, D0							; Set return code & CC's
+			Rts											; Return
+;	
+; We were NOT able to queue this buffer in a reg set		
+; Put this xmit buffer on xmit InUse queue
+;
+@regsetsfull		
+	IF COUNTERS	THEN
+			AddQ.l		#1, XmitRSFull(A2)			
+	ENDIF
+			MoveA.l		(SP)+, A1						; Restore xmit buffer ptr
+
+;			Move		SR,-(SP)            			; Save interrupt mask level	<LW9>
+;			OrI			#DMALockOut, SR					; Disable DMA ints.			<LW9>
+
+			Move.l		InUseTxTail(A2), D1				; Something on the queue?
+			Bne.s		@11								; Yes, branch
+													; Empty queue
+			Move.l		A1, InUseTxTail(A2)				; Point tail at us
+			Move.l		A1, InUseTxHead(A2)				; Point head at us
+			Bra.s		@22
+@11													; Items on queue
+			Move.l		D1, A0							; Get tail
+			Move.l		A1, XmitBuff.Next(A0)			; Put on end of queue
+			Move.l		A1, InUseTxTail(A2)				; Make tail pt to us
+@22			
+			Clr.l		XmitBuff.Next(A1)
+
+			Move		(SP)+,SR						; Restore int. mask level
+			MoveA.l		(SP)+, A2						; Restore C regs
+			MoveQ		#0, D0							; Set return code & CC's
+			Rts											; Return
+			
+			ENDP
+			EJECT
+
+	IF PROM THEN
+;___________________________________________________________________________
+;
+;	MACEXmitProm - xmit packet directly from user's buffer
+;		
+;	Call: 
+;			4(SP) - xmit buffer ptr
+;	 
+;	Return: 
+;			If xmit register sets are full, return CC==NE; else, CC==EQ.
+;	Notes:
+;			Called both on normal writes AND write completion (interrupt level 4)
+;___________________________________________________________________________
+
+MACEXmitProm PROC	EXPORT
+
+XmitPrm		RECORD		{A6Link}
+LocalSize	EQU			*
+A6Link		DS.l		2
+XmitPtr		DS.l		1								; Transmit buffer ptr
+XmitLen		DS.w		1								; Transmit buffer len
+			ENDR
+
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL,LAPMIBStats,XmitPrm
+
+			Link		A6,#LocalSize					; Save A6
+			MoveM.l		A2, -(SP)
+			MoveA.l 	MaceVarPtr, A2					; Get ptr to my vars
+
+			Move		SR,-(SP)            			; Save interrupt mask level
+			OrI			#DMALockOut, SR					; Disable DMA ints.
+			
+			Move		NxtXmitSet(A2), D2				; get offset to next reg set to xmit on
+			MoveA.l		PSCBase(A2), A0
+			Lea			PSC_MACE_XMIT(A0), A0    		; A0-> Xmit DMA Channel base addr
+@chkxmtdn	Move 		CmdStat(A0,D2), D0				; Get DMA status (word)
+			Btst		#TERMCNT, D0					; xfer in progress?
+			Beq.s		@chkxmtdn						; yes, wait for it to complete
+														; no, we can use this set
+;
+; Initialize Xmit DMA Channel Register Set
+;						
+			Move.l		XmitPtr(A6), A1					; A1 - user xmit buffer ptr
+		IF SETDEBUG THEN
+		  IF not SETDEBUGFAIL THEN
+			Tst.b		hasNewPSC(A2)
+			Beq.s		@a01							; go to old PSC patch
+			Move.l		A1, Addr(A0,D2)					; Set DMA dest addr to user buff ptr
+			Bra.s		@aaa1
+@a01
+		  ENDIF
+			Move.l		A1, D0
+			And.l		#$FFFFFFF0, D0					; line aligned addr
+@a1			Move.l		A1, Addr(A0,D2)					; Set DMA dest addr
+			Move.l		Addr(A0,D2), D1
+			And.l		#$FFFFFFF0, D1					; line aligned addr
+			Cmp.l		D0, D1
+		  IF SETDEBUGFAIL THEN
+		    Beq.s		@aa1
+			_Debugger
+			Bra.s		@a1
+@aa1
+		  ELSE
+			Bne.s		@a1
+		  ENDIF
+@aaa1
+		ELSE
+			Move.l		A1, Addr(A0,D2)					; Set DMA dest addr to user buff ptr
+		ENDIF
+
+			MoveQ		#0, D0
+			Move		XmitLen(A6), D0					; Get pkt len (word)
+		IF SETDEBUG THEN
+		  IF not SETDEBUGFAIL THEN
+			Tst.b		hasNewPSC(A2)
+			Beq.s		@a02							; go to old PSC patch
+			Move.l		D0, Cnt(A0,D2)					; Set DMA byte count (long)
+			Bra.s		@aaa2
+@a02
+		  ENDIF
+@a2			Move.l		D0, Cnt(A0,D2)					; Set DMA byte count (long)
+			Move.l		Cnt(A0,D2), D1
+			Cmp.l		D0, D1
+		  IF SETDEBUGFAIL THEN
+		    Beq.s		@aa2
+			_Debugger
+			Bra.s		@a2
+@aa2
+		  ELSE
+			Bne.s		@a2
+		  ENDIF
+@aaa2
+		ELSE
+			Move.l		D0, Cnt(A0,D2)					; Set DMA byte count (long)
+		ENDIF
+
+			BTst		#0, (A1)						; xmiting a multi/bcast?
+			MoveA.l		LAPMIBStatPtr(A2), A1
+			Bne.s		@30
+			AddQ.l		#1, ifOutUcastPkts(A1) 			; inc. non-multi/bcast cntr
+			Bra.s		@31
+@30			AddQ.l		#1, ifOutNUcastPkts(A1) 		; inc. multi/bcast cntr
+@31			Add.l		D0, ifOutOctets(A1)				; inc. sent octet cntr
+
+			Move		#(1<<SENSE)+(1<<ENABLED), CmdStat(A0,D2) ; Enable set, set ints. disabled
+			
+			BChg		#4, D2							; Toggle reg sets
+			Move		D2, NxtXmitSet(A2)				; save offset to next reg set to xmit on
+			Move		(SP)+, SR						; Restore int. mask level
+			Move.l		(SP)+, A2
+			MoveQ		#0, D0							; Set CC's
+			Rts											; Return
+
+			ENDP
+	ENDIF
+			EJECT
+		
+;___________________________________________________________________________
+;
+;	MaceXmitDone - transmit completion routine
+;		
+;	Call: 
+;			4(SP) - xmit buffer ptr
+;	 
+;	Return: 
+;			no return value/status
+;
+;	Notes: called at interrupt level 4 (PSC DMA)
+;___________________________________________________________________________
+
+MaceXmitDone	PROC
+
+TxPrm		RECORD		4
+TxBuff		DS.l		1								; xmit buffer ptr
+TxPrmSz		EQU			*
+			ENDR
+			
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL
+			MoveA.l 	MaceVarPtr, A0					; Get ptr to my vars
+	IF BUFDEBUG THEN
+			AddQ.l		#1, XmtDnActive(A0)
+			CmpI.l		#1, XmtDnActive(A0)
+			Beq.s		@ok
+			_Debugger									; oooppppsss!
+@ok
+	ENDIF
+;
+; Link completed xmit buffer back into free list
+;
+			Move.l		TxPrm.TxBuff(SP), A1			; xmt buffer ptr
+	IF BUFDEBUG THEN
+			CmpA.l		XmitBuff.Next(A1), A1			; linked to myself?
+			Bne.s		@dok1								
+			_Debugger									; oooppppsss!
+@dok1
+			CmpA.l		FreeXmtBuff(A0), A1 			; on free list too?
+			Bne.s		@dok2								
+			_Debugger									; oooppppsss!
+@dok2
+	ENDIF
+			Move.l		FreeXmtBuff(A0), XmitBuff.Next(A1) ; Make us pt to head of freelist
+			Move.l		A1, FreeXmtBuff(A0)				; Make us head of freelist
+
+	; Check to see if xmit's waiting 
+			Move.l		InUseTxHead(A0), D1				; Any waiting xmit's?
+			Beq.s		@inuseempty						; No, branch
+
+	IF COUNTERS	THEN
+			AddQ.l		#1, InUseXmit(A0)
+	ENDIF
+	IF BUFDEBUG THEN
+			Cmp.l		A1, D1			; what we just xmitted should not still be on in use
+			Bne.s		@dok6								
+			_Debugger									; oooppppsss!
+@dok6
+	ENDIF
+		; Remove this buffer, which is the head, from the xmit InUse queue
+			Move.l		D1, A1
+			Move.l		XmitBuff.Next(A1), D1			; D1=0, no more items; D1!=0, more items
+			Move.l		D1, InUseTxHead(A0) 			; Dequeue xmit 
+			Bne.s		@notempty						; Branch if more than 1 xmit waiting
+			Move.l		D1, InUseTxTail(A0) 			; Clear tail; if here, head is clear too.
+@notempty
+			Clr.l		XmitBuff.Next(A1)
+; 
+; One or more transmit(s) are waiting; send the head of the InUse list
+; Note:
+; If MaceXmit can't send pkt because both reg sets are in use, it puts the xmit buff
+; on the TAIL of the InUse queue.  However, we're the xmit completion routine, by definition
+; a xmit reg set is now available so we'll call PrimeXmitRS directly and ignore the return code.
+;		
+			Move.l		A0, -(SP)						; Save MaceVarPtr
+			Move.l		A1, -(SP)						; SP-> buffer to xmit (InUseTxHead)
+			Jsr			PrimeXmitRS
+			MoveA.l		(SP)+, A1						; A1-> buffer just xmitted
+			MoveA.l		(SP)+, A0						; Restore MaceVarPtr
+
+	IF BUFDEBUG THEN
+			CmpA.l		XmitBuff.Next(A1), A1			; linked to myself?
+			Bne.s		@dok3								
+			_Debugger									; oooppppsss!
+@dok3
+			CmpA.l		FreeXmtBuff(A0), A1 			; on free list too?
+			Bne.s		@dok4								
+			_Debugger									; oooppppsss!
+@dok4
+			Move.l		FreeXmtBuff(A0), D1
+			Cmp.l		InUseTxHead(A0), D1			 	; on both?
+			Bne.s		@dok5								
+			_Debugger									; oooppppsss!
+@dok5
+	ENDIF
+	IF COUNTERS	THEN
+			AddQ.l		#1, InUseXmitD(A0)
+	ENDIF
+
+@inuseempty
+			Move.l		XmtDnRtn(A0), D0				
+			Beq.s		@skip							; no xmit completion rtn
+			Move.l		A0, -(SP)						; Save A0
+			Move.l		XmtDnParm(A0), -(SP)			; Push user parm
+			MoveA.l		D0, A0				
+			Jsr			(A0)							; Call user xmit completion rtn
+			AddQ		#4, SP							; Strip parms
+			MoveA.l		(SP)+, A0						; Restore A0
+@skip			
+	IF BUFDEBUG THEN
+			SubQ.l		#1, XmtDnActive(A0)
+	ENDIF
+			Rts
+
+			ENDP
+			EJECT
+;___________________________________________________________________________
+;
+; MaceRecv - Deferred Task Packet receive routine 
+;
+;	Call:
+;		A1 - our variables
+;		Received packet(s) in buffers in chain(s) on InUse Queue and, perhaps,
+;		in buffers in chain(s) on Register Sets.
+;
+;	Return:
+;		Empty InUse Queue
+;
+;	Destroys:
+;
+;	Calls:
+;		Calls user's handler to receive packet.
+;
+;   Notes: 
+;		Since MaceRecv runs under DTMgr, more packets can arrive and  
+;		get queued in chains on InUse queue while we're running.  So, 
+;		we'll loop using InUseRxHead to dequeue and process received packets.
+;		Once we've drained all chains from InUse, we check for packets in the
+;		chain on the active reg set.
+;		Installed via PSCInterrupt, called via Deferred Task Mgr.
+; 		When the chain is ON the reg set, we compare Out & In, where 
+;		In = Limit - Cnt. When the chain is on InUse, we compare Out & Limit.
+;___________________________________________________________________________
+
+MaceRecv	PROC
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL,RecvBuff,RxChnDescr
+			WITH		Dot3StatsEntry,LAPMIBStats
+
+			MoveM.l		A2-A4/D3-D4,-(SP)				; save non-scratch regs
+			
+			Move.l		A1, A2							; A2 -> Mace vars
+			
+	IF COUNTERS	THEN
+			AddQ.l		#1, MaceRcvCnt(A2)
+	ENDIF
+;
+; Check InUse queue for recv chains
+;
+			Move		SR,-(SP)            			; Save interrupt mask level
+			OrI			#DMALockOut, SR					; Disable DMA ints.
+@recvnext			
+			Move.l		InUseRxHead(A2), D0				; recv chain(s) in InUse?
+			Beq			@chksets						; no
+			MoveA.l		D0, A4
+			Move.l		NextChn(A4),  D0				; Another chain in queue?
+			Bne.s		@1								; yes
+			Move.l		D0, InUseRxTail(A2)				; Clear tail
+@1			Move.l		D0, InUseRxHead(A2)				; Make head pt to next entry
+			Clr.l		NextChn(A4)
+
+			Move		(SP)+, SR						; Restore SR
+
+		IF BUFDEBUG	THEN
+			Move.l		A4, CurrRecv(A2)
+		ENDIF
+;
+; Loop until Out == Limit, delivering packets to .ENET
+;
+@dochain	
+			Move		Limit(A4), D0
+			Cmp			Out(A4), D0		 				; are there packets to process?
+			Beq.s		@chaindone						; no
+
+			Bsr			GetPkt							; Get pkt at Out and deliver it
+			
+			Bra.s		@dochain						; check for more pkts
+
+@chaindone
+;
+; Queue the now empty recv chain onto head of Free list.  First check if either reg set
+; needs to be primed since there may have been NO freechains when the DMA interrupt 
+; handler wanted to prime the reg set.
+;
+			MoveA.l		A4, A1							; A1-> now empty chain descr
+
+			Move		SR,-(SP)            			; Save interrupt mask level
+			OrI			#DMALockOut, SR					; Disable DMA ints.
+
+			
+			Move		ActRecvSet(A2), D4				; get offset to active reg set
+			Move		#1, D3							; init loop cntr
+			MoveA.l		PSCBase(A2), A3
+			Lea			PSC_MACE_RECV(A3), A3			; A3-> Recv Channel base address
+@chkset		Tst.l		RxChainSet0(A2,D4)				; Reg Set0/1 need priming?
+			Bne.s		@chk1							; no
+			Bsr			InitRecv						; Prime it
+	IF COUNTERS THEN
+			AddQ.l		#1, (DTprimeSet0,A2,D4)
+	ENDIF
+			Bra			@recvnext						; Go check InUse list
+@chk1		
+			BChg		#4, D4							; Toggle reg sets							; 
+			DBra		D3, @chkset
+													; Put chain on free list
+			Move.l		FreeRxChain(A2), NextChn(A1) 	; Make us pt to current head of free list
+			Move.l		A1, FreeRxChain(A2)				; Make us new head of free list
+			Bra			@recvnext						; Go check InUse list
+
+;
+; We've drained all packets in chains on InUse queue, now check for packets
+; in chains still on reg sets.  We know ActRecvSet is valid since we just checked
+; InUse queue and DMA ints are still masked.  ActRecvSet assures us we'll process
+; pkts in the correct order; ie. InUse head to tail, then ActRecvSet.
+@chksets
+			Move		ActRecvSet(A2), D4				; get offset to active reg set
+			MoveA.l		RxChainSet0(A2,D4), A4			; get active chain descr
+
+			MoveA.l		PSCBase(A2), A3
+			Lea			PSC_MACE_RECV(A3), A3			; A3-> Recv Channel base address
+
+@domore
+; We want to get Limit while ints are off to ensure we calculate "In" with the "real" 
+; limit and not with the "flush" value of limit. We want to get Cnt while ints are off to 
+; ensure Cnt value is Cnt for our chain.  If ints we're on, we could take an int, reprime
+; the reg set with a new chain, and Cnt would no longer refer to our chain.
+			Move		Limit(A4), D1					; get Limit
+			Move.l		Cnt(A3,D4), D2					; get current cnt
+
+; Here, we don't care any more if chain is on or off reg set. We can recv the pkt at Out.
+; However, we'll keep ints masked until after we clear DTInstalled.  This prevents a race cond.
+; where a recv/xmit int could occur between here and @exit.  It could happen when we're here 
+; and there's 1 buffer left in chain (Out = Limit - 1).  The int. hnldlr (ChkRecv) could run
+; and would clear ints on the set then NOT install us since we're already installed.  We'd 
+; leave but no more ints will happen on the set.  If the other set is not primed, we'll never
+; get called again.
+			Sub			D2, D1							; D1 = In = Limit - Cnt
+		IF BUFDEBUG	THEN
+			Move		D1, In(A4)						; save In
+		ENDIF
+			Cmp			Out(A4), D1						; Out == In?
+			Beq.s		@exit							; yes, no more packets to recv
+			
+			Move		(SP), SR						; Restore int mask level
+
+			Bsr.s		GetPkt							; Get pkt at Out and deliver it
+;
+; Verify chain we're processing is still on reg set.  If not, its moved to InUse queue.
+;
+			OrI			#DMALockOut, SR					; Disable DMA ints.
+			
+			Btst		#OnOffSet, State(A4)			; Is chain still on reg set?
+			Beq			@recvnext						; no, go drain it from InUse
+			Bra.s		@domore							; yes, go check for more pkts
+			
+@exit		Clr.b		DTInstalled(A2)					; Indicate Deferred Task NOT Installed
+			Move		#(1<<SENSE)+(1<<IE), CmdStat(A3,D4)	; re-enable set ints.
+
+			Move		(SP)+, SR						; Restore int mask level
+			MoveM.l		(SP)+, A2-A4/D3-D4				; Restore used C registers
+			Rts 										; That's it
+
+; A4 - ptr to chain, A2 - global ptr
+GetPkt		
+			MoveM.l		A5-A6, -(SP)
+
+			MoveQ		#0, D0
+			MoveQ		#11, D1
+			Move		Out(A4), D0						; get Out, segment number with pkt
+			Lsl.l		D1, D0							; Out = Out * 2**11 (RxBuffSz=2048)
+			Add.l		LogChnPtr(A4), D0				; compute address of segment		<SM10>
+			MoveA.l		D0, A0							; A0-> segment in chain
+			Lea		 	MaceStat(A0), A1 				; pt to Mace status
+			MoveA.l		LAPMIBStatPtr(A2), A5			; pt to LAP stats
+			MoveA.l		Dot3StatPtr(A2), A6				; pt to DOT3 stats
+;
+; Retrieve status bytes from beginning of buffer.  Each status byte is present in
+; the high and low bytes of a word.  There are 4 status bytes, so there are 8 bytes 
+; of status.  
+;
+			Move		(A1)+, D2						; Get Byte Cnt(7-0)
+			MoveQ		#0, D1
+			Move.b		D2, D1
+			Add.l		D1, ifInOctets(A5)
+
+			Move		(A1)+, D1						; Get Status(in bits 7-4) and
+														;  Byte Cnt(11-8) in bits 3-0
+			Move.b		D1, D0
+			AndI		#(1<<RcvCLSN)+(1<<RcvFRAM)+(1<<RcvFCS), D0 ; get status bits for user
+			Move.l		D0, -(SP)						; pass status to user later
+
+			Move		(A1)+, D0						; Get Runt pkt cnt
+			Move.b		D0, 0(SP)	
+			Move		(A1), D0						; Get Collision cnt
+			Move.b		D0, 1(SP)	
+			
+			Btst		#RcvOFLO, D1					; Overflow Error?
+			Beq.s		@s1
+			AddQ.l		#1, dot3StatsInternalMacReceiveErrors(A6)
+			Bra.s		@donext							; can't deliver to user
+
+@s1			AndI.b		#(1<<RcvCLSN)+(1<<RcvFRAM)+(1<<RcvFCS), D1 ; Receive Status Error?
+			Beq.s		@s4								; Note: only lower status/len byte trashed
+
+			AddQ.l		#1, ifInErrors(A5)
+			Btst		#RcvFCS, D1						; FCS Error?
+			Beq.s		@s2
+			AddQ.l		#1, dot3StatsFCSErrors(A6)
+@s2			Btst		#RcvFRAM, D1					; Framing Error?
+			Beq.s		@s3
+			AddQ.l		#1, dot3StatsAlignmentErrors(A6)
+@s3			Btst		#RcvCLSN, D1					; Collsion Error?
+			Beq.s		@s4
+			AddQ.l		#1, COLLCnt(A2)					; Yes
+			AddQ.l		#1, dot3StatsLateCollisions(A6) ; xmit & recv cntr
+
+@s4
+			AndI		#$0f00, D1						; Get len from upper status/len byte 
+			AndI		#$00ff, D2						; Ignore upper copy of len byte
+			Or			D1, D2							; Compute length of recv'd pkt
+			Move		D2, -(SP) 						; pass recv pkt len
+;
+; Call user's receive routine
+;
+			Pea			Packet(A0)						; Pass recv packet ptr
+			Move.l		A0, -(SP)						; Pass recv buffer ptr
+			Move.l		RcvParm(A2), -(SP)				; Pass user's rcv rtn parm
+			MoveA.l		RcvRtn(A2), A0					; User's rcv rtn
+			Jsr 		(A0)							; Call user's rcv rtn
+			Add			#RcvParms.ParmsSz, SP			; strip parms
+
+@done		AddQ		#1, Out(A4)						; inc out
+			MoveM.l		(SP)+, A5-A6
+			Rts
+
+@donext		AddQ		#4, SP							; pop status
+			Bra.s		@done
+			
+			ENDP
+			EJECT
+;___________________________________________________________________________
+;
+; MaceInterrupt - Process interrupts from MACE
+;
+;	Call:
+;			A1 - Our variables
+;
+;	Return:
+;			D0=1, indicate interrupt was serviced
+;
+;	Destroys:
+;
+;	Calls:
+;			none
+;
+;	Notes:	Mace interrupts at Level 3 
+;
+;	Primary function is to read the MACE trasmit status upon receipt of the 
+;	Transmit Completion interrupt.  Also, reads and processes interrupts for 
+;	error conditions.
+;___________________________________________________________________________
+
+MaceInterrupt PROC
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL,Dot3StatsEntry,LAPMIBStats
+			MoveM.l		A0/A2/A3/D1, -(SP)					; Save regs
+	IF COUNTERS	THEN
+			AddQ.l		#1, MaceIntCnt(A1)
+	ENDIF
+
+			Move.l		MACEBase(A1), A0				; Base address of Mace
+			Move.b		MACE_INT(A0), D0				; Get Mace Interrupt Status
+			AndI.b		#~OurIntsMask, D0				; Process only the ones we want
+			Beq			@done							; no ints we care about, leave
+
+			MoveA.l		LAPMIBStatPtr(A1), A2
+			MoveA.l		Dot3StatPtr(A1), A3
+;
+; Process Transmit Completion Interrupt
+;
+			BTst		#XMTINT, D0						; Xmit done int?
+			Beq			@rcvco							; no, check for err int.
+
+		; Read Mace Transmit Status
+			MoveQ		#0, D1
+			Move.b		MACE_TX_RETRY_CNT(A0), D1		; Read Xmit Retry Count
+			Add.l		D1, XmtRTRYCnt(A1)
+			Move.b		MACE_TX_FRM_STAT(A0), D1		; Read Xmit Frame Status
+			BTst		#XMTSV, D1						; Is status valid?
+			Bne.s		@10								; yes, continue
+			AddQ.l		#1, XmtStatINV(A1)
+			Bra			@rcvco
+
+@10			Move.b		D1, -(SP)						; save D1
+			AndI.b		#(1<<UFLO)+(1<<LCOL)+(1<<RTRY), D1
+			Beq.s		@1
+			AddQ.l		#1, ifOutErrors(A2)
+@1			Move.b		(SP)+, D1						; restore D1
+
+			BTst		#UFLO, D1						; Underflow?
+			Beq.s		@2								; no
+			AddQ.l		#1, dot3StatsInternalMacTransmitErrors(A3)
+
+@2			BTst		#LCOL, D1						; Late Collision?			
+			Beq.s		@3								; no
+			AddQ.l		#1, XmtLCOL(A1)
+			AddQ.l		#1, dot3StatsLateCollisions(A3)
+
+@3			BTst		#LCAR, D1						; Loss of Carrier?			
+			Beq.s		@4								; no
+			AddQ.l		#1, dot3StatsCarrierSenseErrors(A3)
+
+@4			BTst		#DEFER, D1						; deferred?			
+			Beq.s		@5								; no
+			AddQ.l		#1, dot3StatsDeferredTransmissions(A3)
+
+@5			BTst		#RTRY, D1						; 15 retries?			
+			Beq.s		@6								; no
+			AddQ.l		#1, dot3StatsExcessiveCollisions(A3)
+			Bra.s		@rcvco							; Chk err since remaining  
+														;  bits can't be set
+@6			BTst		#MORE, D1						; More than 1 retry?			
+			Beq.s		@7								; no
+			AddQ.l		#1, dot3StatsMultipleCollisionFrames(A3)
+			Bra.s		@rcvco							; Chk err since remaining 
+														;  bits can't be set
+@7			BTst		#ONE, D1						; Exactly 1 retry?			
+			Beq.s		@rcvco							; no
+			AddQ.l		#1, dot3StatsSingleCollisionFrames(A3)
+;
+; Process Error Interrupts
+;
+@rcvco		BTst		#RCVCO, D0						; Recv Collision Overflow count interrupt?
+														; Indicates RCV coll cntr rolled over from 255->0
+			Beq.s		@mpci							; no
+			AddQ.l		#1, RCVCOCnt(A1)
+
+@mpci		BTst		#MPCO, D0						; Missed packet count interrupt? This int.
+														; indicates MPC reg. rolled over from 255->0
+			Beq.s		@cerr							; no
+			AddQ.l		#1, MPCOCnt(A1)
+			Add.l		#256, ifInErrors(A2)
+
+
+@cerr		BTst		#CERR, D0						; Collision error interrupt?
+			Beq.s		@babl							; no
+			AddQ.l		#1, dot3StatsSQETestErrors(A3)
+			AddQ.l		#1, ifOutErrors(A2)
+			
+@babl		BTst		#BABL, D0						; Babble error interrupt?
+	IF COUNTERS	THEN
+			Beq.s		@chkrcv							; no
+			AddQ.l		#1, dot3StatsFrameTooLongs(A3)
+			AddQ.l		#1, ifOutErrors(A2)
+
+@chkrcv		BTst		#RCVINT, D0						; Recv int?
+			Beq.s		@done							; no, check ints.
+			AddQ.l		#1, RcvInts(A1)
+	ELSE
+			Beq.s		@done							; no
+			AddQ.l		#1, dot3StatsFrameTooLongs(A3)
+			AddQ.l		#1, ifOutErrors(A2)
+	ENDIF
+
+@done		MoveM.l		(SP)+, A0/A2/A3/D1
+			MoveQ		#1, D0							; Indicate int. was serviced
+			RtS											; Return from MaceInterrupt
+			
+			ENDP
+			EJECT
+;___________________________________________________________________________
+;
+; PSCInterrupt - Process DMA Interrupt from PSC
+;
+;	Call:
+;		A1 - our variables
+;
+;	Return:
+;		D0=1, Indicate Interrupt was serviced
+;
+;	Destroys:
+;		A2 - our variables
+;		A3 - Receive or Transmit DMA Channel base address
+;		D4.b - Register Set offset, 0 or $10
+;
+;	Calls:
+;		PrimeRecv - reprime a Recv DMA reg set
+;		MaceXmitDone - read Xmit status and reprime Xmit DMA regs if needed
+;
+;	RePrime Receive and Transmit Register Sets. Install Deferred Task to 
+;	process Received Packets and Transmit Completions.
+;___________________________________________________________________________
+
+PSCInterrupt PROC
+			WITH		MACERegs,MaceVars,PSC_DMA_CHNL
+
+			MoveM.l		A0/A2-A3/D1-D4, -(SP)			; Save regs
+			Move.l		A1, A2							; A2 -> our variables
+
+	IF COUNTERS	THEN
+			AddQ.l		#1, PSCIntCnt(A2)
+	ENDIF
+;
+; Check for packet in Receive DMA Channel
+;
+;	If bus error, go handle it, make sure DT installed, then check for xmit done int.
+;	Else
+;	  If set's chain is full, reprime set and install DT.  Loop back and check the other
+;		set, ONLY so we can, if needed, disable ints for this set.  Note: DT checks 
+;		"active set" after draining InUse.
+;	  Else set's chain is NOT full, disable ints for set, install DT, and leave.
+;
+ChkRecv
+			MoveA.l		PSCBase(A2), A0
+			Move		PSC_MACE_RECV_CNTL(A0), D1
+			BTst		#BERR, D1						; Bus Error on recv channel?
+			Beq.s		@noberr							; no
+			Bsr			RecvBusErr						; go handle it
+			Bra.s		@rcvberrcont					; go make sure DT installed
+
+@noberr		BTst		#CIRQ, D1						; Interrupt on recv channel?
+			Beq.s		ChkXmitDone						; no, check xmit channel
+			
+			Lea			PSC_MACE_RECV(A0), A3			; A3-> Recv Channel base address
+			Move		ActRecvSet(A2), D4				; D4-> offset to reg set
+
+	IF COUNTERS	THEN
+			AddQ.l		#1, (RecvSet0Cnt,A2,D4)			; inc count for set
+	ENDIF
+	IF DEBUG	THEN
+			Move		CmdStat(A3,D4), D1				; Get command/status
+			BTst		#IF, D1							; Recv packet?
+			Bne.s		@ok1
+			_Debugger									; no, actrecvset screwed up?
+@ok1
+	ENDIF
+			Move		#(1<<IF)+(1<<IE), CmdStat(A3,D4) ; Clear set int & int ENABLE
+		; If chain not full:
+		;  we'll get another DMA int. for 2 cases: 1-DT recvs pkt and re-enables
+		;  ints for this set; 2-all of chain's buffers fill up, PSC switches sets, and
+		;  first pkt on new set causes int.
+		; Else chain is full:
+		;  we'll re-enable ints when set is reprimed.
+
+			Move.l 		Cnt(A3,D4), D1					; get reg set DMA cnt
+			Beq.s		@chnfull						; bra if chain full
+
+@rcvberrcont			
+			Pea			ChkXmitDone						; push return address so we leave ChkRecv
+
+@installDT
+			Tst.b		DTInstalled(A2)					; Is Deferred Task already installed?
+	IF COUNTERS	THEN
+			Beq.s		@33								; no, go install it
+			AddQ.l		#1, noDTInstall(A2)				; Yes, don't install it again
+			Bra.s		@donerecv
+@33						
+	ELSE
+			Bne.s		@donerecv						; Yes, don't install it again
+	ENDIF
+			ST			DTInstalled(A2)					; Indicate Deferred Task Installed
+	IF USEDEFERREDTASK THEN
+		  	Lea			DTQE(A2), A0				  	; A0->deferred task queue element
+		  	MoveA.l		JDTInstall, A1
+		  	Jmp			(A1)						  	; install deferred task
+	ELSE
+			Move		SR, -(SP)
+			Move		#$0300, D0						; Disable ▓ l3 ints.
+			_SETINTMASK	D0
+			Lea			MaceRecv, A0
+			MoveA.l		A2, A1
+			Jsr			(A0)
+			Move		(SP)+, SR
+	ENDIF		
+@donerecv	Rts
+
+@chnfull	Bsr			PrimeRecv						; All of chain's buffers are full,
+														; reprime reg set with new chain
+			Bsr.s		@installDT						; make sure DT installed
+			Bra.s		ChkRecv							; go check other reg set
+			
+;								
+; Check for Transmit Completion Interrupt
+;
+ChkXmitDone
+			MoveA.l		PSCBase(A2), A0
+			Move		PSC_MACE_XMIT_CNTL(A0), D1
+			BTst		#BERR, D1						; Bus Error on xmit channel?
+			Beq.s		@noberr							; no
+			Bsr			XmitBusErr						; yes, go handle it
+			Bra.s		@donePSCInt
+
+@noberr		BTst		#CIRQ, D1						; Interrupt on xmit channel?
+			Beq.s		@donePSCInt						; no, leave
+			
+			Lea			PSC_MACE_XMIT(A0), A3			; A3-> Xmit Channel base address
+			Move		ActXmitSet(A2), D4				; get offset to active reg set
+
+	IF COUNTERS	THEN
+			AddQ.l		#1, (XmitSet0Cnt,A2,D4)			; inc count for set
+	ENDIF
+	IF DEBUG	THEN
+			Move		CmdStat(A3,D4), D1				; Get command/status
+			BTst		#IF, D1							; Xmit done packet?
+			Bne.s		@ok1
+			_Debugger									; no, ActXmitSet screwed up?
+@ok1
+	ENDIF
+			Move		#(1<<IF), CmdStat(A3,D4) 		; Clear int flag in command/status
+													; Process Xmit completion interrupt		
+			Lea			TxBuffSet0(A2), A0
+	IF BUFDEBUG	THEN
+			Move.l		(A0,D4), D0						; get xmit buffer address
+			Bne.s		@ok2							; got one
+			_Debugger									; no, ActXmitSet screwed up?
+@ok2
+	ENDIF
+			Move.l		(A0,D4), -(SP)					; Push xmit buffer address
+			Clr.l		(A0,D4)							; Indicate MaceXmit can use reg set
+			BChg		#4, D4
+			Move		D4, ActXmitSet(A2)				; update active reg set
+			Bsr			MaceXmitDone
+			AddQ		#4, SP							; Strip parms
+
+			Bra.s		ChkXmitDone						; go check other reg set
+			
+@donePSCInt	MoveQ 		#1, D0						    ; Indicate interrupt was serviced
+			MoveM.l		(SP)+, A0/A2-A3/D1-D4
+			
+			Rts											; Return from PSCInterrupt
+
+			ENDP
+			EJECT
+						
+;___________________________________________________________________________
+;
+; MaceInit - Get var and DMA memory, then initialize DMA Register Sets and 
+;				MACE chip
+;
+;	Call: following record on stack:
+;
+;			MACEInitParms	RECORD		0
+;			RecvRtn			DS.l		1	; address of Ethernet receive routine
+;			RecvPrms		DS.l		1	; parms to pass @ receive
+;			XmitRtn			DS.l		1	; address of Ethernet xmit complete routine
+;			XmitPrms		DS.l		1	; parms to pass @ xmit complete
+;			MACECfgPtr		DS.l		1	; ptr to MACE config record
+;			Dot3NetStats	DS.l		1	; ptr to 802.3 statistics array
+;			LAPMIBNetStats	DS.l		1	; ptr to LAP MIB statistics array
+;			EnetAddr		DS.l		1	; ptr to ethernet address
+;			FastMoveRtn		DS.l		1	; ->proc to move memory FAST
+;			IPSize			EQU			*
+;
+;	Return:
+;			D0 = openErr (-23) or mFulErr (-41)
+;___________________________________________________________________________
+
+MaceInit	PROC		EXPORT
+
+parms			RECORD		{A6Link}
+LocalSize		EQU			*
+A6Link			DS.l		2							; link and return address
+initp			DS			MACEInitParms				; parameters passed to us
+				ENDR
+
+			IMPORT		TranslateAddress, GetMemory, FreeMemory
+			WITH		parms,initp,MACERegs,MaceVars,PSC_DMA_CHNL,PSC_INT_TBL
+			
+			Link		A6,#LocalSize					; Save A6
+			MoveM.l		A2-A4/D3-D5,-(SP)				; Save regs
+			
+		WITH		GetMem
+			Sub.l		#GetMemSz, SP					; room for results
+			Move.l		#MaceVarSz, memsize(SP)			; requested memory size
+			Move.l		#0, memoptions(SP) 				; do NOT want memory locked,
+									 					;  contiguous, and non-cacheable
+			Pea			MaceVarPtr
+			Move.l		(SP)+, memhndl(SP)
+			Lea			GetMemory, A0
+			Jsr			(A0)							; get memory
+			Add.l		#GetMemSz, SP					; pop parms
+			Blt			@InitError						; bra if error
+		ENDWITH
+			MoveA.l		MaceVarPtr, A2					; get ptr to my vars
+			
+			Move.l		UnivInfoPtr, A0					; get ptr to ProductInfo
+			Add.l		ProductInfo.DecoderInfoPtr(A0), A0	; point to the base address table
+			Move.l		DecoderInfo.PSCAddr(A0), PSCBase(A2) ; Save the PSC base address
+
+			Move.l		RecvRtn(A6), RcvRtn(A2)			; save addr of recv rtn
+			Move.l		RecvPrms(A6), RcvParm(A2)		; save parm for recv rtn
+				
+			Move.l		XmitRtn(A6), XmtDnRtn(A2)		; save addr of xmit compl rtn
+			Move.l		XmitPrms(A6), XmtDnParm(A2)		; save parm for xmit compl rtn
+								
+			Move.l		MACECfgPtr(A6), A4
+			Move.l		MACECfg.MACEBase(A4), MACEBase(A2)
+			Move.l		A4, MCfg(A2)					; save ptr to MACE config record
+			
+			Move.l		Dot3NetStats(A6), Dot3StatPtr(A2)
+			Move.l		LAPMIBNetStats(A6), LAPMIBStatPtr(A2)
+			
+			Move.l		EnetAddr(A6), OurAddrPtr(A2)	; save ptr to our Ethernet address
+			
+			Move.l		FastMoveRtn(A6), MemMove(A2)	; save addr of fast mem move rtn
+
+			MoveQ		#0, D0							; initialize some regs
+			Move.l		D0, D2
+			Move.l		D0, D3
+			Move.l		D0, D5
+			Move		MACECfg.XmitBuffs(A4), D2
+			Bne.s		@10
+			Move		#DefTxBuffs, D2					; 0 passed in, set to default
+@10			Move		MACECfg.RecvBuffs(A4), D3
+			Bne.s		@11
+			Move		#DefRxBuffs, D3					; 0 passed in, set to default
+@11			Move		MACECfg.RecvChains(A4), D5
+			Bne.s		@12
+			Move		#DefChns, D5					; 0 passed in, set to default
+@12													; force 1 ▓ recv chains ▓ max
+			CmpI		#OneChn, D5						; 1 recv chain?
+			Bne.s		@chkmax							; no
+			CmpI		#MaxBufpChn, D3					; too many buffers in our 1 chain?
+			Bls.s		@GetMem							; no
+			Move		#MaxBufpChn, D3					; reset # of buffers to max allowed
+			Bra.s		@GetMem
+			
+@chkmax		CmpI		#MaxChns, D5					; must be ▓ max allowed	
+			Bls.s		@cont1
+			Move		#MaxChns, D5
+@cont1		Move		D5, MACECfg.RecvChains(A4)		; set # of chains
+
+			Move		D5, D0							; D0.w=# of chains
+			Move		D3, D5							; D5.l=# of recv buffers
+			DivU		D0, D5							; D5.l=# of buffers per chain in low word
+			Swap		D5								; get remainder in low word
+			Tst			D5								; was there a remainder?
+			Beq.s		@noremndr						; no
+			Sub			D5, D3							; adjust # recv buffers down so 
+														; same # per chain
+			Clr			D5								; clear remainder
+@noremndr	Swap		D5								; get back # of buffers per chain
+
+			CmpI		#MaxBufpChn, D5					; too many buffers per chain?
+			Bls.s		@chkmin							; no
+			Move		#MaxBufpChn, D5					; reset # of buffers to max allowed
+			Bra.s		@cont2
+@chkmin		CmpI		#MinBufpChn, D5					; too few buffers per chain?
+			Bhs.s		@Getmem							; no
+			Move		#MinBufpChn, D5					; reset # of buffers to min allowed
+			Move		#DefChns, MACECfg.RecvChains(A4) ; reset # of chains
+@cont2		Move		D5, D3							; D3=# of buffers per chain
+			Move		MACECfg.RecvChains(A4), D1		; D1=# of chains
+			MulU		D1, D3							; D3.l=total # of recv buffers
+
+@GetMem
+			Move		D2, D4							; D4=# xmit buffers
+			Move		#XmitBuff.TxBuffSz, D0
+			MulU		D4, D0							; D0.l=memory for xmit buffers
+			
+			Move		D3, D4							; D4=# recv buffers
+			Move		#RecvBuff.RxBuffSz, D1			; size of a recv buffer
+			MulU		D1, D4							; D4.l=memory for recv buffers, used later
+
+			Add.l		D4, D0							; D0=memory for recv & xmit buffers
+			AddI.l		#RecvBuff.RxBuffSz, D0			; add 1 since we must 2K align recv buffs
+
+		WITH		GetMem
+			Sub.l		#GetMemSz, SP					; room for results
+			Move.l		D0, memsize(SP)					; requested memory size
+			Move.l		#(1<<Locked)+(1<<Contig)+(1<<CacheOff), memoptions(SP) ; want memory locked,
+														; contiguous, and non-cacheable
+			Pea			MACEmem(A2)
+			Move.l		(SP)+, memhndl(SP)
+			Pea			RecvBuffMem(A2)
+			Move.l		(SP)+, memhndla(SP)
+			Pea		 	RecvXmitMemSz(A2)
+			Move.l		(SP)+, memhndlasz(SP)
+			Lea			GetMemory, A0
+			Jsr			(A0)							; get memory
+			Add.l		#GetMemSz, SP					; pop parms
+		ENDWITH
+			Beq.s		@haveMem						; bra if NO error
+
+			SubQ		#1, D2							; adjust # xmit buffers first
+			Bgt.s		@GetMem
+
+			MoveQ		#1, D2							; set to mininum of one xmit buf
+			Sub.l		D5, D3							; now adjust # recv buffers, by #
+														;  of recv buffers per chain
+														;  Note: if OneChn, D5 = 1
+			CmpI		#OneChn, D5						; 1 recv chain?
+			Bne.s		@decchn							; no
+			CmpI		#MinBufpChn,D3					; less than min # bufs/chn?
+			Blo.s		@err							; yes
+			Bra.s		@GetMem							; try for mem while │ MinBufpChn
+@decchn		SubI		#1, MACECfg.RecvChains(A4)		; dec. # of chains
+			Bgt.s		@GetMem							; try for mem while │ OneChn
+
+@err		Move.w		#mFulErr, D0
+			Bra 		@InitError						; get out with error
+
+@haveMem
+			Move		D2, MACECfg.XmitBuffs(A4)		; save # of xmit buffs
+			Move		D3, MACECfg.RecvBuffs(A4)		; save # of recv buffs
+
+			Move.l 		RecvBuffMem(A2), D0 			; get ptr to aligned mem
+			Add.l		D4, D0							; D0 = Recv ptr + recv mem size
+			Move.l		D0, XmitBuffMem(A2)				; save xmit mem ptr			
+;
+; GetMem for recv chain descriptors
+;
+		WITH	RecvBuff,RxChnDescr
+			Move		MACECfg.RecvChains(A4), D4
+			Mulu		#RxChnDescrSz, D4				; D4.l = recv chain descr size
+
+		WITH		GetMem
+			Sub.l		#GetMemSz, SP					; room for results
+			Move.l		D4, memsize(SP)					; requested memory size
+			Move.l		#0, memoptions(SP) 				; do NOT want memory locked,
+									 					;  contiguous, and non-cacheable
+			Pea			ChnDescrMem(A2)
+			Move.l		(SP)+, memhndl(SP)
+			Lea			GetMemory, A0
+			Jsr			(A0)							; get memory
+			Add.l		#GetMemSz, SP					; pop parms
+			Blt			@InitError						; bra if error
+		ENDWITH
+
+			Move.l		ChnDescrMem(A2), D0
+			Move.l		D0, FreeRxChain(A2)				; set up ptr to chain descr's
+;
+; Initialize recv buffer chains
+;
+			MoveA.l		D0, A3							; get recv chain descr ptr
+			Move.l		RecvBuffMem(A2), LogChnPtr(A3)	; pt chain descr at chain
+
+			Move		MACECfg.RecvChains(A4), D1		; # of chains
+			CmpI		#OneChn, D1						; do we have only 1 chain?
+			Bne.s		@r4								; no
+			Move		MACECfg.RecvBuffs(A4), D5		; yes, D5 contain total # of recv buffers
+@r4			
+			Move		D5, D3							; get # buffers per chain
+			MulU		#RxBuffSz, D3 					; D3.l = size of chain
+@r3													
+													; Initialize chain head
+			Move		D5, savedLimit(A3)				; Set chain limit
+			Move		#0, Out(A3)
+		IF BUFDEBUG	THEN
+			Move		#0, In(A3)
+		ENDIF
+			MoveM.l 	D1/D2, -(SP)					; Save used C-scratch regs
+			Move.l		D3, -(SP)						; logical size of chain
+			Move.l		LogChnPtr(A3), -(SP)			; logical address of chain
+			Lea			TranslateAddress, A0 
+			Jsr 		(A0)							; get physical address in D0
+			AddQ		#8, SP							; trash parms
+			MoveM.l 	(SP)+, D1/D2					; restore used C-scratch regs
+			Blt			@InitError
+			Move.l		D0, PhyChnPtr(A3)				; save physical address of chain
+
+			SubQ		#1, D1							; are we done?
+			Beq.s		@done							; yes
+			Lea			RxChnDescrSz(A3), A0			; compute ptr to next chain descr
+			Move.l		A0, NextChn(A3)					; make us pt to next chain descr
+			MoveA.l		LogChnPtr(A3), A1
+			AddA.l		D3, A1							; compute addr of next chain
+			Move.l		A1, LogChnPtr(A0)				; save addr of next chain
+			Move.l		A0, A3							; pt to next chain descr
+			Bra.s		@r3								; process next chain
+@done
+		ENDWITH
+;
+; Link together xmit buffers
+;
+		WITH	XmitBuff
+			Move.l		XmitBuffMem(A2), FreeXmtBuff(A2)
+			MoveA.l		FreeXmtBuff(A2), A0				; Get Xmit header pointer
+			MoveQ		#0, D0
+			Move		MACECfg.XmitBuffs(A4), D0		; get # xmit buffers
+			SubQ		#1,D0							; adjust loop count
+			Bra.s		@x1
+@x2 											
+			Lea 		TxBuffSz(A0), A1				; A1-> next buffer address
+			Move.l		A1, Next(A0)					; set link to next buffer
+			MoveA.l 	A1, A0							; point to next buffer
+@x1
+			DBra		D0,@x2							; do them all
+			Clr.l		Next(A0)						; clear last buffer's next ptr
+;
+; Get and save physical address of each transmit buffer's packet data area 
+; This loop depends on all buffers being contiguous.
+;
+			Move.l		FreeXmtBuff(A2), A0				; Get Xmit header pointer
+			Move.l		D2,D1
+			SubQ		#1,D1							; adjust loop count
+@x3 											
+			Lea			Packet(A0), A1					; Get Packet logical address
+			MoveM.l 	A0/D1/D2, -(SP)					; Save used C regs
+			Move.l		#TxBuffSz, -(SP)				; logical size
+			Move.l		A1, -(SP)						; logical address
+			Lea			TranslateAddress, A0 
+			Jsr 		(A0)							; get physical address in D0
+			MoveA.l 	(SP)+, A1						; get back buffer addr
+			AddQ		#4, SP							; trash length
+			MoveM.l 	(SP)+, A0/D1/D2					; restore used C regs
+			Blt			@InitError
+			Move.l		A1, LogBufPtr(A0) 				; save logical address
+			Move.l		D0, PhyBufPtr(A0)				; save physical address
+			Lea 		TxBuffSz(A0), A0				; A0-> next buffer address
+			DBra		D1,@x3							; do them all
+		ENDWITH
+;
+; MACE Chip initialization
+;
+			MoveA.l		MACEBase(A2), A0				; A0-> base address of Mace regs
+
+			Bsr			ResetMACE						; Reset MACE chip and PSC DMA chnls
+
+			Move.b		#(1<<RTRD), MACE_USER_TEST_REG(A0) ; Disable access to Reserved Test Regs
+			Move.b		#MaceIntMask, MACE_INT_MSK(A0) 	; Disable all ints.
+			Move.b		#XMTS64, MACE_BIU_CNFG(A0)		; Xmit start after 64 bytes, Intel Bus Mode
+			Move.b		MACECfg.XmitFrmCtl(A4), MACE_TX_FRM_CNTRL(A0) ; Xmit Control -> Default:
+														;  Enable Retry, FCS, Auto Padding
+			Move.b		MACECfg.RecvFrmCtl(A4), MACE_RX_FRM_CNTRL(A0)  	; Recv Control -> Default:
+														;  Disable Auto Pad Stripping
+														; Set up FIFOs' configuration
+			Move.b		MACECfg.FIFOCfgCtl(A4), MACE_FIFO_CNFG(A0)				
+			Move.b		#0, MACE_PLS_CNFG(A0) 				; Set up for normal transmit
+
+			Move.b		MACE_CHIP_ID_HIGH(A0), D0
+			Lsl			#8, D0
+			Move.b		MACE_CHIP_ID_LOW(A0), D0
+			Move		D0, MACEChipID(A2)
+
+			Move.b		#(1<<ADDRCHG), MACE_ADDR_CNFG(A0) ; Set address change bit
+@wait1		Move.b		MACE_ADDR_CNFG(A0), D0			; wait for MACE to clear it
+			BTst		#ADDRCHG, D0
+			Bne.s		@wait1
+
+			Move.b		#(1<<PHYADDR), MACE_ADDR_CNFG(A0) 	; Select physical address
+			Lea			MACE_PHY_ADDR(A0), A0			; A0-> Mace Phy Address Reg
+			MoveA.l		OurAddrPtr(A2), A1				; A1-> Our node address
+			Move.b		(A1)+, (A0) 					; Move addr byte0 to Mace reg
+			Move.b		(A1)+, (A0) 					; Move addr byte1 to Mace reg
+			Move.b		(A1)+, (A0) 					; Move addr byte2 to Mace reg
+			Move.b		(A1)+, (A0) 					; Move addr byte3 to Mace reg
+			Move.b		(A1)+, (A0) 					; Move addr byte4 to Mace reg
+			Move.b		(A1), (A0) 						; Move addr byte5 to Mace reg	
+			MoveA.l		MACEBase(A2), A0				; Get back base address of Mace regs
+
+			Move.b		#(1<<ADDRCHG), MACE_ADDR_CNFG(A0) ; Set address change bit
+@wait2		Move.b		MACE_ADDR_CNFG(A0), D0			; wait for MACE to clear it
+			BTst		#ADDRCHG, D0
+			Bne.s		@wait2
+
+			Move.b		#(1<<LOGADDR), MACE_ADDR_CNFG(A0) ; Select logical address
+			Lea			MACE_LOG_ADDR(A0), A1			; A1-> Mace Phy Address Reg
+			MoveQ		#7, D0
+@laf		Move.b		#0, (A1) 						; CLEAR all bits in Log Addr Filter
+			DBra		D0, @laf
+			
+			Move		#0, NxtXmitSet(A2)				; make set0 next reg set to xmit on
+			Move		#0, ActXmitSet(A2)				; make set0 active xmit reg set
+			Move		#0, ActRecvSet(A2)				; make set0 active recv reg set
+
+		IF SETDEBUG THEN
+;???? temp code to see if we have post evt5 PSC that has non-sticking register write fix
+			MoveA.l 	VIA, A1
+			BTst 		#vSCCWrReq, vDirA(A1)			; new psc: bit(vSCCWrReq) = 0
+														; old psc: bit(vSCCWrReq) = 1
+			Seq.b 		hasNewPSC(A2)
+; end temp code
+		ENDIF
+		
+			Bsr			InitRecvChl						; Initialize DMA recv channel
+			
+		; Install MACE Recv DMA channel Deferred Task, called by MACE_RECVhndlr
+		  	Move.w		#dtQType, DTQE+qType(A2)	  	; Set Deferred Task queue type
+		  	Lea			MaceRecv, A1
+		  	Move.l		A1, DTQE+dtAddr(A2)		 	 	; Set address of DT, called by slot int. hndlr.
+		  	Move.l		A2, DTQE+dtParm(A2)		  		; Set variable pointer to MACE vars
+
+		; Install PSC DMA handlers for Mace Recv & Xmit channels
+			MoveA.l		PSCBase(A2), A3 				; Get the PSC base address
+		WITH	ExpandMemRec
+			MoveA.l		([ExpandMem],emDMADispatchGlobals), A0; A0-> PSC Interrupt table ptr
+		ENDWITH
+			Lea			PSCInterrupt, A1
+			Move.l		A1, MACE_RECVhndlr(A0)			; Install DMA recv handler
+			Move.l		A2, MACE_RECVparm(A0)			; MaceVarPtr passed back in A1
+			Move.l		A1, MACE_XMIThndlr(A0)			; Install DMA xmit done handler
+			Move.l		A2, MACE_XMITparm(A0)			; MaceVarPtr passed back in A1
+			Move.b		#(1<<L4B7)+(1<<DMA), L4IER(A3)  ; Enable DMA interrupts
+														
+		; Initialize Recv & Xmit DMA Channel Control Registers
+			Move		#(1<<SENSE)+(1<<CIE), PSC_MACE_XMIT_CNTL(A3)
+			Move		#(1<<SENSE)+(1<<CIE), PSC_MACE_RECV_CNTL(A3)
+	
+			Move		#(1<<PAUSE), PSC_MACE_XMIT_CNTL(A3) ; UnPause the DMA xmit channel
+			Move		#(1<<PAUSE), PSC_MACE_RECV_CNTL(A3) ; UnPause the DMA recv channel
+
+		; Install Mace Interrupt handler, called at Level 3
+			Lea			MaceInterrupt, A1
+			Move.l		A1, MACEhndlr(A0)
+			Move.l		A2, MACEparm(A0)				; MaceVarPtr passed back in A1
+			Move.b		#(1<<L3B7)+(1<<MACE), L3IER(A3)	; Enable MACE interrupts
+
+			Move.l		MACEBase(A2), A0				; Base address of Mace
+			Move.b		MACECfg.MACCfgCtl(A4), MACE_MAC_CNFG(A0) ; Default: Enable xmit and recv
+			Move.b		#OurIntsMask, MACE_INT_MSK(A0) 	; Enable ints. we care about
+
+			MoveQ		#0, D0
+			Bra.s		@60
+			
+;
+; Init error - clear out variable pointer for next try
+;
+@InitError
+			Move		D0,D3							; Save error code
+
+			Bsr			FreeMACEMem						; Free, and unlock if needed, all mem blks
+
+			Move		D3,D0
+			CmpI		#-1,D0							; Translate generic error
+			Bne.s		@60
+			MoveQ		#openErr,D0
+@60
+			Tst			D0
+			MoveM.l		(SP)+, A2-A4/D3-D5				; Restore regs
+			Unlk		A6
+			Rts 										; Return with error
+
+			ENDP
+
+			END
+
+
+

@@ -1,0 +1,928 @@
+;
+;	File:		piDDP.a
+;
+;	Contains:	xxx put contents here xxx
+;
+;	Written by:	xxx put writers here xxx
+;
+;	Copyright:	© 1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 1/29/93	RB		Do not move the SCCLockout value to the status register, always
+;									do an ORI.W with it so that NuKernel works and the stack is not
+;									changed.
+;		 <2>	10/13/92	DCL		Steve Bollinger (4-2122) 9/24/92
+;									Network events don't work anymore, so we always set the packet
+;									recvd flag. The caller can just poll this to see when we are
+;									done. set the packet recvd flag
+;
+;
+    BLANKS ON
+    STRING ASIS
+
+			EJECT
+			
+;_______________________________________________________________________
+;
+;		   DDP Routines
+;_______________________________________________________________________
+;
+
+;_______________________________________________________________________
+;
+;	Socket Listener
+;
+;	This socket listener is called from MPP.
+;
+;	Upon entering the socket listener, the LAP header bytes, and the
+;	appropriate DDP header bytes have been written into the RHA and the
+;	RHA's ptr will point past the last byte in the RHA.
+;
+;	A4 and A5 are usable until ReadRest 2(A4) is called.  After that,
+;	the normal interrupt conventions (A0-A3,D0-D3) apply.	D2 is
+;	preserved across ReadPacket and ReadRest.
+;
+;	The RHA contains enough room for LAP and long DDP headers, plus 8
+;	extra bytes.  This socket listener moves as many as 4 bytes into the
+;	RHA in order to prevent the SCC from overflowing.
+;
+;	If the buffer is to small to hold the incoming packet, it will be
+;	truncated to fit and a buf2small error will be returned.  When this
+;	happens, checksums and the RetCksErr flag are ignored, so that even
+;	if the caller specified "don't return checksum errors"  he could
+;	potentially be returned a packet with a checksum error if the buffer
+;	was too small.
+;
+;	Call:
+;	 A0,A1	 .LONG	  SCC read/write addresses (preserve)
+;	 A2		 .LONG	  local vars (preserve)
+;	 A3		 .LONG	  ptr into the RHA (hdr bytes already loaded in)
+;	 A4		 .LONG	  address of the ReadPacket routine
+;	 D0		 .BYTE	  socket number for this read
+;	 D1		 .WORD	  length still left to read (preserve)
+;
+;
+;	Return:
+;	 D0		 .WORD	  error result
+;
+;	Possible errors:
+;
+;	Modification History:
+;	 8/24/84	 Ready for alpha release  (GRT)
+;	 8/24/84	 Checksum routine added (ABO)
+;	10/11/84	 Code-crunching and speedup (RFA)
+;	 3/15/85	 RecoverHandle call added (GRT)
+;	 5/1/86	 GRT  Not using _RecoverHandle anymore
+;
+;_______________________________________________________________________
+
+tmpOffset 	EQU	  	0		   ; entry num of the handler we are using
+tmpRHAPtr 	EQU	  	tmpOffset+2		 ; pointer into RHA at end of DDP hdr
+
+SocketListener	PROC
+			MOVEQ	#4,D3		 ; max number of bytes to read
+			CMP	 	D3,D1		  ; check to see how many bytes are left
+			BHS.S	@02			 ; if more then just use the 4 bytes
+			MOVE  	D1,D3		  ; else its less, so read however many left
+@02		 	LEA   	saveArea,A5		  ; save A3 because we need it later
+			MOVE.L	A3,tmpRHAPtr(A5)	; (12) save ptr to RHA
+			MOVE  	D3,D2		  ; remember # of bytes & check for zero
+			SWAP  	D2		   ; move into upper word for now
+			MOVE.B	D0,D2		 ; save socket number in D2 also
+			TST	 	D3		   ; how many bytes to read?
+			BEQ.S	@03			 ; if zero, branch around ReadPacket
+			JSR	 	(A4)		  ; read the bytes into the RHA and adjust
+
+******************************************************************************
+*** BEGINNING OF MAIN TIME CRITICAL SECTION **********************************
+
+			BNE.S	@08			 ; if error, exit
+
+;  A4 and A5 are restored upon completion of the ReadPacket call.
+;  A5 -> ptr to my save area
+
+@03		 	LEA   	theSocketTable,A3   ; A3 -> my socket table
+			MOVEQ	#maxSkts-1,D3		; start at end of list
+@05		 	CMP.B	 aSktNum(A3,D3),D2	 ; match?
+			DBEQ  	D3,@05		  ;	 no, check next one
+			BNE.S	@11			 ; if not found, goto @11
+
+; If we have reached here, we have found the socket entry in our table, and we
+; will now get the buffer ptr stored in the AB record.  If a Read call has not
+; been issued, we will throw the packet away.
+
+			LSL	 	#2,D3		  ; get offset into RBPtr field
+			MOVE  	D3,tmpOffset(A5)	 ; save offset * 4
+			MOVE.L	aRBPtr(A3,D3),A3	; get read block ptr
+			MOVE.L	A3,D0		 ; set CCR to see if read buf was NIL
+			BEQ.S	@11			 ; if no read buffer, ignore packet
+
+			MOVE.L	rbABHdl(A3),A3 	; A3 = AB record handle
+			MOVE.L	(A3),A3		 ; deref it
+			MOVE  	ddpReqCount(A3),D3  ; D3 = number of bytes want to read
+			MOVE.L	ddpDataPtr(A3),A3	; A3 -> buffer ptr for packet
+			SWAP  	D2		   ; restore byte count into low word
+			ADD	 	D2,A3		  ; modify ptr
+			SUB	 	D2,D3		  ; D3 = bytes to read - what I've already read
+
+			JSR	 	2(A4)		  ; read in rest of packet
+
+*** END OF TIME CRITICAL SECTION **********************************************
+*******************************************************************************
+
+			BNE.S	@08			 ; if error, just exit
+			BRA.S	@12			 ; else go on
+
+@08		 	RTS 		    ; short branch exit point
+
+; Error exit section - This will exit the socket listener and call MPP (which
+;			will read the rest of the packet and ignore it.
+
+@11		 	MOVEQ	#0,D3		  ; tell MPP we dont want the packet
+			JMP	 	2(A4)		  ; and call MPP
+
+; OK, the packet is now hopefully where it is supposed to be so we can now pass
+; other information back to the user.
+;
+; D3 = number of bytes Read in compared to the number of bytes in the buffer
+;	  (if D3 < 0 then the users buffer was not big enough, so report an error)
+;
+; Registers D0-D3 and A0-A3 are now usuable
+
+@12		 	TST  	 D3 	    ; check to see if we overflowed buffer
+			BGE.S	@13			 ; if not then branch
+
+			MOVE  	#buf2SmallErr,D0	 ; set error code
+
+; Copy any bytes I temporarily stored in the RHA back into the user's buffer
+;  A0 -> ABRecord, A1 -> save area, A3 -> 1st DDP data byte in RHA
+
+@13		 	MOVE.L	A2,-(SP) 	  ; save local var ptr
+			LEA		saveArea,A1		 ; get save area start point
+			LEA	 	theSocketTable,A2	 ; point to socket table
+			MOVE  	tmpOffset(A1),D1	 ; restore table offset
+			MOVE.L	aRBPtr(A2,D1),A2	; A2 -> Read Block
+			MOVE.L	rbABHdl(A2),A0 	; A0 = ABRecord handle
+			MOVE.L	(A0),A0		 ; deref it
+			MOVE  	ddpReqCount(A0),D1  ; get requested number of bytes
+			SUB	 	D3,D1		  ; get how many we actually read
+			MOVE  	D1,ddpActCount(A0)  ; actual bytes read in
+
+			MOVE.L	tmpRHAPtr(A1),A3	; get saved RHA pointer
+			MOVE.L	ddpDataPtr(A0),A2	; A2 -> input data buffer
+
+			CMP	 	ddpReqCount(A0),D2  ; is buffer big enough to hold 'em?
+			BLE.S	@15			 ; yes, proceed
+			MOVE  	ddpReqCount(A0),D2  ; no, only copy what will fit
+
+@15		 	SUBQ  	#1,D2		   ; dec counter
+			BLT.S	@17			 ; if neg then exit
+			MOVE.B	0(A3,D2),0(A2,D2)	; copy RHA bytes into buffer
+			BRA.S	@15			 ; do it again until done
+
+; Move any pertinant data to the AB record to send back to the caller.
+; We return the dest node ID to the user to let him know if it was a broadcast
+; or directed.  A $FF means broadcast, else it will be this node's ID
+
+@17		 	MOVE.L	 (SP)+,A2 	  ; restore A2 MPP local vars
+			MOVE  	D0,abResult(A0)	 ; set return result code
+			CLR.B	ddpTypeField-1(A0)	; clear junk byte for Pascal
+			MOVE.B	DDPType-DDPHSzLong(A3),ddpTypeField(A0) ; ddp type
+			MOVE.B	DDPSrcSkt-DDPHSzLong(A3),ddpAddrSkt(A0) ; 'from' skt num
+			CLR.B	ddpNodeID-1(A0)	; clear junk byte for Pascal
+			MOVE.B	ToRHA+LAPDstAdr(A2),ddpNodeID(A0) ; dest node ID
+
+; Set up A1 -> Socket Table, D1 and D2 are offsets into that table
+
+			MOVE  	tmpOffset(A1),D2	 ; D2 = entry offset in table * 4
+			MOVE  	D2,D1		  ; D1 has it too!
+			LSR	 	#2,D1		  ; get actual offset into socket field
+			LEA	 	theSocketTable,A1	 ; A1 -> theSocketTable of info
+
+			CMP.B	#shortDDP,ToRHA+LAPType(A2) ; is this a short DDP hdr?
+			BNE.S	@18			 ; branch for long header
+
+			MOVE.B	ToRHA+LAPSrcAdr(A2),ddpAddrID(A0) ; stuff source node ID
+			CLR	 	ddpAddrNet(A0)	 ; clear network number
+			MOVE.L	aRBPtr(A1,D2),A3	; get read block ptr
+			BRA.S	@23			 ; all done - go clean up
+
+; If DDP long header, we return extended header info in addr blk to user
+
+@18		 	MOVE.B	 DDPSrcNode-DDPHSzLong(A3),ddpAddrID(A0) ; 'from' xtend hdr ID
+			MOVE  	DDPSrcNet-DDPHSzLong(A3),ddpAddrNet(A0) ; 'from' xtend net ID
+			TST	 	DDPChecksum-DDPHSzLong(A3) ; examine checksum in packet
+			MOVE.L	aRBPtr(A1,D2),A3	; get read block ptr
+			BEQ.S	@23			 ; if cksum zero, nothing to calculate
+
+			TST	 	D0		   ; any errors so far (buf2small)?
+			BNE.S	@23			 ; if so, forget checksum
+			BSR	 	CalcCheckSum		 ; calculate checksum (D3 = error)
+			BEQ.S	@23			 ; checksums match
+			TST.B	rbRetCksErr(A3)	; does user want Cksum errs returned?
+			BEQ.S	@40			 ; no, ignore this packet
+			MOVE  	#ckSumErr,abResult(A0) ; else report the error
+
+@23		 	MOVE.L	rbABHdl(A3),A0	 ; A0 = AB rec handle
+			_HUnlock			  ; unlock the ABRecord handle
+
+; Steve Bollinger (4-2122) 9/24/92
+; Network events don't work anymore, so we always set the packet recvd
+; flag. The caller can just poll this to see when we are done.
+; set the packet recvd flag
+
+			ST	  	aRcvFlag(A1,D1)	  ; set the pkt recvd flag to true
+
+; unlink and unlock read block from the queue (has to be at the beginning)
+; A3 -> read block
+
+@30		 	MOVE.L	0(A3),aRBPtr(A1,D2) ; unlink read blk
+			MOVE.L	rbHdl(A3),A0		; A0 = read block handle
+			JSR	 	UnlockAndLinkHdl	 ; dispose of the handle
+@40		 	RTS
+
+			EJECT
+;_______________________________________________________________________
+;
+;	CalcCheckSum
+;
+;	Calculate the checksum of the DDP packet.  This checksum includes
+;	the DDP header bytes (starting from Dst Net field) and the data bytes.
+;
+;	Call:
+;		 A0 -> ABRecord
+;		 A2 -> MPP variables
+;
+;	Return:
+;		 D3 = 0 if checksum match, non-zero otherwise
+;		 D1 and A1 are saved/restored, D0 is trashed
+;
+;	Modification History:
+;	 8/24/84	 ABO  Ready for alpha release
+;	 9/11/84	 GRT  Saved register A1
+;	10/12/84	 RFA  Code crunch, saved D1
+;	11/6/84	 GRT  If checksum calculated to be zero, then set to -1
+;
+;_______________________________________________________________________
+
+CalcCheckSum	MOVEM.L	D1/A1,-(SP)		; save registers
+			CLR	 	D3		   ; start from scratch
+			LEA	 	ToRHA+LAPHdSz+DDPDstNet(A2),A1 ; A1 -> Dest Net field
+			MOVEQ	#DDPHSzLong-DDPDstNet,D1 ; size of DDP header to cksum
+			BSR.S	DoCheckSum	 ; Checksum DDP header fields
+
+			MOVE.L	ddpDataPtr(A0),A1	; A1 -> user data
+			MOVE  	ddpActCount(A0),D1  ; D1 = user data count
+			BSR.S	DoCheckSum	 ; Checksum user data
+
+			TST	 	D3		   ; check final result of checksum
+			BNE.S	@10			 ; if not zero then branch
+			SUBQ  	#1,D3		  ; however, if it was, then force to -1
+
+@10		 	SUB   	ToRHA+LAPHdSz+DDPChecksum(A2),D3 ; Subtract off pkt's cksum
+			MOVEM.L	(SP)+,D1/A1		; restore registers
+			RTS			   ; D3 zero if all ok, CCR set
+
+;_____________________________
+;
+; DoCheckSum - accumulate ongoing checksum
+;
+;	Call:
+;	 D1 = number of bytes to checksum
+;	 D3 = current checksum
+;	 A1 -> bytes to checksum
+;
+;	Return:
+;	 Uses D0
+;	 D3 = accumulated checksum
+;_____________________________
+
+DoChecksum	CLR		D0		   ; Clear D0 high byte
+			SUBQ  	#1,D1		  ; Decrement count by 1 for DBRA
+@10		 	MOVE.B	(A1)+,D0 	  ; D0 (word) = next byte
+			ADD	 	D0,D3		  ; Accumulate checksum
+			ROL	 	#1,D3		  ; Rotate checksum
+			DBRA  	D1,@10		  ; And keep going
+			RTS
+
+			ENDPROC
+			
+;_______________________________________________________________________
+;
+;	LookUpSkt
+;
+;	This routine looks up a socket in my socket table.  It is called by
+;	both DDPCloseSocket and DDPRead.
+;
+;	Entry:
+;	 D3 = socket number to find in table
+;
+;	Exit
+;	 D1 = offset value in table
+;	 z-bit set in CCR if found else cleared
+;_______________________________________________________________________
+
+LookUpSkt 	PROC
+			LEA	 	theSocketTable,A1	 ; point to start of socket table
+			MOVEQ	#maxSkts-1,D1		; start at end of table
+@10		 	CMP.B	aSktNum(A1,D1),D3	 ; check for match
+			DBEQ  	D1,@10		  ; found it?
+			RTS
+			
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	DDPOpenSocket
+;
+;	Opens a socket for DDP and optionally installs a socket listener
+;	for the requested socket.  Socket number 0 means ephemeral.  Socket
+;	number 1 owned by the RTMP socket listener (automatically attached
+;	when MPP initializes.
+;
+;	This interface maintains its own socket table, apart from MPP's.
+;	This table holds info for all sockets opened by DDPOpenSocket for
+;	which the default socket listener was specified.
+;
+;	A NIL value in sktListener will automatically install this interfaces
+;	built-in socket listener into my socket table.
+;
+;	FUNCTION DDPOpenSocket(VAR theSocket : Byte; sktListener : Ptr): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .LONG	  Pointer to socket listener (see above)
+;		  .LONG	  address of the sockets variable
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;
+;	Possible errors:		No more sockets
+;
+;	The IO queue element is allocated on the stack for the control call.
+;	This call is made synchronously.
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	10/12/84	 RFA  Code-crunch
+;
+;_______________________________________________________________________
+
+DDPOpenSocket	PROC	EXPORT
+			JSR	 	RemoveHdlBlks 	 ; check to see if handles need to be disposed
+			MOVE.L	(SP)+,D2		 ; save return address
+			MOVE.L	(SP)+,A1		 ; get socket listener ptr
+			MOVE.L	A1,D1		 ; set ccr; is it zero??
+			BNE.S	@10			 ; if not then branch and continue
+			LEA	 	SocketListener,A1	 ; get address of built-in listener
+			MOVE.L	A1, D1		 ; save it away in D1
+@10		 	MOVE.L	(SP)+,A1 	  ; address of socket variable
+			MOVE.L	D3,-(SP)		 ; save D3 register
+			MOVE.B	1(A1),D3		 ; get socket number
+
+			SUB	 	#IOQElSize,SP 	 ; allocate space for the IOQEl
+			MOVE.L	SP,A0		 ; A0 -> IO queue element block
+			MOVE.B	D3,socket(A0)		; socket number
+			MOVE.L	D1,listener(A0)	; socket listener
+
+			MOVE  	#OpenSkt,CSCode(A0) ; code for attach proto hndlr
+			MOVE 	#MPPRefNum,IORefNum(A0) ; set refnum up
+			_Control
+			TST	 	D0		   ; check D0 - CCR doesn't get set right by _Control
+			BNE.S	@90			 ; if error, branch and exit
+
+; Return the socket number to the user.  Check skt listener address to see if
+; we need to add it to our table.	If it was not sent as NIL then don't add it.
+
+			MOVE.B	Socket(A0),D3		; get the (possibly) new socket
+			MOVE.B	D3,1(A1)		 ; return skt num to user
+			LEA	 	SocketListener,A0	 ; see if we're using the default
+			CMPA.L	D1,A0		 ;	socket listener
+			BNE.S	@90			 ; if not, then don't add to our table
+
+; Caller wants to use the default socket listener, so store the socket number
+; in my own table for use by DDPRead and the socket listener.
+
+			LEA	 	theSocketTable,A1	 ; A1 -> my table of skt listeners
+			MOVE  	#maxSkts-1,D1 	 ; start at the end of the list
+@20		 	TST.B	aSktNum(A1,D1)	 ; test for zero
+			DBEQ  	D1,@20		  ; find it?
+			BNE.S	@80			 ; if not found then branch with error
+
+; Found an entry so set up info in the socket table
+
+@30		 	MOVE.B	D3,aSktNum(A1,D1)	 ; store the socket number
+			CLR.B	aRcvFlag(A1,D1)	; zero out the pkt rcvd flag
+			LSL	 	#2,D1		  ; offset to actual place in table
+			CLR.L	aRBPtr(A1,D1)		; no read blocks linked in yet
+			BRA.S	@90
+
+@80		 	MOVE  	#ddpSktErr,D0	  ; no free entry in table (ERROR)
+
+@90		 	ADD   	#IOQElSize,SP	  ; deallocate the queue element
+			JMP	 	ExitD3		  ; restore D3 and exit
+
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	DDPCloseSkt
+;
+;	Detaches the socket listener and socket number from the table.  Unlocks
+;	all Read Blocks associated with the socket and queues them for disposal.
+;	Unlocks all ABRecords associated with the Read Blocks.  Error
+;	is returned by MPP if the socket was not found in the table.
+;
+;	FUNCTION DDPCloseSocket(theSocket : Byte): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .BYTE	  pascal filler
+;		  .BYTE	  socket number
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;
+;	Possible errors:		MPP errors:	Socket not found
+;
+;	The IO queue element is allocated on the stack for the control call.
+;	This call is made synchronously.
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	10/12/84	 RFA  Code-crunch
+;	10/16/84	 RFA  Clean up all Read Blocks and unlock all ABRecs
+;	 3/15/85	 GRT  RecoverHandle call added
+;
+;_______________________________________________________________________
+
+DDPCloseSocket	PROC	EXPORT
+			JSR	 	RemoveHdlBlks 	 ; memory handles to be disposed?
+			MOVE.L	(SP)+,D2		 ; save return address
+			MOVE  	(SP)+,D0 	  ; get socket number (stored in word order)
+			MOVE.L	D3,-(SP)		 ; save register
+			MOVE.B	D0,D3		 ; skt number
+			SUB	 	#IOQElSize,SP 	 ; allocate IOQElement
+			MOVE.L	SP,A0		 ; A0 -> IOQEl
+			MOVE.B	D3,socket(A0)		; pass parameter to IOQ
+			MOVE  	#CloseSkt,CSCode(A0) ; control code
+			MOVE  	#MPPRefNum,IORefNum(A0) ; set refnum up
+			_Control			  ; make the call
+			ADD	 	#IOQElSize,SP 	 ; deallocate the IOQ element
+			TST.B	D0		  ; did we get an error
+			BNE.S	@15			 ; if so then branch
+
+;	Scan through table until either an matched entry is found, or until
+;	the end of the table is reached.  If the entry is not found, we can't assume
+;	an error since the socket might have not been for our socket table.
+
+			JSR		LookUpSkt 	 ; check for socket
+			BNE.S	@15			 ; if not found then just exit
+			CLR.B	aSktNum(A1,D1) 	; zero out the field to nullify it
+			CLR.B	aRcvFlag(A1,D1)	; just to be on the safe side
+
+			LSL	 	#2,D1		  ; get offset into RBPtrs
+			MOVE.L	aRBPtr(A1,D1),A0	; get first Read Block
+			CLR.L	aRBPtr(A1,D1)		; zero it out for cleanup
+			MOVE.L	A0,A1		 ; A1 -> Read Block
+
+@10		 	MOVE.L	A1,D0		  ; is it nil?
+			BEQ.S	@15			 ; if so, we're done
+			MOVE.L	rbABHdl(A1),A0 	; A0 = AB rec handle
+			_HUnlock			  ; and unlock it
+
+			MOVE.L	A1,A0
+			_RecoverHandle 		 ; recover handle to read block
+			MOVE.L	(A1),A1		 ; but first, get ptr to next RdBlk
+			JSR	 UnlockAndLinkHdl	 ; unlock and queue it up for disposal
+			BRA.S	@10
+
+@15		 	JMP   	ExitD3		   ; return
+
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	DDPWrite
+;
+;	Write a packet out to the cable either synchronously or asynchronously.
+;	If sync, do the operation and return when completed.  If async, pass
+;	control back after queueing the call, and when completed, post a network
+;	event back to the application with a message consisting of the ABRecHandle.
+;
+;	The ABRecHandle is locked down during most of the call.  abResult will
+;	contain a 1 in it as long as the operation is still in progress (ASYNC
+;	only)
+;
+;	FUNCTION DDPWrite(abRecord : ABRecHandle; doCheckSum : BOOLEAN;
+;		   async : BOOLEAN): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .BYTE	  pascal filler
+;		  .BYTE	  async flag
+;		  .BYTE	  pascal filler
+;		  .BYTE	  checkSum flag
+;		  .LONG	  handle to record data structure
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;		  Additional data in record structure
+;
+;	Possible errors:
+;
+;
+;	Upon allocation of the IOQElement block, an additional 36 bytes are
+;	allocated at the end.  The data structure looks like this:
+;
+;	|=========================|
+;	:			   :
+;	:	IOQElement blk 	 :		50 bytes
+;	:			   :
+;	:			   :
+;	|=========================|
+;	:	AB record hdl		 :		4 byte hdl to AB record
+;	|-------------------------|
+;	:	 Q element hdl 	 :		4 byte hdl to this queue element
+;	|-------------------------| <----------- WDS1Start
+;	: WDS element1 (hdr info) :		6 bytes (2 byte length, 4 byte ptr)
+;	|-------------------------|
+;	: WDS element2 (write)	 :		6 bytes (points to data to write)
+;	|-------------------------|
+;	|_	WDS Termination	_|		2 bytes
+;	|		Word 	  |
+;	|-------------------------|
+;	|	   async flag		 |		1 byte
+;	|=========================| <----------- WDS1stEntry
+;	:	7 bytes for LAP	 :		7 bytes (THIS IS ODD ALIGNED!)
+;	:	header, DDP length	 :
+;	:	and checksum fields  :
+;	|-------------------------|
+;	|_	Destination Network _|		2 Bytes
+;	|		Number		 |
+;	|-------------------------|
+;	|_			  _| 	  2 Bytes unused in call
+;	|			   |
+;	|-------------------------|
+;	|	Dest Node Address	 |		1 Byte
+;	|-------------------------|
+;	|			   | 	  1 Byte unused in call
+;	|-------------------------|
+;	|	Dest Skt Number	 |		1 Byte
+;	|-------------------------|
+;	|			   | 	  1 Byte unused in call
+;	|-------------------------|
+;	|	Level 2 Type		 |		1 Byte
+;	|-------------------------|
+;	|			   | 	  1 Byte unused in call
+;	|=========================|
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	10/12/84	 RFA  D0 must be .long when calling GetHdlAndLock
+;	12/17/84	 GRT  CmpEventPost changed to Cmp1EventPost
+;	 4/30/86	 GRT  Saving Q element handle in the queue element
+;_______________________________________________________________________
+
+DDPWrite		PROC	EXPORT
+			JSR	 	RemoveHdlBlks 	 ; check for disposable handles
+			LEA	 	retAddr,A1	  ; save place for ret address
+			MOVE.L	(SP)+,(A1)	 ; save return address; A1 available now
+			MOVE.B	(SP)+,D1		 ; save async flag
+			MOVE.B	(SP)+,D2		 ; save checksum flag
+			MOVE.L	(SP)+,A0		 ; abRecord handle
+			MOVEM.L	A2-A3,-(SP)		; save A2/3
+			_HLock			  ; lock abRecord down
+			TST	 	D0		   ; check error - MUST DO THIS!
+			BNE	 	@90 		  ; if not zero return an error
+			MOVE.L	(A0),A2		 ; A2 -> Ptr to ABRecord
+			MOVE.L	A0,A1		 ; save another copy of handle for later
+			MOVE  	#1,abResult(A2)	 ; still in execution
+			MOVE.B	#tDDPWrite,abOpCode(A2) ; put call type in record
+
+; We are allocating an extra n bytes at the end of the IOQElement for storage
+; of the misc data (see diagram)
+
+			MOVE.L	#IOQElSize+WDSXtraDDPSize,D0 ; number of bytes to allocate
+			JSR	 	GetHdlAndLock 	 ; allocate the memory A0->IOQElement Hdl
+			BNE.S	@90			 ; error if didn't work
+			MOVE.L	A0,D0		 ; save handle in D0
+			MOVE.L	(A0),A0		 ; A0 -> IOQElement blk (dereferenced)
+			MOVE.L	D0,qElHdl(A0)		; save handle in queue element
+
+; A2 -> ABRecord.  A0 -> IOQElement
+
+			MOVE.L	A1,abRecHdl(A0)	; save hdl in IOQElement
+
+			LEA	 	WDS1Start(A0),A3	 ; start of our vars in IOQ blk
+			MOVE  	#16,(A3)+	  ; length is always 16 for the WDS hdr
+			LEA	 	WDS1stEntry(A0),A1  ; address of the WDS header entry
+			MOVE.L	A1,(A3)+		 ; A1 = WDS entry 1 ptr
+			MOVE  	ddpReqCount(A2),(A3)+ ; buffer size to write out
+			MOVE.L	ddpDataPtr(A2),(A3)+; buffer data pointer
+			CLR	 	(A3)+		  ; zero means end of WDS
+			MOVE.B	D1,(A3)		 ; async flag stored in IOQELBlk
+
+; Fill in the parameters of the IO Q element
+
+			MOVE.B	ddpTypeField(A2),dType(A0)	; store ddp type field
+			MOVE.B	ddpSocket(A2),Socket(A0) ; store source socket
+			MOVE  	ddpAddrNet(A2),dDstNet(A0)	 ; store dest network
+			MOVE.B	ddpAddrID(A2),dDstNodeAddr(A0); store dest node address
+			MOVE.B	ddpAddrSkt(A2),dDstSkt(A0)	; store dest socket number
+
+			LEA	 	WDS1Start(A0),A2	 ; get pointer to WDS block
+			MOVE.L	A2,WDSPointer(A0)	; move it into the IOQElement
+			MOVE.B	D2,ChecksumFlag(A0) ; pass checksum flag to DDP
+			MOVE  	#WriteDDP,CSCode(A0) ; set control code
+
+			LEA	 	DDPWrteCompletion,A2  ; A2 -> our IO completion routine
+			JSR	 	DoControlCall 	 ; make the control call
+
+@90		 	MOVEM.L	(SP)+,A2-A3		 ; restore A2/3
+			MOVE.L	retAddr,D2	 ; get back return address
+			JMP	 	ExitD0		  ; and exit
+
+;_______________________________________________________________________
+;
+;	DDPWrteCompletion
+;
+; This routine is called when the IO has been completed
+; A0 -> IOQElBlk
+;_______________________________________________________________________
+
+DDPWrteCompletion
+
+			MOVEM.L	D0/A0-A2,-(SP) 	; save registers
+
+			JSR	 	CmpEntrance		 ; set up registers and unlock ab record hdl
+			JSR	 	Cmp1EventPost 	  ; if event needs to be posted, do it
+
+			MOVEM.L	(SP)+,D0/A0-A2 	; restore registers
+			RTS
+
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	DDPRead
+;
+;	Read a packet coming in from the cable.
+;
+;	IMPORTANT:  The DDPRead call can only be used with the built in socket
+;	listener.
+;
+;	The ABRecHandle is locked down until the call completes.  The socket
+;	listener is responsible for unlocking it. (unless an error occurs in the
+;	read queueing, in which case its unlocked by this routine)
+;
+;	All packets received with a long DDP header are examined to see if they
+;	contain a valid checksum.  If so, we calculate the checksum and see if they
+;	match.  If they don't, the retCksumErrs flag is checked to see if the user
+;	wants packets with checksum errors returned to him/her.  If they do, we
+;	return the packet but with a ckSumErr error.  If not, the packet is thrown
+;	away and the Read does not complete.
+;
+;	FUNCTION DDPRead(abRecord : ABRecHandle; retCksumErrs : BOOLEAN;
+;		   async : BOOLEAN): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .BYTE	  async flag
+;		  .BYTE	  pascal filler
+;		  .BYTE	  return checksum errs flag
+;		  .BYTE	  pascal filler
+;		  .LONG	  handle to record data structure
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;		  Additional data in record structure
+;
+;	Possible errors:		Bad socket (zero or not open)
+;
+;
+;	A 14 byte read block is allocated dynamically for every read call.  This
+;	block is linked in a FIFO queue for every active socket number .  When a
+;	pkt is received, the first read block data in the link is read and the
+;	socket listener attempts to read the packet into the buffer pointed to by
+;	the ddpDataPtr parameter in the ABRecord.
+;
+;	|-------------------------|
+;	|	Link to next		 |		4 byte pointer link
+;	|	read block		 |
+;	|			   |
+;	|-------------------------|
+;	|	AB record handle	 |		4 byte hdl to AB record
+;	|			   |
+;	|			   |
+;	|-------------------------|
+;	|	async flag		 |		1 byte
+;	|-------------------------|
+;	| return cksum errs flag  |		1 byte
+;	|-------------------------|
+;	|	read block hdl 	 |		4 byte hdl to this read block
+;	|			   |
+;	|			   |
+;	|-------------------------|
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	10/12/84	 RFA  Code-crunch, D0 must be .long when calling GetHdlAndLock,
+;			& handles being recovered wrong under error conditions
+;	 3/15/85	 GRT  RecoverHandle call added
+;	 4/30/86	 GRT  Read block handle saved in the read block
+;_______________________________________________________________________
+
+DDPRead		PROC	EXPORT
+			JSR	 	RemoveHdlBlks 	 ; check disposable handles
+			LEA	 	returnAddr,A1 	 ; address of save longword
+			MOVE.L	(SP)+,(A1)	 ; save return address
+			MOVE.B	(SP)+,D2		 ; save async flag
+			SWAP  	D2		   ;   in upper word of D2
+			MOVE.B	(SP)+,D2		 ; save checksum errs flag
+			MOVE.L	(SP)+,A0		 ; record handle
+			MOVEM.L	D3/A2-A3,-(SP) 	; save registers for later
+			MOVE.L	A0,A3		 ; save ABRecHdl in A3
+			_HLock			  ; lock abRecord down
+			TST	 	D0		   ; test result of the lock operation
+			BNE	 	ReadExit 	  ; if not zero return an error
+
+; first check my socket listener table for the matching socket number
+
+			MOVE  	#readQErr,D0		 ; assume an error
+			MOVE.L	(A0),A2		 ; A2 -> ABRecord
+			MOVE.B	ddpSocket(A2),D3	; get the socket number
+			BEQ.S	Read1Exit 	 ; zero type is invalid
+
+			JSR	 	LookUpSkt	  ; check for socket number in table
+			BNE.S	Read1Exit 	 ; if not found then leave
+
+; we found the socket, so get a Read Block and set it up
+
+			MOVE  	#1,abResult(A2)	 ; in execution
+			MOVE.B	#tDDPRead,abOpCode(A2)	; put call type in
+			MOVEQ	#rdBlkSize,D0		; size of a read blk entry
+			JSR	 	GetHdlAndLock 	 ; get a handle to the memory
+			BNE.S	Read1Exit 	 ; exit if error (must clean up)
+			MOVE.L	A0,D0		 ; save handle in D0
+			MOVE.L	(A0),A0		 ; A0 -> my read block (dereference)
+			MOVE.L	D0,rbHdl(A0)		; put handle in read block
+
+; A0 -> my read block   A2 -> AB record 	  stuff the read blk full of data
+
+			CLR.L	rbNxPtr(A0)		; zero out ptr to next element
+			MOVE.L	A3,rbABHdl(A0) 	; copy the AB rec hdl into it
+			MOVE.B	D2,rbRetCksErr(A0)	; save the checksum flag
+			SWAP  	D2		   ; get the async flag
+			MOVE.B	D2,rbAFlag(A0) 	; save the async byte flag
+
+; must reset the pkt recvd flag before the read buffer is linked in
+; SCC interrupts are being turned off while linking the block in
+; A0 -> read blk, A1 -> theSocketTable (set up by LookUpSkt)
+
+@10		 	CLR.B	aRcvFlag(A1,D1)	 ; zero out the pkt recvd flag
+			MOVE  	D1,D2		  ; D1,D2 has offset
+			LSL	 	#2,D2		  ; D2 * 4 = actual offset in table
+			MOVE  	SR,-(SP) 	  ; save status register on stack
+			ORI.W  	#SCCLockOut,SR	 ; lock out the SCC interrupts		<SM2> rb
+			LEA	 	aRBPtr(A1,D2),A3	 ; A3 -> read element entry link
+@15		 	TST.L	(A3)		  ; is next link empty?
+			BEQ.S	@20			 ; yes, we're at then end
+			MOVE.L	(A3),A3		 ; no, step to next link
+			BRA.S	@15			 ; and repeat
+@20		 	MOVE.L	A0, (A3) 	  ; put Read Block at end of list
+			MOVE  	(SP)+,SR 	  ; restore interrupt status
+			CLR	 	D0		   ; I guess that there are no errors!
+			TST.B	rbAFlag(A0)		; is this an async call?
+			BNE.S	ReadExit		 ; if so exit (don't unlock the handle)
+
+; Since the call is sync, we wait until the pkt recvd flag says one has come in
+; The result code will have been put in the record by the protocol handler.
+
+@25		 	TST.B	aRcvFlag(A1,D1)	 ; has a packet been received?
+			BEQ.S	@25			 ; if not, then wait
+			MOVE  	abResult(A2),D0	 ; pick the result code out of the record
+			BRA.S	ReadExit		 ; exit
+
+; If an error occurred we must unlock the ABRecord block
+
+Read1Exit 	MOVE  	D0,D1		  ; save error code
+			MOVE.L	A2,A0
+			_RecoverHandle 		 ; recover handle to abRec
+			_HUnlock			  ; unlock the handle
+			MOVE  	D1,D0		  ; recover error code
+
+ReadExit		MOVEM.L	(SP)+,D3/A2-A3 	; restore registers
+			MOVE  	D0,(SP)		  ; stuff function result
+			MOVE.L	returnAddr,A1		; get return address
+			JMP	 	(A1)		  ; return
+
+			EJECT
+
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	DDPRdCancel
+;
+;	Cancel a pending asynchronous DDPRead and free its associated data structures.
+;
+;	IMPORTANT:  The DDPRdCancel call can only be used with asynchronous DDPRead
+;	calls on a socket whose socket listener is the default.
+;
+;	The ABRecord is unlocked, and the associated Read Block is dequeued from
+;	the list of pending Read requests and marked for disposal.	This call can
+;	only be made synchronously.
+;
+;	FUNCTION DDPRdCancel(abRecord : ABRecHandle): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .LONG	  handle to record data structure
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;			   The abResult field of the abRecord is set to zero
+;
+;	Possible errors:		Bad socket (zero or not open)
+;			   abRecord not found
+;
+;	Note that by the time the Read request queue is searched for the Read Block
+;	pointing to the specified abRecord, a packet may arrive and satisfy the
+;	request.	An "abRecord not found" error will then be returned.  In such a
+;	case, the caller should check the abResult field of the abRecord to see
+;	if it indeed has completed.  If it did, it will contain zero or a negative
+;	error indication.  If it is equal to 1, then something is seriously wrong.
+;
+;	Modification History:
+;	10/23/84	 RFA  New today
+;	 3/15/85	 GRT  RecoverHandle call added
+;	 5/1/86	 GRT  changed rbABPtr to rbABHdl
+;	12/10/86	 SJF	 fixed _RecoverHandle Bug
+;_______________________________________________________________________
+
+DDPRdCancel	PROC	EXPORT
+			JSR	 	RemoveHdlBlks 	 ; check disposable handles
+			MOVEM.L	(SP)+, D2/A0		; D2 = return adr, A0 = abRec hdl
+			MOVEM.L	D3/A2-A4, -(SP)	; save some registers
+
+; first check my socket listener table for the matching socket number
+
+			MOVE  	#readQErr,D0		 ; assume an error
+			MOVE.L	(A0),A2		 ; A2 -> ABRecord
+			MOVE.B	ddpSocket(A2),D3	; get the socket number
+			BEQ.S	RdCnclExit	 ; zero is invalid
+
+			JSR	 	LookUpSkt	  ; check for socket number in table
+			BNE.S	RdCnclExit	 ; if not found then leave
+
+; we found the socket, so search list of Read Blocks for one that points to abRec
+
+			MOVE  	#recNotFnd, D0	 ; assume an error
+			LSL	 	#2, D1		  ; get offset into Read Blocks
+			LEA	 	aRBPtr(A1,D1), A1	 ; A1 = Read Block queue header
+			MOVE  	SR, -(SP)	  ; save old status
+			ORI.W  	#SCCLockout, SR	 ; disable interrupts			<SM2> rb
+
+@10		 	MOVE.L	0(A1), A3	  ; check next element
+			CMP.L	#0, A3		 ; is there a next element?
+			BNE.S	@20			 ; yes, continue checks
+			MOVE  	(SP)+, SR	  ; no, we're at the end & no match!
+			BRA.S	RdCnclExit	 ; restore interrupt state & return
+
+@20		 	MOVE.L	rbABHdl(A3),A4	 ; get handle to ABRecord
+			CMP.L	(A4),A2		 ; is this the RdBlk for our abRec?
+
+			BEQ.S	FoundIt		 ; yes!
+			MOVE.L	A3, A1		 ; no, skip down to next Read Block
+			BRA.S	@10			 ; and check it
+
+; we found the right Read Block, so dequeue it and dispose of it
+
+FoundIt		MOVE.L	(A3), (A1)	 ; dequeue the Read Block
+			MOVE  	(SP)+, SR	  ; safe now to re-enable interrupts
+			CLR	 	abResult(A2)		 ; clear result field in abRecord
+			_HUnlock			  ; unlock the abRecord
+			MOVE.L	A3,A0
+			_RecoverHandle 		 ; recover read block handle
+			_HUnlock			  ; unlock it and dispose of it
+			_DisposHandle			 ; (hopefully clears D0 as well)
+
+RdCnclExit	MOVEM.L	(SP)+, D3/A2-A4	; restore registers
+			MOVE  	D0, (SP) 	  ; set function result
+			MOVE.L	D2, A0		 ; restore return address
+			JMP	 	(A0)		  ; and return
+
+			ENDPROC
+			

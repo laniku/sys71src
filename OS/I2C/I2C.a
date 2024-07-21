@@ -1,0 +1,416 @@
+;
+;	File:		I2C.a
+;
+;	Contains:	Routines for reading and writing I-squared-C serial ROMS.
+;
+;	Written by:	
+;
+;	Copyright:	© 1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		<K2>	 5/20/93	EH		Fixed up comments.
+;		 <1>	 5/20/93	EH		first checked in
+;
+;
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ				 <5> HJR
+;
+;	Routine: X24c01aGetID
+;
+;	This routine talks to the X24c01a Xicor Serial ROM part to get the Ethernet ID
+;	address stored therein. The X24c01a belongs to a class of parts whose interface
+;	is the standard I-squared-C (I2C) inteface, consististing of two signals, a clock
+;	and a bi-directional data signal.
+;
+;	On Blackbird, the clock signal is hooked up to PB0 of the VIA 1 cell inside Whitney.
+;				  the clock signal is hooked up to PB1 of the VIA 1 cell inside Whitney.
+;
+;	Since there are an increasing number of I2C ROMs in Macintosh products, we may
+;	want to generalize this solution at some point. But for now...
+;	 
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ				 <5> HJR
+
+			print		off
+			load		'StandardEqu.d'
+			include		'HardwarePrivateEqu.a'
+			include		'i2cEqu.a'
+			print		on
+			machine		MC68040
+
+
+X24c01aGetID	PROC	EXPORT
+
+*			bra.s		BBirdGetENetID
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ				 
+; Routine:	BBirdGetENetID																		  
+;																										  
+; Inputs:	a0.l - points to memory in which to place the ROM ID bytes
+;
+; Outputs:	a0.l - points to valid ROM ID bytes
+;				   or points to zeroes
+;
+; Trashes:	
+;
+; Function:	Gets the EtherNet ID from the Serial EtherNet ID ROM.
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+BBirdGetENetID		
+ENetregs	REG		d0-d7/a5
+			movem.l	ENetregs, -(sp)
+			
+			moveq	#retryCnt, d3					; set the retry count
+			move.l	VIA, a5							; point to the via
+
+@ReadCmdStart			
+			bsr.w	SendStart						; send Start Condition
+			move.b	#$A0, d4						; send slave address for write
+			bsr.w	SendByte
+			bsr.w	ReceiveAck						; get Acknowledge 
+			beq.s	@sendWordAddr					; Ack OK? then go on
+
+@error
+			move.l	a1, a0							; restore our pointer
+			cmpi.w	#WereLosers, d0					; are we totally dead?
+			beq.s	@exit							; totally dead, so exit with ID = 0
+			dbra	d3, @ReadCmdStart				; retry if non-zero retry count
+			bra.s	@exit							; retries exhausted, so punt with ID = 0
+			
+@sendWordAddr
+			moveq	#0, d4							; send read addr = 0
+			bsr.w	SendByte
+			bsr.w	ReceiveAck						; get Acknowledge 
+			bne.s	@error							; Ack OK? then go on
+			
+@sendSlaveAddr
+			bsr.w	SendStart						; send another Start Condition
+			move.b	#$A1, d4						; send slave address for read
+			bsr.w	SendByte
+			bsr.w	ReceiveAck						; get Acknowledge 
+			bne.s	@error
+@read			
+			move.l	a0, a1							; save our pointer
+			moveq	#8-1, d1						; get 8 bytes
+@byteLoop
+			bsr.w	GetByte							; get a byte
+			bsr.w	SendAck							; send acknowledge
+			move.b	d4, (a0)+						; save it
+			dbra	d1, @byteLoop
+			
+			move.l	a1, a0							; restore our pointer
+			
+@exit		bsr.w	SendStop
+			movem.l	(sp)+, ENetregs
+			rts
+			
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ				 
+; Routine:	BBirdSetENetID																		  
+;																										  
+; Inputs:	a0.l - points to ROM ID in memory to send to ROM
+;
+; Outputs:	
+;
+; Trashes:	
+;
+; Function:	Sets the EtherNet ID for the Serial EtherNet ID ROM.
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+BBirdSetENetID		
+			movem.l	ENetregs, -(sp)
+			
+			moveq	#retryCnt, d3					; set the retry count
+			move.l	VIA, a5							; point to the via
+			moveq	#2-1, d6						; page cnt: two pages = eight bytes
+			moveq	#0, d7							; write address start
+
+@PageWriteStart			
+			move.l	a0, a1							; save our pointer
+			bsr.s	SendStart						; send Start Condition
+			move.b	#$A0, d4						; send slave address for write
+			bsr.w	SendByte
+			bsr.w	ReceiveAck						; get Acknowledge 
+			beq.s	@sendWordAddr					; Ack OK? then go on
+
+@error
+			move.l	a1, a0							; restore our pointer
+			bsr.s	SendStop						; stop the music
+			cmpi.w	#WereLosers, d0					; are we totally dead?
+			beq.s	@exit							; totally dead, so exit with ID = 0
+			dbra	d3, @PageWriteStart				; retry if non-zero retry count
+			bra.s	@exit							; retries exhausted, so punt with ID = 0
+			
+@sendWordAddr
+			move.l	d7, d4							; starting write addr for this page 
+			bsr.w	SendByte
+			bsr.w	ReceiveAck						; get Acknowledge 
+			bne.s	@error							; Ack OK? then go on
+@write			
+			moveq	#4-1, d1						; send 4 bytes
+@byteLoop	move.b	(a0)+, d4 						; get byte to send
+			bsr.s	SendByte						; send it
+			bsr.w	ReceiveAck						; wait for acknowledge
+			bne.s	@error							; punt on error
+			dbra	d1, @byteLoop					; loop thru page bytes
+			
+			bsr.s	SendStop						; stop the music
+			bsr.w	Wait10ms						; wait for ROM's internal write cycle
+			addq.w	#4, d7							; bump write addr to next page
+			dbra	d6, @PageWriteStart				; loop thru 2 pages = eight bytes
+			
+			move.l	a1, a0							; restore our pointer
+@exit		movem.l	(sp)+, ENetregs
+			rts
+			
+
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ				 
+; Routine:	SendStart																		  
+;																										  
+; Inputs:	a5.l -	points to VIA 
+;
+; Outputs:	None
+;
+; Trashes:	d2
+;
+; Function:	Sends Start condition for transaction to Ethernet ID ROM.
+;			Start indicated by HIGH to LOW Data transition while Clock is HIGH.
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+SendStart	
+			bset.b	#vENetIDData,vDIRB(a5)			; set Data direction OUT
+			bset.b	#vENetIDData, (a5)				; must init data ...
+			bset.b	#vENetIDClk, (a5)				; 	... before clock
+			bsr.w	Wait10							; wait start-setup time
+			bclr.b	#vENetIDData, (a5)				; set the start condition
+			bsr.w	Wait10							; wait start-hold time
+			bclr.b	#vENetIDClk, (a5)				; and drop the clock
+			rts
+						
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ				 
+; Routine:	SendStop																		  
+;																										  
+; Inputs:	a5.l -	points to VIA 
+;
+; Outputs:	None
+;
+; Trashes:	d2
+;
+; Function:	Sends Start condition for transaction to Ethernet ID ROM.
+;			Data must be LOW coming in (we have just ack'd).
+;			Stop indicated by LOW to HIGH Data transition while Clock is HIGH.
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+SendStop	
+			bset.b	#vENetIDData,vDIRB(a5)			; set Data direction OUT
+			bset.b	#vENetIDClk, (a5)				; set clock HIGH
+			bsr.w	Wait10							; wait stop-setup time
+			bset.b	#vENetIDData, (a5)				; set the stop condition
+			bsr.w	Wait10							; wait stop-hold time
+			rts
+						
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ				 
+; Routine:	ClockBit																		  
+;																										  
+; Inputs:	a5.l - points to VIA
+;
+; Outputs:	d5.b - level of rcv bit when clock is high
+;
+; Trashes:	d2
+;
+; Function:	Pulse high.
+;			Turns off interrupts so we don't screw up.
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+ClockBit	
+
+			move	sr, -(sp)						; save status register
+			ori.w	#hiIntMask, sr					; turn off interrupts
+			
+			bsr.w	Wait10							; wait some more
+			bset.b	#vENetIDClk, (a5)				; clock goes HIGH
+			btst.b	#vENetIDData, (a5)				; get the bit
+			sne.b	d5								; 
+			bclr.b	#vENetIDClk, (a5)				; clock goes LOW
+			bsr.w	Wait10							; wait some more
+			
+			move	(sp)+, sr						; restore interrupts
+			rts
+			
+			
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ				 
+; Routine:	SendByte																		  
+;																										  
+; Inputs:	d4.b - byte to send
+;
+; Outputs:	
+;
+; Trashes:	
+;
+; Function:	Sends a byte to the EtherNet ID ROM
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+SendByte	
+sendregs	REG		d0-d3/d5
+
+			movem.l	sendregs, -(sp)				
+			
+			bset.b	#vENetIDData,vDIRB(a5)			; set Data direction OUT
+			moveq	#1,d1							; set send/rcv flag
+			moveq	#8-1, d3						; loop thru 8 bits
+
+@loop		rol.b	#1,d4							; get bit to send in the carry
+			bcc.s	@zero							;
+			bset.b	#vENetIDData, (a5)				; send a one
+			bra.s	@clockData
+@zero		bclr.b	#vENetIDData, (a5)				; send a zero
+@clockData	bsr.s	ClockBit						; send out a bit
+			dbra	d3, @loop
+			
+			movem.l (sp)+, sendregs
+			rts
+			
+			
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ				 
+; Routine:	GetByte																		  
+;																										  
+; Inputs:	
+;
+; Outputs:	d4.b has the received byte
+;
+; Trashes:	
+;
+; Function:	Receives a byte from the EtherNet ID ROM
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+GetByte
+getByteRegs		REG		d0-d3/d5
+
+			movem.l	getByteRegs, -(sp)				
+			
+			bclr.b	#vENetIDData,vDIRB(a5)			; Data direction is IN
+			moveq	#0,d1							; clear send/rcv flag
+			moveq	#8-1, d3						; loop thru 8 bits
+			moveq	#0,d4							; clear for incoming byte
+
+@loop		bsr.s	ClockBit						; clock in a bit
+			roxl.b	#1,d5							; get incoming bit into extend bit
+			roxl.b	#1,d4							; shift incoming bit receive byte
+			dbra	d3, @loop
+
+			movem.l (sp)+, getByteRegs
+			rts
+			
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ				 
+; Routine:	ReceiveAck																		  
+;																										  
+; Inputs:	a5.l - points to VIA
+;			
+;
+; Outputs:	d0.w - error indicator
+;
+; Trashes:	
+;
+; Function:	Waits for an acknowledge bit from the EtherNet ID ROM.
+;			Data direction must be IN.
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+ReceiveAck	
+ackregs	REG		d1-d3/d5
+			movem.l	ackregs, -(sp)					
+
+			bclr.b	#vENetIDData,vDIRB(a5)			; Data direction is IN
+			moveq	#0, d1							; clear the xmit/rcv flag
+			bsr.s	ClockBit						; get a bit
+			tst.b	d5								; did we get the ACK?
+			beq.s	@ackOK
+			
+			moveq	#badACK, d0						; assume we get ACK late
+			moveq	#8-1-1, d3						; lets try to get ACK for rest of byte
+@tryForAck
+			bsr.s	ClockBit						; get a bit
+			tst.b	d5								; did we get the ACK?
+			beq.s	@getToKnownState				; 	yes, now get into a known state
+			dbra	d3, @tryForAck					; 	no, try for ACK again
+			moveq	#WereLosers, d0					; never got an ACK, return PUNT error
+			bra.s	@exit
+			
+@getToKnownState
+			bsr.s	GetByte							; read ROM just in case
+			bclr.b	#vENetIDData, (a5)				; send out ACK
+			bsr.w	SendStop						; send Stop
+			bra.s	@exit							; return bacACK error
+			
+
+@ackOK		moveq	#0,d0							; return happy-Ack
+@exit		movem.l (sp)+, ackregs
+			tst.w	d0								; set error condition
+			rts
+			
+			
+			
+
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ			
+; Routine:	SendAck																		  
+;																										  
+; Inputs:	a5.l - points to VIA
+;
+; Outputs:	
+;
+; Trashes:	d1, d4
+;
+; Function:	Sends an acknowledge bit to the EtherNet ID ROM
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+SendAck		
+@sendackregs	REG d1/d4
+
+			movem.l @sendackregs, -(sp)
+			
+			bset.b	#vENetIDData,vDIRB(a5)			; Data direction is OUT
+			moveq	#1, d1							; set xmit/rcv flag
+			bclr.b	#vENetIDData, (a5)				; clear for Ack
+			bsr.w	ClockBit						; send Ack bit
+			
+			movem.l (sp)+, @sendackregs
+			rts
+			
+
+
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ	
+; Routine:	Wait5, Wait10, Wait10ms																			  
+;																										  
+; Inputs:	
+;
+; Outputs:	
+;
+; Trashes:	d2
+;
+; Function:	Delays 5µs, 10µs, and 10ms 
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+Wait10		move.w	TimeVIAdb,d2			; 1 ms delay
+			lsl.w	#2,d2					; 4 ms delay
+			add.w	TimeVIAdb,d2			; 5 ms delay
+			lsr.w	#8,d2					; 9.76 µs delay
+			lsr.w	#1,d2
+@loop		tst.b	([VIA])
+			dbra	d2,@loop
+			rts
+
+Wait5		move.w	TimeVIAdb,d2			; 1 ms delay
+			lsl.w	#2,d2					; 4 ms delay
+			add.w	TimeVIAdb,d2			; 5 ms delay
+			lsr.w	#8,d2					; 4.88 µs delay
+			lsr.w	#2,d2
+@loop		tst.b	([VIA])
+			dbra	d2,@loop
+			rts
+
+Wait10ms	move.w	TimeVIAdb,d2			; 1 ms delay
+			lsl.w	#3,d2					; 8 ms delay
+			add.w	TimeVIAdb,d2			; 9 ms delay
+			add.w	TimeVIAdb,d2			; 10 ms delay
+@loop		tst.b	([VIA])
+			dbra	d2,@loop
+			rts
+
+			
+			ENDPROC	
+
+	END

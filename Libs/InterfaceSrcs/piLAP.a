@@ -1,0 +1,766 @@
+;
+;	File:		piLAP.a
+;
+;	Contains:	xxx put contents here xxx
+;
+;	Written by:	xxx put writers here xxx
+;
+;	Copyright:	© 1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 1/29/93	RB		Do not move the SCCLockout value to the status register, always
+;									do an ORI.W with it so that NuKernel works and the stack is not
+;									changed.
+;
+;
+
+    BLANKS ON
+    STRING ASIS
+
+			EJECT
+;_______________________________________________________________________
+;
+;		   LAP Routines
+;_______________________________________________________________________
+;
+
+;_______________________________________________________________________
+;
+;	LAPOpenProtocol
+;
+;	Installs a protocol handler into MPP protocol table.  There are
+;	two protocol handler tables used in ABPasIntf; one is kept in .MPP
+;	containing the protocol's type number and the address of the protocol's
+;	handler; and another is kept here in the interface for use by the
+;	LAPRead call. It contains an async flag, and a pointer to a readBlock
+;	structure. (defined in LAPRead)
+;
+;	A NIL value in protoPtr will automatically install this interfaces
+;	built-in protocol handler.  My protocol table will only include types
+;	that use the default protocol handler.
+;
+;	FUNCTION LAPOpenProtocol(theLAPType : HalfByte; protoPtr : Ptr): INTEGER;
+;
+;	Stack upon entry:
+;
+;	TOS => .LONG	  Return address
+;		  .LONG	  Pointer to protocol handler (see above)
+;		  .BYTE	  LAP type field  (only 1..127 is valid)
+;		  .BYTE	  pascal filler
+;		  .WORD	  function result code
+;
+;	Returns:	.WORD  Result code
+;
+;	Possible errors:
+;	 Invalid protocol type (must be 1..127)
+;	 Protocol type already in table
+;	 No room in protocol table
+;
+;	Register usage: D0-D2/A0-A1
+;		   D3 is saved/restored
+;
+;	The IO queue element is allocated on the stack for the control call
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	 8/28/84	 GRT  general code crunching pass
+;	 1/9/85	 GRT  Error 'AttErr' changed to 'LAPProtErr'
+;
+;_______________________________________________________________________
+
+LAPOpenProtocol 	PROC	EXPORT
+			
+			IMPORT	LAPProtoHdlr
+			
+			JSR		RemoveHdlBlks 	 ; check for disposable handles
+			MOVE.L	(SP)+,D2		 ; save return address
+			MOVE.L	(SP)+,A1		 ; get protocol handler ptr
+			LEA	 	tmpHandler,A0
+			MOVE.L	A1,(A0)		 ; save for later
+			MOVE.L	A1,D1		 ; is it zero??
+			BNE.S	@10			 ; if not then branch and continue
+			LEA		LAPProtoHdlr,A1	 ; get address of built-in hdlr
+@10		 	MOVE.B	(SP)+,D1 	  ; lap type field
+			MOVE.L	D3,-(SP)		 ; save D3 register
+			MOVE  	#LAPProtErr,D0	 ; assume error
+			MOVE.B	D1,D3		 ; transfer register over
+			BEQ.S	@90			 ; check for a zero
+			SUB	 	#IOQElSize,SP 	 ; allocate space for the IOQEl
+			MOVE.L	SP,A0		 ; A0 -> IO queue element block
+			MOVE.B	D3,ProtType(A0)	; lap type
+			MOVE.L	A1,Handler(A0) 	; protocol handler
+			MOVE  	#AttachPH,CSCode(A0) ; code for attach proto hndlr
+			MOVE  	#MPPRefNum,IORefNum(A0) ; set refnum up
+			_Control
+			ADD	 	#IOQElSize,SP 	 ; deallocate the queue element
+			BNE.S	@90			 ; check to see if control call had error
+
+; store the protocol address and type in my own table for use by the READ op,
+; but only if the proto address passed to us was zero.
+
+			MOVE.L	tmpHandler,D1		; was the proto handler for us?
+			BNE.S	@90
+			LEA	 	myHndlrTable,A1	 ; A1 -> table of pr handlers
+			MOVE  	#(maxHndlr-1)*entrySize,D1 ; start at the end of the list
+@20		 	TST.B	 theHndlr(A1,D1)	 ; is there a free entry (zero?)
+			BEQ.S	@30			 ; if zero then free so branch
+			SUBQ  	#entrySize,D1 	 ; change index number
+			BPL.S	@20			 ; check again
+			MOVE  	#LAPProtErr,D0	 ; no free entry in table (ERROR)
+			BRA.S	@90
+@30		 	CLR.L	 thePtr(A1,D1) 	 ; no read blocks linked in yet
+			MOVE.B	D3,theHndlr(A1,D1)	; store the LAP type
+			CLR.B	theRcvFlag(A1,D1)	; zero out the pkt rcvd flag
+@90		 	JMP   	ExitD3		   ; restore D3, set func result and exit
+
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	LAPCloseProtocol
+;
+;	Detaches the protocol handler from the table(s).	Error is returned if
+;	the LAP type was not found in the MPP table.  My protocol table is also
+;	scanned to remove the protocol type, but if it's not found, it is
+;	ignored.	It is then assumed that the protocol type was for a protocol
+;	handler other than mine and therefore it was never installed in my
+;	table in the first place.
+;
+;	FUNCTION LAPCloseProtocol(theLAPType : HalfByte): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .BYTE	  LAP type
+;		  .BYTE	  pascal filler
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;
+;	Possible errors:
+;	 Protocol type not found in table.
+;
+;	The IO queue element is allocated on the stack for the control call
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	 8/28/84	 GRT  no longer using D3
+;	 10/1/84	 RFA,GRT	 register fun (changing register usage)
+;
+;_______________________________________________________________________
+
+LAPCloseProtocol 	PROC	EXPORT
+			JSR	RemoveHdlBlks		; check to see if handles need to be disposed
+			MOVE.L	(SP)+,D2		 ; save return address
+			MOVE.B	(SP)+,D1		 ; get LAP type
+			SUB	 	#IOQElSize,SP 	 ; allocate IOQElement
+			MOVE.L	SP,A0		 ; A0 -> IOQEl
+			MOVE.B	D1,ProtType(A0)	; pass parameter to IOQ
+			MOVE  	#DetachPH,CSCode(A0) ; control code
+			MOVE  	#MPPRefNum,IORefNum(A0) ; set refnum up
+			_Control			  ; make the call
+			ADD	 	#IOQElSize,SP 	 ; deallocate the IOQ element
+			BNE.S	@20			 ; check for error in control call
+
+;	Scan through table until either an matched entry is found, or until
+;	the end of the table is reached.
+
+;  Note#1: At this point we have successfully removed it from MPP's variable
+;  area.	If we can't find the type in our local table, we ignore the error
+;  since we accomplished what we wanted anyways.	(Why it's not there is beyond
+;  me)
+
+			LEA	 	myHndlrTable,A1	 ; A1 -> table of pr handlers
+			MOVE  	#(maxHndlr-1)*entrySize,D0 ; start at the end of the list
+@05		 	CMP.B	 theHndlr(A1,D0),D1  ; do they match?
+			BEQ.S	@10			 ; OK so exit
+			SUBQ  	#entrySize,D0 	 ; down one entry
+			BPL.S	@05
+			BRA.S	@15			 ; not here, so just exit (see note#1)
+
+@10		 	CLR.B	theHndlr(A1,D0)	 ; zero out the field to nullify it
+@15			CLR   	D0 	    ; no errors
+@20		 	JMP  	ExitD0		   ; set func result and exit
+
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	LAPWrite
+;
+;	Write a packet out to the cable either synchronously or asynchronously.
+;	If sync, do the operation and return when completed.  If async, pass
+;	control back after queueing the call, and when completed, post a network
+;	event (currently eventCode #10) back to the application.
+;
+;	The ABRecHandle is locked down during most of the call.  As for all async
+;	calls, abResult will contain a 1 in it as long as the operation is still
+;	in progress.
+;
+;	The WDS used by MPP for writing is allocated under the IOQ element block.
+;
+;	FUNCTION LAPWrite(abRecord : ABRecHandle; async : BOOLEAN): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .BYTE	  async flag
+;		  .BYTE	  pascal filler
+;		  .LONG	  handle to record data structure
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;		  Additional data in record structure
+;
+;	Possible errors:
+;
+;
+;	Upon allocation of the IOQElement block, an additional n bytes are
+;	allocated at the end.  The data structure looks like this:
+;
+;	|=========================|
+;	:			   :
+;	:	IOQElement blk 	 :		50 bytes
+;	:			   :
+;	:			   :
+;	|=========================|
+;	:	AB record handle	 :		4 byte handle to AB record
+;	|-------------------------|
+;	:	Q Element handle	 :		4 byte handle to this queue element
+;	|-------------------------|
+;	: WDS element1 (hdr info) :		6 bytes (2 byte length, 4 byte ptr)
+;	|-------------------------|
+;	: WDS element2 (write)	 :		6 bytes (points to data to write)
+;	|-------------------------|
+;	|_	WDS Termination	_|		2 bytes
+;	|		Word 	  |
+;	|-------------------------|
+;	|	   async flag		 |		1 byte
+;	|=========================|
+;	| WDS dest node address	 |		1 byte  (WDS element1 data; odd aligned)
+;	|-------------------------|
+;	|	   unused 	  |		 1 byte  (LAP src address goes here)
+;	|-------------------------|
+;	| WDS lap type field	 |		1 byte
+;	|=========================|
+;
+;	The pointer in WDS element1 will always point to the data portion of the
+;	element (stored under the async flag).	This data is always 3 bytes long.
+;
+;	Modification History:
+;	 8/24/84	 GRT  Ready for alpha release
+;	 8/29/84	 GRT  Code crunching
+;	 10/1/84	 RFA  GetHdlAndLock needs long word parameter instead of word
+;	 12/17/84  GRT  CmpEventPost changed to Cmp1EventPost
+;	 2/7/85	 GRT  LAPProtType byte moved incorrectly into WDS header
+;	 4/30/86	 GRT  Saving queue element handle in the queue element
+;_______________________________________________________________________
+
+LAPWrite		PROC	EXPORT
+			JSR	 	RemoveHdlBlks 	 ; check to see if handles need to be disposed
+			MOVE.L	(SP)+,D2		 ; save return address
+			MOVE.B	(SP)+,D1		 ; save async flag
+			MOVE.L	(SP),A0		 ; copy of record handle
+			MOVE.L	(SP)+,A1		 ; another record handle copy made
+			MOVEM.L	A2-A3,-(SP)		; save A2-A3
+			_HLock			  ; lock abRecord down
+			BNE	 	@30 		  ; if not zero return an error
+			MOVE.L	(A1),A2		 ; A2 -> Ptr to ABRecord
+			MOVE  	#1,abResult(A2)	 ; 1 means we are currently in execution
+			MOVE.B	#tLAPWrite,abOpCode(A2) ; put call type in record
+
+; We are allocating an extra 22 bytes at the end of the IOQElement for storage
+; of the misc data (see diagram)
+
+			MOVE.L	#IOQElSize+WDSXtraLAPSize,D0 ; number of bytes to allocate
+			JSR	 	GetHdlAndLock 	 ; allocate the memory A0->IOQElement Hdl
+			BNE.S	@30			 ; error if didn't work
+			MOVE.L	A0,D0		 ; save handle
+			MOVE.L	(A0),A0		 ; A0 -> IOQElement blk (dereferenced)
+			MOVE.L	D0,qElHdl(A0)		; save handle in the queue element
+
+; A2 points to ABRecord.  A0 points to IOQElement
+
+			MOVE.B	D1,ABAsyncFlag(A0)	; async flag stored in IOQELBlk+18
+			MOVE.L	A1,ABRecHdl(A0)	; save handle in IOQElement blk
+			LEA	 	WDS1stEntry(A0),A3  ; address of the WDS header entry
+									; currently A3 is ODD aligned
+
+; Fill up the WDS data at the end of the IOQ element block
+
+			LEA		WDS1Start(A0),A1	 ; start of WDS stuff
+			MOVE.L	A1,WDSPointer(A0)	; move it into the IOQEl param area
+			MOVE  	#LAPHdSz,(A1)+	 ; length is always 3 for the addr block
+			MOVE.L	A3,(A1)+		 ; stuff dest add ptr
+			MOVE  	lapReqCount(A2),(A1)+ ; buffer size to write out
+			MOVE.L	lapDataPtr(A2),(A1)+ ; buffer data pointer
+			CLR	 	(A1)		  ; zero means end of WDS
+
+			LEA	 	lapAddress(A2),A1	 ; address of the addr block
+			MOVE.B	(A1),(A3) 	 ; dest node into WDS header
+			MOVE.B	2(A1),2(A3)		; move proto type into WDS header
+
+			MOVE  	#WriteLAP,CSCode(A0) ; set control code
+			LEA	 	WriteCompletion,A2  ; A2 -> our IO completion routine
+			JSR	 	DoControlCall 	 ; make the control call
+
+@30		 	MOVEM.L	(SP)+,A2-A3		 ; restore A2-A3
+			JMP	 	ExitD0		  ; set func result and exit
+
+;_______________________________________________________________________
+
+; This routine is called when the IO has been completed
+; A0 -> IOQElBlk
+;_______________________________________________________________________
+
+
+WriteCompletion
+
+; on entry, A0 -> IOQElement block
+
+			MOVEM.L	D0/A0-A2,-(SP) 	; save registers
+
+			JSR	 	CmpEntrance		 ; set up registers and unlock ab record hdl
+			JSR	 	Cmp1EventPost 	  ; post event if needed
+
+			MOVEM.L	(SP)+,D0/A0-A2 	; restore registers
+			RTS
+
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	LAPRead
+;
+;	Read a packet coming in from the cable.  If the call is sync, it will
+;	wait in a loop until a packet is recieved in its buffer.  If made
+;	async, an event will be posted upon reception.  Note that if two async
+;	calls are made and then a sync call is made, 3 packets must be received
+;	before control will return to the user!  The sync call will only return
+;	when a packet has been recieved in the buffer that was used for the sync
+;	call.
+;
+;	IMPORTANT:  The LAPRead call can only be used with the built in protocol
+;	handler.
+;
+;	The ABRecHandle is locked down until the call completes.  The protocol
+;	handler is responsible for unlocking it. (unless an error occurs in the
+;	read queueing)
+;
+;	FUNCTION LAPRead(abRecord : ABRecHandle; async : BOOLEAN): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .BYTE	  async flag
+;		  .BYTE	  pascal filler
+;		  .LONG	  handle to record data structure
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;		  Additional data in record structure
+;
+;	Possible errors:
+;
+;
+;	A 14 byte read block is allocated dynamically for every read call.  This
+;	block is linked in a FIFO queue for every handler type.  When a pkt is
+;	received, the first read block is taken and the packets data is put where
+;	the ptr points to.	If the buffer is not big enough, the remaining part of
+;	the packet is discarded and an error is returned to the application.	The
+;	packet up to the point of the end of the buffer, however, is returned intact.
+;
+;	|=========================|
+;	|			   		 |
+;	|  Link to next read blk  |		4 byte pointer link
+;	|			   		 |
+;	|			   		 |
+;	|-------------------------|
+;	:	AB record handle	 |		4 byte hdl to AB record
+;	|-------------------------|
+;	:   Q element handle	 |		4 byte hdl to this queue element
+;	|-------------------------|
+;	|	async flag		 |		1 byte
+;	|-------------------------|
+;	|	  unused		  	 |		1 byte
+;	|=========================|
+;
+;	Modification History:
+;	 8/24/84	 Ready for alpha release  (GRT)
+;	 10/1/84	 RFA  GetHdlAndLock needs long word parameter
+;	 3/15/85	 GRT  Added RecoverHandle call
+;	 4/30/86	 GRT  Saving queue element handle in the queue element
+;_______________________________________________________________________
+
+LAPRead		PROC	EXPORT
+			ENTRY	LAPProtoHdlr
+			
+			JSR	 	RemoveHdlBlks 	 ; any handles to dispose of?
+			MOVE.L	(SP)+,D2		 ; save return address
+			MOVE.B	(SP)+,D1		 ; save async flag
+			MOVE.L	(SP),A0		 ; record handle copy made
+			MOVE.L	(SP)+,A1		 ; and another in A1
+			MOVEM.L	 A2-A4,-(SP)		; save A2-4 for later
+			_HLock			  ; lock it down
+			BNE	 	ReadLExit	  ; if error then exit
+			MOVE.L	A0,A4		 ; save temporarily
+			MOVE.L	(A4),A2		 ; A2 -> Ptr to ABRecord
+			MOVE  	#1,abResult(A2)	 ; 1 means we are currently in execution
+			MOVE.B	#tLAPRead,abOpCode(A2) ; put call type in
+			MOVEQ	#rdBlkSize,D0		; size of a read blk entry
+			JSR	 	GetHdlAndLock 	 ; get a handle to the memory
+
+; A0 has handle to new memory block (to be used for the read block)
+
+			BNE.S	ReadL1Exit	 ; exit if error (must clean up)
+			MOVE.L	A0,D0		 ; save handle in D0
+			MOVE.L	(A0),A0		 ; A0 -> my read block (dereference)
+			MOVE.L	D0,rbHdl(A0)		; move handle to queue element
+
+; A0 -> my read block   A2 -> AB record
+; first stuff the read blk full of data
+
+			CLR.L	rbNxPtr(A0)		; zero out ptr to next element
+			MOVE.L	A1,rbABHdl(A0) 	; copy the AB rec hdl into it
+			MOVE.B	D1,rbAFlag(A0) 	; save the aysnc byte flag
+
+; now check the hndlr table for the matching type field
+
+			MOVE.B	lapAType(A2),D0	; get the lap type
+			BEQ.S	@06			 ; zero type is invalid
+			LEA	 	myHndlrTable,A1	 ; A1 -> table of prot handlers
+			MOVE  	#(maxHndlr-1)*entrySize,D1 ; start at the end of the table
+@05		 	CMP.B	theHndlr(A1,D1),D0  ; do they match?
+			BEQ.S	@10			 ; OK so exit
+			SUBQ  	#entrySize,D1 	 ; down one entry
+			BPL.S	@05
+@06		 	MOVE.L	A4,A0		  ; recover the handle
+			JSR	 	UnlockAndLinkHdl	 ; get rid of the read blk
+			MOVE  	#readQErr,D0		 ; set error code
+			BRA.S	ReadL1Exit
+
+; must reset the pkt recvd flag before the read buffer is linked in
+; SCC interrupts are being turned off while linking the block in
+; A0 -> read blk
+
+@10		 	CLR.B	theRcvFlag(A1,D1)	 ; zero out the pkt recvd flag if sync
+			MOVE  	SR,-(SP) 	  ; save status register on stack
+			ORI.W  	#SCCLockOut,SR	 ; lock out the SCC interrupts			<SM2> rb
+
+			LEA	 	thePtr(A1,D1),A4	 ; A4 -> read element entry link
+			MOVE.L	(A4),A3		 ; A3 -> next read element
+@15		 	MOVE.L	 A3,D0		  ; is it the end of the link?
+			BEQ.S	@20			 ; if so, then we found the end
+			MOVE.L	A3,A4		 ; save previous ptr
+			MOVE.L	(A3),A3		 ; get next ptr in link
+			BRA.S	@15			 ; back and check
+
+@20		 	MOVE.L	A0,0(A4) 	  ; put the read blk into link
+			MOVE  	(SP)+,SR 	  ; restore interrupt status
+			CLR	 	D0		   ; no errors if we got here!
+			TST.B	rbAFlag(A0)		; is this an async call?
+			BNE.S	ReadLExit 	 ; if so exit (don't unlock the handle)
+
+; Since the call is sync, we wait until the pkt recvd flag says one has come in
+; The result code will have been put in the record by the protocol handler.
+
+@25		 	TST.B	theRcvFlag(A1,D1)	 ; has a packet been received?
+			BEQ.S	@25			 ; if not, then wait
+			MOVE  	abResult(A2),D0	 ; get result of operation into D0
+			BRA.S	ReadLExit
+
+; If an error occurred, but we have already locked memory blk, unlock blk
+
+ReadL1Exit	MOVE  	D0,D1		  ; save error code
+			MOVE.L	A2,A0		 ; get the abRecHandle
+			_RecoverHandle
+			_HUnlock			  ; unlock the handle if no call was made
+			MOVE  	D1,D0		  ; recover error code
+
+ReadLExit 	MOVEM.L	(SP)+,A2-A4		; restore registers
+			JMP	 	ExitD0		  ; set func result (D0) and exit
+
+; The table entries in memory are organized by entries and not by types.
+;
+; ENTRY 1: | protoHdlr Type (1)| Pkt rcvd flag (1)| read block link ptr (4)|
+; ENTRY 2: | protoHdlr Type (1)| Pkt rcvd flag (1)| read block link ptr (4)|
+; ENTRY 3: | protoHdlr Type (1)| Pkt rcvd flag (1)| read block link ptr (4)|
+; ENTRY 4: | protoHdlr Type (1)| Pkt rcvd flag (1)| read block link ptr (4)|
+
+			EJECT
+;_______________________________________________________________________
+;
+;	LAPProtoHdlr
+;
+;	This is the LAP protocol handler used in reading straight LAP packets.
+;	It is called by the MPP driver when a packet has been received if the
+;	type field has been installed by the AttachPH routine.
+;
+;	The first two data bytes of the LAP packet have already been read into
+;	the RHA.	(actually the RHA also has the 3 byte LAP hdr in it too)
+;
+;	If you didn't already know it, the first two bytes of the data field of
+;	the LAP packet must be the length bytes in order for this to work!!
+;
+;	Call:
+;	 A0,A1	 .LONG	  SCC read/write addresses (preserve)
+;	 A2		 .LONG	  local vars (preserve)
+;	 A3		 .LONG	  ptr into the RHA (5 bytes already loaded in)
+;	 A4		 .LONG	  address of the ReadPacket routine
+;	 A5		 .LONG	  useable until ReadRest is called
+;	 D1		 .WORD	  length still left to read (preserve)
+;
+;	Return:
+;	 D0		 .WORD	  error result
+;
+;	Possible errors:
+;
+;	Modification History:
+;	 8/24/84	 Ready for alpha release  (GRT)
+;	 10/1/84	 RFA,GRT	 Code crunching pass made
+;	 3/15/85	 GRT  RecoverHandle call added
+;	 4/30/86	 GRT  Getting rid of the _RecoverHandle traps
+;_______________________________________________________________________
+
+LAPProtoHdlr
+
+; MPP subtracts two from the length bytes of the packet.  We have to make sure
+; that D1 contains at least one byte to read, else we skip this section
+
+			MOVEQ	#4,D3		 ; we want to read in at most 4 bytes
+			CMP	 	D3,D1		  ; check to see how many bytes are left
+			BHS.S	@02			 ; if more then just use the 4 bytes
+			MOVE  	D1,D3		  ; else its less, so read however many left
+@02		 	LEA   	myRHALen,A5		  ; address of storage area
+			MOVE  	D3,(A5)		  ; save 'bytes to read'
+			BEQ.S	@03			 ; dont read if zero bytes left
+
+			JSR	 (A4)		  ; read the bytes into the RHA and adjust
+			BNE.S	@08			 ; if error then exit
+
+; now that we've bought some time, scan through the table to find a buffer
+; A2 -> MPP vars
+; A3 -> modified RHA ptr
+; D1 = number of bytes left to read in
+
+@03		 	MOVE.L	A3,-(SP) 	  ; save RHA ptr
+			MOVEM.L	A0-A1,-(SP)		; save other registers
+			LEA	 	myHndlrTable,A5	 ; A5 -> table of pr handlers
+			MOVE  	#(maxHndlr-1)*entrySize,D2 ; start at the end of the list
+			LEA	 	ToRHA(A2),A0		 ; address of top of RHA
+			MOVE.B	LAPType(A0),D3 	; get lap type of packet from RHA
+
+; D2 = entry number in PHT
+
+@05		 	CMP.B	 theHndlr(A5,D2),D3  ; do they match?
+			BEQ.S	@10
+			SUBQ  	#entrySize,D2 	 ; next entry
+			BPL.S	@05			 ; go back and check the next one
+
+; No valid type in table. Ignore packet
+
+@07		 	MOVEM.L	(SP)+,A0-A1		 ; restore the registers back
+			MOVE.L	(SP)+,A3		 ; restore RHA ptr
+			MOVEQ	#0,D3		 ; tells MPP we don't want the pkt
+			JMP	 	2(A4)		  ; read in the rest of the packet; exit
+
+; Exit point - it's here because we want short branches!
+
+@08		 	RTS
+
+; We have found the entry so get how many bytes to read and read them into buf
+
+@10		 	LEA   	tmpHndlrEntry,A1
+			MOVE  	D2,(A1)		  ; save the entry offset in the table
+			MOVE.L	thePtr(A5,D2),A0	; A0 -> read block structure
+			CMP	 	#0,A0		  ; is there a buffer there?
+			BEQ.S	@07			 ; if not, ignore the pkt
+			MOVE.L	rbABHdl(A0),A0 	; A1 -> AB record ptr
+			MOVE.L	(A0),A1		 ; dereference handle
+			MOVE.L	lapDataPtr(A1),A3	; A3 -> data buffer
+			MOVE  	myRHALen,D2		 ; get length saved up
+			ADDQ  	#2,D2		  ; add the length bytes
+			ADD	 	D2,A3		  ; modify ptr
+			MOVE  	lapReqCount(A1),D3  ; D3 = number of bytes want to read
+			SUB	 	D2,D3		  ; D3 = bytes to read - what I've already read
+			MOVEM.L	(SP)+,A0-A1		; restore them back
+			JSR	 	2(A4)		  ; read in rest of packet
+
+; D3 = number of bytes read compared to the buffer length (if less than zero, the
+; buffer was not big enough!
+; after call 2(A4) [ReadRest], we are able to use all conventional registers again
+
+			MOVE.L	(SP)+,A3		 ; restore RHA ptr	(CCs not affected)
+			BNE	 	@40 		  ; if error, branch
+			TST	 	D3		   ; check length info
+			BGE.S	@13			 ; if buffer is OK then branch
+			MOVE  	#buf2SmallErr,D0	 ; buffer was not big enough
+
+; copy bytes from the RHA into the users buffer
+
+@13		 	MOVE  	myRHALen,D2		  ; get length of rha
+			ADDQ  	#2,D2		  ; add length bytes
+			SUB	 	D2,A3		  ; point to beginning of RHA data (not lap hdr)
+
+			MOVE  	tmpHndlrEntry,D1	 ; get offset
+			LEA	 	myHndlrTable,A1	 ; address of my prot handler table
+			MOVE.L	thePtr(A1,D1),A1	; get the read block ptr
+			MOVE.L	rbABHdl(A1),A0 	; get the ab record handle
+			MOVE.L	(A0),A0		 ;	and dereference
+
+			CMP	 	lapReqCount(A0),D2  ; is buffer big enough to hold RHA?
+			BLE.S	@14			 ; yes, proceed
+			MOVE  	lapReqCount(A0),D2  ; no, only copy bufSize bytes
+
+@14		 	MOVE  	(A3),lapActCount(A0) ; actual bytes read in
+			MOVE.L	lapDataPtr(A0),A2	; A2 -> input data buffer
+
+@15		 	SUBQ  	#1,D2		   ; dec counter
+			BLT.S	@18			 ; if neg then exit
+			MOVE.B	0(A3,D2),0(A2,D2)	; copy RHA bytes into buffer
+			BRA.S	@15			 ; do it again until done
+
+; move any pertinant data to the AB record to send back to the caller
+; A0 -> ABrecord
+
+@18		 	LEA   	myHndlrTable,A2	  ; "wheres the table?"
+			MOVE 	 D0,abResult(A0)	 ; set return result code
+			SUB	 	#3,A3		  ; A3 -> beginning of RHA!
+			MOVE.B	(A3)+,lapADest(A0)	; move dst byte to record
+			MOVE.B	(A3),lapASource(A0) ; move src node ID to record
+			MOVE.L	rbABHdl(A1),A0 	; A0 = handle to AB record
+			_HUnlock			  ; unlock the ABRecord handle
+			TST.B	rbAFlag(A1)		; test async flag
+			BEQ.S	@20			 ; if false branch
+
+; it's async so post the event
+
+			MOVE.L	A0,D0		 ; event message (ABRecHandle)
+			MOVE  	#networkEvt,A0	 ; event code
+			_PostEvent		  ; post event to caller; D0=err code
+			BRA.S	@30
+
+; it's sync so set the packet recvd flag
+
+@20		 	ST	  theRcvFlag(A2,D1)   ; set the pkt recvd flag to true
+
+; unlink and unlock read block from the queue (has to be at the beginning)
+
+@30		 	MOVE.L	 0(A1),thePtr(A2,D1) ; unlink read blk
+			MOVE.L	rbHdl(A1),A0		; A0 = handle to read block
+			JSR	 UnlockAndLinkHdl	 ; dispose of the handle
+@40		 	RTS
+
+			ENDPROC
+			
+			EJECT
+;_______________________________________________________________________
+;
+;	LAPRdCancel
+;
+;	Cancel a pending asynchronous LAPRead and free its associated data structures.
+;
+;	IMPORTANT:  The LAPRdCancel call can only be used with asynchronous LAPRead
+;	calls on a protocol type whose protocol handler is the default.
+;
+;	The ABRecord is unlocked, and the associated Read Block is dequeued from
+;	the list of pending Read requests and marked for disposal.	This call can
+;	only be made synchronously.
+;
+;	FUNCTION LAPRdCancel(abRecord : ABRecHandle): INTEGER;
+;
+;	Stack upon entry:
+;
+;	 TOS =>	 .LONG	 Return address
+;		  .LONG	  handle to record data structure
+;		  .WORD	  function result code
+;
+;	Returns:		.WORD	Result code
+;			   The abResult field of the abRecord is set to zero
+;
+;	Possible errors:		Bad Protocol Type (zero or not open)
+;			   abRecord not found
+;
+;	Note that by the time the Read request queue is searched for the Read Block
+;	pointing to the specified abRecord, a packet may arrive and satisfy the
+;	request.	An "abRecord not found" error will then be returned.  In such a
+;	case, the caller should check the abResult field of the abRecord to see
+;	if it indeed has completed.  If it did, it will contain zero or a negative
+;	error indication.  If it is equal to 1, then something is seriously wrong.
+;
+;	Modification History:
+;
+;	12/20/84	 GRT  New today from code originally written by RFA for DDP
+;	3/15/85	 GRT  RecoverHandle call added
+;
+;_______________________________________________________________________
+
+LAPRdCancel	PROC	EXPORT
+			JSR	 	RemoveHdlBlks 	 ; check disposable handles
+			MOVEM.L	(SP)+, D2/A0		; D2 = return adr, A0 = abRec hdl
+			MOVEM.L	D3/A2-A3, -(SP)	; save some registers
+
+; first check my protocol handler table for the matching protocol type
+
+			MOVE  	#readQErr,D0		 ; assume an error
+			MOVE.L	(A0),A2		 ; A2 -> ABRecord
+			MOVE.B	lapAType(A2),D3	; get the lap type
+			BEQ.S	LRdCnclExit		; zero is invalid
+
+; scan table: D3 = lap type; A2 = abRecord ptr
+
+			LEA	 	myHndlrTable,A1	 ; A1 -> table of pr handlers
+			MOVE  	#(maxHndlr-1)*entrySize,D1 ; start at the end of the list
+@05		 	CMP.B	theHndlr(A1,D1),D3  ; do they match?
+			BEQ.S	@07			 ; OK so exit
+			SUBQ 	#entrySize,D1 	 ; down one entry
+			BPL.S	@05
+
+			BRA.S	LRdCnclExit		; if not found then leave
+
+; we found the type, so search list of Read Blocks for one that points to abRec
+; A1 -> protocol handler table
+
+@07		 	MOVE  	#recNotFnd, D0	  ; assume an error
+			LEA	 	thePtr(A1,D1), A1	 ; A1 = head of Read Block queue
+			MOVE  	SR, -(SP)	  ; save old status
+			ORI.W  	#SCCLockout, SR	 ; disable interrupts				<SM2> rb
+
+; the first time through, the check for the next element is made in the table;
+; from then on, the check is made through the queue
+
+@10		 	MOVE.L	rbNxPtr(A1), A3	 ; check next element
+			MOVE.L	A3,D3		 ; is there a next element?
+									; check A3 for zero (in SR)
+			BNE.S	@20			 ; yes, continue checks
+			MOVE  (SP)+, SR	  ; no, we're at the end & no match!
+			BRA.S	LRdCnclExit		; restore interrupt state & return
+
+@20		 	CMPA.L	rbABHdl(A3), A0	 ; is this the RdBlk for our abRec?
+			BEQ.S	FoundLIt		 ; yes!
+			MOVE.L	A3, A1		 ; no, skip down to next Read Block
+			BRA.S	@10			 ; and check it
+
+; we found the right Read Block, so dequeue it and dispose of it
+
+FoundLIt		MOVE.L	(A3), (A1)	 ; dequeue the Read Block
+			MOVE  	(SP)+, SR	  ; safe now to re-enable interrupts
+
+			CLR	 abResult(A2)		 ; clear result field in abRecord
+
+; A0 still contains the abRecHandle to remove; A3 -> read block to dispose of
+
+			_HUnlock			  ; unlock the abRecord
+			MOVE.L	A3,A0
+			_RecoverHandle 		 ; recover handle to Read Block
+			_HUnlock			  ; unlock it and dispose of it
+			_DisposHandle			 ; (hopefully clears D0 as well)
+
+LRdCnclExit	MOVEM.L	(SP)+, D3/A2-A3	; restore registers
+			JSR	 	ExitD0
+
+			ENDPROC

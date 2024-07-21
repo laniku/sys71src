@@ -1,0 +1,842 @@
+;
+;	File:		DispatchPatch.a
+;
+;	Contents:	a patch to get a new trap dispatcher on the machines that need it
+;				The dispatcher is a faster one for the II ROMs, and one that is
+;				both faster, and supports a secondary trap table on the Plus and SE ROMs.
+;
+;				Since this gets in the way of debugging, it is loaded as part of the
+;				pre-patch boot process, before MacsBug is loaded.  This code, along with
+;				BootCode.a, makes up the 'boot' 3 resource.
+;
+;	Copyright:	© 1982-1990, 1992-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 7/20/93	SAM		Added a macro to correctly set the assembler directive according
+;									to the build conditional "CPU".
+;		 <6>	 3/27/92	JSM		Update header comments, this code now lives in 'boot' 3.
+;		 <5>	 2/12/92	JSM		Moving to TrapDispatcher directory, keeping all revisions.
+;		 <4>	 8/14/90	dba		get auto-pop and extended cases working on a Plus or SE w/68020
+;		 <3>	 7/11/90	gbm		blast some asm warnings
+;		 <2>	 6/15/90	EMT		Fixed a few typos.
+;		 <1>	 6/11/90	EMT		New today.
+;
+
+			load 'StandardEqu.d'
+
+			MACRO
+			SETMACHINE
+	IF CPU = 020 THEN
+			MACHINE		MC68020
+	ELSEIF CPU = 030 THEN
+			MACHINE		MC68030
+	ELSEIF CPU = 040 THEN
+			MACHINE		MC68040
+	ELSE
+			AERROR		'Unknown CPU type'
+	ENDIF
+			ENDM
+
+			SETMACHINE
+
+MacPlus		equ		$0075
+MacSE		equ		$0276
+MacII		equ		$0178
+numTbTrap 	equ 	512   					; old number of toolbox traps
+XnumTbTrap	equ		1024					; total # of toolbox traps in the extended trap dispatcher
+XnumTrapMask equ	XNumTbTrap-1			; mask for number of extended toolbox traps
+XTbEntries	equ		XNumTbTrap-numTbTrap	; # of toolbox traps in extended portion of trap table
+XTbSize		equ		XTbEntries*4			; size of the extended trap table (in bytes)
+ToolTable 	equ 	$0E00 					; start of toolbox trap table
+PlusToolDiff equ	$0C00-ToolTable			; difference between the MacPlus and the current toolbox trap table
+
+			MACRO
+			InitPlusFix
+			GBLA	&NumTTRefs
+&NumTTRefs	SETA	0
+			ENDM
+			InitPlusFix
+
+			MACRO
+			PlusToolTrapRef	&Offset
+			GBLA	&NumTTRefs
+&NumTTRefs	SETA	&NumTTRefs + 1
+			ENTRY	PlusToolTrapRefTab_&NumTTRefs
+PlusToolTrapRefTab_&NumTTRefs	EQU	*+&Offset
+			ENDM
+
+			MACRO
+			FixUpMacPlus
+			LEA		StartFixMacPlus,A0
+@NextFix
+			MOVE.W	(A0)+, D0				; Offset in D0
+			BEQ.S	EndFixMacPlus			; If 0, we're done.
+			LEA		StartFixMacPlus(PC, D0.W), A1	; Get address of code to patch.
+			ADD.W	#PlusToolDiff, (A1)		; Add the magic difference.
+			BRA.S	@NextFix				; And move on.
+
+; Build the table.
+			GBLA	&NumTTRefs
+			LCLA	&i
+StartFixMacPlus
+&i			SETA	1
+			WHILE	&i <= &NumTTRefs DO
+				DC.W	PlusToolTrapRefTab_&i - StartFixMacPlus
+&i				SETA	&i + 1
+			ENDWHILE
+			DC.W	0
+EndFixMacPlus
+			ENDM
+
+; -----------------------------------------------------------------------------------------
+;
+;		A-Trap Dispatcher Patch for the Mac Plus and SE <4.3>
+;		===============================================
+;
+;			This code "borrowed" from Gary Davidian's rewrite of the A-Trap Dispatcher
+;			(Nov. '88).  For the complete history of this code, see file "OS:Dispatch.a".
+;
+;			The basic upgrade is to install Gary's optimized A-Trap Dispatch code and
+;			to extend the size of the Toolbox Trap dispatch table.  On the Plus and the
+;			SE, the Toolbox trap table consists of 512 entries.  On the II and beyond,
+;			it consists of 1024 entries (see HardwareEqu.a for details).
+;
+;			NOTE - this code completely replaces all previous A-Trap dispatch code.
+;			Because it is possible to have accelerators that could possibly be another
+;			processor besides the 68000 (a 68010, 68020 or 68030), we provide three (3)
+;			dispatchers (a 68000, 68010, and one for 68020/68030).
+;
+;			BG		5-July-89
+; -----------------------------------------------------------------------------------------
+
+MacPlusAndSEATrapDispatch	PROC
+
+;	****************************************************
+;	*                                                  *
+;	* Varous ENTRYs required by the installation code *
+;	*                                                  *
+;	****************************************************
+
+			ENTRY		MacPlusAndSEATrap68000
+			ENTRY		MacPlusAndSEATrap68010
+			ENTRY		EndMacPlusAndSEATrap68000
+			ENTRY		MacPlusAndSEATrap68020
+			ENTRY		EndMacPlusAndSEATrap68020
+
+;_______________________________________________________________________
+;
+; Routine:		MacPlusAndSEATrap68000
+;
+; Function: 	Dispatch A-line emulator traps to Mac system.
+;
+; Input:		(SP)	-	status register
+;				2(SP)	-	address of trapped instruction
+;				6(SP)	-	stack frame format word (for 68010s)
+;
+; Output:		none
+;
+; Called by:	Jump through vector at $28 when trap occurs.
+;
+;	68000 A-line trap dispatcher
+;
+;	Timing information		Clocks	ROM Reads	RAM Reads	RAM Writes
+;
+;	ToolBox, autopop		196		23			14			8
+;	ToolBox, normal			206		24			14			10
+;
+		if	OSTable-($100*4) <> 0 then
+;	OpSys, A0 not saved		306		36			21			16
+		else
+;	OpSys, A0 not saved		302		35			21			16
+		endif
+;	OpSys, normal			328		37			23			18
+;_______________________________________________________________________
+MacPlusAndSEATrap68000					; 34 0 4 3	overhead for A-Trap exception
+			move.w	d3,-(sp)			;  8 1 0 1	save d3, stack has d3.lo/x/pc
+			move.l	a2,-(sp)			; 12 1 0 2	save a2, stack has a2/d3.lo/x/pc
+			movea.l	4+4(sp),a2			; 16 2 2 0	get return address
+			move.w	(a2)+,d3			;  8 1 1 0	get trap word, inc pc
+			cmpi.w	#$A800,d3			;  8 2 0 0	see if os or tool trap
+			blo.s	OSTrap68000			;  8 1 0 0	os-traps are lower
+
+ToolTrap68000
+			add.w	d3,d3				;  4 1 0 0	trap number * 2
+			add.w	d3,d3				;  4 1 0 0	trap number * 4
+; +++
+;	We subtract *numTbTrap* as well as $A800 to determine whether it is either (1) in the
+;	extended toolbox or (2) an autoPop operation.  This allows the "standard A-Trap (in the
+;	normal range of Plus/SE traps) to still run at the fastest possible speed.  We'll take
+;	care of sorting out autoPop and/or extended entries out of the main flow of traffic.
+
+			subi.w	#(($A800+numTbTrap)\;  8 2 0 0	subtract tool trap start
+					*4)**$FFFF,d3		;           and see if auto-pop set
+										;           OR if in extended toolbox table
+			bhs.s	@Extended			;  8 1 0 0	handle auto pop separately
+; ---
+;	This is the "standard" A-Trap handling.
+			move.l	a2,4+4(sp)			; 16 2 0 2	save updated return pc
+			movea.w	d3,a2				;  4 1 0 0	setup index to table entry
+			move.w	4(sp),d3			; 12 2 1 0	restore d3
+; +++
+;	We re-add in *numTbTrap* because we subtracted it above.
+			PlusToolTrapRef	2
+			move.l	ToolTable\			; 28 3 2 2	get trap table entry
+					+(numTbTrap*4)(a2)\	;			biased by -extended- bit
+					,4(sp)				;			setup routine address
+; ---
+			movea.l	(sp)+,a2			; 12 1 2 0	restore a2
+			rts							; 16 2 2 0	jump to the routine
+
+; +++
+;	Here, we need to do two things:
+;
+;	1.  See whether or not trap is an auto-pop one.
+;		-- if it is NOT, then it has to be an extended one.
+;		-- if it IS, continue checking (at #2)
+;	2.	If you made it here, we need to check if we're dealing with an extended autoPop.
+;		Check if the Extended bit is on.
+;		-- if it IS, perform the extended autoPop dance.
+;		-- if not, handle the "normal" auto-pop trap dispatch.
+
+@Extended								;  2 1 0 0	overhead needed to branch here
+			addi.w	#(numTbTrap*4),d3	;  8 2 0 0	restore original shifted offset value
+			bclr	#12,d3				; 10 1 0 0	clear (and test)(shifted) auto-pop bit
+			beq.s	@JustExtended		;  8 1 0 0	if not an auto-pop
+			bclr	#11,d3				; 10 1 0 0	clear (and test)(shifted) extended bit
+			beq.s	@AutoPop			;  8 1 0 0	not extended - perform std. auto-pop
+
+;		Handle extended auto-pop) toolbox trap addressing here:
+;		-- D3.w now contains the offset into the extended trap table.
+
+@XAutoPop								;  2 1 0 0	overhead needed to branch here
+			movea.w	d3,a2				;  4 1 0 0	setup index to table entry
+			adda.l	XToolTable,a2		; 22 2 5 0	add in base address of extended table
+			move.l	(a2),4+4(sp)		; 16 ? 3 1	get trap table entry
+			movea.l	(sp)+,a2			; 12 1 2 0	restore a2
+			move.w	(sp),d3				;  8 1 1 0	restore d3
+			addq.w	#4,sp				;  8 1 0 0	pop hole from stack
+			rts							; 16 2 2 0	jump to the routine
+
+;		Handle extended (non-auto-pop) toolbox trap addressing here:
+;		-- D3.w now contains the offset into the extended trap table.
+
+@JustExtended							;  2 1 0 0	overhead needed to branch here
+			bclr	#11,d3				; 10 1 0 0	clear extended bit (since we know its set)
+			move.l	a2,4+4(sp)			; 16 2 0 2	save updated return pc
+			movea.w	d3,a2				;  4 1 0 0	setup index to table entry
+			move.w	4(sp),d3			; 12 2 1 0	restore d3
+			adda.l	XToolTable,a2		; 22 2 5 0	add in base address of extended table
+			move.l	(a2),4(sp)			; 16 ? 3 1	get trap table entry
+			movea.l	(sp)+,a2			; 12 1 2 0	restore a2
+			rts							; 16 2 2 0	jump to the routine
+@AutoPop
+; ---
+			movea.w	d3,a2				;  4 1 0 0	setup index to table entry
+			PlusToolTrapRef	2
+			move.l	ToolTable(a2)\		; 28 3 2 2	get trap table entry
+					,4+4(sp)			;			setup routine address
+			movea.l	(sp)+,a2			; 12 1 2 0	restore a2
+			move.w	(sp),d3				;  8 1 1 0	restore d3
+			addq.w	#4,sp				;  8 1 0 0	pop hole from stack
+			rts							; 16 2 2 0	jump to the routine
+
+MacPlusAndSEATrap68010
+			move.w	d3,(sp)				;			save d3, stack has d3.lo/pc/x
+			move.l	a2,-(sp)			;			save a2, stack has a2/d3.lo/x/pc
+			movea.l	4+2(sp),a2			;			get return address
+			move.w	(a2)+,d3			;  8 1 1 0	get trap word, inc pc
+			cmpi.w	#$A800,d3			;  8 2 0 0	see if os or tool trap
+			bhs.s	ToolTrap68000		;  8 1 0 0	Tool traps are higher or equal
+
+OSTrap68000								;  2 1 0 0	overhead needed to branch here
+			move.l	a2,4+4(sp)			; 16 2 0 2	save updated return pc
+			move.l	d2,-(sp)			; 12 1 0 2	save d2, stack has d2/a2/xx/pc
+			move.l	d1,-(sp)			; 12 1 0 2	save d1, stack has d1/d2/a2/xx/pc
+			move.l	a1,-(sp)			; 12 1 0 2	save a1, stack has a1/d1/d2/a2/xx/pc
+			move.w	d3,d1				;  4 1 0 0	pass trap word to OStraps in D1
+			andi.w	#$0100,d3			;  8 2 0 0	test the don't save A0 bit
+			bne.s	@A0NotSaved			;  8 1 0 0	handle it separately
+
+			move.l	a0,-(sp)			; 12 1 0 2	save a0, stack has a0/a1/d1/d2/a2/xx/pc
+			move.b	d1,d3				;  4 1 0 0	zero extend the trap table index
+			add.w	d3,d3				;  4 1 0 0	trap number * 2
+			add.w	d3,d3				;  4 1 0 0	trap number * 4
+			movea.w	d3,a2				;  4 1 0 0	setup index to table entry
+			move.w	5*4(sp),d3			; 12 2 1 0	restore d3.low
+			movea.l	OSTable(a2),a2		; 16 2 2 0	get trap table entry
+			jsr		(a2)				; 16 2 0 2	call the routine
+			movea.l	(sp)+,a0			; 12 1 2 0	restore a0
+			movea.l	(sp)+,a1			; 12 1 2 0	restore a1
+			movem.l	(sp)+,d1/d2/a2		; 36 2 7 0	restore d1/d2/a2
+			tst.w	d0					;  4 1 0 0	set conditions based on d0.w
+			addq.w	#4,sp				;  8 1 0 0	pop hole from stack
+			rts							; 16 2 2 0	return
+
+@A0NotSaved								;  2 1 0 0	overhead needed to branch here
+			move.b	d1,d3				;  4 1 0 0	zero extend the trap table index
+			add.w	d3,d3				;  4 1 0 0	trap number * 2
+			add.w	d3,d3				;  4 1 0 0	trap number * 4
+			movea.w	d3,a2				;  4 1 0 0	setup index to table entry
+			move.w	4*4(sp),d3			; 12 2 1 0	restore d3.low
+		if	OSTable-($100*4) <> 0 then
+			movea.l	OSTable\			; 16 2 2 0	get trap table entry
+					-($100*4)(a2),a2	;			biased by the dont save A0 bit
+		else
+			movea.l	OSTable\			; 12 1 2 0	get trap table entry
+					-($100*4)(a2),a2	;			biased by the dont save A0 bit
+		endif
+			jsr		(a2)				; 16 2 0 2	call the routine
+			movea.l	(sp)+,a1			; 12 1 2 0	restore a1
+			movem.l	(sp)+,d1/d2/a2		; 36 2 7 0	restore d1/d2/a2
+			tst.w	d0					;  4 1 0 0	set conditions based on d0.w
+			addq.w	#4,sp				;  8 1 0 0	pop hole from stack
+			rts							; 16 2 2 0	return
+
+EndMacPlusAndSEATrap68000
+
+;_______________________________________________________________________
+;
+; Routine:		MacPlusAndSEATrap68020
+;
+; Function: 	Dispatch A-line emulator traps to Mac system.
+;
+; Input:		(SP)	-	status register
+;				2(SP)	-	address of trapped instruction
+;				6(SP)	-	stack frame format word
+;
+; Output:		none
+;
+; Called by:	Jump through vector at $28 when trap occurs.
+;
+;	68020 / 68030 A-line trap dispatcher
+;
+;	Approx Mem information	ROM Reads	RAM Reads	RAM Writes
+;
+;	ToolBox, autopop		13			8			7
+;	ToolBox, normal			12			8			8
+;
+;	OpSys, A0 not saved		20			10			10
+;	OpSys, normal			20			11			11
+;_______________________________________________________________________
+
+			machine	mc68020
+			align	16					; align on cache line boundary
+MacPlusAndSEATrap68020					; 2 1 4	overhead for A-Trap exception
+			move.l	a2,-(sp)			; 1 0 1	save a2, stack has a2/x/pc/x
+			move.l	d2,-(sp)			; 0 0 1	save d2, stack has d2/a2/x/pc/x
+			movea.l	4+4+2(sp),a2		; 1 2 0	get return address
+			move.w	(a2)+,d2			; 1 1 0	get trap word, inc pc
+			cmpi.w	#$A800,d2			; 1 0 0	see if os or tool trap
+			blo.s	@OSTrap				; 0 0 0	os-traps are lower
+
+@ToolTrap
+; +++
+			subi.w	#($A800+numTbTrap)\	; 1 0 0	subtract tool trap start
+					,d2					;		and see if auto-pop set
+			bhs.s	@Extended			; 1 0 0	handle auto pop separately
+
+;	This is the "standard" toolbox trap handling path.
+
+			PlusToolTrapRef	4
+			move.l	(ToolTable\			; 2 1 1	get trap table entry
+					+(numTbTrap*4)\		;		biased by extended bit
+					,d2.w*4),4+4(sp)	;		setup routine address
+; ---
+			move.l	a2,4+4+4(sp)		; 1 0 1	save updated return pc
+			move.l	(sp)+,d2			; 0 1 0	restore d2
+			movea.l	(sp)+,a2			; 1 1 0	restore a2
+			rts							; 1 1 0	jump to the routine
+
+; +++
+;	Here, we need to do two things:
+;
+;	1.  See whether or not trap is an extended one.
+;		-- if it is NOT, then it has to be a standard autoPop.
+;		-- if it IS, continue checking (at #2)
+;	2.	If you made it here, we need to check if we're dealing with autoPop.
+;		-- if it IS, perform the extended autoPop dance.
+;		-- if not, handle the "normal" extended trap dispatch.
+
+@Extended								; 1 0 0	overhead needed to branch here
+			cmp.w	#autoPop-numTbTrap\	;      	check and see if this is auto-pop
+					,d2
+			blo.s	@JustExtended		;      	it is just extended (not auto-pop)
+			sub.w	#autoPop,d2			;      	get rid of the auto-pop bit
+			bcs.s	@AutoPop			;      	not extended - perform std. auto-pop
+
+;	The stack will have a2/d2/trap_addr/hole.l.
+;	We get rid of the hole with an RTD, and top of stack will have original
+;	user's return address.
+
+@XAutoPop								; 1 0 0	overhead needed to branch here
+			move.l	([XToolTable],\		;      	get base address of extended table
+					d2.w*4),4+4(sp)		;      	setup routine address
+			move.l	(sp)+,d2			; 0 1 0	restore d2
+			movea.l	(sp)+,a2			; 1 1 0	restore a2
+			rtd		#4					; 1 1 0	jump to the routine (and remove hole)
+
+;	Handle extended (non-auto-pop) toolbox trap addressing here:
+;	The stack will be rewritten to look like  a2/d2/trap_addr/inc'ed_pc.
+
+			align	16					; align on cache line boundary
+@JustExtended							; 1 0 0	overhead needed to branch here
+			move.l	([XToolTable],\		;      	get base address of extended table
+					d2.w*4),4+4(sp)		;      	setup routine address
+			move.l	a2,4+4+4(sp)		; 1 0 1	save updated return pc
+			move.l	(sp)+,d2			; 0 1 0	restore d2
+			movea.l	(sp)+,a2			; 1 1 0	restore a2
+			rts							; 1 1 0	jump to the routine
+
+			align	16					; align on cache line boundary
+@AutoPop								; 1 0 0	overhead needed to branch here
+			PlusToolTrapRef	4
+			move.l	(ToolTable\			; 2 1 1	get trap table entry
+					+(numTbTrap*4)\		;		biased by extended bit
+					,d2.w*4),4+4(sp)	;		setup routine address
+			move.l	(sp)+,d2			; 1 1 0	restore d2
+			movea.l	(sp)+,a2			; 0 1 0	restore a2
+			rtd		#4					; 1 1 0	jump to the routine
+
+			align	16					; align on cache line boundary
+@OSTrap									; 1 0 0	overhead needed to branch here
+			move.l	d1,-(sp)			; 1 0 1	save d1, stack has d1/d2/a2/xx/pc
+			move.l	a1,-(sp)			; 0 0 1	save a1, stack has a1/d1/d2/a2/xx/pc
+			move.w	d2,d1				; 1 0 0	pass trap word to OStraps in D1
+			move.l	a2,5*4(sp)			; 1 0 1	save updated return pc
+			andi.w	#$0100,d2			; 1 0 0	test the don't save A0 bit
+			bne.s	@A0NotSaved			; 0 0 0	handle it separately
+
+			move.b	d1,d2				; 1 0 0	zero extend the trap table index
+			move.l	a0,-(sp)			; 0 0 1	save a0, stack has a0/a1/d1/d2/a2/xx/pc
+			jsr		([OSTable,d2.w*4])	; 3 1 1	call the routine
+			movea.l	(sp)+,a0			; 1 1 0	restore a0
+			movea.l	(sp)+,a1			; 0 1 0	restore a1
+			move.l	(sp)+,d1			; 1 1 0	restore d1
+			move.l	(sp)+,d2			; 0 1 0	restore d2
+			movea.l	(sp)+,a2			; 1 1 0	restore a2
+			tst.w	d0					; 0 0 0	set conditions based on d0.w
+			addq.w	#4,sp				; 1 0 0	pop hole from stack
+			rts							; 1 1 0	return
+
+			align	16					; align on cache line boundary
+@A0NotSaved								; 1 0 0	overhead needed to branch here
+			move.b	d1,d2				; 1 0 0	get the trap table index
+			jsr		([OSTable-($100*4),d2.w*4])	; 2 1 1	call the routine
+			movea.l	(sp)+,a1			; 1 1 0	restore a1
+			move.l	(sp)+,d1			; 0 1 0	restore d1
+			move.l	(sp)+,d2			; 1 1 0	restore d2
+			movea.l	(sp)+,a2			; 0 1 0 restore a2
+			tst.w	d0					; 1 0 0	set conditions based on d0.w
+			addq.w	#4,sp				; 0 0 0	pop hole from stack
+			rts							; 2 1 0	return
+
+EndMacPlusAndSEATrap68020
+			ENDPROC
+
+TrapCommon	PROC	ENTRY
+
+			ENTRY		GetTrapAddress
+			ENTRY		SetTrapAddress
+			ENTRY		vCacheFlush68020
+			ENTRY		vCacheFlush
+			ENTRY		EndTrapCommon
+
+;_______________________________________________________________________
+;
+; Routine:		FindTableEntry
+;
+; Function: 	Return address of trap entry in the dispatch table.
+;				(flushes Inst cache on 020).
+;
+; Input:		D0		-	trap number in low bits
+;				D1		-	Get/Set TrapAddress trap word (for NewTool/NewOS bit testing)
+;
+; Output:		A1		-	address of trap table entry for specified trap number
+;
+;_______________________________________________________________________
+
+FindTableEntry
+			_AssumeEq	OldDisp,ToolDisp-1	; OldDisp is next to, and lower than ToolDisp
+			lsl.w	#16-ToolDisp,d1		; ccr.c <- ToolDisp, ccr.n <- OldDisp
+			bpl.s	@oldTrap			; if OldDisp = 0, it's an old style trap
+			bcc.s	@osTrap				; if ToolDisp = 0, it's a new style OS trap
+
+;		Otherwise, it's a new style ToolBox trap
+@toolTrap	andi.w	#XnumTrapMask,d0	; clear all but trap bits
+			move.w	d0,d1				; save a copy for "extended" testing
+			subi.w	#numTbTrap,d1		; < 0 if NOT an extended table entry
+			PlusToolTrapRef	2
+			lea		ToolTable,a1		; point to base of the Toolbox table
+			bmi.s	@done				; if ccr.n, trap is in orig. part of the trap table
+			movea.l	XToolTable,a1		; place extended toolbox address in A1
+			move.w	d1,d0				; move (trap# - numTbTrap) [extended TB trap offset] to D1
+
+@done		add.w	d0,d0				; trap number * 2
+			add.w	d0,d0				; trap number * 4
+			adda.w	d0,a1				; index into the dispatch table
+			bra.s	CacheFlush			; flush inst cache and return (destroys only reg D1)
+
+@oldTrap	andi.w	#$01FF,d0			; clear irrelevant bits
+			moveq.l	#-$0057,d1			; setup to check for ToolBox range
+			add.w	d0,d1				; d1 := TrapNum - $0057
+			bgt.s	@toolTrap			; $0058 É $01FF are tool box traps
+			beq.s	@osTrap				; $0057 is an OS trap
+			addq.w	#$0057-$004F,d1		; d1 := TrapNum - $004F
+			ble.s	@osTrap				; $0000 É $004F are OS traps
+			subq.w	#$0054-$004F,d1		; d1 := TrapNum - $0054
+			bne.s	@toolTrap			; $0054 is an OS trap, $50É$53,$55,$56 are tool box
+@osTrap		andi.w	#$00FF,d0			; only 8 bits for OS trap numbers
+			lea		OSTable,a1			; point to base of the OS table
+			bra.s	@done				; index into the table and return
+
+;_______________________________________________________________________
+;
+; Routine:		GetTrapAddress
+;
+; Function: 	Return trap address from dispatch table.
+;
+; Input:		D0		-	trap number in low 9 bits
+;
+; Output:		A0		-	trap address
+;
+;_______________________________________________________________________
+
+GetTrapAddress
+			bsr.s	FindTableEntry		; locate the dispatch table entry
+			movea.l	(a1),a0				; get the routine address from the table
+			moveq.l	#noErr,d0			; return with success
+			rts							; all done
+
+;_______________________________________________________________________
+;
+; Routine:		SetTrapAddress
+;
+; Function: 	Load new trap vector into dispatch table.
+;				On 020 machines, flush the cache as well.
+;
+; Input:		D0		-	trap number in low 9 bits
+;				A0		-	trap address
+;
+; Output:		none
+;
+;_______________________________________________________________________
+
+SetTrapAddress
+			bsr.s	FindTableEntry		; locate the dispatch table entry
+			move.l	a0,(a1)				; install the new routine address into the table
+			moveq.l	#noErr,d0			; return with success
+			rts							; all done
+
+;_______________________________________________________________________
+;
+; Macros:		CacheFlush, vCacheFlush
+;
+; Function: 	Flush the 68020 Cache.  For programs that do self modifying code, etc.
+;
+; Arguments;	none
+;
+; Invoked by:	BlockMove, GetTrapAddress, LoadSeg, Read, SetTrapAddress, UnloadSeg
+;
+;	Note that this routine only trashes one register, namely D1.  D1 was chosen to speed up
+; blockmove.  In blockmove we can trash D1, since D1 is not used in blockmove, and since D1
+; is preserved by the trap dispatcher.
+;
+;_______________________________________________________________________
+
+CacheFlush
+			move.l	jCacheFlush,-(sp)	; push the vector
+			rts							; jump through the vector
+
+vCacheFlush68020						; change at runtime if cache found
+			movec.l		cacr,d1			; get current cache state of 68020
+			addq.w		#1<<3,d1		; flush the instruction cache				<1.4>
+			movec.l		d1,cacr			; write back to the control register
+
+vCacheFlush								; if no cache, nothing to flush
+			rts							; all done
+
+; ------------------------------------------------------------------------------------
+;
+;		End of code for optimized, extended A-Trap Dispatcher.
+;
+; ------------------------------------------------------------------------------------
+EndTrapCommon
+			ENDPROC
+
+; -----------------------------------------------------------------------------------------
+;
+;		A-Trap Dispatcher Patch for the Mac II
+;		======================================
+;
+;			This code "borrowed" from Gary Davidian's rewrite of the A-Trap Dispatcher
+;			(Nov. '88).  For the complete history of this code, see file ":OS:Dispatch.a".
+;
+;			The basic upgrade is to install Gary's optimized A-Trap Dispatch code.
+;			NOTE - this code completely replaces all previous A-Trap dispatch code.
+;
+;			<BG>	7-July-1989
+; -----------------------------------------------------------------------------------------
+
+			PROC
+			ENTRY	MacIIATrap68020
+			ENTRY	EndMacIIATrap68020
+
+;_______________________________________________________________________
+;
+; Routine:		ATrap68020
+;
+; Function: 	Dispatch A-line emulator traps to Mac system.
+;
+; Input:		(SP)	-	status register
+;				2(SP)	-	address of trapped instruction
+;				6(SP)	-	stack frame format word
+;
+; Output:		none
+;
+; Called by:	Jump through vector at $28 when trap occurs.
+;
+;	68020 / 68030 A-line trap dispatcher
+;
+;	Approx Mem information	ROM Reads	RAM Reads	RAM Writes
+;
+;	ToolBox, autopop		13			8			7
+;	ToolBox, normal			12			8			8
+;
+;	OpSys, A0 not saved		20			10			10
+;	OpSys, normal			20			11			11
+;_______________________________________________________________________
+
+MyAlignment	set		16					; alignment set to 16 for 68030
+			align	MyAlignment			; align on cache line boundary			<1.5>
+MacIIATrap68020							; 2 1 4	overhead for A-Trap exception
+			move.l	a2,-(sp)			; 1 0 1	save a2, stack has a2/x/pc/x
+			move.l	d2,-(sp)			; 0 0 1	save d2, stack has d2/a2/x/pc/x
+			movea.l	4+4+2(sp),a2		; 1 2 0	get return address
+			move.w	(a2)+,d2			; 1 1 0	get trap word, inc pc
+			cmpi.w	#$A800,d2			; 1 0 0	see if os or tool trap
+			blo.s	@OSTrap				; 0 0 0	os-traps are lower
+
+@ToolTrap
+			subi.w	#($A800+autoPop)\	; 1 0 0	subtract tool trap start
+					,d2					;		and see if auto-pop set
+			bhs.s	@AutoPop			; 1 0 0	handle auto pop separatly
+
+			move.l	(ToolTable\			; 2 1 1	get trap table entry
+					+(autoPop*4)\		;		biased by autopop bit
+					,d2.w*4),4+4(sp)	;		setup routine address
+			move.l	a2,4+4+4(sp)		; 1 0 1	save updated return pc
+			move.l	(sp)+,d2			; 0 1 0	restore d2
+			movea.l	(sp)+,a2			; 1 1 0	restore a2
+			rts							; 1 1 0	jump to the routine
+
+			align	MyAlignment			; align on cache line boundary			<1.5>
+@AutoPop								; 1 0 0	overhead needed to branch here
+			move.l	(ToolTable,d2.w*4)\	; 2 1 1	get trap table entry
+					,4+4(sp)			;		setup routine address
+			move.l	(sp)+,d2			; 1 1 0	restore d2
+			movea.l	(sp)+,a2			; 0 1 0	restore a2
+			rtd		#4					; 1 1 0	jump to the routine
+			eject
+			align	MyAlignment			; align on cache line boundary			<1.5>
+@OSTrap									; 1 0 0	overhead needed to branch here
+			move.l	d1,-(sp)			; 1 0 1	save d1, stack has d1/d2/a2/xx/pc
+			move.l	a1,-(sp)			; 0 0 1	save a1, stack has a1/d1/d2/a2/xx/pc
+			move.w	d2,d1				; 1 0 0	pass trap word to OStraps in D1
+			move.l	a2,5*4(sp)			; 1 0 1	save updated return pc
+			andi.w	#$0100,d2			; 1 0 0	test the don't save A0 bit
+			bne.s	@A0NotSaved			; 0 0 0	handle it separatly
+
+			move.b	d1,d2				; 1 0 0	zero extend the trap table index
+			move.l	a0,-(sp)			; 0 0 1	save a0, stack has a0/a1/d1/d2/a2/xx/pc
+			jsr		([OSTable,d2.w*4])	; 3 1 1	call the routine
+			movea.l	(sp)+,a0			; 1 1 0	restore a0
+			movea.l	(sp)+,a1			; 0 1 0	restore a1
+			move.l	(sp)+,d1			; 1 1 0	restore d1
+			move.l	(sp)+,d2			; 0 1 0	restore d2
+			movea.l	(sp)+,a2			; 1 1 0	restore a2
+			tst.w	d0					; 0 0 0	set conditions based on d0.w
+			addq.w	#4,sp				; 1 0 0	pop hole from stack
+			rts							; 1 1 0	return
+
+			align	MyAlignment			; align on cache line boundary			<1.5>
+@A0NotSaved								; 1 0 0	overhead needed to branch here
+			move.b	d1,d2				; 1 0 0	get the trap table index
+			jsr		([OSTable-($100*4),d2.w*4])	; 2 1 1	call the routine
+			movea.l	(sp)+,a1			; 1 1 0	restore a1
+			move.l	(sp)+,d1			; 0 1 0	restore d1
+			move.l	(sp)+,d2			; 1 1 0	restore d2
+			movea.l	(sp)+,a2			; 0 1 0 restore a2
+			tst.w	d0					; 1 0 0	set conditions based on d0.w
+			addq.w	#4,sp				; 0 0 0	pop hole from stack
+			rts							; 2 1 0	return
+
+EndMacIIATrap68020
+		ENDPROC
+
+			SETMACHINE					; set it back to the native type		<SM7>
+
+; ------------------------------------------------------------------------------------
+;
+;		Beginning of installation code
+;
+; ------------------------------------------------------------------------------------
+InstallDispatch	PROC	EXPORT
+			move.l	ROMBase,a0				; point to ROM
+			move.w	8(a0),d0				; get ROM version
+			cmp.w	#MacPlus,d0				; is it a Mac Plus?
+			beq.s	InstallPlus				; go to it.
+			cmp.w	#MacSE,d0				; is it a Mac SE?
+			beq.s	InstallSE				; go to it.
+			cmp.w	#MacII,d0				; is it a Mac II?
+			beq		InstallMacII			; go to it.
+			rts								; nothing to do.
+
+; ------------------------------------------------------------------------------------
+;
+;		Beginning of installation code for optimized, extended A-Trap Dispatcher. <4.1>
+;
+;		This creates the extended part of the Toolbox A-Trap dispatch table used
+;		by all new dispatcher code.  It also installs new UnImplemented,
+;		GetTrapAddress, and SetTrapAddress traps.  Finally, it decides which of
+;		the A-Trap dispatch tables to use based on *CpuFlag*.
+;
+;		<BG>	5-July-1989
+;		csd		16-Oct-89	Moved this install code above all other patches.		<5.5>
+;
+; ------------------------------------------------------------------------------------
+InstallPlus
+			FixUpMacPlus
+
+InstallSE
+;	setup registers
+			move.l	#XTbSize,d0			; size of toolbox trap table extension
+			_NewPtr	sys					; request the extension to be in the system heap
+			bne		Error				; ... no, so don't perform any further installation
+
+			move.l	a0,XToolTable		; Save location of extended toolbox trap table
+			move.l	a0,a1				; use a1 for it
+
+;	Initialize extended Toolbox trap table with _Unimplemented.
+
+			move.w	#$A89F,d0			; offset into toolbox trap table for _Unimplemented
+			_GetTrapAddress
+			move.w	#XTbEntries-1,d1	; number of extended Toolbox trap entries
+
+@XTableInit
+			move.l	a0,(a1)+			; point all extended entries at BadTrap
+			dbra	d1,@XTableInit
+
+;	Now make the decision as to which A-Trap table to use, based on *CpuFlag*
+			moveq.l	#0,d2				; d2 = offset to Line1010 vector.  Assume no offset
+			cmpi.b	#1,CpuFlag			; let's see what kind of dispatcher we need
+			blo.s	@Install68000
+			beq.s	@Install68010
+
+			move.l	#EndMacPlusAndSEATrap68020-MacPlusAndSEATrap68020,d1
+			lea		MacPlusAndSEATrap68020,a1
+			bsr.s	MoveToSysAlign		; copy the code on down.
+			move.l	#vCacheFlush68020-TrapCommon,d1
+			bra.s	@InstallCommon		; a1 = Line1010 vector, d1 = offset to CacheFlush
+
+@Install68010
+			move.l	#MacPlusAndSEATrap68010-MacPlusAndSEATrap68000,d2
+										; d2 = offset to Line1010 vector.
+
+@Install68000
+			move.l	#EndMacPlusAndSEATrap68000-MacPlusAndSEATrap68000,d1
+			lea		MacPlusAndSEATrap68000,a1
+			bsr.s	MoveToSys			; copy the code on down.
+			move.l	#vCacheFlush-TrapCommon,d1
+			add.l	d2,a1				; add the offset to the Line1010 vector.
+
+@InstallCommon
+			move.l	a1,Line1010			; install the Line-A exception handler
+			move.l	d1,d2				; save the CacheFlush offset in d2
+
+			move.l	#EndTrapCommon-TrapCommon,d1
+			lea		TrapCommon,a1
+			bsr.s	MoveToSys			; copy the code on down.
+
+; The common code is now in the system heap and pointed to by a1.  The offset to the correct
+; CacheFlush routine is in d2.  We need to install the CacheFlush vector.
+			lea		(a1,d2.l),a0		; add the offset to CacheFlush.
+			move.l	a0,jCacheFlush		; initialize cache-flushing vector
+
+;	Now update the _GetTrapAddress and _SetTrapAddress traps to point to the new code.
+			lea		GetTrapAddress-TrapCommon(a1),a0
+			moveq.l	#$46,d0				; _GetTrapAddress
+			_SetTrapAddress
+			lea		SetTrapAddress-TrapCommon(a1),a0
+			moveq.l	#$47,d0				; _SetTrapAddress
+			_SetTrapAddress
+
+			rts
+
+; ------------------------------------------------------------------------------------
+;
+;		End of installation code for optimized, extended A-Trap Dispatcher.
+;
+; ------------------------------------------------------------------------------------
+
+; ------------------------------------------------------------------------------------
+;
+;		Beginning of installation code for optimized, extended A-Trap Dispatcher.
+;
+;		This installs the new dispatcher code.
+;
+;		<BG>	7-July-1989
+;
+; ------------------------------------------------------------------------------------
+InstallMacII
+			move.l	#EndMacIIATrap68020-MacIIATrap68020,d1
+			lea		MacIIATrap68020,a1
+			bsr.s	MoveToSysAlign
+			move.l	a1,Line1010			; install the Line-A exception handler
+			rts
+
+; ------------------------------------------------------------------------------------
+; Creates a block in the system heap, copies the block of memory starting at a1 for d1 bytes into
+; it.  Returns the place it copied to in a1.
+MoveToSys
+			move.l	d1,d0				; How much space we'll need.
+			_NewPtr	sys					; request the system heap
+			bne.s	Error				; no memory, panic.
+
+			exg		a1,a0				; put source and destinaton for blockmove in right place.
+			move.l	d1,d0				; number of bytes
+			_BlockMove
+			rts
+
+; ------------------------------------------------------------------------------------
+; Creates a block in the system heap, copies the block of memory starting at a1 for d1 bytes into
+; it, and aligns it to a 16 byte boundary.  Returns the place it copied to in a1.
+MoveToSysAlign
+			moveq	#14,d0				; Add 14 bytes of slop to the pointer.
+			add.l	d1,d0				; How much space we'll need.
+			_NewPtr	sys					; request the system heap
+			bne.s	Error				; no memory, panic.
+
+			moveq.l	#15,d0				; align to a 16 byte boundary
+			add.l	a0,d0				; by adding 15
+			and.b	#$F0,d0				; and clearing out the low nibble
+
+			move.l	a1,a0				; source for blockmove
+			move.l	d0,a1				; destination for blockmove (aligned 16)
+			move.l	d1,d0				; number of bytes
+			_BlockMove
+			rts
+
+Error
+			moveq	#dsMemFullErr,d0
+			_SysError
+			rts
+
+			ENDPROC
+
+; ------------------------------------------------------------------------------------
+;
+;		End of installation code for optimized, extended A-Trap Dispatcher.
+;
+; ------------------------------------------------------------------------------------
+			END

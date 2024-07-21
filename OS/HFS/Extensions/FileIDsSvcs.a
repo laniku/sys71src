@@ -1,0 +1,1090 @@
+;
+;	File:		FileIDsSvcs.a
+;
+;	Contains:	This file implements the low level File IDs facility by making a new
+;				type of CNode record called file threads. FThreads are similar to threads 
+;				in record structure (key record = [ID, null]; data record = [parID, CName]
+;				and in functionality. (fThread data record locates the CNode record of file,
+;				while thread data record locates the CNode record of a directory).
+;				Note: File threads are keyed off the file number.
+;				For more details, see the documentation preceeding each call.
+;
+;	Written by:	Earsh Nandkeshwar
+;
+;	Copyright:	© 1989-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM1>	 4/15/92	kc		Removed the "ROM" prefix from the RomBind routines.
+;									¥ Pre-SuperMario comments follow ¥
+;		<13>	 9/13/91	JSM		Cleanup header.
+;		<12>	 3/30/91	KST		bb, #83912: Fixing a bug in ExchangeFile which uses a signed
+;									branch on an unsigned comparison (in CheckExtents).
+;		<11>	 1/14/91	KST		With BB: Documentation change.
+;		<10>	 1/14/91	KST		With BB: "FIDCreateID" should handle the situation when a file is
+;									MOVED or RENAMED on 6.0 system which doesn't update file thread.
+;		 <9>	 9/21/90	KST		Check the file number in FidResolveID. Also, we don't delete the
+;									fileID if the file is not found. We just return an error.
+;		 <8>	 8/24/90	KST		Delete the thread record only if the volume is writable (Re:
+;									<7>).
+;		 <7>	 8/23/90	KST		Fixing a bug in ResolveID which didn't check for left-over
+;									FileID. (BRC#70809, #71502)
+;		 <6>	  8/9/90	KST		Fixing a bug in FIDExchangeFiles (DeleteExts) that uses an
+;									invalid HINT which could cause the system to crash.
+;		 <5>	 7/30/90	dnf		Rename rom references and use jsrROM macro.
+;
+;		 <4>	 5/23/90	dnf		Change tests for catalog record type to explicitly look for type
+;									"file" instead avoiding type "dir thread"
+;		 <3>	 3/16/90	dnf		Clear VCBDirIDM on all routines that make BTree calls (moving
+;									the hint) so as to not break indexed GetCatInfo calls
+;		 <2>	  2/4/90	DNF		Get rid of include of HFS70Equ.a
+;	   <1.9>	11/15/89	EKN		Tweeks from 2nd code review.
+;				 11/9/89	EKN		Tweeks from 2nd code review.
+;	   <1.8>	10/13/89	EKN		Cleanup UpdateLastID. Added FIDGetID.
+;				10/12/89	EKN		Cleanup UpdateLastID some.
+;	   <1.7>	 9/29/89	EKN		REWORK ExchangeFiles AND Some minor twiddles in styleish stuff
+;									from code review.
+;				 9/28/89	EKN		Minor twiddles on stylish stuff from code review. MAIN Thing:
+;									Quit on ioErrors. Only Back out of DskFulErr. AND BIGGIE:
+;									Redesign ExchangeFiles and MoveExtents to make it simpler.
+;									BugFix: ResolveID and DeleteID should CMPI.B for cdrType tests.
+;	   <1.6>	 8/29/89	EKN		FIDDeleteID and FIDResolveID doing CMPI.W instead of CMPI.B
+;									#cdrThdRec.
+;	   <1.5>	 7/24/89	EKN		ExchangeFiles: Fix & cleanup backing out of errors A LOT.
+;									Cathints as parameters. Give bogusID back. Exch mod dates.
+;				 7/24/89	EKN		Give nextID back after Exchange. Pretty up: Capitalize all
+;									"bsr"s; Change all JSRs to BSRs; Fix comments; Change labels.
+;									Cleaned up "backing out of errors" in ExchangeFiles A LOT! Add
+;									exchanging of mod dates (in CopyCNodeInfo). Have ExchangeFiles
+;									take cat hints as parameters.
+;	   <1.4>	 5/30/89	dnf		Getting more kinks out
+;	   <1.3>	 5/30/89	dnf		Change MOVEQ to MOVE.W for errors which changed to < -127
+;	   <1.2>	 5/30/89	dnf		Changes to support HFS7.0 Enhancements ptch
+;				 5/29/89	EKN		Created file.
+;	   <1.1>	 5/24/89	rwh		include inc.sum.a to fix build problems
+;	   <1.0>	 5/15/89	EKN		New for FileIDs facility.
+;
+;	To Do:
+;
+;-- THINGS TO DO (FUTURE ENHANCEMENTS):
+;-- 1) Make common setup routine for 4 external calls, if we decide not to vector all 4.
+;
+
+;_________________________________________________________________________________
+;
+; External
+;  Routines: FIDCreateID  -  Creates a file thread to an HFS existing file.
+;			 FIDDeleteID  -  Destroys the file thread to the HFS File.
+;			 FIDGetID  -  Returns the value of the file ID if it exists.
+;			 FIDResolveID -  Given a fileID, returns the parID and cname of the file.
+;			 FIDExchangeFiles  -   Swaps the data of the files. For doing "save as".
+;
+; Note about VCBDirIDM:  								dnf <2>
+;			 The indexed GetCatInfo call (and CMGetOff below it) depend on the fact
+;			 that if VCBDirIDM is non-zero then the current btree hint is at VCBOffsM
+;			 in directory VCBDirIDM.  Thus, on an indexed call CMGetOff can do a 
+;			 quick BTGetRec instead of a search.  
+;
+;			 All of the catalog manager routines which can change the hint clear 
+;			 VCBDirIDM.  However, the FileIDsSvcs routines in this file don't use
+;			 any of the CMxxx routines, so VCBDirIDM needs to be cleared manually in
+;			 here.
+;
+;_________________________________________________________________________________
+
+
+ 				BLANKS	ON				; need semicolons to separate comments now
+				STRING  ASIS   			; strings are the way they look
+				PRINT	PUSH
+				PRINT   OFF				; don't send lines to assembly listing file
+				LOAD	'StandardEqu.d'
+				include	'LinkedPatchMacros.a'
+				PRINT   POP				; okay, send the lines for the listing
+				PRINT   NOGEN			; don't show the macro expansions
+				
+FileIDsSvcs		PROC	EXPORT
+
+				EXPORT	FIDCreateID, FIDDeleteID, FIDGetID, FIDResolveID, FIDExchangeFiles
+				
+;_________________________________________________________________________________
+;
+; Routine:		FIDCreateID (Create a file thread)
+;
+; Function: 	FIDCreateID creates a file thread to an HFS file. The file thread
+;				is similar to a directory thread, with it's key being a 
+;				[fileCNodeID, NULL], instead of a [dirID, NULL]. If the file thread
+;				exists, fidExists is returned in D0, and the ID in D1 anyway.
+;
+; Input:		A2.L  -  VCB pointer
+;				D0.L  -  DirID
+;				A0.L  -  CName pointer
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 CMnotfound = CNode not found
+;						     CMExists = CNode for file thread exists 
+;							 cmFThdDirErr = file is a directory, not a file
+;							 -n = IO Error
+;				D1.L  -  file thread
+; Modification History:
+; <11Jan91>		KSCT	File with a thread could be moved on the 6.0 system without updating the
+;						thread record. FIDCreateID should check and do the update if necessary.
+;_______________________________________________________________________________________________
+  				
+FIDCrRegs	reg		D2-D6/A1/A3-A4					
+FIDCreateID: 
+
+;
+; do some initial stuff
+;
+			MOVE.L	(SP)+,-(A6)			; save return address on A6 stack
+			MOVEM.L	FIDCrRegs, -(A6)	; save registers
+			MOVE.L	D0,D6				; save the par ID
+			MOVEA.L	A0,A3				; save the cname ptr
+			jsrROM 	CMSETUP   			; set up key storage pointed to by A4
+			MOVEQ	#0,D5				; clear fileID, in case we return early due to errors
+			CLR.L	VCBDirIDM(A2)		; invalidate current DirID marker
+;				
+; locate the file record
+;
+			MOVEQ 	#0,D2				; no catalog hint
+			jsrROM 	LOCCREC   			
+			BNE		@CrExit				; it's not there, just exit with what's in D0
+			CMPI.B	#cdrFilRec, cdrType(A1); better be a file (type=2)
+			BNE.S	@CrNotAFileErr
+			MOVE.L  D2,D4				; save cat hint for later
+			MOVE.B	FilFlags(A1),D3		; save the flag byte						<11Jan91 #10>	
+;
+; build the key for the file thread
+;
+			MOVE.L	filFlNum(A1), D0	; get file's CNode id for fthread key
+			MOVE.L	D0,D5				; keep fileID for later
+			SUBA.L	A0,A0				; use NULL for fthread key name
+			LEA 	ckrOff(A4), A1		; use this storage for the fthread key
+			jsrROM 	BUILDKEY   			; fill in the key
+;
+; and do the data of the file thread 
+;			
+			LEA 	cdrOff(A4),A1		; clear
+			MOVE.W	#(lenthd/2)-1,D0	;
+@1			CLR.W	(A1)+				;
+			DBRA	D0,@1				; ...the record first
+			
+			LEA		cdrOff(A4),A1
+			MOVE.B	#cdrfThdRec, cdrType(A1)
+			MOVE.L	D6, thdParID(A1)	; the saved parID
+			
+			MOVEA.L	A3, A0				; the cname ptr
+			LEA		thdCName(A1), A1
+			jsrROM 	UPDCNAME   			
+;
+; Insert the file thread in the catalog btree
+;
+			MOVE.W	VCBCtRef(A2), D0	; refnum of catalog file   
+			MOVE.W	#lenthd, D1			
+			LEA		cdrOff(A4), A1
+			LEA		ckrOff(A4), A0
+			jsrROM 	BTINSERT   
+			BNE.S	@CrBTErr			; could be disk full, so stop
+;
+; finally, turn on thread flag in file CNode. Too bad, gotta find it again
+;
+			MOVE.L	D4, D2				; use saved cat hint
+			MOVE.L	D6, D0				; dirID or parent dirID
+			MOVEA.L	A3, A0				; CName pointer
+			jsrROM 	LOCCREC   			; we know it's there
+			BSET	#fThreadFlag,FilFlags(A1); set the flag
+			
+			MOVE.W	VCBCtRef(A2),D0		; refnum of catalog file
+			jsrROM 	BTUPDATE   			
+			BNE.S	@CRExit				; if there was an error, catalog could be shot!
+;
+; get it out to disk 
+;
+			jsrROm	CMFLUSH   			; flush the catalog
+			BRA.S	@CrExit
+;
+; handle errors			
+;	
+@CrNotAFileErr	
+			MOVE.W	#cmFThdDirErr,D0	; Error "cmFThdDirErr = it is a directory"
+		 	BRA.S	@CrExit
+@CrBTErr	CMP.W	#BTExists,D0
+			BNE.S	@CrExit				; It maybe out of space. Let it pass through.
+
+		;; Thread already exists, check if the thread info is consistent.			<11Jan91 #10>
+		;; Fixing a bug if the file has been MOVED or RENAMED on a 6.0 system which doesn't update FID info!
+			MOVE.L	D5,D0				; file number								<11Jan91 #10>
+			SUBA.L	A0,A0				; no Cname									<11Jan91 #10>
+			MOVEQ	#0,D2				; no hint									<11Jan91 #10>
+			jsrROM	LOCCREC   			; locate thread record						<11Jan91 #10>
+			BNE.S	@7					; bad time for error						<11Jan91 #10>
+		
+			CMP.B	#cdrfThdRec,cdrType(A1) ; file thread type?						<11Jan91 #10>
+			BNE.S	@7					; serious problem							<11Jan91 #10>
+			BTST	#fThreadFlag,D3		; flag should be set						<11Jan91 #10>
+			BEQ.S	@7					; serious problem							<11Jan91 #10>
+			CMP.L	thdParID(A1),D6		; has the file been moved?					<14Jan91 #11>
+			BEQ.S	@4					; NO, (this is the common case)				<11Jan91 #10>
+			MOVE.L	D6,thdParID(A1)		; otherwise, update it						<11Jan91 #10>
+			MOVEQ	#0,D3				; D3 = 0 means we changed the file			<11Jan91 #10>
+@4
+			LEA		thdCName(A1),A1		; the dest cname ptr						<11Jan91 #10>
+			MOVEA.L	A3,A0				; the source cname ptr						<11Jan91 #10>
+			MOVEM.L	A0/A1,-(SP)			; save two names							<11Jan91 #10>
+			MOVEQ	#0,D0				; clear D0									<11Jan91 #10>
+			MOVE.B	(A0)+,D0			; D0(high order word) = length of A0		<11Jan91 #10>
+			SWAP	D0 					; swap it									<11Jan91 #10>
+			MOVE.B	(A1)+,D0			; D0( low order word) = length of A1		<11Jan91 #10>
+			_RelString					; has the file been renamed?				<14Jan91 #11>
+			MOVEM.L	(SP)+,A0/A1			; restore the names							<11Jan91 #10>
+			BEQ.S	@5					; NO, (this is the common case)				<11Jan91 #10>
+										; A0/A1 preserved across the call			<11Jan91 #10>
+			MOVEQ	#1,D0				; include length byte						<11Jan91 #10>
+			ADD.B	(A0),D0				; D0.L = length of source					<11Jan91 #10>
+			_BlockMove					; A0 -> A1									<11Jan91 #10>
+			BRA.S	@6					; always updateBT							<11Jan91 #10>
+@5			TST.W	D3					; have we changed the file?					<11Jan91 #10>
+			BNE.S	@7					; no										<11Jan91 #10>
+@6			MOVE.W	VCBCtRef(A2),D0		; refnum of catalog file (input = D0/D2)	<11Jan91 #10>
+			jsrROM 	BTUPDATE   			; mark the node (D2) dirty					<11Jan91 #10>
+			BNE.S	@CrExit				; bad time for error						<11Jan91 #10>
+			jsrROm	CMFLUSH   			; flush the catalog	(input = A2)			<11Jan91 #10>
+			BNE.S	@CrExit				; bad time for error						<11Jan91 #10>
+
+@7			MOVE.W	#CMExists,D0		; Translate error "CMExists = cnode already there"
+;
+; cleanup and return
+;									
+@CrExit		MOVE.L	D5,D1				; return the file id
+			ADD 	#lenCMVars,A6		; de-allocate memory for CM vars
+			MOVEM.L (A6)+, FIDCrRegs	; restore regs
+
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0 					; set condition codes 
+			RTS 						; exit FIDCreateID
+				
+
+; sameNameP	
+; Input:	A1 = cat. file name
+;			A3 = user's file name
+; Output:	BEQ if 2 names are the same
+			LEA		thdCName(A1), A1
+			jsrROM 	UPDCNAME   	
+
+
+;_________________________________________________________________________________
+;
+; Routine:		FIDDeleteID (Delete a file thread)
+;
+; Function: 	FIDDeleteID invalidates a file id, by removing the thread from the 
+;				from the cat file and by turning off the file CNode link flag.
+;
+; Input:		A2.L  -  VCB pointer
+;				D0.L  -  file thread
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 CMnotfound = CNode not found
+;							 cmFThdGone = File thread not found
+;							 cmFThdDirErr = file is a directory, not a file
+;							 -n = IO error
+;_________________________________________________________________________________
+  				
+FIDDelRegs	reg		D1-D7/A1/A3-A4					
+FIDDeleteID: 
+
+;
+; do some initial stuff
+;
+			MOVE.L	(SP)+,-(A6)			; save return address on A6 stack
+			MOVEM.L	FIDDelRegs,-(A6)	; save registers
+			jsrROM  CMSETUP   			; set up key storage pointed to by A4
+			MOVE.L	D0, D5				; save fileID
+			MOVEQ	#0, D7				; save error in here, if CNode for file is missing
+			CLR.L	VCBDirIDM(A2)		; invalidate current DirID marker
+;					
+; locate the file thread
+;
+			MOVEQ 	#0, D2				; no catalog hint
+			SUBA.L	A0, A0				; use NULL for fthread key. 
+			jsrROM 	LOCCREC   			
+			BNE.S	@DlNoThdErr			; it's not there
+			CMPI.B	#cdrFThdRec, cdrType(A1); better be a file
+			BNE.S   @DlNotAFileErr
+;				
+; and then find the file 
+;	
+			MOVEQ	#0, D2				; no catalog hint 
+			MOVE.L	thdParID(A1), D0	; get file's dir id from fthread data
+			LEA		thdCName(A1), A0	; and it's name
+			jsrROM 	LOCCREC   	
+			BEQ.S	@DlUnsetFlg
+			MOVE.W	D0, D7				; need to return the error later
+			BNE.S	@DlDelThd			; whoops, it's not there...well, delete the thread
+;			
+; ** NOTE: If LocCNode were modified for fthreads, the two LocCRecs above could be avoided
+;
+; turn off thread flag in file CNode 
+;
+@DlUnsetFlg	BCLR	#fThreadFlag,FilFlags(A1) 
+			MOVE.W	VCBCtRef(A2), D0	; refnum of catalog file
+			jsrROM 	BTUPDATE   			; tell the btree
+			BNE.S	@DlExit				; if there's an error, the catalog could be shot!
+;
+; Delete the file thread in the catalog btree
+;
+@DlDelThd	MOVE.L  D5, D0				; file id
+			SUBA.L	A0,A0				; use NULL for fthread key			
+			LEA		ckrOff(A4), A1 		; use this storage for fthread key
+			jsrROM 	BUILDKEY   			; fill in the key
+			
+			LEA		ckrOff(A4), A0 	; get the storage again
+			MOVE.W	VCBCtRef(A2), D0	; refnum of catalog file
+			jsrROM 	BTDELETE   			; delete file thread
+			BNE.S	@DlExit				; we know it exists, so must be IOError...
+										; ...Oh well, leave the cnode's fthread flag off.					
+;
+; get it out to disk. 
+;
+			jsrROM 	CMFLUSH   			; flush the catalog
+			MOVE.W	D7, D0				; should be clear, unless file CNode was missing
+			BRA.S	@DlExit
+;
+; handle errors	
+;	
+@DlNoThdErr	CMP.W	#CMNotFound, D0		; translate the error so callee knows it wasn't a fnfErr
+			BNE.S	@DlExit
+			MOVE.W	#cmFThdGone, D0
+			BRA.S	@DlExit
+@DlNotAFileErr 
+			MOVE.W	#cmFThdDirErr, D0	; Error "cmFThdDirErr = it's a directory"
+;
+; cleanup and return
+;									
+@DlExit		ADD 	 #lenCMVars,A6		; de-allocate memory for CM vars
+			MOVEM.L  (A6)+, FIDDelRegs	; restore regs
+
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes 
+			RTS 						; exit FIDDeleteID
+			
+				
+;_________________________________________________________________________________
+;
+; Routine:		FIDGetID (Get a file thread)
+;
+; Function: 	FIDGetID returns a file thread to an HFS file if it exists. 
+;
+; Input:		A2.L  -  VCB pointer
+;				D0.L  -  DirID
+;				A0.L  -  CName pointer
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 CMnotfound = CNode not found
+;							 cmFThdGone = File thread not found
+;							 cmFThdDirErr = file is a directory, not a file
+;							 -n = IO Error
+;				D1.L  -  file thread
+;_________________________________________________________________________________
+  				
+FIDGtRegs	reg		A1/A4/D2					
+FIDGetID: 
+
+;
+; do some initial stuff
+;
+			MOVE.L	(SP)+,-(A6)			; save return address on A6 stack
+			MOVEM.L	FIDGtRegs, -(A6)	; save registers
+			jsrROM 	CMSETUP   			; set up key storage pointed to by A4
+			MOVEQ	#0,	D5				; clear fileID, in case we return early due to errors
+			CLR.L	VCBDirIDM(A2)		; invalidate current DirID marker
+;				
+; locate the file record
+;
+			MOVEQ 	#0, D2				; no catalog hint
+			jsrROM 	LOCCREC   			
+			BNE		@GtExit				; it's not there, just exit with what's in D0
+			CMPI.B	#cdrFilRec, cdrType(A1); better be a file
+			BNE.S	@GtNotAFileErr
+;
+; finally, if the file thread flag is set, grab the fileID and set D0
+;
+			BTST	#fThreadFlag,FilFlags(A1); tst the flag
+			BEQ.S	@GtNoThdErr
+			MOVE.L	filFlNum(A1),D1		; save file number
+			BRA.S	@GtExit1
+;
+; handle errors			
+;	
+@GtNotAFileErr	
+			MOVE.W	#cmFThdDirErr, D0	; Error "cmFThdDirErr = it is a directory"
+		 	BRA.S	@GtExit
+@GtNoThdErr	MOVE.W	#cmFThdGone, D0		; Error "cmFThdGone = file ID doesn't exist"
+;
+; cleanup and return
+;									
+@GtExit		MOVE.L	D5, D1				; return the file id
+@GtExit1	ADD 	 #lenCMVars,A6		; de-allocate memory for CM vars
+			MOVEM.L  (A6)+, FIDGtRegs	; restore regs
+
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes 
+			RTS 						; exit FIDGetID
+				
+;_________________________________________________________________________________
+;
+; Routine:		FIDResolveID (Resolves a file thread)
+;
+; Function: 	FIDResolveID finds the dirID and CName for a file, given it's thread.   
+;
+; Input:		A2.L  -  VCB pointer
+;				D0.L  -  file thread
+;				A0.L  -  CName pointer (empty storage)
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 cmFThdDirErr = file is a directory, not a file
+;							 CMNotFound = Cnode not found (where cnode is file thread)
+;							 -n = IO Error
+;				A0.L  -  CName pointer (filled in storage)
+;				D1.L  -  dirID
+;	23Aug90	KST	Checking for possible dangling fileID and delete the thread record if it is.
+;_________________________________________________________________________________
+
+FIDResRegs	reg		D2-D6/A1/A3-A5		; <why saving all those regs??		23Aug90>
+FIDResolveID:		
+
+;
+; do some initial stuff
+;
+			MOVE.L	(SP)+,-(A6)			; save return address on A6 stack
+			MOVEM.L	FIDResRegs,-(A6)	; save registers
+			MOVE.L	D0,D3				; save fileID
+			jsrROM 	CMSETUP   			; set up key record and data storage
+			MOVEA.L A0, A3				; save cName ptr
+			CLR.L	VCBDirIDM(A2)		; invalidate current DirID marker
+;					
+; locate the file thread
+;
+		;;	MOVEQ 	#0, D2				; no catalog hint					<23Aug90>
+			SUBA.L	A0, A0				; use NULL for file name. 
+			jsrROM 	LOCCREC   			
+			BNE.S	@RsExit				; it's not there, pass error on up
+			CMPI.B	#cdrFThdRec, cdrType(A1); better be a file
+			BNE.S   @RsNotAFileErr
+;				
+; extract the info 			
+			MOVE.L	thdParID(A1), D0	; get file's dir id from fthread data
+			LEA		thdCName(A1), A0	; and it's name
+			MOVEM.L	D0/D2/A0,-(A6)		; save dirID/hint/name				<23Aug90>
+			MOVEQ 	#0, D2				; no catalog hint					<23Aug90>
+			jsrROM 	LOCCREC   			; does the file exist?				<23Aug90>
+			MOVEM.L	(A6)+,D1/D2/A0		; restore dirID/hint/name			<23Aug90>
+			BNE.S	@dangling			; it's not there					<23Aug90>
+
+		;; we found the file, but is this the file we really want?			<21Sep90>
+			CMP.L	filFlNum(A1),D3		; file number match?				<21Sep90>
+			BNE.S	@dangling			; it's not							<21Sep90>
+		
+			MOVEA.L A3, A1				; the cname ptr
+			jsrROM 	UPDCNAME   		
+			MOVEQ	#0, D0				; to be safe
+;
+; cleanup and exit
+;											
+@RsExit		ADD 	#lenCMVars,A6		; de-allocate memory for CM vars
+			MOVEM.L (A6)+, FIDResRegs	; restore regs
+
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0 					; set condition codes 
+			RTS 						; exit FIDResolveID
+;
+; handle errors
+;
+@RsNotAFileErr	
+			MOVE.W	#cmFThdDirErr, D0	; Error "cmFThdDirErr = it's a directory"
+			BRA.S	@RsExit
+@dangling
+		;; This is a dangling fID, if the volume is writable,				<24Aug90>
+		;; then delete the thread record in the catalog btree.				<23Aug90>
+		;	jsrROM	CVFLGS   			; is VOL writable? (IN: A2=vcb)		<24Aug90>
+		;	BNE.S	@2					; no, don't bother with delete		<24Aug90>
+			
+		;	MOVE.L  D3,D0				; file id							<23Aug90>
+		;	SUBA.L	A0,A0				; use NULL for fthread key			<23Aug90>
+		;	LEA		ckrOff(A4), A1 		; use this storage for fthread key	<23Aug90>
+		;	jsrROM 	BUILDKEY   			; fill in the key					<23Aug90>
+			
+		;	LEA		ckrOff(A4),A0 		; get the storage again				<23Aug90>
+		;	MOVE.W	VCBCtRef(A2),D0		; refnum of catalog file			<23Aug90>
+		;	jsrROM 	BTDELETE   			; delete file thread				<23Aug90>
+		;	BNE.S	@2					; this must be IOError or VolLocked	<23Aug90>
+		;	jsrROM 	CMFLUSH   			; flush the catalog					<23Aug90>
+
+		;; Now we just return an error, we don't delete the Fid.			<21Sep90>
+@2			MOVE.W	#badFidErr,D0		; treat it as fidNotFound error		<21Sep90>
+			BRA.S	@RsExit				; and return						<23Aug90>
+
+;_________________________________________________________________________________
+;
+; Routine:		FIDExchangeFiles
+;
+; Function: 	FIDExchangeFiles exchanges the data of the source and dest files. It has to  
+;				locate the CNodes, check for extents in extents file,  exchange them,  
+;				and then exchange the CNode file record info pertaining to data 
+;				(lengths, extents, and mod dates).
+;				All other CNode info remains unchanged (finder info, create/backup dates).
+;				FIDExchangeFiles gives apps the functionality of a "safe save".
+;
+; Input:		A2.L  -  VCB pointer
+;				D1.L  -  destination directory id
+;				D0.L  -  source directory id
+;				A1.L  -  destination name
+;				A0.L  -  source name
+;				D2.L  -  src cat hint to CNode rec
+;				D3.L  -  dest cat hint to Cnode rec
+;
+; Output:		D0.W  -  result code
+;							 0 = ok
+;							 cmFThdDirErr = file is a directory, not a file
+;							 CMNotFound = Cnode for source or dest not found
+;							 -n = IO error
+;_________________________________________________________________________________
+ 
+FIDExchRegs	reg		D1-D7/A0-A1/A3-A5
+FIDExchangeFiles:  
+
+;
+; STEP 0: DO SOME INITIAL STUFF
+;
+			MOVE.L	(SP)+,-(A6)			; save return address on A6 stack
+			MOVEM.L	FIDExchRegs, -(A6)	; save registers
+			SUB 	#lenFIDSwapVars, A6	; grab some storage
+			MOVEA.L	A6, A4				; set storage to A4
+			MOVEA.L	A1, A3				; save dest Cname for later
+			MOVEA.L	A0, A5				; save src CName for later
+			MOVE.L	D1,	destDIDOff(A4)
+			MOVE.L	D0, srcDIDOff(A4)
+			MOVE.L	D3, D7				; save dest catHint for later
+			MOVE.L	D2, D6				; save src catHint for later
+			CLR.L	VCBDirIDM(A2)		; invalidate current DirID marker			
+			
+;
+; STEP 1: GRAB THE CNODE RECORDS AND CHECK FOR EXTENTS IN EXTENT FILE
+;
+; locate the source file, test for extents in extent file, and copy the cat record for later
+;
+			CLR.W	extFlgsOff(A4)		; assume no extents in extents file
+			jsrROM 	LOCCREC   			; A0, D0, D2 already set up from input
+			BNE		@ExExit				; either CNode not there or io error
+			CMPI.B	#cdrFilRec, cdrType(A1); better be a file
+			BNE		@ExNotAFileErr
+			MOVE.L	D2, D6				; save the catHint in case it changed
+						
+			LEA		filExtRec(A1), A0	; are there extents in source data fork
+			MOVE.L	filPyLen(A1), D0
+			BSR		CheckExtents		
+			TST.W	D0
+			BEQ.S	@ExNxt
+			BSET	#srcExt, extFlgsOff(A4)
+			BRA.S	@ExNxt1				; no need to check resource fork now
+			
+@ExNxt		LEA		filRExtRec(A1), A0	; are there extents in source resource fork
+			MOVE.L	filRPyLen(A1), D0
+			BSR		CheckExtents		
+			TST.W	D0
+			BEQ.S	@ExNxt1
+			BSET	#srcExt, extFlgsOff(A4)
+			
+@ExNxt1		MOVEA.L	A1, A0				; source - the cnode in memory
+			LEA		srcCNode(A4), A1 	; dest - the cnode on the stack
+			MOVEQ	 #lencdr, D0		; length of file record
+			_BlockMove
+;
+; locate the dest file, test for extents in extent file, and copy the cat record for later
+;
+			MOVE.L	D7, D2				; catalog hint
+			MOVE.L	destDIDOff(A4), D0	; it's dir id
+			MOVEA.L	A3, A0				; it's name
+			jsrROM 	LOCCREC   			; keep the cat hint in D2 for the BTUpdate later
+			BNE		@ExExit				; either CNode not there or io error (callee knows it's there!)
+			CMPI.B	#cdrFilRec, cdrType(A1); better be a file
+			BNE		@ExNotAFileErr
+			MOVE.L	D2, D7				; save the catHint in case it changed
+			
+			LEA		filExtRec(A1), A0	; are there extents in dests data fork
+			MOVE.L	filPyLen(A1), D0
+			BSR		CheckExtents		
+			TST.W	D0
+			BEQ.S	@ExNxt2
+			BSET	#destExt, extFlgsOff(A4)
+			BRA.S	@ExNxt3				; no need to check resource fork now
+			
+@ExNxt2		LEA		filRExtRec(A1), A0	; are there extents in dests resource fork
+			MOVE.L	filRPyLen(A1), D0
+			BSR		CheckExtents		
+			TST.W	D0
+			BEQ.S	@ExNxt3
+			BSET	#destExt, extFlgsOff(A4)
+						
+@ExNxt3		MOVEA.L	A1, A0				; source - the cnode in memory
+			LEA		destCNode(A4), A1	; dest - the cnode on the stack
+			MOVEQ #lencdr, D0			; length of file record
+			_BlockMove
+
+;	
+; STEP 2: EXCHANGE THE EXTENTS KEY IN THE EXTENT FILE (IF ANY)
+; NOTE: We could avoid some backing out of errors on DskFullErr if we checked free space first, right?
+;
+			MOVEQ	#fidBogusExtID, D0	; first delete any existing extents of this value (resulting from a crash)
+			BSR		DeleteExts
+			BNE		@ExExit				; best to stop
+			
+			LEA		srcCNode(A4), A0	; get the source cnode record
+			LEA		destCNode(A4), A1  	; get the dest cnode record
+			
+			BTST	#srcExt, extFlgsOff(A4) ; does the source file have extents?
+			BNE.S	@ExYesSrc			; yep, =>
+			BTST	#destExt, extFlgsOff(A4) ; nope, so test dest
+			BNE.S	@ExNoSrcExt			; yep, no source extents, but some dest extents
+			BRA.S	@ExGetOut			; YIPPIE!!! No extents in extents files!
+			
+@ExYesSrc	BTST	#destExt, extFlgsOff(A4) ; src has extents, what about dest?
+			BEQ.S	@ExNoDestExt		; no dest extents, so =>
+;
+; GROSS! Extents in both files. Now we got grab a new ID to move one set of extents into
+;
+			MOVEQ	#fidBogusExtID, D5	; get the ID reserved for exchanging extents
+			MOVE.L	filFlNum(A0), D1	; move this ID to ...
+			MOVE.L	D5, D2				; ...this one
+			BSR		MoveExtents			; change source extents to bogus id extents
+			BNE		@ExUndo1
+			MOVE.L	filFlNum(A1), D1	; move this ID to ...
+			MOVE.L	filFlNum(A0), D2	; ... this one
+			BSR		MoveExtents			; change dest extents to source extents
+			BNE		@ExUndo2
+			MOVE.L	D5, D1				; move this ID to ...
+			MOVE.L	filFlNum(A1), D2	; ... this one
+			BSR		MoveExtents			; change bogus id extents to dest extents
+			BNE.S	@ExUndo3
+			BRA.S	@ExGetOut
+			
+@ExNoSrcExt	MOVE.L	filFlNum(A1), D1 	; move this ID to...
+			MOVE.L	filFlNum(A0), D2 	; ... this one
+			BSR		MoveExtents
+			BNE		@ExUndo0
+			BRA.S	@ExGetOut
+			
+@ExNoDestExt MOVE.L	filFlNum(A0), D1 	; move this ID to ...
+			MOVE.L	filFlNum(A1), D2 	; ... this one
+			BSR		MoveExtents
+			BNE		@ExUndo0			
+;
+; STEP 3: CHANGE THE DATA IN THE CNODES
+;
+; find the source cnode and put dest info in it
+;
+@ExGetOut	MOVE.L	D6, D2				; catalog hint
+			MOVEA.L	A5,A0				; it's name
+			MOVE.L	srcDIDOff(A4), D0	; it's dir id
+			jsrROM 	LOCCREC   				
+			BNE		@ExBusted	 
+			
+			LEA		destCNode(A4), A0 	; from saved dest (A0) to memory src (A1)
+			BSR		CopyCNodeInfo
+			
+			MOVE.W	VCBCtRef(A2), D0
+			jsrROM 	BTUPDATE   			; tell the btree
+			BNE		@ExExit				; if there's an error, the catalog could be shot!
+
+;
+; find the destination cnode and put source info in it
+;
+			MOVE.L	D7, D2				; catalog hint
+			MOVEA.L	A3, A0				; it's name
+			MOVE.L	destDIDOff(A4), D0	; it's dir id
+			jsrROM 	LOCCREC   			; keep cat hint in D2 for the BTUpdate later
+			BNE		@ExBusted
+			
+			LEA		srcCNode(A4), A0 	; from saved src (A0) to memory dest (A1)
+			BSR		CopyCNodeInfo
+			
+			MOVE.W	VCBCtRef(A2), D0
+			jsrROM	BTUPDATE   			; tell the btree
+			BNE		@ExExit				; if there's an error, the catalog could be shot!
+			BRA.S   @ExFinishUp
+			
+;
+; STEP 4: ERROR HANDLING SECTION (just deal with DiskFulErr. With the others, stop and don't flush!)
+;
+@ExUndo3	CMP.W	#dskFulErr, D0
+			BNE		@ExExit				; don't flush a thing on other errors!
+			MOVE.L	filFlNum(A1), D0	; delete dest extents
+			BSR		DeleteExts
+			BNE.S	@ExExit				; we are doomed. Just QUIT!
+			MOVE.L	filFlNum(A1), D2
+			MOVE.L	filFlNum(A0), D1
+			BSR		MoveExtents			; move source extents back into dest extents
+			BNE.S	@ExExit				; we are doomed. Just QUIT!
+			BRA.S	@ExUndo2a
+			
+@ExUndo2	CMP.W	#dskFulErr, D0
+			BNE.S	@ExExit				; don't flush a thing on other errors!
+@ExUndo2a	MOVE.L	filFlNum(A0), D0	; delete src extents
+			BSR		DeleteExts
+			BNE.S	@ExExit				; we are doomed. Just QUIT!
+			MOVE.L	filFlNum(A0), D2	
+			MOVE.L	D5, D1
+			BSR		MoveExtents			; move nextID extents back into source extents
+			BNE.S	@ExExit				; we are doomed. Just QUIT!
+			BRA.S	@ExUndo1a
+			
+@ExUndo1	CMP.W	#dskFulErr, D0
+			BNE.S	@ExExit				; don't flush a thing on other errors!
+@ExUndo1a	MOVE.L	D5, D0				; delete nextID extents
+			BSR		DeleteExts
+			BNE.S	@ExExit				; we are doomed. Just QUIT!
+			BRA.S	@ExFinishErr
+
+@ExUndo0	CMP.W	#dskFulErr, D0
+			BNE.S	@ExExit				; don't flush a thing on other errors!
+			MOVE.L	D2, D0
+			BSR		DeleteExts			; delete src or dest 
+			BNE.S	@ExExit				; we are doomed. Just QUIT!
+;
+; STEP 5: ALL DONE....ALMOST...
+;
+@ExFinishErr	
+			jsrROM	CMFLUSH   			; flush the catalog
+			jsrROM 	XFFLUSH   			; flush the extent file (unneeded for common case, but it's cheap)			
+			MOVE.W	#dskFulErr, D0		; well, report the original error even if the flushes croaked.
+			BRA.S	@ExExit
+@ExNotAFileErr
+			MOVE.W	#cmFThdDirErr, D0	; Error "cmFThdDirErr = it's a directory"
+			BRA.S	@ExExit
+@ExBusted	MOVE.W	#cmBadNews, D0		; the cnode record got lost after we looked it up
+			BRA.S	@ExExit
+;
+; cleanup and return
+;
+@ExFinishUp
+			MOVEQ	#0, D0				; no errors....yet...
+			jsrROM 	CMFLUSH   			; flush the catalog
+			jsrROM 	XFFLUSH   			; flush the extent file (unneeded for common case, but it's cheap)	
+@ExExit		ADD 	#lenFIDSwapVars,A6	; de-allocate memory for CM vars
+			MOVEM.L (A6)+, FIDExchRegs	; restore regs
+
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes 
+			RTS 						; exit FIDExchangeFiles
+
+			
+;__________________________________________________________________________________			
+; INTERNAL ROUTINES
+;__________________________________________________________________________________			
+
+;__________________________________________________________________________________
+; Routine:		CheckExtents
+;
+; Function: 	Checks the extents in CNode to see if there are any more in the
+;				extent file. 
+;
+; Input:		A0.L  -  addr(extent in CNODE of data or resource fork)
+;				D0.L  -  peof of file
+;				A2.L  -  vcb pointer
+;
+; Output:		D0.W  -  first FABN in extent file (or zero if none in extent file)
+;				A0.L  - unchanged from input
+;
+; <30Mar91>	KSCT	Fixing a bug in ExchangeFile which uses a signed
+;					branch on an unsigned comparison.
+;__________________________________________________________________________________
+
+CheckExtents:
+
+			MOVE.L	(SP)+,-(A6)			; save return address on A6 stack
+			MOVEM.L	D1-D4, -(A6)		; save registers
+			
+			MOVE.L	D0, D3				; extract peof (it's in bytes and a long word)
+			TST.L	D3					; convert it to blocks
+			BEQ.S	@ChNoneThere		; zero length file
+			SUBQ.L	#1, D3
+			DIVU.W	vcbAlBlkSiz+2(A2), D3 ; the high word could have trash in it, but we don't care
+			ADDQ.W	#1, D3				; now the peof is in blocks and only a word size
+			
+@1			CLR.W	D1					; extent offset in extent record
+			MOVEQ	#0, D0				; sum of extents allocation blocks
+			MOVEQ	#numExts-1, D2		; loop through extents checking for last FABN
+@2			MOVE.W	xdrNumABlks(A0, D1.W), D4 ; make sure we only pick up a word!
+			ADD.W	D4, D0  			
+			CMP.W	D3, D0				; check for eof
+			BHS.S	@ChNoneThere		; greater than or equal (extents can add past eof if 'Close" crashes w/o truncating new clump)		
+										; changed from BGE to BHS			<30Mar91 #12>
+			ADDQ.W	#lenExt, D1			; bump to next extent
+			DBRA	D2, @2
+			BRA.S	@ChExit
+
+@ChNoneThere MOVEQ	#0, D0			
+@ChExit		MOVEM.L  (A6)+, D1-D4		; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			RTS
+			
+;_________________________________________________________________________________
+; CopyCNodeInfo
+;
+; Routine:		CopyCNodeInfo
+;
+; Function: 	Copies the info in the file cnode record relating to data exchanges.
+;
+; NOTE: 		If the layout in the catalog file record changes between bytes 24-98,
+;				this WILL BREAK!
+;
+; Input:		A0.L  -  from
+;				A1.L  -  to
+;_________________________________________________________________________________
+
+CopyCNodeInfo:
+
+			MOVE.L	(SP)+, -(A6)
+			MOVEM.L	D0/A0-A1, -(A6)
+			
+			ADDA.W	#filStBlk, A1		; set up to copy filStBlk, filLgLen, filPyLen, ...
+			ADDA.W	#filStBlk, A0		; ...filRStBlk, filRLgLen, filRPyLen
+			MOVE.W	#((filCrDat-filStBlk)/2)-1, D0
+@1			MOVE.W	(A0)+, (A1)+
+			DBRA	D0, @1
+			
+			ADDA.W	#4, A0				; skip past the filCrDat
+			ADDA.W	#4, A1				; skip past the filCrDat
+			MOVE.L	(A0)+, (A1)+		; copy the filMdDat
+			
+			ADDA.W	#(filExtRec-filBkDat), A1	; set up to copy filExtRec and filRExtRec
+			ADDA.W	#(filExtRec-filBkDat), A0
+			MOVE.W	#((filResrv-filExtRec)/2)-1, D0
+@2			MOVE.W	(A0)+, (A1)+
+			DBRA	D0, @2
+			
+			MOVEM.L	(A6)+, D0/A0-A1
+			MOVE.L	(A6)+, -(SP)			
+			RTS		
+			
+;__________________________________________________________________________________
+; Routine:		CopyExtentInfo
+;
+; Function: 	Copy the key and data extents to a storage. 
+;
+; Input:		A0.L  -  addr(key)
+;				A1.L  -  addr(data)
+;				A3.L  -  addr(extent storage) 
+;
+; Output:		A3.L  -  addr(end of extent storage, all filled in)
+;__________________________________________________________________________________
+
+CopyExtentInfo:		
+
+			MOVE.L	(SP)+, -(A6)		; save return address on A6 stack
+			MOVEM.L	D0/A0-A1, -(A6)
+			
+			MOVEQ	#(lenxkr/2)-1, D0	; copy the key
+@1			MOVE.W	(A0)+, (A3)+
+			DBRA	D0, @1
+			MOVEQ	#(lenxdr/2)-1, D0	; copy the data
+@2			MOVE.W	(A1)+, (A3)+		; A3 should be right place at start
+			DBRA	D0, @2
+
+			MOVEM.L	(A6)+, D0/A0-A1
+			MOVE.L	(A6)+, -(SP)		; put return address back on stack
+			RTS
+			
+;__________________________________________________________________________________
+; Routine:		DeleteExts
+;
+; Function: 	Delete all extents in extent file that have the ID given. 
+;
+; Input:		A4.L  -  fidSwapVars pointer (pointer to variable storage)
+;				A2.L  -  vcb pointer
+;				D0.L  -  ID of file with extents to delete
+;
+; Output:		D0.W  -  errors
+;__________________________________________________________________________________
+
+DXRegs		reg		D1-D3/D6/A0-A1
+DeleteExts:
+;
+; set up some initial stuff
+;
+			MOVE.L	(SP)+,-(A6)			; save return address on A6 stack
+			MOVEM.L	DXRegs, -(A6)		; save registers
+			MOVE.L	D0, D6				; save it for later
+;
+; set up key to delete
+;
+			LEA		tempKeyOff(A4), A0	; get the blank key we started out with
+			MOVE.B	#lenxkr-1, xkrKeyLen(A0)
+			CLR.B	xkrFkType(A0)		; clear the fork
+			MOVE.L	D0, xkrFNum(A0)		; set the key's ID			
+ 			CLR.W	xkrFABN(A0)			; clear the FABN
+;
+; start grabbing extents from extent file and delete them
+;
+@DXNxtDelete 
+			MOVEQ	#0, D2				; no hint (after BTDelete)			<09Aug90>
+			MOVE.W	VCBXTRef(A2), D0	; extents file refnum
+			jsrROM 	BTSEARCH   			; search BTree for extent record
+			CMP.W	#BTNotFound, D0
+			BNE.S	@DXExit				; has to be an ioerror!
+			MOVEQ	#0,	D1				; get what it's pointing at
+			MOVE.W	VCBXTRef(A2), D0	; extents file refnum
+			jsrROM	BTGETRECORD   		; this is the first record we want for this file
+			BNE.S	@DXBtErr
+			CMP.L	xkrFNum(A0), D6
+			BNE.S	@DXExit				; Yippie!!! We're done!
+			
+			MOVE.W	VCBXTRef(A2), D0	; extent file's refnum
+			jsrROM 	BTDELETE   			; and delete from btree (AO has key)
+			BNE.S	@DXExit
+			
+			LEA		tempKeyOff(A4), A0	; look again
+			BRA.S	@DXNxtDelete
+;
+; handle errors
+;
+@DXBTErr	CMP.W   #BTNotFound, D0		
+			BNE.S	@DXExit				; let the other errors go on up
+			CLR.W	D0
+;
+; cleanup and return
+;
+@DXExit		MOVEM.L  (A6)+, DXRegs		; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes  
+			RTS
+			
+;_________________________________________________________________________________
+; MoveExtents
+;
+; Routine:		MoveExtents
+;
+; Function: 	Reads in up to four extent records at a time, change the ID in the keys,
+;				and inserts them back in the extent btree.
+;				Then searches again one-by-one for the original extents and deletes them. 
+;
+; NOTE:			Picking four extent records up is just a guess. Perhaps more is
+; 				necessary. But since we're getting the storage for them off the A6
+; 				stack, best not take too much. However, the fewer we pick up the more
+; 				disk arm movement will occur during the "search, edit, insert"
+; 				per extent record cycle
+;
+; Input:		D1.L  -  source key ID 
+;				D2.L  -  dest key ID 
+;				A2.L  -  vcb pointer
+;				A4.L  -  fidSwapVars pointer (pointer to variable storage)
+;
+; Output:		D0 - errors
+;				All others - unchanged
+;_________________________________________________________________________________
+
+MvRegs		reg		D1-D7/A0-A1/A3-A4
+MoveExtents:	
+
+extSize		EQU		lenxkr+lenxdr
+
+;
+; do some initial stuff
+;
+			MOVE.L	(SP)+,-(A6)			; save return address on A6 stack
+			MOVEM.L	MvRegs, -(A6); save registers
+
+			MOVE.L	D1, D6				; save src ID for later
+			MOVE.L	D2, D7				; save dest ID for later
+;
+; collect the extent records
+;
+			LEA		tempKeyOff(A4), A0	; get some key storage
+			MOVE.B	#lenxkr-1, xkrKeyLen(A0)
+			CLR.B	xkrFkType(A0)		; clear the fork
+			MOVE.L	D6, xkrFNum(A0)		; set the key's ID			
+ 			CLR.W	xkrFABN(A0)			; clear the FABN
+
+@MvNextBatch MOVE.W	VCBXTRef(A2), D0	; extents file refnum
+			MOVEQ	#0, D2				; no hint
+			jsrROM	BTSEARCH   			; search BTree for extent record. 
+			CMP.W	#BtNotFound, D0		; it won't exist the first time thru the loop
+			BEQ.S	@MvGoOn
+			TST.W	D0
+			BNE		@MvExit				; must be ioError
+			MOVEQ	#1, D1				; second or later batch has to skip over last key searched
+			BRA.S	@MvGoOn1
+@MvGoOn		MOVEQ	#0,	D1				; get what it's pointing at
+@MvGoOn1	MOVEQ	#numExtToCache-1, D3 ; set up counter
+			LEA		extOff(A4), A3 		; extent ptr
+			
+@MvNextRec	MOVE.W	VCBXTRef(A2), D0	; extents file refnum
+			jsrROM	BTGETRECORD   		; this is the first record we want for this file
+			CMP.W	#BtNotFound, D0		; if xkrFNum(A0) is cleared on this error, then this test is bogus!
+			BEQ.S	@MvNoMoreExts
+			TST.W	D0
+			BNE.S	@MvExit				; must be ioError
+			CMP.L	xkrFNum(A0), D6
+			BNE.S	@MvNoMoreExts		; whoops, no more of this file's extents
+			BSR		CopyExtentInfo		; copy the key and data to storage
+			MOVEQ	#1, D1				; tell it you want the next record
+			DBRA	D3, @MvNextRec
+;			
+; edit each extent key, and reinsert each extent record in the extent file
+;			
+@MvNoMoreExts 
+			CMP.W	#numExtToCache-1, D3 ; did we do anything?
+			BEQ.S	@MvGoDelete			; nope, we're done collecting and inserting
+			MOVEQ	#numExtToCache-2, D0 ; -1 for loop counting, -1 cause counter had a DBRA
+			SUB.W	D3, D0				; number of valid extents (-1) for looping
+			MOVE.W	D0, D3
+			SWAP	D3					; save for later
+			MOVE.W	D0, D3
+			
+			LEA		extOff(A4), A0		; pointer to key
+			MOVEA.L	A0, A1
+			ADDQ	#lenxkr, A1			; pointer to data
+			MOVEQ	#lenxdr, D1			; data length 
+@2			MOVE.L	D7, xkrFNum(A0)		; change only the id in the key to dest ID
+			MOVE.W	VCBXTRef(A2), D0	; extent file's refnum
+			jsrROM 	BTINSERT    		; insert in btree
+			BNE.S	@MvBTInsertErr
+			ADDA.W	#extSize, A0
+			ADDA.W	#extSize, A1
+			DBRA	D3, @2
+;
+; okay, done with this batch, go get the next set of extent records
+;
+			SWAP	D3					; check how many were cached
+			CMP.W	#numExtToCache-1, D3
+			BNE.S	@MvGoDelete			; since it stopped early, must not be anymore
+			SUBA	#extSize, A0 		; get the last key cached ...
+			MOVE.L	D6, xkrFNum(A0)		; change it back to what it was before the insert code...
+			BRA.S	@MvNextBatch		; ... and go search again
+;			
+; we are done with all the inserts. Now go and delete the old entries.
+;			
+@MvGoDelete	MOVE.L	D6, D0				; srcID
+			BSR		DeleteExts
+			BRA.S	@MvExit
+;
+; handle errors
+;
+@MvBTInsertErr
+			CMP.W	#BTExists, D0		; BUG! 
+			BNE.S	@MvExit				; let the other errors go on up
+			MOVE.W	#cmbadnews, D0
+;
+; cleanup and return
+;
+@MvExit		MOVEM.L  (A6)+, MvRegs		; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	 D0 				; set condition codes  
+			RTS
+			
+		
+			ENDP
+			END

@@ -1,0 +1,1391 @@
+;
+;	File:		ADBPrimitives.a
+;
+;	Contains:	low-level hardware-dependent ADB and DebugUtil routines
+;
+;	Written by:	Steve Christensen 
+;
+;	Copyright:	й 1991-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;   This file is used in these builds: ROM
+;
+;	Change History (most recent first):
+;
+;	   <SM9>	 11/9/93	KW		added some eieioSTP macros.  Only expands for CygnusX1 ROM
+;	   <SM8>	  8/4/93	JDR		private sound defines were moved to SoundPrivate.a
+;	   <SM7>	 6/14/93	kc		Roll in Ludwig.
+;	   <LW2>	 1/21/93	KW		CudaDebugEnter should not send PDMSuspend command...should just
+;									fall through to EgretDebugEnter.  CudaDebugExit should send
+;									PDMDebugContinue instead of PDMContinue.  Bug fix #1049224
+;	   <SM6>	11/23/92	SWC		Put the build conditionals back in. Added a table for Cuda and
+;									fixed the Cuda routines so they don't require any Universal
+;									checks (the whole point of using primitives).
+;	   <SM5>	 8/26/92	kc		Roll in Horror changes.
+;		<H4>	 8/25/92	BG		Changed VIAStartReq at @waitforinput so that the code waits for
+;									at least 8.8╡s before switching the direction of the shift
+;									register (output to input) to guarantee that we don't outrun the
+;									ADB micro's ability to respond.  Removed <H3>.
+;		<H3>	 7/10/92	BG		Added a temporary KLUDGE to ViaDebugPoll to allow typing in
+;									MacsBug/etc. to function 'normally' again.  See the comments for
+;									more details.
+;		<H2>	  5/3/92	BG		Removed references to hasOrwell2, since it is now superfluous to
+;									hasOrwell.
+;	   <SM4>	07-14-92	jmp		Added a changed to make typing MacsBug work a little better on
+;									Quadra 700s until GR finds a better way to do this.
+;	   <SM3>	 7/10/92	mal		Changed include from ApplDeskBusPriv.a to AppleDeskBusPriv.a.
+;	   <SM2>	 5/28/92	KW		(GS,P3) Added suspend/continue PDM to the Debug util code.
+;		 <1>	 5/17/92	kc		first checked in
+;	   <SM0>	  5/2/92	kc		Roll in Horror. Comments follow:
+;		<H1>	  4/3/92	SWC		Adding this file into the build.
+
+
+			PRINT	OFF
+			LOAD	'StandardEqu.d'
+			INCLUDE	'HardwarePrivateEqu.a'
+			INCLUDE	'SoundPrivate.a'
+			INCLUDE	'UniversalEqu.a'
+		IF PwrMgrADB THEN
+			INCLUDE	'PowerPrivEqu.a'
+		ENDIF
+		IF hasEgret THEN
+			INCLUDE	'EgretEqu.a'
+		ENDIF
+		IF IopADB THEN
+			INCLUDE	'IopEqu.a'
+		ENDIF
+			INCLUDE	'AppleDeskBusPriv.a'
+			INCLUDE	'IOPrimitiveEqu.a'
+			PRINT	ON
+			PRINT	NOMDIR
+			MACHINE	MC68020
+
+NoIntMask	EQU		$0700					; all ints disabled on all machines
+
+
+
+ADBPrimitives PROC	EXPORT
+
+			IMPORT	ImplicitRequestDone, ExplicitRequestDone
+
+			WITH	ADBVars,ADBMsg
+
+
+;╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤╤
+;
+;	ADB primitives vector table
+;
+;	Tables pointed to by the universal ProductInfo record (ADBDebugUtilPtr) for low-level
+;	hardware-dependent ADB routines.  There should be a table for each supported
+;	ProductInfo.
+
+
+		IF ViaADB THEN
+			EXPORT	ViaADBTable
+			DC.W	(VIATableEnd-ViaADBTable)/4			; number of entries
+ViaADBTable
+			DC.L	VIAInitADB-ViaADBTable				; ADB initialization
+			DC.L	0									; not used
+			DC.L	0									; not used
+			DC.L	0									; not used
+			DC.L	VIADebugPoll-ViaADBTable			; DebugUtil ADB polling
+			DC.L	0									; not used
+VIATableEnd
+		ENDIF
+
+
+		IF PwrMgrADB THEN
+			EXPORT	PMgrADBTable
+			DC.W	(PMGRTableEnd-PMgrADBTable)/4		; number of entries
+PMgrADBTable
+			DC.L	PMgrInitADB-PMgrADBTable			; ADB initialization
+			DC.L	PMgrEnableKbdNMI-PMgrADBTable		; not used
+			DC.L	0									; not used
+			DC.L	0									; not used
+			DC.L	PMgrDebugPoll-PMgrADBTable			; DebugUtil ADB polling
+			DC.L	0									; not used
+PMGRTableEnd
+		ENDIF
+
+
+		IF hasEgret THEN
+			EXPORT	EgretADBTable
+			DC.W	(EgretTableEnd-EgretADBTable)/4		; number of entries
+EgretADBTable
+			DC.L	EgretInitADB-EgretADBTable			; ADB initialization
+			DC.L	0									; not used
+			DC.L	EgretDebugEnter-EgretADBTable		; DebugUtil enter
+			DC.L	EgretDebugExit-EgretADBTable		; DebugUtil exit
+			DC.L	EgretDebugPoll-EgretADBTable		; DebugUtil ADB polling
+			DC.L	0									; not used
+EgretTableEnd
+
+			EXPORT	CudaADBTable
+			DC.W	(CudaTableEnd-CudaADBTable)/4		; number of entries
+CudaADBTable
+			DC.L	EgretInitADB-CudaADBTable			; ADB initialization
+			DC.L	0									; not used
+			DC.L	CudaDebugEnter-CudaADBTable			; DebugUtil enter
+			DC.L	CudaDebugExit-CudaADBTable			; DebugUtil exit
+			DC.L	EgretDebugPoll-CudaADBTable			; DebugUtil ADB polling
+			DC.L	0									; not used
+CudaTableEnd
+		ENDIF
+
+
+		IF IopADB THEN
+			EXPORT	IOPADBTable
+			DC.W	(IOPTableEnd-IOPADBTable)/4			; number of entries
+IOPADBTable
+			DC.L	IOPInitADB-IOPADBTable				; ADB initialization
+			DC.L	0									; not used
+			DC.L	IOPRunKBD-IOPADBTable				; DebugUtil enter
+			DC.L	0									; not used
+			DC.L	IOPRunKBD-IOPADBTable				; DebugUtil ADB polling
+			DC.L	0									; not used
+IOPTableEnd
+
+		  IF hasOrwell THEN								;											<H2>
+			EXPORT	QuadraADBTable
+			DC.W	(QuadraADBTableEnd-QuadraADBTable)/4; number of entries
+QuadraADBTable
+			DC.L	IOPInitADB-QuadraADBTable			; ADB initialization
+			DC.L	0									; not used
+			DC.L	IOPRunKBD-QuadraADBTable			; DebugUtil enter
+			DC.L	0									; not used
+			DC.L	QuadraDebugPoll-QuadraADBTable		; DebugUtil ADB polling
+			DC.L	QuadraCheckSecure-QuadraADBTable	; check if keyswitch is in SECURE position
+QuadraADBTableEnd
+		  ENDIF
+		ENDIF
+
+
+
+		IF ViaADB THEN
+;еееееееееееееееееееееееееееееееееееееееее VIA ееееееееееееееееееееееееееееееееееееееееее
+
+			IMPORT	RunADBRequest
+
+;________________________________________________________________________________________
+;
+; Routine:	VIAInitADB
+;
+; Inputs:	A3	-	pointer to ADBBase
+;
+; Outputs:	
+;
+; Trashes:	A0
+;
+; Function:	initializes the ADB Manager for VIA-based ADB
+;________________________________________________________________________________________
+
+VIAInitADB	LEA		FDBShiftInt,A0			; get the address of the interrupt handler
+			MOVE.L	A0,Lvl1DT+(4*ifSR)		;  and install it as the SR interrupt receiver
+			LEA		VIAStartReq,A0			; setup the procedure to start an ADB request
+			MOVE.L	A0,StartReqProc(A3)
+			MOVEA.L	VIA,A0					; point to the VIA1 registers
+			ORI		#NoIntMask,SR			; mask out interrupts
+		eieioSTP
+			MOVE.B	#(1<<ifIRQ)|\			; enable the shift register interrupt
+					 (1<<ifSR),vIER(A0)
+		eieioSTP
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	VIAStartReq
+;
+; Inputs:	A2	-	pointer to transmit data buffer
+;			A3	-	pointer to ADBBase
+;			D2	-	number of bytes of transmit data
+;			D3	-	command byte (bits 0-7) + implicit flag (bit 31)
+;
+; Outputs:	A1	-	pointer to base of VIA1
+;			A3	-	pointer to ADBBase
+;
+; Trashes:	D0,D1,D3
+;
+; Function:	starts an ADB request using the VIA interface to the ADB transceiver processor
+;________________________________________________________________________________________
+
+VIAStartReq	MOVEA.L	VIA,A1					; point to VIA1
+			BSET	#fDBBusy,FDBAuFlag(A3)	; remember that we are busy
+			BNE.S	@AlreadyBusy			; -> already busy, so do nothing and return
+
+			TST.L	D3						; is this an implicit request?
+			BPL.S	@Explicit				; -> nope
+
+;	send an implicit command (auto / SRQ polling), no data needs to be sent
+
+@Implicit	MOVE.B	PollAddr(A3),D3			; get the auto/SRQ polling address
+			LSL.B	#4,D3
+			ORI.B	#talkCmd+0,D3			;  and make it a Talk R0 command
+			BSR		@SendCmd				; send out the command byte
+			BEQ.S	@AutoReply				; -> see if prior auto poll data returned instead
+
+			MOVE.B	fDBCmd(A3),pollCmd(A3)	; remember the command byte
+			BSR.S	@StartAutoPoll			; start auto polling
+			BTST	#fDBQEmpty,FDBFlag(A3)	; see if anything queued
+			BNE.S	@Idle					; -> no, just wait for auto poll data
+
+;	We have just changed from state 0 to state 3.  If a command is in the queue, we will
+;	want to change back to state 0, and send a new command.  We have to give the xcvr
+;	processor time to recognize the state change into state 3 before we change back to
+;	state 0, otherwise it will be out of sync.
+
+			MOVE.W	TimeViaDB,D0		; get 1ms VIA loop time constant
+		;	LSR.W	#4,D0				; 1ms/16 = 62.5╡s
+		;ееее STP еее eric -- let's double it??
+			lsr.w	#2,d0				; 1ms/16 = 62.5╡s
+@Delay	
+		eieioSTP
+			BTST	#0,vBufB(A1)		; timing based on BTST loop, we don't care
+		eieioSTP
+			DBRA	D0,@Delay			; wait at least 50╡s for state change to occur
+			BSR.S	@Idle				; mark us idle
+			BRA.L	RunADBRequest		; go run the next request in the queue
+
+@Idle		BCLR	#fDBBusy,FDBAuFlag(A3)	; allow explicit cmds to interrupt auto polling
+@AlreadyBusy
+			RTS							; if not, just let auto polling continue
+
+@StartAutoPoll
+			MOVEQ	#(1<<vFDesk1)|\
+					(1<<vFDesk2),D1		; change from state 0 to state 3
+			BSR		@waitForInput		; start auto polling, wait for a reply
+			ORI.B	#(1<<fDBAPoll)|\	; indicate that auto poll data returned
+					(1<<fDBBusy),FDBAuFlag(A3)	; auto poll found something, we're busy again
+			MOVEQ	#(1<<vFDesk2),D1	; change from state 3 to state 1
+			BRA.S	@getReply			; join common code to get reply
+
+@explicit	MOVEQ	#maskADBCmd,D0		; setup to extract command
+			AND.B	D3,D0				; clear addr and reg
+			SUBQ.B	#listenCmd,D0		; check for listen command
+			BEQ		@listen				; explicit listen is special case
+
+;	send an explicit command (other than listen), no data needs to be sent
+
+			BSR.S	@sendCmd			; send out the command byte
+			BNE.S	@explicitReply		; see if auto poll data returned instead
+@autoReply	BSET	#fDBAPoll,FDBAuFlag(A3)	; indicate that auto poll data returned
+			MOVE.B	pollCmd(A3),fDBCmd(A3)	; poll command is command that is completing
+@explicitReply
+
+			MOVEQ	#(1<<vFDesk1),D1	; change from state 0 to state 1
+@getReply	BSR.S	@waitForInput		; wait for the first byte
+			BNE.S	@noTimeout			; see if timeout occured
+			BSET	#fDBNoReply,FDBAuFlag(A3)	; indicate that no reply data was returned
+@noTimeout	CLR.B	fDBCnt(A3)			; indicate buffer empty
+
+			BSR.W	@getNextByte		; wait for the second byte
+			BNE.S	@noSRQ				; see if SRQ occured
+			BSET	#fDBSRQ,FDBAuFlag(A3)	; indicate that no service request was returned
+@noSRQ
+
+@fetchLoop	BSR.W	@getNextByte		; wait for another byte
+			BEQ.S	@fetchDone			; exit if end of data reached
+			CMPI.B	#8,fDBCnt(A3)		; see if end of buffer reached
+			BLO.S	@fetchLoop			; keep fetching until end of data
+@fetchDone	BTST	#fDBNoReply,FDBAuFlag(A3)	; see if buffer data is valid
+			SEQ		D0					; $FF if data is valid, $00 if no reply
+			AND.B	D0,fDBCnt(A3)		; set count to zero if timeout
+			BRA		VIAReqDone
+
+
+@sendCmd	ANDI.B	#$FF-(\
+					(1<<fDBAPoll)|\		; clear auto poll reply flag
+					(1<<fDBSRQ)|\		; clear SRQ active in reply flag
+					(1<<fDBNoReply)),\	; clear reply timeout flag
+					FDBAuFlag(A3)		; clear the flags
+			MOVE.W	SR,D0				; save int mask
+			ORI		#NoIntMask,SR		; disable ALL interrupts
+
+			MOVEQ	#(1<<vFDesk2)+\
+					(1<<vFDesk1),D1		; mask the current state
+		eieioSTP
+			AND.B	vBufB(A1),D1
+			CMPI.B	#(1<<vFDesk2)+\
+					(1<<vFDesk1),D1		; are we in state 3?
+			BNE.S	@SendCont			; no, procede as usual
+		eieioSTP
+			BTST	#vFDBInt,vBufB(a1)	; yes, test the FDBInt~ status
+		eieioSTP
+			BEQ.S	@SendExit			; asserted, xcvr already clocking autopoll data
+										; exit (wait for autopoll to complete)
+
+@SendCont
+		eieioSTP
+			ORI.B	#$1C,vACR(a1)		; set SR to shift-out with ext clk
+		eieioSTP
+			MOVE.B	D3,vSR(a1) 			; load shift reg with cmd, start shifting
+		eieioSTP
+			MOVE.B	D3,fDBCmd(A3)		; save the command
+		eieioSTP
+			ANDI.B	#-1-(1<<vFDesk2)-\
+					(1<<vFDesk1),vBufB(A1)	; force state bits to zero
+		eieioSTP
+@SendExit	MOVE.L	(SP)+,ShiftIntResume(A3); save resume address
+			MOVE	D0,SR				; restore interrupt mask
+			RTS							; return to callers caller, wait for interrupt
+
+
+@waitForInput
+;	Shouldn't do the change to shift-in mode til rising edge of ADB clock, which could		<H4> thru next <H4>
+;	be a max. of 8.8╡s after getting the shift register interrupt from sending out the
+;	command byte.  These TSTs aren't to actually test a condition - they are to wait
+;	the appropriate amount of time before changing mode.  We have already done 2 accesses
+;	to the VIA, so we have 2.4╡s of time already accounted for.
+		eieioSTP
+			tst.b	vBufB(A1)			; wait for ADB xcvr to have a rising edge (~8.8╡s)
+		eieioSTP
+			tst.b	vBufB(A1)			; (each of these should be ~1.2╡s)
+		eieioSTP
+			tst.b	vBufB(A1)
+		eieioSTP
+			tst.b	vBufB(A1)
+		eieioSTP
+			tst.b	vBufB(A1)
+		eieioSTP
+			tst.b	vBufB(A1)
+		eieioSTP
+			tst.b	vBufB(A1)			;													<H4>
+		eieioSTP
+			BCLR	#4,vACR(A1)			; change to shift-in mode
+		eieioSTP
+			TST.B	vSR(A1) 			; empty shift reg to start shifting
+		eieioSTP
+			EOR.B	D1,vBufB(A1)		; change the state
+		eieioSTP
+			MOVE.L	(SP)+,ShiftIntResume(A3); save resume address
+			RTS							; return to callers caller, wait for interrupt
+
+
+@getNextByte
+			LEA		fDBCnt(A3),A0		; point to the length byte of the buffer
+			MOVEQ	#1,D0				; zero extend the index
+			ADD.B	(A0),D0				; get, and increment the index
+			MOVE.B	D0,(A0)				; update the index
+		eieioSTP
+			MOVE.B	vSR(a1),(A0,D0.W)	; save the new byte in the buffer
+		eieioSTP
+			EORI.B	#(1<<vFDesk1)|\
+					(1<<vFDesk2),vBufB(A1)	; alternate between state 1 and state 2
+		eieioSTP
+			MOVE.L	(SP)+,ShiftIntResume(A3); save resume address
+		eieioSTP
+			RTS							; return to callers caller, wait for interrupt
+
+;	send an explicit Listen command, send data buffer.
+;
+; Inputs:	D2	-	length of transmit buffer data
+;			D3	-	command byte / implicit flag (bit 31)
+;			A2	-	pointer to buffer containing transmit data
+;			A3	-	pointer to ADBBase
+
+@listen		SUBQ.B	#2,D2				; check for min length of 2
+			BHS.S	@minOK				; if >= 2, use it
+			MOVEQ	#0,D2				; otherwise use 0, which will become 2
+@minOK		SUBQ.B	#8-2,D2				; check for max length of 8
+			BLS.S	@maxOK				; if <= 8, use it
+			MOVEQ	#0,D2				; otherwise use 0, which will become 8
+@maxOK		ADDQ.B	#8,D2				; restore count
+			MOVE.B	D2,fDBCnt(A3)		; update buffer length
+			MOVE.L	A2,ListenBuffPtr(A3); save buffer starting address
+
+			BSR.S	@sendCmd			; send out the command byte
+			BEQ		@autoReply			; see if auto poll data returned instead
+
+			BSR.S	@sendFirstByte		; send the first byte
+			BNE.S	@noListenTimeout	; see if timeout occured
+			BSET	#fDBNoReply,FDBAuFlag(A3)	; indicate that no reply data was returned
+@noListenTimeout
+			BSR.S	@sendNextByte		; send the second byte
+			BNE.S	@sendLoop			; if no SRQ, send the data
+			BSET	#fDBSRQ,FDBAuFlag(A3)	; remember that a service request was returned
+
+@sendLoop	TST.B	fDBCnt(A3)			; see if end of buffer reached
+			BEQ.S	VIAReqDone			; leave when count is zero, no reply data
+			BSR.S	@sendNextByte		; send another byte
+			BRA.S	@sendLoop			; loop until count exhausted
+
+
+
+@sendFirstByte
+			MOVEQ	#(1<<vFDesk1),D1	; change from state 0 to state 1
+			BRA.S	@sendByte			; join common code
+
+@sendNextByte
+			MOVEQ	#(1<<vFDesk1)|\
+					(1<<vFDesk2),D1		; alternate between state 1 and state 2
+@sendByte	MOVEA.L	ListenBuffPtr(A3),A0; get the buffer pointer
+		eieioSTP
+			MOVE.B	(A0)+,vSR(A1)		; send the byte
+		eieioSTP
+			MOVE.L	A0,ListenBuffPtr(A3); update the buffer pointer
+			SUBQ.B	#1,fDBCnt(A3)		; decrement the send count
+		eieioSTP
+			EOR.B	D1,vBufB(A1)		; change the state
+		eieioSTP
+			MOVE.L	(SP)+,ShiftIntResume(A3); save resume address
+		eieioSTP
+			RTS							; return to callers caller, wait for interrupt
+
+
+;________________________________________________________________________________________
+;
+; Routine:	FDBShiftInt
+;
+; Inputs:	A1	-	pointer to base of VIA1
+;
+; Outputs:	A1	-	pointer to base of VIA1
+;			A3	-	pointer to ADBBase
+;			CCR	-	BEQ/BNE based on state of vFDBInt bit in VIA1's buffer B
+;
+; Trashes:	A0
+;
+; Function:	handles the shift register interrupt and resumes asynchronous processing
+;________________________________________________________________________________________
+
+FDBShiftInt	MOVEA.L	ADBBase,A3				; point to ADB globals
+			MOVEA.L	ShiftIntResume(A3),A0	;  and get the address to resume at
+		eieioSTP
+			BTST	#vFDBInt,vBufB(A1)		; test the FDBInt~ status
+		eieioSTP
+			JMP		(A0)					; resume async processing
+
+
+;________________________________________________________________________________________
+;
+; Routine:	VIAReqDone
+;
+; Inputs:	A3	-	pointer to ADBBase
+;
+; Outputs:	A2	-	pointer to receive data buffer
+;			A3	-	pointer to ADBBase
+;			D2	-	number of bytes of receive data
+;			D3	-	command byte (bits 0-7) + SRQ flag (bit 31)
+;
+; Trashes:	A0,D0,D1
+;
+; Function:	completion routine for servicing replies from the ADB transceiver
+;________________________________________________________________________________________
+
+VIAReqDone	MOVE.B	FDBAuFlag(A3),D0		; get the flags
+			MOVE.B	fDBCmd(A3),D1			;  and the command
+			MOVEQ	#(1<<fDBSRQ),D3			; mask to test for SRQ pending
+			AND.B	D0,D3
+			NEG.L	D3						; set bit 31 if SRQ pending
+			MOVE.B	D1,D3					; insert the command byte
+
+			LSR.B	#4,D1					; isolate the device address
+			TST.L	D3						; was there an SRQ?
+			BPL.S	@NoSRQ					; -> no, don't advance the poll address
+
+			MOVE.W	DevMap(A3),D2			; get the list of possible address to search
+			BSET	D1,D2					; if no other bits are set, come back to this one
+
+@SRQloop	ADDQ.B	#1,D1					; try the next address
+			ANDI.B	#$0F,D1					; wrapping around if needed (clear bit 7, autopoll addr change)
+			BTST	D1,D2					; is there a device with that address?
+			BEQ.S	@SRQloop				; -> no, try the next address
+
+@NoSRQ		MOVE.B	D1,PollAddr(A3)			; remember where to auto/SRQ poll next
+
+			LEA		fDBCnt(A3),A0			; point to the length byte of the buffer
+			MOVEQ	#0,D2					; zero extend the length
+			MOVE.B	(A0)+,D2				; get length of receive data
+			MOVEA.L	A0,A2					; point to the data buffer
+
+			CLR.B	FDBAuFlag(A3)			; clear the flags, especially fDBBusy
+			BTST	#fDBAPoll,D0			; see what kind of request completed
+			BNE.L	ImplicitRequestDone		; auto poll data returned, call handler
+			BRA.L	ExplicitRequestDone		; if explicit, call the completion routine
+
+
+		ENDIF								; {ViaADB}
+
+
+		IF ViaADB | hasEgret THEN
+;________________________________________________________________________________________
+;
+; Routine:	VIADebugPoll,EgretDebugPoll
+;
+; Inputs:	none
+;
+; Outputs:	none
+;
+; Trashes:	A0,A1,A3,...
+;
+; Function:	DebugUtil code to check if ADB data is available, for implementations that
+;			use the VIA1 shift register interrupt
+;________________________________________________________________________________________
+
+VIADebugPoll
+			JSR		([jCacheFlush])			; Temporary ╥fix╙ so that MacsBug works on Q700s. <SM4>
+EgretDebugPoll
+			MOVEA.L	VIA,A1					; point to the VIA
+		eieioSTP
+			BTST	#ifSR,vIFR(A1)			; is the shift register full?
+		eieioSTP
+			BEQ.S	@PollDone				; -> no, just return
+			MOVE.L	Lvl1DT+(4*ifSR),-(SP)	; get the handler address
+@PollDone	RTS								;  and call the interrupt handler
+
+		ENDIF
+
+
+		IF PwrMgrADB THEN
+;ееееееееееееееееееееееееееееееееееее Power Manager еееееееееееееееееееееееееееееееееееее
+
+			WITH	pmCommandRec
+
+;________________________________________________________________________________________
+;
+; Routine:	PMgrInitADB
+;
+; Inputs:	A3	-	pointer to ADBBase
+;
+; Outputs:	none
+;
+; Trashes:	A0
+;
+; Function:	initializes the ADB Manager for Power Manager based ADB
+;________________________________________________________________________________________
+
+PMgrInitADB	LEA		PMgrStartReq,A0			; setup the procedure to start an ADB request
+			MOVE.L	A0,StartReqProc(A3)
+			LEA		PMgrReqDone,A0			; get the address of the interrupt handler
+			MOVE.L	A0,Lvl1DT+(4*ifSR)		;  and install it as the SR interrupt receiver
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	PMgrEnableKbdNMI
+;
+; Inputs:	none
+;
+; Outputs:	none
+;
+; Trashes:	none
+;
+; Function:	Enables the NMI "programmer's key" on Power Manager based systems so we can
+;			break into a debugger if one is installed.  The reason this is an option is
+;			that if the key is turned on without a debugger, the unaware user can die a
+;			gory "deep shit" death if they hit the key accidentally.
+;________________________________________________________________________________________
+
+PMgrEnableKbdNMI
+			MOVEM.L	D0/A0,-(SP)
+			MOVE.B	#1,-(SP)				; buffer contains enable flag
+			MOVE.L	SP,-(SP)				;  pmRBuffer
+			MOVE.L	(SP),-(SP)				;  pmSBuffer
+			MOVE.W	#1,-(SP)				;  pmLength
+			MOVE.W	#$24,-(SP)				;  pmCommand = enable/disable keyboard NMI
+			MOVEA.L	SP,A0					; point to the parameter block
+			_PMgrOp							; send the command
+			LEA		pmRBuffer+4+2(SP),SP	; clean up the stack
+			MOVEM.L	(SP)+,D0/A0
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	PMgrStartReq
+;
+; Inputs:	A2	-	pointer to transmit data buffer
+;			A3	-	pointer to ADBBase
+;			D2	-	number of bytes of transmit data
+;			D3	-	command byte (bits 0-7) + implicit flag (bit 31)
+;
+; Outputs:	A1	-	pointer to base of VIA1
+;			A3	-	pointer to ADBBase
+;
+; Trashes:	A0,D0,D3
+;
+; Function:	sends an ADB request to the Power Manager and asynchronously waits for a reply
+;________________________________________________________________________________________
+
+PMgrStartReq
+			MOVEA.L	VIA,A1					; point to the base of VIA1
+		eieioSTP
+			MOVE.B	#(0<<ifIRQ)|\
+					 (1<<ifCB1),vIER(A1)	;  and disable the interrupt since it's set
+
+		eieioSTP
+			LEA		-12(SP),SP				; allocate a buffer on the stack
+			MOVEA.L	SP,A0					;  and point to it
+			MOVE.L	A0,-(SP)				;  pmRBuffer
+			MOVE.L	A0,-(SP)				;  pmSBuffer
+			MOVEQ	#3,D0					; transmit length is size of buffer + 3
+			ADD.B	D2,D0
+			MOVE.W	D0,-(SP)				;  pmLength
+			MOVE.W	#PMgrADB,-(SP)			;  pmCommand
+
+			MOVEQ	#(0<<pMgrAutoPoll)|\
+					 (0<<pMgrPollEnable),D0 ; explicit, poll disabled
+			TST.L	D3						; is this an explicit request?
+			BMI.S	@Implicit				; -> no, go set exerything up
+
+			BSET	#fDBExpActive,fDBAuFlag(A3)	; remember that an explicit command has been sent
+			BNE.S	@DontCall				; -> it's already been sent, so just exit
+			BRA.S	@Explicit
+
+@Implicit	MOVE.B	PollAddr(a3),d3			; get the auto/srq polling address
+			BMI.S	@DontCall				; -> already autopolling, so don't call to restart
+			TestFor	PMgrNewIntf				; does the PMGR do auto-polling?
+			BEQ.S	@oldPMGR				; -> no, let the CPU manage it
+			MOVE.B	#(1<<pMgrSetPoll)|\
+					 (1<<pMgrAutoPoll)|\
+					 (1<<pMgrPollEnable),D0 ; set autopoll, poll enabled if implicit
+			SWAP	D0
+			MOVE.W	DevMap(A3),D0			; pass the Polling Enable bit map
+			MOVE.L	D0,(A0)					; fill in our transmit buffer
+			MOVE.W	#4,pmLength(SP)			; reset count to 4 bytes for this command
+			BRA.S	@SendCmd				;  and send it
+
+@oldPMGR	MOVEQ	#1<<pMgrAutoPoll,D0		; set auto poll if implicit
+			LSL.B	#4,D3					; position the address
+			ORI.B	#talkCmd+0,D3			; make it a Talk R0 command
+
+@Explicit	MOVE.B	D3,(A0)+				;  command
+			MOVE.B	D0,(A0)+				;  flags
+			MOVE.B	D2,(A0)+				;  send data count
+			BRA.S	@CopyStart				; start the copy
+
+@CopyLoop	MOVE.B	(A2)+,(A0)+				; copy into the message buffer one byte at a time
+@CopyStart	DBRA	D2,@CopyLoop
+
+@SendCmd	MOVEA.L	SP,A0					; point to the parameter block
+			_PmgrOp							; send the request to the PMGR
+@DontCall	LEA		pmRBuffer+4+12(SP),SP	; clean up the stack
+
+		eieioSTP
+			MOVE.B	#(1<<ifIRQ)|\
+					 (1<<ifCB1),vIER(A1)	; re-enable PMGR interrupts
+		eieioSTP
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	PMgrReqDone
+;
+; Inputs:	A0	-	???????????????????????????????
+;			A3	-	pointer to ADBBase
+;
+; Outputs:	A2	-	pointer to receive data buffer
+;			A3	-	pointer to ADBBase
+;			D2	-	number of bytes of receive data
+;			D3	-	command byte (bits 0-7) + SRQ flag (bit 31)
+;
+; Trashes:	A0,D0,D1
+;
+; Function:	completion routine for servicing messages received from the PMGR
+;________________________________________________________________________________________
+
+PMgrReqDone	MOVEA.L	ADBBase,A3				; point to ADB globals
+
+			MOVE.B	(A0)+,D1				; get the command that completed
+			MOVE.B	(A0)+,D0				;  and the flags byte
+
+			MOVEQ	#(1<<pMgrSRQ),D3		; mask to test for SRQ pending
+			AND.B	D0,D3
+			NEG.L	D3						; set bit 31 if SRQ pending
+			MOVE.B	D1,D3					; insert the command byte
+
+;	Keep the ADB Parser program happy by updating the following variables.
+;	They are not used by this implementation, but we fill them in with
+;	approximate values to make the tool happy.
+
+			MOVE.B	D3,fDBCmd(A3)			; save the last ADB command
+			MOVE.B	D3,pollCmd(A3)			; assume that it was a poll command
+
+			LSR.B	#4,D1					; isolate the device address
+			BSET	#7,D1					; indicate no change in autopoll address needed
+
+			TestFor	PMgrNewIntf				; does the PMGR do auto-polling?
+			BEQ.S	@oldPMGR				; -> no, let the CPU manage it
+			BTST	#pMgrPollEnable,D0		; is polling enabled?
+			BNE.S	@noSRQ					; -> yes, skip
+			BCLR	#7,D1					; indicate a new autopoll address is needed
+			BRA.S	@noSRQ
+
+@oldPMGR	TST.L	D3						; was there an SRQ?
+			BPL.S	@noSRQ					; -> no, don't advance the poll address
+
+			MOVE.W	DevMap(A3),D2			; get the list of possible address to search
+			BSET	D1,D2					; if no other bits are set, come back to this one
+
+@SRQloop	ADDQ.B	#1,D1					; try the next address
+			ANDI.B	#$0F,D1					; wrapping around if needed (clear bit 7, autopoll addr change)
+			BTST	D1,D2					; is there a device with that address?
+			BEQ.S	@SRQloop				; -> no, try the next address
+
+@noSRQ		MOVE.B	D1,PollAddr(A3)			; remember where to auto/SRQ poll next
+
+			MOVEQ	#0,D2					; get the length of received data
+			MOVE.B	(A0)+,D2
+			MOVEA.L	A0,A2					; point to the data buffer
+
+			BTST	#pMgrAutoPoll,D0		; see what kind of request completed
+			BNE.S	@Implicit				; -> polling command, so figure out what to do
+
+			TestFor	PMgrNewIntf				; does the PMGR do auto-polling?
+			BNE.S	@Explicit				; -> yes
+			BCLR	#7,PollAddr(A3)			; indicate that PollAddr address should be used
+@Explicit	BCLR	#fDBExpActive,fDBAuFlag(A3)	; remember that it has completed
+			BRA.L	ExplicitRequestDone		; call the completion routine
+
+@Implicit	BRA.L	ImplicitRequestDone		; auto poll data was returned, so call the handler
+
+
+;________________________________________________________________________________________
+;
+; Routine:	PMgrDebugPoll
+;
+; Inputs:	none
+;
+; Outputs:	none
+;
+; Trashes:	A1
+;
+; Function:	DebugUtil code to check if ADB data is available
+;________________________________________________________________________________________
+
+PMgrDebugPoll
+			MOVEA.L	VIA,A1					; point to the VIA
+		eieioSTP
+			BTST	#ifCB1,vIFR(A1)			; does the PMgr have some data?
+		eieioSTP
+			BEQ.S	@PollDone				; -> no, just return
+			MOVE.L	Lvl1DT+(4*ifCB1),-(SP)	; get the handler address
+@PollDone	RTS								;  and call the interrupt handler
+
+
+		ENDIF								; {PwrMgrADB}
+
+
+
+		IF hasEgret THEN
+;ееееееееееееееееееееееееееееееееееееееее Egret еееееееееееееееееееееееееееееееееееееееее
+
+			WITH	EgretPB
+
+jEgretDispatch EQU	OSTable+($92*4)			; OS trap table entry for _EgretDispatch
+
+
+;________________________________________________________________________________________
+;
+; Routine:	EgretInitADB
+;
+; Inputs:	A3	-	pointer to ADBBase
+;
+; Outputs:	
+;
+; Trashes:	A0,A1
+;
+; Function:	initializes the ADB Manager for Power Manager based ADB
+;________________________________________________________________________________________
+
+EgretInitADB
+			LEA		EgretStartReq,A0		; setup the procedure to start an ADB request
+			MOVE.L	A0,StartReqProc(A3)
+			MOVE.W	#(specialPkt<<8)+\		; pbCmdType = special packet
+					 (aPoll<<0),\			; pbCmd = install/remove autopoll handler
+					 ImplicitEPB.pbCmdType(A3)	; init the param block
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	EgretStartReq
+;
+; Inputs:	A2	-	pointer to transmit data buffer
+;			A3	-	pointer to ADBBase
+;			D2	-	number of bytes of transmit data
+;			D3	-	command byte (bits 0-7) + implicit flag (bit 31)
+;
+; Outputs:	A1	-	pointer to base of VIA1
+;			A3	-	pointer to ADBBase
+;
+; Trashes:	A0,A1,A2,D0,D1,D2,D3
+;
+; Function:	sends an ADB request to Egret and asynchronously waits for a reply
+;________________________________________________________________________________________
+
+EgretStartReq
+			TST.L	D3						; is this an implicit request?
+			BPL.S	@Explicit				; -> no
+
+@Implicit	BTST	#fDBInit,fDBFlag(A3)	; is initialization happening?
+			BNE.S	@impDone				; -> yes, implicit commands are ignored
+			BSET	#fDBImpInited,fDBAuFlag(A3)	; has implicit command initialization occured?
+			BNE.S	@impDone				; -> yes, we're done
+
+			LEA		ImplicitEPB(A3),A0		; point to the autopoll parameter block
+			LEA		@ImplicitCompleted,A1	; handler address
+			MOVE.L	A1,pbCompletion(A0)		; install the handler
+			BSR		@SendToEgret			; install the autopoll handler
+
+			MOVE.L	#(pseudoPkt<<24)\		;  pcCmdType = pseudo packet
+					+(wrDevList<<16),D0		;  pbCmd = write device list
+			MOVE.W	DevMap(A3),D0			; pbParam = device map
+			BSR.S	@syncReq				; send command to specify auto polling addresses
+
+			MOVE.L	#(pseudoPkt<<24)\		;  pcCmdType = pseudo packet
+					+(aPoll<<16)\			;  pbCmd = autoPoll
+					+($FF<<8),D0			;  pbParam = $FF (only high byte is used)
+											; send command to start auto polling
+
+@syncReq	LEA		-EgretPBSize(SP),SP		; put a parameter block on the stack
+			MOVEA.L	SP,A0					;  and point to it
+			MOVE.L	D0,pbCmdType(A0)		; init pcCmdType, pbCmd, and high word of pbParam
+			CLR.L	pbCompletion(A0)		; no completion routine, sync call
+			BSR.S	@SendToEgret			; send the request off to the ADB micro
+			LEA		EgretPBSize(SP),SP		; deallocate the param block
+@ignoreExplicit
+@impDone	RTS								; auto-polling/srq data will arrive unsolicited from now on
+
+
+@ImplicitCompleted
+			MOVEQ	#(1<<EgSRQ),D3			; mask to test for SRQ pending
+		eieioSTP
+			AND.B	(A1)+,D3
+		eieioSTP
+			NEG.L	D3						; set bit 31 if SRQ pending
+		eieioSTP
+			MOVE.B	(A1)+,D3				; get the ADB command byte
+			MOVEQ	#0,D2					; zero extend the length
+		eieioSTP
+			MOVE.W	D0,D2
+			MOVEA.L	A1,A2					; get the buffer pointer
+			BSR		@FillInVars				; setup A3 and ADB globals for ADB Parser
+			BRA.L	ImplicitRequestDone		; return control to the ADB Manager
+
+
+@Explicit	BSET	#fDBExpRunning,fDBAuFlag(A3); explicit command starting, so exclude new ones
+			BNE.S	@IgnoreExplicit				; -> it's already in progress, so don't run it twice
+			MOVE.B	D3,ExplicitEPB.pbCmd(A3)	; setup the ADB command,
+			MOVE.W	D2,ExplicitEPB.pbByteCnt(A3);  byte count,
+			MOVE.L	A2,ExplicitEPB.pbBufPtr(A3)	;  buffer pointer
+
+			BSET	#fDBExpInited,fDBAuFlag(A3)	; see if explicit command initialization has occured
+			BNE.S	@expInited					; if already inited, no need to change anything
+
+			LEA		@ExplicitCompleted,A0			; explicit request completion routine address
+			MOVE.L	A0,ExplicitEPB.pbCompletion(A3)	; setup buffer pointer
+
+			LEA		ImplicitEPB(A3),A0		; point to the autopoll parameter block
+			CLR.L	pbCompletion(A0)		; no completion routine
+			BSR.S	@SendToEgret			; remove the auto poll handler
+
+			MOVE.L	#(pseudoPkt<<24)\		;  pcCmdType = pseudo packet
+					+(aPoll<<16)\			;  pbCmd = autoPoll
+					+($00<<8),D0			;  pbParam = $00 (only high byte is used)
+			BSR.S	@syncReq				; send command to stop auto polling
+
+@expInited	LEA		ExplicitEPB(A3),A0		; point to the param block
+@SendToEgret
+			MOVEQ	#0,D1					; zero the trapword flag bits (in case they ever get used)
+			MOVEA.L	jEgretDispatch,A2		; get the OSTrap table entry
+			JMP		(A2)					; _EgretDispatch, issue the request (asynchronously), return
+
+
+@ExplicitCompleted							; A0 points to the EgretPB
+			MOVEQ	#(1<<EgSRQ),D3			; mask to test for SRQ pending
+			AND.B	pbFlags(A0),D3
+			NEG.L	D3						; set bit 31 if SRQ pending
+			MOVE.B	pbCmd(A0),D3			; get the ADB command byte
+			MOVEQ	#0,D2					; zero extend the length
+			MOVE.W	pbByteCnt(A0),D2
+			MOVEA.L	pbBufPtr(A0),A2			; get the buffer pointer
+			BSR.S	@FillInVars				; setup A3 and ADB globals for ADB Parser
+			BCLR	#fDBExpRunning,fDBAuFlag(A3)	; explicit command completed, allow new ones
+
+;	Egret must check the ADB Device address against the Device Bitmap to see if the device exists.
+;	If it does not, force Egret to poll the mouse as the MRU device and keyboard as the LRU device.
+;	This fixes an Egret bug.
+
+			MOVE.W	Devmap(A3),D1			; get the ADB device Bitmap
+			btst.l	D0,D1					; does this device exist?
+			BNE.S	@ExpDone				; -> yes, done
+
+			LEA		-EgretPBSize(SP),SP		; put a parameter block on the stack
+			MOVEA.L	SP,A0					;  and point to it
+			CLR.L	pbCompletion(A0)		; no completion routine
+			MOVE.W	#(pseudoPkt<<8)+\
+					(Wr6805addr<<0),pbCmdType(A0)	; packet type & command
+			MOVE.W	#(MouseAddr<<12)+\		; put mouse address into bits 12-15 (MRU)
+					(KbdAddr<<4),-(SP)		;  and keyboard address into bits 4-7 (LRU)
+			MOVE.L	SP,pbBufPtr(A0)			; buffer pointer
+			MOVE.W	#MRUAddr,pbParam(A0)	; Egret address to write
+			MOVE.W	#2,pbByteCnt(A0)		; 2 bytes to write
+			_EgretDispatch					; issue the call
+			LEA		EgretPbSize+2(SP),SP	; clean up the stack
+
+@ExpDone	BRA.L	ExplicitRequestDone		; return control to the ADB Manager
+
+
+;	Keep the ADB Parser program happy by updating the following variables.
+;	They are not used by this implementation, but we fill them in with
+;	approximate values to make the tool happy.
+
+@FillInVars	MOVEA.L	ADBBase,A3				; point to ADB globals in low memory
+			MOVE.B	D3,fDBCmd(A3)			; last ADB command
+			MOVE.B	D3,pollCmd(A3)			; assume that it was a poll command
+			MOVE.B	D3,D0					; copy the command
+			LSR.B	#4,D0					; get the address
+			MOVE.B	D0,pollAddr(A3)			; assume that it was a poll address
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	CudaDebugEnter
+;
+; Inputs:	none
+;
+; Outputs:	none
+;
+; Trashes:	D0, D1, A0
+;
+; Function:	DebugUtil code to be executed when entering a debugger: turns off one-second
+;			interrupts
+;________________________________________________________________________________________
+
+CudaDebugEnter
+			; fall thru into EgretDebugEnter
+
+
+;________________________________________________________________________________________
+;
+; Routine:	EgretDebugEnter
+;
+; Inputs:	none
+;
+; Outputs:	none
+;
+; Trashes:	D0, D1, A0
+;
+; Function:	DebugUtil code to be executed when entering a debugger: turns off one-second
+;			interrupts
+;________________________________________________________________________________________
+
+EgretDebugEnter
+			MOVEQ	#0,D1					; turn off mode 3 clock data packets
+			BRA.S	EgretDebugCommon
+
+
+;________________________________________________________________________________________
+;
+; Routine:	CudaDebugExit
+;
+; Inputs:	none
+;
+; Outputs:	none
+;
+; Trashes:	D0, D1, A0
+;
+; Function:	DebugUtil code to be executed when exiting a debugger: turns on one-second
+;			interrupts
+;________________________________________________________________________________________
+
+CudaDebugExit
+			MOVEQ	#PDMDebugCont,D1		; continue PDM							<LW2>
+			BSR.S	EgretDebugPDM			;										<P3>
+			; fall thru into EgretDebugExit
+
+
+;________________________________________________________________________________________
+;
+; Routine:	EgretDebugExit
+;
+; Inputs:	none
+;
+; Outputs:	none
+;
+; Trashes:	D0, D1, A0
+;
+; Function:	DebugUtil code to be executed when exiting a debugger: turns on one-second
+;			interrupts
+;________________________________________________________________________________________
+
+EgretDebugExit
+			MOVEQ	#Mode3Clock,D1			; turn on mode 3 clock data packets
+EgretDebugCommon
+			MOVEQ	#EgretPBSize/2-1,D0
+@ClearPB	CLR.W	-(SP)					; zero all fields in the parameter block
+			DBRA	D0,@ClearPB				; (forces mode 0 and no completion vector)
+			MOVEA.L	SP,A0					; point to the parameter block
+			MOVE.W	#(pseudoPkt<<8)+\
+					 (Wr1SecMode<<0),pbCmdType(A0)	; set up the packet type and command
+			MOVE.B	D1,pbParam(A0)			; turn on/off Mode 3 clock data packets
+			_EgretDispatch					; turn on/off one-second interrupts
+			LEA		EgretPbSize(SP),SP		; clean up the stack
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	EgretDebugPDM
+;
+; Inputs:	D1 - contains the PDM Selector	
+;			Disable = 0, Enable = 1, Suspend = 2, Continue = 3
+;
+; Outputs:	none
+;
+; Trashes:	D0, D1, A0
+;
+; Function:	DebugUtil code to be executed when entering/exiting a debugger: 
+;			if Egret chip with Cuda firmware, suspend/continue PDM
+;________________________________________________________________________________________
+
+EgretDebugPDM
+			moveq	#EgretPBSize/2-1,d0		;											<P3>
+@ClearPB	clr.w	-(sp)					; zero all fields in the parameter block	<P3>
+			dbra	d0,@ClearPB				; (forces mode 0 and no completion vector)	<P3>
+			movea.l	sp,a0					; point to the parameter block				<P3>
+			move.w	#(PseudoPkt << 8) \	
+					+ EnDisPDM,pbCmdType(a0); Enable PowerDown Messages					<P3>
+			move.b	d1,pbParam(a0) 			; PDM Selector								<P3>
+			_EgretDispatch					;											<P3>
+			LEA		EgretPbSize(SP),SP		; clean up the stack						<P3>
+			rts
+
+
+		ENDIF								; {hasEgret}
+
+
+
+		IF IopADB THEN
+;еееееееееееееееееееееееееееееееееееееееее IOP ееееееееееееееееееееееееееееееееееееееееее
+
+			WITH	IOPRequestInfo
+
+			IMPORT	IOPInterrupt
+
+
+;________________________________________________________________________________________
+;
+; Routine:	IOPInitADB
+;
+; Inputs:	A3	-	pointer to ADBBase
+;
+; Outputs:	
+;
+; Trashes:	A0,A1
+;
+; Function:	initializes the ADB Manager for IOP based ADB
+;________________________________________________________________________________________
+
+IOPInitADB	LEA		IOPStartReq,A0			; setup the procedure to start an ADB request
+			MOVE.L	A0,StartReqProc(A3)
+
+;	initialize the XmtRequest message (all other fields remain zero)
+		eieioSTP
+			MOVE.B	#ADBIopNum,XmtRequest.irIOPNumber(A3)
+		eieioSTP
+			MOVE.B	#IOPRequestInfo.irSendXmtMessage,XmtRequest.irRequestKind(A3)
+		eieioSTP
+			MOVE.B	#ADBMsgNum,XmtRequest.irMsgNumber(A3)
+		eieioSTP
+			LEA		XmtMsg(A3),A0			; get pointer to message buffer
+		eieioSTP
+			MOVE.L	A0,XmtRequest.irMessagePtr(A3)
+		eieioSTP
+
+;	initialize the RcvRequest message (all other fields remain zero)
+
+		eieioSTP
+			MOVE.B	#ADBIopNum,RcvRequest.irIOPNumber(A3)
+		eieioSTP
+			MOVE.B	#IOPRequestInfo.irWaitRcvMessage,RcvRequest.irRequestKind(A3)
+		eieioSTP
+			MOVE.B	#ADBMsgNum,RcvRequest.irMsgNumber(A3)
+		eieioSTP
+			MOVE.B	#ADBMsg.ADBMsgSize,RcvRequest.irMessageLen(A3)
+		eieioSTP
+			LEA		RcvMsg(A3),A0			; get pointer to message buffer
+		eieioSTP
+			MOVE.L	A0,RcvRequest.irMessagePtr(A3)
+		eieioSTP
+			MOVE.L	A0,RcvRequest.irReplyPtr(A3)
+		eieioSTP
+			LEA		IOPReqDone,A0			; get handler pointer
+		eieioSTP
+			MOVE.L	A0,RcvRequest.irHandler(A3)
+		eieioSTP
+			LEA		RcvRequest(A3),A0		; setup pointer to param block
+		eieioSTP
+			_IOPMsgRequest					; install the Rcv message handler
+		eieioSTP
+			MOVE.B	#IOPRequestInfo.irSendRcvReply,RcvRequest.irRequestKind(A3)
+		eieioSTP
+			RTS
+
+
+;________________________________________________________________________________________
+;
+; Routine:	IOPStartReq
+;
+; Inputs:	A2	-	pointer to transmit data buffer
+;			A3	-	pointer to ADBBase
+;			D2	-	number of bytes of transmit data
+;			D3	-	command byte (bits 0-7) + implicit flag (bit 31)
+;
+; Outputs:	A3	-	pointer to ADBBase
+;
+; Trashes:	A0,A1,A2,D0,D1,D2
+;
+; Function:	sends an ADB request to the IOP and asynchronously waits for a reply
+;________________________________________________________________________________________
+
+IOPStartReq	MOVEQ	#ADBMsg.ADBData-ADBMsg+2,D0	; length of msg preceeding data +2 for implicit
+			ADD.B	D2,D0						; d0 := length of message buffer
+		eieioSTP
+			BCLR	#fDBUseRcvMsg,fDBAuFlag(A3)	; see which buffer/message to use
+		eieioSTP
+			BNE.S	@useRcv						; if rcv available, use it
+
+@useXmt		LEA		XmtRequest(A3),A0		; get the iop xmt request param block
+			LEA		XmtMsg(A3),A1			; use the xmt message buffer
+		eieioSTP
+			MOVE.B	D0,irMessageLen(A0)		; setup the message length
+		eieioSTP
+			BRA.S	@fillInReq				; fill in the remaining fields and exit
+
+@useRcv		LEA		RcvRequest(A3),A0		; get the iop rcv request param block
+			LEA		RcvMsg(A3),A1			; use the rcv message buffer
+		eieioSTP
+			MOVE.B	D0,irReplyLen(A0)		; setup the reply length
+		eieioSTP
+
+@fillInReq	
+		eieioSTP
+			MOVE.W	#(((1<<PollEnable)\		; setup ADBMsg.Flags, enable polling, assume implicit
+					+(1<<SetPollEnables))<<8)\	; indicate that DevMap is being passed
+					+2,Flags(A1)			; setup ADBMsg.DataCount = 2 (DevMap is 2 bytes long)
+		eieioSTP
+			TST.L	D3						; see if implicit
+		eieioSTP
+			BMI.S	@implicit				; if implicit, ADBCmd is ignored, send DevMap
+
+		eieioSTP
+			CLR.W	Flags(A1)				; setup ADBMsg.Flags, implicit, idle, DataCount
+		eieioSTP
+			BSET	#fDBExpActive,fDBAuFlag(A3)	; remember that an explicit command has been sent
+		eieioSTP
+			BNE.S	@SendToIOP				; if it had already been sent, just go idle
+
+		eieioSTP
+			MOVE.B	#(1<<ExplicitCmd),(A1)+	; setup ADBMsg.Flags, explicit command
+		eieioSTP
+			MOVE.B	D2,(A1)+				; setup ADBMsg.DataCount
+		eieioSTP
+			MOVE.B	D3,(A1)+				; setup ADBMsg.ADBCmd
+		eieioSTP
+			BRA.S	@copyStart				; start the copy
+		eieioSTP
+@copyLoop	
+		eieioSTP
+			MOVE.B	(A2)+,(A1)+				; copy into the message buffer one byte at a time
+		eieioSTP
+@copyStart	
+		eieioSTP
+			DBRA	D2,@copyLoop			; loop for all bytes
+		eieioSTP
+
+@SendToIOP	MOVEA.L	jIOPMsgRequest,A2		; get the OSTrap table entry
+			JMP		(A2)					; _IOPMsgRequest send the message (Asynchronously), return
+
+@implicit	
+		eieioSTP
+			MOVE.W	DevMap(A3),ADBData(A1)	; pass the Polling Enable bit map
+		eieioSTP
+			BRA.S	@SendToIOP				; pass it to the IOP
+
+
+;________________________________________________________________________________________
+;
+; Routine:	IOPReqDone
+;
+; Inputs:	A2	-	pointer to receive data buffer
+;			A3	-	pointer to ADBBase
+;			D2	-	number of bytes of receive data
+;			D3	-	command byte (bits 0-7) + SRQ flag (bit 31)
+;
+; Outputs:	A3	-	pointer to ADBBase
+;
+; Trashes:	A0,A1,A2,A3,D0,D1,D2,D3
+;
+; Function:	completion routine for servicing messages received from the IOP
+;________________________________________________________________________________________
+
+IOPReqDone	MOVEA.L	ADBBase,A3			; point to ADB globals in low memory
+		eieioSTP
+			MOVE.B	RcvMsg.Flags(A3),D0	; get flags telling what interrupt occurred
+			MOVEQ	#(1<<SRQReq),D3		; mask to test for SRQ pending
+			AND.B	D0,D3				; isolate the bit
+			NEG.L	D3					; set bit 31 if SRQ pending
+		eieioSTP
+			MOVE.B	RcvMsg.ADBCmd(A3),D3; get command that completed
+		eieioSTP
+
+;	keep the ADB Parser program happy by updating the following variables
+;	They are not used by this implementation, but we fill them in with approximate
+;	values to make the tool happy.
+
+		eieioSTP
+			MOVE.B	D3,fDBCmd(A3)		; last ADB command
+		eieioSTP
+			MOVE.B	D3,pollCmd(A3)		; assume that it was a poll command
+		eieioSTP
+			MOVE.B	D2,D2				; copy the command zzz should this be move.b d3,d2?
+			LSR.B	#4,D2				; get the address
+		eieioSTP
+			MOVE.B	D2,pollAddr(A3)		; assume that it was a poll address
+
+			MOVEQ	#0,D2				; zero extend the length
+		eieioSTP
+			MOVE.B	RcvMsg.DataCount(A3),D2	; get length of receive data
+		eieioSTP
+			LEA		RcvMsg.ADBData(A3),A2	; point to the data buffer
+		eieioSTP
+			BSET	#fDBUseRcvMsg,fDBAuFlag(A3)	; use the receive buffer for the reply
+			BTST	#ExplicitCmd,D0		; see if explicit or implicit
+			BEQ.L	ImplicitRequestDone	; if implicit
+		eieioSTP
+			BCLR	#fDBExpActive,fDBAuFlag(A3)	; remember that it has completed
+		eieioSTP
+			BRA.L	ExplicitRequestDone	; if explicit
+
+
+;________________________________________________________________________________________
+;
+; Routine:	IOPRunKBD
+;
+; Inputs:	
+;
+; Outputs:	
+;
+; Trashes:	
+;
+; Function:	code to handle keyboard polling in a debugger
+;________________________________________________________________________________________
+
+IOPRunKBD	MOVE.L	#(%00001000<<24)+\		; allow xmt msg 3
+					(%00001000<<16)+\		; allow rcv msg 3
+					(0<<8)+\				; this byte must be zero
+					1,d0					; ADB is on SWIM IOP (IOP 1)
+			BRA.L	IOPInterrupt			; go handle the interrupt
+
+
+			ENDWITH							; {IOPRequestInfo}
+
+		ENDIF								; {IopADB}
+
+
+
+;ееееееееееееееееееееееееееееееееееее Miscellaneous еееееееееееееееееееееееееееееееееееее
+
+
+		IF hasOrwell THEN					;													<H2>
+;________________________________________________________________________________________
+;
+; Routine:	QuadraDebugPoll
+;
+; Inputs:	none
+;
+; Outputs:	none
+;
+; Trashes:	A1, D0, D1
+;
+; Function:	checks if the Caboose-style keyswitch is in the POWER OFF position, and if
+;			so, turns the system off.
+;
+;			NOTE: A side effect of reading the keyswitch (VIA2, vBufB) is that if there
+;				  are any pending sound interrupts, they'll be cleared in the VIA (design
+;				  flaw?).  Therefore, if there are any pending interrupts, it will diddle
+;				  with Batman to regenerate the interrupt in the VIA.
+;________________________________________________________________________________________
+
+QuadraDebugPoll
+			MOVEQ	#v2PowerOff,D1			; which bit to test in VIA2 vBufB
+			BSR.S	QuadraCheckKeyswitch	; is the keyswitch in the POWER OFF position?
+			BNE.S	IOPRunKBD				; -> no, go do the keyboard polling
+
+@PowerOff	_PowerOff						; kill the power
+			BRA.S	@PowerOff
+
+
+;________________________________________________________________________________________
+;
+; Routine:	QuadraCheckSecure
+;
+; Inputs:	A3	-	pointer to ADBBase
+;
+; Outputs:	CCR	-	BNE: call the handler, BEQ: skip it
+;
+; Trashes:	A1, D0, D1
+;
+; Function:	checks if the Caboose-style keyswitch is in the SECURE position (and if so,
+;			the ADB Manager won't call the device completion routines)
+;
+;			NOTE: A side effect of reading the keyswitch (VIA2, vBufB) is that if there
+;				  are any pending sound interrupts, they'll be cleared in the VIA (design
+;				  flaw?).  Therefore, if there are any pending interrupts, it will diddle
+;				  with Batman to regenerate the interrupt in the VIA.
+;________________________________________________________________________________________
+
+QuadraCheckSecure
+			MOVEQ	#v2Keyswitch,D1			; which bit to test in VIA2 vBufB
+
+QuadraCheckKeyswitch
+@switchOffset EQU	$80						; bit 7 is a don't care to the VIA2 decode
+
+			MOVEA.L	VIA2,A1					; point to VIA2
+		eieioSTP
+			MOVE.B	vBufB+@switchOffset(A1),D0	; read the keyswitch register, clearing interrupts (GAG)
+		eieioSTP
+			BTST	#ifCB1,vIFR(A1)			; do we think a sound interrupt is still pending?
+		eieioSTP
+			BNE.S	@HaveInt				; -> yes, we're done
+
+			MOVEA.L	ASCBase,A1				; point to Batman
+			CMPA.L	#-1,A1					; is it setup yet?
+			BEQ.S	@HaveInt				; -> no, bail
+
+			MOVE	SR,-(SP)				; save the status register
+			ORI		#NoIntMask,SR			;  and disable all interrupts
+
+		eieioSTP
+			TST.B	bmIntControlA(A1)		; is the channel A interrupt enabled?
+		eieioSTP
+			BNE.S	@NoChannelA					; -> no
+		eieioSTP
+			MOVE.B	#1,bmIntControlA(A1)	; disable channel A interrupts,
+			NOP								;  give Batman time to process the disable,
+			CLR.B	bmIntControlA(A1)		;   and clear the interrupt mask to regenerate
+
+@NoChannelA	
+		eieioSTP
+			TST.B	bmIntControlB(A1)		; is the channel B interrupt enabled?
+		eieioSTP
+			BNE.S	@NoChannelB				; -> no
+		eieioSTP
+			MOVE.B	#1,bmIntControlB(A1)	; disable channel B interrupts,
+			NOP								;  give Batman time to process the disable,
+			CLR.B	bmIntControlB(A1)		;   and clear the interrupt mask to regenerate
+		eieioSTP
+
+@NoChannelB	MOVE	(SP)+,SR				; restore the status register
+
+@HaveInt	BTST	D1,D0					; test the bit we're interested in (0 = switch on)
+			RTS
+
+
+		ENDIF								; {hasOrwell}
+
+
+			END

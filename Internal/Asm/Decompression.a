@@ -1,0 +1,268 @@
+;
+;	File:		Decompression.a
+;
+;	Contains:	Equates for patch to Resource Manager's CheckLoad hook for resource decompression.
+;
+;	Written by:	Donn Denman, Greg Marriott (but he never ever works on compression any more)
+;
+;	Copyright:	© 1990-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <1>	 4/14/92	stb		first checked in
+;		<19>	 4/14/91	stb		<sm1>stb Add to SuperMario project for use by ResourceMgr.a.  Corrected some speling.
+;		<18>	  7/9/91	JSM		No need to define SysVers here.
+;		<17>	 1/30/91	gbm		sab, #38: Change the name of one of the decompressor header
+;									files (because Sheila said it was okay)
+;		<15>	  9/3/90	gbm		add knowledge of newer header formats. Compressed resources with
+;									formats higher than 8 have a more general header format. A new
+;									header format is necessary for the latest defProc (2), also
+;									known as  GreggyBits :).
+;		 <9>     4/19/90	DD		added Equ's for RunLengthEncoding and DeltaEncoding.
+;		 <8>     4/12/90	DD		pulled Max1ByteReuse since we now have multiple dcmp's with 
+;									different values for Max1ByteReuse.
+;		 <7>	 3/23/90	DD		changed Max1ByteReuse to 40, to match DeCompressDefProc.a
+;		 <6>	 1/18/90	DD		added ResourceTemplate Record to go with new DeCompressPatch.a
+;		 <5>	 3/7/90		PAT		put a ";" in place of the "#" which previously
+;									preceded commment <4> directly below.
+;		 <4>	 1/18/90	DD		put conditional around the header
+;		 <3>	 1/18/90	DD		reorganized the resource header for extended         attribute
+;									resources, and compressed flavor         extended attribute
+;									resources
+;	To Do:
+;
+;		Rip the guts out, and do it all over.
+;
+
+	include	'InternalMacros.a'	; for ENDRSize
+	
+DoDebug			EQU	0		;0-no, 1-error breaks, 2-Head/tail, 3-all breaks.
+DoFullList		EQU	0		;give a full listing.
+
+****************************************
+*
+* Macro definitions.
+*
+****************************************
+
+	MACRO				; all this hassle just to get the version
+	MakeVersion	&Vers	;	from a variable
+	STRING	PASCAL
+	dc.b	'&Vers'		; ascii version (blanks for Intl?)
+	STRING	ASIS
+	ALIGN	 2
+	ENDM
+
+	MACRO				; all this hassle just to get the date
+	MakeADate			;	from a variable
+	GBLC	&CurDate
+	dc.b	'&CurDate'	; ascii date.
+	ENDM
+
+;---------------------------------------------------
+; Macro to break into debugger if NE.
+
+		Macro
+		BreakError &A
+		IF	DoDebug > 0	THEN
+			STRING PASCAL
+			PEA	#&A
+			dc.w	$abff
+			STRING ASIS
+		ENDIF
+		ENDM
+
+;---------------------------------------------------
+; Macro to break into debugger if ResErr NE.
+		
+		Macro
+		BreakResError
+		IF	DoDebug 	Then
+		Tst.W	ResErr
+		Beq.S	@2
+		Move.W	ResErr,D0
+;		_Debugger
+@2
+		ENDIF
+		ENDM
+
+****************************************
+*
+* MACRO HEAD, TAIL  routine headers
+*
+****************************************
+;---------------------------------------------------
+; Head and Tail macros for the beginning end end of subroutines.
+;	generates a label for the debugger IFF DoDebug > 1.
+
+		Macro
+&Lab		HEAD	&LinkSiz						;with label parameter
+&Lab											;generate the label
+		GBLA	&HaveLink
+&HaveLink	SetA	1
+		IF	DoDebug>1 	Then
+		Link	A6,#&Default(&LinkSiz,'0')
+		GBLC	&DebugLabel			;parameter to pass the label.
+&DebugLabel	SetC	&Lab				;pass the label to the Tail Macro.
+		ElseIF	&LinkSiz<>'' THEN
+		Link	A6,#&Default(&LinkSiz,'0')
+		Else
+&HaveLink	SetA	0
+		ENDIF
+		ENDM
+		
+		Macro
+		TAIL
+		GBLA	&HaveLink
+		GBLC	&DebugLabel
+		IF 	&HaveLink	Then
+			Unlk	A6
+		EndIF
+		Rts
+		IF 	DoDebug>1 	Then
+			LclA	&i
+			LclA	&c
+			While	&i<(&Len(&DebugLabel)+1)	Do
+				IF	&i=0 Then
+&c					SetA	(&Len(&DebugLabel)+128)
+				Else
+&c					SetA	&Ord(&Default(&SubStr(&DebugLabel,&i,1),' '))
+				EndIF
+				DC.B	&c
+&i				SetA	&i+1		
+			EndWhile
+		Align	2
+		EndIF
+		EndM
+
+;---------------------------------------------------
+; Break to debugger macro
+		Macro
+		BREAK &A
+		IF	DoDebug > 2	THEN
+			STRING PASCAL
+			PEA	#&A
+			dc.w	$abff
+			STRING ASIS
+		ENDIF
+		ENDM
+
+;---------------------------------------------------
+; Break to debugger on nonzero ResErr
+
+		Macro
+		TrapResError
+		IF		DoDebug 	Then
+		Tst.W	ResErr
+		Beq.S	@2
+		Move.W	ResErr,D0
+		_Debugger
+@2
+		ENDIF
+		ENDM
+
+*********************************************************************
+*
+*  Global Equates
+*
+*********************************************************************
+DeCompressDefType	EQU	'dcmp'		; res type of the decompressor def proc.
+ResDeCompress		Equ	ResLoad+1	; need a real low memory global for this.
+
+resExtended			EQU	0		; This resource has extended attributes.
+resCompressed		EQU	0		; This resource is compressed on disk.
+
+
+*********************************************************************
+*
+*  Compressor/Decompressor Equates
+*
+*********************************************************************
+PosEncodedWord		EQU	0		;posative encoded word in input stream.
+NegEncodedWord		EQU	1		;replace this part of pattern with a negative encoded value?
+RawWord				EQU	2		;should we copy a word from the input?
+RawLong				EQU	3		;encoded value should be treated as a long.
+SignExtendedByte	EQU	4		;sign extend a byte from input into a word.
+EncodedLong			EQU	5		;should we replace with a long?
+maxReplacement		EQU	6		;end of substitution list.
+
+
+;---------------------------------------------------------------------------------
+;
+;	RECORD ExtendedResource
+;
+;	Template for an ExtendedResource header.  Taken from DecompressorPatch.Equ
+;
+;---------------------------------------------------------------------------------
+ExtendedResource	Record	0
+signature			DS.L	1		;used for robustness.  Tells if data is compressed now.
+headerLength		DS.W	1		;length of this header in bytes.
+headerVersion		DS.B	1		;number of items in this header. ( must be < 128 ).
+extendedAttributes	DS.B	1		;extension to the attributes for this resource.
+actualSize			DS.L	1		;the size after decompression, or just minus the header.
+extendedData		DS.B	0		;start of data for a normal extended attribute resource.
+endOfExtHeader		EQU		*
+; Donn's Compressed Resources also have the following fields.
+
+varTableRatio		DS.B	1		;number of 256ths of unpacked size needed for var table. 		
+overRun				DS.B	1		;number of bytes of overrun to expect during decompress.
+decompressID		DS.W	1		;ID of the decompression algorithem used (0 for default).
+cTableID			DS.W	1		;ID of the compression table, or 0.
+compressedData		DS.B	0		;compressed data starts here.
+
+; Future compressed resources have these fields
+					ORG		endOfExtHeader
+defProcID			DS.W	1
+decompressSlop		DS.W	1
+endOfDecompressCommon	EQU	*
+
+; Greg's extended resources have these fields
+					ORG		endOfDecompressCommon
+byteTableSize		DS.B	1
+compressFlags		DS.B	1
+					EndRSIZE
+
+CurHeaderVersion	EQU	8			; version number of Donn's header.
+GreggyHeaderVersion	EQU	9			; version number of GreggyBits
+
+byteTableSaved		EQU		0		; bit zero of the compressFlags byte (see ExtendedResource record above)
+bitmappedData		EQU		1		; bit 1 of compressFlags byte
+greggyBits			EQU		2		; ID of decompressor resource for Greg's scheme
+
+; Disk format of an Extended Resource.
+
+ExtResRecord		Record	0
+ResSize				DS.L	1
+ResHeader			DS.L	ExtendedResource
+ResHeaderSize		DS.L	0
+			EndR
+		
+ResourceTemplate	Record	0
+ResFrame			DS.L	ExtResRecord
+ResTemplateSize		DS.L	0
+			EndR
+		
+
+
+TwoByteValue		Equ	128		;integers below this value are one byte.
+FourByteValue		Equ	255		;encoding used for long values.
+
+
+JumpTableTransCode		Equ	0	;Extended Opcode variations:
+EntryVectorTransCode	Equ	1	; Entry Vector, Jump Table.
+RunLengthByteTransCode	Equ	2	; RunLength by bytes
+RunLengthWordTransCode	Equ	3	; RunLength by words
+DiffWordTransCode		Equ	4	; difference trans by words
+DiffEncWordTransCode	Equ	5	; difference trans with encoded words
+DiffEncLongTransCode	Equ	6	; difference trans with encoded longs
+
+RobustnessData	Equ	$A89F6572	;unimplemented instruction, followed by 'er', used as signature.
+		
+; Local storage for Decompressor.
+		
+VarTableRec		Record	0
+NextVarIndex	DS.W	1			;index past last variable
+VarsList		DS.W	1			;self relative pointer to a string.
+VarRecSize		DS.W	0			;size of a var table record.
+	EndR
+

@@ -1,0 +1,2327 @@
+;----------------------------------------------------------------------------------------------
+;
+;	File:		SCSIMgrNew.a
+;
+;	Written by:	Jerry Katzung
+;
+;	Copyright:	© 1989-1992 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM6>	 11/3/92	SWC		Changed SCSIEqu.a->SCSI.a.
+;	   <SM5>	  6/2/92	kc		Revert to <SM3>
+;	   <SM4>	  6/1/92	CS		Roll more cyclone stuff in.
+;	   <SM3>	 5/17/92	kc		Include PowerPrivEqu.a. The powerCntl equ was moved inside the
+;									pmCommandRec record.
+;		 <8>	  5/1/92	JSM		Get rid of conditionals: don’t use not forROM, this file is only
+;									used in ROM builds, don’t use hasGDU, isUniversal, or onMacXX
+;									style conditionals, left padForOverPatch conditionals for now.
+;		 <7>	 1/15/92	KC		Fixed "short branch to the next instruction changed to NOP"
+;									warning.
+;		 <6>	 9/16/91	JSM		Cleanup header.
+;		 <5>	 9/21/90	BG		Removed <4>. 040s are behaving more reliably now.
+;		 <4>	 7/20/90	BG		Added EclipseNOPs for flakey 040s.
+;		 <3>	 5/16/90	MSH		Added hasPowerControls to hcmac conditional.
+;		 <2>	 1/11/90	CCH		Added include of “HardwarePrivateEqu.a”.
+;	   <1.5>	 9/11/89	jwk		NEEDED FOR F19 - Support for Disc during DMA, Mac SE and Mac
+;									Plus support
+;	   <1.4>	 7/24/89	jwk		NEEDED FOR AURORA - Unlink w/ ioQElSize to fix alt. bus call bug
+;	   <1.3>	 7/17/89	jwk		NEEDED FOR AURORA - Fixed "Command" routine to use scsiCmdOffs
+;									ptr
+;	   <1.2>	 7/15/89	jwk		NEEDED FOR AURORA - Added code review changes, F19 support
+;									routines
+;	   <1.1>	 6/29/89	jwk		NEEDED FOR AURORA - Fixed Tape Drive and Slow Write timing bugs
+;	   <1.0>	 6/13/89	jwk		Reorganizing SCSI sources to be Universal-ROM friendly
+;
+;----------------------------------------------------------------------------------------------
+;
+;	Old comments are saved for historical purposes in the SCSIMgrOld.a file.	<v1.2>
+;
+;----------------------------------------------------------------------------------------------
+
+			BLANKS		ON
+			STRING		ASIS
+			PRINT		OFF
+
+
+	IF (&TYPE('dbSymbols') = 'UNDEFINED') THEN
+dbSymbols		EQU		0						; for debugging purposes		<v1.5>
+	ENDIF
+
+	IF (&TYPE('phaseLogging') = 'UNDEFINED') THEN
+phaseLogging	EQU		0
+	ENDIF
+
+
+			LOAD		'StandardEqu.d'
+			INCLUDE		'HardwarePrivateEqu.a'
+			INCLUDE 	'SCSI.a'
+			INCLUDE 	'SCSIPriv.a'
+			INCLUDE		'PowerPrivEqu.a'
+
+			PRINT		ON
+
+SCSINew		PROC		EXPORT
+
+			WITH	scsiPB,scsiPrivPB, scsiGlobalRecord, dcInstr, machSpecRecord
+
+			EXPORT	ClearBus
+
+			EXPORT	DataDMA															;<v1.2>
+			EXPORT	DataIO,			Command,		StatusPhase,	ResetBus,		MsgOut, MsgIn
+			EXPORT	msgCmdComplete,	msgSaveDataPtr,	msgRestorePtrs,	msgDisconnect
+			EXPORT	msgIdentifyIn,	msgMsgRejIn,	msgInvalidIn,	msgLCCF
+			EXPORT	msgInvalidOut,	msgIdentifyOut,	msgNoOp,		msgMsgRejOut,	msgKillIO
+			EXPORT	msgBusDevRst																;<v1.5>
+			EXPORT	Preflight,		EnDequeue
+			EXPORT	Message,		SCSIDT,			Find,			Setup,			TimeTask
+			EXPORT	ClearState,		SetTimer,		LogError						;<v1.2>
+
+			EXPORT	NewSCSITrap
+			EXPORT	DoRequestIO,	DoKillIO,		DoBusInfo,		AltBusCall
+
+			WITH	scsiPB,scsiPrivPB, scsiGlobalRecord, dcInstr, PmgrRec
+
+;-------------------------------------------------------------
+;
+;	The new and improved SCSI Manager.
+;
+;	A4 is set up by StdEntry and contains a pointer to the SCSI Manager global
+;	area in the system heap.
+;
+;
+;	Register convention:
+;
+;				Old SCSI Mgr							New SCSI Mgr
+;
+;			a0 - scratch								scratch
+;			a1 - scratch								scratch
+;			a2 - buffer pointer							buffer pointer
+;			a3 - SCSI read base pointer					SCSI read base pointer
+;			a4 - SCSI Mgr globals pointer				SCSI Mgr globals pointer
+;			a5 - n/a									active request pointer
+;
+;			d0 - scratch (result)						scratch
+;			d1 - scratch (bytes left)					scratch
+;			d2 - scratch (count)						scratch
+;			d3 - scratch (6)							scratch
+;			d4 - scratch (data transfer flags)			data transfer flags
+;			d5 - scratch								data-chaining instruction ptr
+;			d6 - scratch/patches' SCSI write offset		SCSI write offset for patches
+;			d7 - zero register							zero register
+;
+
+;
+;	NewSCSITrap
+;
+;	Called by:	OS trap dispatcher.
+;
+;	Calls:		Preflight, ResetBus, Message
+;
+;	On entry:	a0 - pointer to SCSI request parameter block
+;				d0 - routine selector
+;
+;	On exit:	d0 - result code (OSErr)
+;
+;	Function:	This routine is responsible for implementing the various new SCSI Mgr routines.
+;				The new SCSI Mgr routines are dispatched OS traps, with a selector passed in d0.
+;				It checks the parameter block, enqueues the request, and starts processing it if
+;				it is the only request in the queue.  Returns an OSErr to describe what happened.
+;
+
+NewSCSITrap:
+			movem.l	scsiRegs,-(sp)				; save registers
+			movea.l	SCSIGlobals,a4				; get pointer to SCSI Manager globals		<v1.7>
+
+NewSCSICommon									;											<v1.2>
+			move.l	a0,a5						; set up pointer to the request				<v1.2>
+			move.l	base5380(a4),a3				; SCSI chip read base address
+			moveq.l	#0,zeroReg					; set up the "zero register"
+@checkBusID
+			tst.w	scsiBus(a5)					; is it for the motherboard ?
+			beq.s	@checkCall					; keep going, it's for us
+@sendItOff
+			movea.l	jvAltBusCall(a4),a0			; get addr of alternate SCSI bus call
+			jsr		(a0)						; pass the call off to the other SCSI bus
+			bra.s	@exit						; let's get out of here
+@checkCall
+			cmpi.w	#scsiNewSCSIMax,d0			; valid selector ?
+			bls.s	@goodSelector				; if so, call the appropriate routine
+@SCSIOops
+			move.w	#scsiBadPBErr,d0			; tell driver that call is not implemented	<v1.2>
+			bra.s	@exit						; return the error message
+@goodSelector
+			lea.l	newSCSIDisp(a4),a0			; point to base of NewSCSI dispatch table
+
+			movea.l	0(a0,d0.w*4),a0				; get address of trap code					<v1.2>
+
+			jsr		(a0)						; call the appropriate trap code
+@exit
+			movem.l	(sp)+,scsiRegs				; restore registers (d0 is not restored)
+			rts
+
+;
+;	Send a synchronous control call to the other SCSI bus.
+;	Map any errors to "scsiBadPB".
+;
+AltBusCall:
+			lea.l	-ioQElSize(sp),sp			; reserve storage for control PB			<v1.2>
+			movea.l	sp,a0						; point to Control PB
+			move.w	scsiBus(a5),ioRefNum(a0)	; SCSI bus ID is the driver refnum
+			move.w	d0,csCode(a0)				; pass NewSCSI selector to driver
+			move.l	a5,csParam+4(a0)			; pass pointer to scsiPB in Control PB
+			_Control							; send it off synchronously
+			lea.l	ioQElSize(sp),sp			; clean up the stack						<v1.4>
+			beq.s	@exit						; if no error, then we can leave
+			move.w	#scsiBadPBErr,d0			; map all errors into "bad PB" errors		<v1.2>
+@exit
+			rts
+;
+;	Perform a SCSIRequestIO call
+;
+DoRequestIO:
+			movea.l	jvPreflight(a4),a0			; get address of routine
+			jsr		(a0)						; preflight the parameter block
+			bne.s	@exit						; get out
+@goodPB
+			moveq.l	#scNewRequest,d0			; we've got a new request to process
+			move.l	a5,d1						; ptr to parameter block
+			movea.l	jvMessage(a4),a0			; addr of deferred task messaging routine
+			jsr		(a0)						; send the message
+			moveq.l	#noErr,d0					; queueing was successful
+			move.l	scsiMgrFlags(a5),d1			; get SCSI flags
+			btst.l	#scsiBAsync,d1				; is the async bit set ?
+			bne.s	@exit						; if async, then exit
+@wait
+			tst.w	scsiResult(a5)				; wait for a change to negative or zero
+			bgt.s	@wait						; if greater than zero, keep waiting
+@exit
+			rts
+;
+;	Perform a SCSIKillIO call
+;	Could be graceful here; instead, reset the SCSI bus, killing all aboard.
+;
+DoKillio:
+			movea.l	jvResetBus(a4),a0			; addr of "reset SCSI bus" routine
+			jsr		(a0)						; reset the bus, and kill all I/O requests
+			moveq.l	#noErr,d0					; it worked (imagine that)
+			rts									; we're done
+;
+;	Perform a SCSIBusInfo call
+;
+DoBusInfo:
+			moveq.l	#noErr,d0					; assume no error							<v1.2>
+			move.w	scsiVersion(a5),d1			; get the selector							<v1.2>
+			bne.s	@check1						; if nonzero, check if it is a 1			<v1.2>
+			move.l	zeroReg,d1					; clear upper bits							<v1.2>
+			move.b	state2(a4),d1				; return our SCSI Mgr revision level		<v1.2>
+			move.l	d1,scsiQLink(a5)			; return the result							<v1.2>
+			rts									; we're done								<v1.2>
+@check1
+			subq.l	#1,d1						; what's our byte-to-byte timeout ?
+			bne.s	@check2						; check if it is a 2
+			move.l	busTO(a4),scsiQLink(a5)		; return the result							<v1.2>
+			rts									; we're done								<v1.2>
+@check2
+			subq.l	#1,d1						; do we have a SCSI DMA channel ?
+			bne.s	@SCSIOops					; if not, we have an unimplemented selector
+			move.l	G_Reserved0(a4),d1			; get machine info (including SCSI DMA)	<v1.1><v1.2>
+			andi.l	#1<<sSCSIDMAExists,d1		; mask for DMA bit (clears other bits) 	<v1.1><v1.2>
+			beq.s	@DMArslt					; return zero if no DMA 				<v1.1><v1.2>
+			moveq.l	#1,d1						; return one if DMA 					<v1.1><v1.2>
+@DMArslt	move.l	d1,scsiQLink(a5)			; return the result 					<v1.1><v1.2>
+			rts									; we're out of here							<v1.2>
+
+@SCSIOops
+			move.w	#scsiBadPBErr,d0			; tell driver that call is not implemented	<v1.2>
+			rts									; return the result
+
+;
+;	ResetBus - Reset the SCSI bus and kill all the requests in the queue.
+;
+;	Calls:		ClearState
+;
+ResetBus:
+			move.w	sr,-(sp)
+			ori.w 	#HiIntMask,sr				; no more interrupts
+			move.b	#iRST,sICR+WrOffs(a3)		; assert SCSI Reset line
+			lea.l	scsiQHead(a4),a5			; load pointer to first request in the queue
+			lea.l	dummy(a4),a1				; point to dummy parameter block
+			move.w	#scsiBusResetErr,d0			; report that SCSI bus was reset			<v1.2>
+			movea.l	jvClearState(a4),a0			; addr of clear request routine
+@loop
+			movea.l	scsiQLink(a5),a5			; point to the next request					<v1.2>
+			cmp.l	a5,zeroReg					; are we done ?
+			beq.s	@delay1						; if so, delay for good measure				<v1.2>
+			cmpa.l	a1,a5						; are we pointing at the dummy PB ?
+			beq.s	@killOldPB					; if so, kill it differently
+			jsr		(a0)						; kill off the new SCSI Mgr PB
+			bra.s	@loop						; keep going
+@killOldPB
+			moveq.l	#scsiOldSCSIErr,d1			; pretend old SCSI Mgr is killing this request
+			exg.l	d0,d1						; switch error messages
+			jsr		(a0)						; kill the request
+			exg.l	d0,d1						; restore the error message
+			bra.s	@loop						; keep going
+@delay1
+			move.w	TimeDBRA,d0					; DBRAs/ms.									<v1.2>
+			lsr.w	#2,d0						; 1 ms./4 = 250 us.	<C859>					<v1.2>
+@delay
+			dbra	d0,@delay					; twiddle our thumbs...
+			move.b	zeroReg,sICR+WrOffs(a3)		; de-assert *RST
+			movea.l	jvClearIRQ(a4),a0			; routine to clear interrupt request
+			jsr		(a0)						; clear 5380's IRQ
+			move.w	(sp)+,sr					; restore interrupts
+
+			move.w	TimeDBRA,d0					; DBRAs/ms.
+			mulu.w	#500,d0						; delay 500 msec for recovery	<C859>
+			move.l	d0,d1
+			swap	d1							; get high word for dbra
+@2			dbra	d0,@2						; low word
+			dbra	d1,@2						; high word
+
+			btst.b	#sSCSIDMAExists,G_Reserved0+3(a4)	; do we have a SCSI DMA chip ?	<2.8>
+			beq.s	@DMAdone					; if not, skip it						<2.8>
+
+			move.l	#iINTREN,sDCTRL(a3)			; turn off hhsk						<C914>	<v1.2>
+@DMAdone										;										<2.8>
+
+			move.b	zeroReg,sMR+WrOffs(a3)		; make certain of SCSI mode
+			rts
+
+;
+;	EnDequeue
+;
+;	Called by:	ClearState, Message, SCSIGet
+;
+;	On entry:	a1		- ptr to "scsiPB" to enqueue/dequeue
+;				d0.l	- selector:
+;				enqueueFlag (bit 31): 1 = enqueue, 0 = dequeue
+;				values:
+;					enqNormal = Enqueue at end of queue
+;					enqFront  = Enqueue at front of queue
+;					deqNormal = Dequeue 1 request (linked commands are elevated)
+;					deqLinked = Dequeue linked cmds completely (to cleanly kill linked cmds)
+;
+;	Function:	Removes a SCSI request from the SCSI request queue
+;
+EnDequeue:
+			move.w	sr,-(sp)					; preserve status
+			ori.w 	#HiIntMask,sr				; disable interrupts for exclusion
+			btst.l	#enqueueFlag,d0				; is this an enqueue request ?
+			bne.s	@enqueue					; if so, enqueue the PB
+;
+; dequeue the request
+;
+@dequeue
+			movem.l a2-a3,-(sp) 				; preserve work registers
+			move.l	scsiQHead(a4),a2			; start searching at the head
+			move.l	a2,a3
+@deqLoop
+			cmp.l	a3,a1						; is this the one?
+			beq.s	@delete						; if so, go delete it
+@nextElement
+			move.l	a3,a2						; update previous pointer
+			move.l	QLink(a2),a3				; follow the link
+			cmp.l	scsiQTail(a4),a2			; have we reached the tail?
+			bne.s	@deqLoop
+@noElement
+			bra.s	@deqDone1					; we don't return an error				<v1.2>
+@delete
+			cmp.l	a2,a3						; deleting the first element?
+			bne.s	@delGeneral					; if not, perform general case delete
+@first											; special case for first element in the queue
+			move.l	QLink(a2),scsiQHead(a4)		; point head ptr to next element
+			bne.s	@deqDone					; was it the only element?
+			clr.l	scsiQTail(a4)				; if so, clear the tail too
+			bra.s	@deqDone					; we're done
+@delGeneral										; delete for the general case
+			move.l	QLink(a3),QLink(a2) 		; unlink it from the chain
+			cmp.l	scsiQTail(a4),a1			; was it the tail?
+			bne.s	@deqDone					; if not we're done
+			move.l	a2,scsiQTail(a4)			; update tail pointer
+@deqDone
+			clr.l	scsiQLink(a1)				; clear the link in the element
+@deqDone1
+			movem.l (sp)+,a2-a3 				; restore work registers
+			bra.s	@exit						; we're finished
+;
+; enqueue the request
+;
+@enqueue
+			movem.l	d1/a2-a3,-(sp)				; save registers
+			movea.l	a1,a3						; point to request
+@linkLoop
+			move.l	scsiLinkCmd(a3),d1			; is there a linked command ?
+			beq.s	@noLink						; if not, exit
+			move.l	d1,scsiQLink(a3)			; point this PB at the linked PB
+			move.l	d1,a3						; point to the linked PB
+			bra.s	@linkLoop					; keep going
+@noLink
+			move.l	scsiQHead(a4),d1			; anything in the queue ? (Used later)
+			bne.s	@nonempty					; if so, handle differently
+@empty
+			move.l	a1,scsiQHead(a4)			; empty queue - point head to new element
+			move.l	a3,scsiQTail(a4)			; point tail to new element
+			bra.s	@enqDone					; we're out of here
+@nonempty
+			cmpi.w	#enqNormal,d0				; enqueue at the end ?
+			bne.s	@front						; no - enqueue at the front
+@normal
+			move.l	scsiQTail(a4),a2 			; get ptr to old QTail
+			move.l	a1,scsiQLink(a2)			; update its link
+			move.l	a3,scsiQTail(a4) 			; update QTail
+			bra.s	@enqDone					; we're done
+@front
+			move.l	d1,scsiQLink(a3)			; point last linked PB at old head-of-queue (set above)
+			move.l	a1,scsiQHead(a4)			; point queue header at new head-of-queue
+@enqDone
+			movem.l	(sp)+,d1/a2-a3				; restore registers
+@exit
+			move.w	(sp)+,sr					; restore status and go home
+			moveq.l	#noErr,d0					; return noErr							<v1.2>
+			rts
+
+;
+;	LogError - Record a SCSI error in the parameter block								<v1.2>
+;																						<start>
+;	On entry:	a4 - ptr to the SCSI Mgr globals
+;				a5 - ptr to the active PB
+;				d0.w - result code for the parameter block
+;
+LogError:
+			cmp.l	a5,zeroReg					; do we have an active request ?
+			beq.s	@exit						; if not, nothing to record
+			movea.l	scsiPrivate(a5),a0			; get private storage
+			cmp.l	a0,zeroReg					; so we have private storage ?
+			beq.s	@exit						; if not, nothing to record
+			tst.w	scsiTempErr(a0)				; have we stored an error message ?
+			bne.s	@exit						; if so, don't clobber it
+			move.w	d0,scsiTempErr(a0)			; save the error message
+@exit											;										<end>
+			rts									; we're done							<v1.2>
+
+;
+;	ClearState - Mark the SCSI Mgr as free
+;
+;	Called by:	SCSIRequestIO, SCSIKillIO, SCSIIntHnd, MsgIn, Data
+;
+;	Calls:		EnDequeue
+;
+;	On entry:	a3 - ptr to SCSI base read address
+;				a4 - ptr to the SCSI Mgr globals
+;				a5 - ptr to the PB to be removed
+;				d0.w - result code for the parameter block
+;
+;	On exit:	d0.w - result
+;
+;	Function:
+;		This routine is the standard exit routine for a completed request, as well as a failed
+;		request.
+;		It removes the request from the SCSI request queue, sets the result field,
+;		and then calls the completion routine (if any).
+;		Additionally, the "timeout" global is reset by walking the SCSI request queue.
+;
+ClearState:
+			movem.l	intrRegs,-(sp)				; save registers
+			;
+			;	If the error in d0 is "oldSCSIMgrErr", then ClearState was called
+			;	by the old SCSI Mgr.  Dequeue the dummy PB, and check if the SCSI bus is ok.
+			;
+			cmpi.w	#scsiOldSCSIErr,d0			; were we called by the old SCSI Mgr ?
+			bne.s	@newSCSIMgr					; if not, we were called by the new SCSI Mgr
+@oldSCSIMgr
+			move.l	scsiQHead(a4),d1			; get head of the queue
+			beq.s	@clearGState				; if no dummy element, just clear G_State
+			moveq.l	#deqNormal,d0				; dequeue the dummy PB normally
+			lea.l	dummy(a4),a1				; get address of dummy parameter block
+			movea.l	jvEnDequeue(a4),a0			; blow away the dummy parameter block
+			jsr		(a0)						; use the standard routine
+@clearGState
+			move.b	zeroReg,G_State(a4)			; clear out SCSI Mgr semaphore
+			tst.b	discID(a4)					; any disconnected ID's ?
+			beq.w	@exit						; if not, we can leave Reselection interrupts disabled
+			move.b	G_ID(a4),sSER+wrOffs(a3)	; enable Reselection interrupts
+			bra.w	@exit						; bus can't be cleared under old SCSI Mgr	<v2.3>
+			;
+			;	If we get here, ClearState was called by the new SCSI Mgr, so a5 is valid.
+			;	If a5 is zero, then we got a Reselect from a device we don't know about.
+			;
+@newSCSIMgr
+			move.l	zeroReg,activeReq(a4)		; no currently active request
+			move.l	a5,a1						; point to SCSI request to dequeue
+			move.l	d0,d2						; hold onto the result code
+			moveq.l	#deqNormal,d0				; dequeue this request normally
+			movea.l	jvEnDequeue(a4),a0			; addr of routine to dequeue request
+			jsr		(a0)						; dequeue the request
+@releasePrivates
+			move.l	scsiPrivate(a5),d0			; point at the SCSI Mgr private storage
+			beq.s	@cleanupGlobals				; no private storage for this request		<v1.2>
+			move.l	d0,a0						; valid pointer								<v1.2>
+			move.w	scsiTempErr(a0),d0			; do we have a pending error ?				<v1.2>
+			beq.s	@rel1						; if not, then use the error in d2			<v1.2>
+			move.w	d0,d2						; return original error message				<v1.2>
+@rel1
+			move.l	zeroReg,scsiPrivate(a5)		; release the SCSI Mgr private storage
+			move.l	zeroReg,scsiFlags(a0)		; clear "scsiFlags","State","Flag1", and "Flag2"
+			move.l	zeroReg,scsiTime(a0)
+			move.l	zeroReg,scsiCmdOffs(a0)
+			move.l	zeroReg,scsiTempErr(a0)		; clear temporary error and filler fields	<v1.2>
+			move.l	zeroReg,scsiDCSaved(a0)
+			move.l	zeroReg,scsiDCOffs(a0)
+			move.l	zeroReg,scsiMoveOffs(a0)
+			tst.l	nextPrivate(a4)				; check for a free private storage record
+			bne.s	@cleanupGlobals				; there is already a free record
+			move.l	a0,nextPrivate(a4)			; this record is free
+@cleanupGlobals
+			move.w	d2,scsiResult(a5)			; save the result code
+			lea.l	discLUN(a4),a1				; point to disconnected LUN table
+			move.l	zeroReg,d2					; clear offset into LUN table
+			move.b	scsiReqID(a5),d2			; get offset into LUN table
+			move.b	scsiReqLUN(a5),d1			; this LUN is available now
+			bclr.b	d1,0(a1,d2.l)				; requests for this LUN can be run
+			tst.b	0(a1,d2.l)					; is anybody disconnected at this ID ?
+			bne.s	@completion					; if so, continue
+			bclr.b	d2,discID(a4)				; this entire ID is available
+@completion
+			move.l	scsiMgrFlags(a5),d0			; get the SCSI flags
+			btst.l	#scsiBImmed,d0				; is it a page-fault request ?				<v1.1>
+			beq.s	@chkAsync					; if not, continue
+			move.l	zeroReg,pageFault(a4)		; clear page fault indicator
+@chkAsync
+			btst.l	#scsiBAsync,d0				; is it an asynchronous call ?
+			beq.s	@newTimeOut					; synchronous - "scsiCompletion" is undefined
+			move.l	scsiCompletion(a5),d0		; is there a valid completion routine ?
+			beq.s	@newTimeOut					; if not, calculate new earliest timeout
+			movem.l	intrRegs,-(sp)				; save all registers						<v1.1>
+			btst.b	#sDeferUserFn,G_Reserved0+3(a4)	; is the VM-friendly call implemented ?	<start>
+			bne.s	@DUF						; if so, defer completion routine cleanly
+@noDUF
+			move.l	d0,a1						; get completion routine address
+			move.l	a5,a0						; point a0 at parameter block
+			jsr		(a1)						; simply jump to completion routine
+			bra.s	@afterCompletion			; we've called the completion routine
+@DUF
+			move.l	d0,a0						; pointer to completion routine
+			move.l	a5,d0						; pointer to parameter block
+			nop									; trap not defined ???
+;			_DeferUserFn						; post the completion (can't recover from an error)
+@afterCompletion								;											<v1.1>
+			movem.l	(sp)+,intrRegs				; restore all registers						<end>
+@newTimeOut
+			moveq.l	#-1,d0						; start out with an "infinite" timeout
+			lea.l	scsiQHead(a4),a1			; get pointer to first parameter block
+@loop
+			movea.l	scsiQLink(a1),a1			; get the next parameter block
+			cmp.l	a1,zeroReg					; are we done ?
+			beq.s	@setTimeOut					; if so, save timeout and make sure the bus is free
+			move.l	scsiPrivate(a1),d1			; is this request in progress ?
+			beq.s	@loop						; if not, check next parameter block
+			move.l	d1,a0						; point to private storage for this request
+			cmp.l	scsiTime(a0),d0				; is this timeout earlier ?
+			blo.s	@loop						; if not, check the next parameter block
+			move.l	scsiTime(a0),d0				; if earlier, save it
+			bra.s	@loop						; check next parameter block
+@setTimeOut
+			move.l	d0,timeout(a4)				; save the new timeout
+@exit
+			movem.l	(sp)+,intrRegs				; restore registers
+			rts
+;
+;	ClearBus - Clean up the bus, if necessary.
+;
+;	Called by:	SCSIRequestIO, SCSIKillIO, SCSIIntHnd, MsgIn, Data
+;
+;	Calls:		ResetBus
+;
+;	On entry:	a3 - ptr to SCSI base read address
+;				a4 - ptr to the SCSI Mgr globals
+;				a5 - ptr to the PB to be removed (NIL = reselected by a timed-out ID)
+;				d0.w - result code for the parameter block
+;
+;	On exit:	d0.w - result
+;
+;	Function:
+;		This routine attempts to clean up the bus in three stages: first, an attempt is made
+;		to send an "Abort" message to the device; second, a "Bus Device Reset" message is
+;		sent to the device; finally, the SCSI bus is reset.
+;		(If the parameter block pointer is nil, then a device is on the bus, but the device's
+;		request has timed out.  This is handled by aborting the rest of the transfer, since
+;		the original request has already failed.)
+;
+;
+ClearBus:
+			movem.l	intrRegs,-(sp)				; save registers
+@chkBus
+			;
+			;	At this point, the bus is probably hosed.  It is possible that a SCSI Bus Reset
+			;	is in progress, but the following code will ignore this.
+			;
+			moveq.l	#aBSY+aSEL,d0				; clear all but BSY and SEL (ignore RST)	<v1.2>
+			and.b	sCSR(a3),d0					; mask with a snapshot of the bus			<v1.2>
+			beq.s	@exit						; if no BSY or SEL, bus is clear
+
+			;
+			;	Reset the SCSI bus.  We were running, so our device is hanging on the bus.
+			;	If we are in the middle of a Reset, no other devices should be on the bus.
+			;
+@assertReset
+			movea.l	jvResetBus(a4),a0			; get address of bus reset routine
+			jsr		(a0)						; reset the SCSI bus and kill all requests
+@exit
+			movem.l	(sp)+,intrRegs				; restore registers
+			rts
+;
+;	Message
+;
+;	Function:	Sends a message to the deferred task.
+;				(It also installs the deferred task, if necessary)
+;
+;	On entry:	d0.b - message selector
+;				d1	 - additional information, if any
+;
+;	Current messages include:
+;
+;		scResel			ID mask in d1.b
+;		scEOP
+;		scPhaseMm
+;		scNewRequest	ptr to scsiPB in d1.l
+;		scLossBsy
+;		scBusReset
+;		scParity
+;		
+;		
+;
+Message:
+			movem.l	intrRegs,-(sp)				; save registers
+			bset.b	d0,dTask+dtParm(a4)			; tell SCSIDT which interrupt occurred
+@reselect
+			cmpi.b	#scResel,d0					; is it a Reselect message ?
+			bne.s	@newRequest
+			move.b	d1,dTask+dtParm+3(a4)		; pass the reselect ID to dTask in low byte of dtParm
+			bra.s	@enqueueSCSIDT
+@newRequest
+			cmpi.b	#scNewRequest,d0			; is there a new request to process ?
+			bne.s	@enqueueSCSIDT
+			movea.l	jvEnDequeue(a4),a0			; address of enqueue/dequeue routine
+			move.l	d1,a1						; get the pointer to the request
+			move.l	scsiMgrFlags(a1),d1			; get the flags from the request
+			btst.l	#scsiBImmed,d1				; is this a page-fault request ?			<v1.1>
+			bne.s	@enqInsert					; if so, place it at the front
+@enqNormal
+			moveq.l	#enqNormal,d0				; enqueue this request at the end of the queue
+			jsr		(a0)						; go do it
+			bra.s	@enqExit					; we're done
+@enqInsert
+			move.l	a1,pageFault(a4)			; we're handling a page fault - keep ptr to PB
+			moveq.l	#enqFront,d0				; place this request at the front of the queue
+			jsr		(a0)						; go do it
+			movea.l	jvSCSIDT(a4),a0				; address of SCSI Mgr deferred task
+			jsr		(a0)						; handle VM page-fault by calling SCSIDT directly
+@enqExit
+@enqueueSCSIDT
+			bset.b	#dtEnqueued,state1(a4)		; going to enqueue the deferred task
+			bne.s	@exit						; if already set, then don't enqueue dTask
+			lea.l	dTask(a4),a0				; point to deferred task record
+			_DTInstall							; install it in the deferred task queue
+@exit
+			movem.l	(sp)+,intrRegs				; restore registers
+			rts
+;
+;	Preflight
+;
+;	Called by:	SCSIRequestIO
+;
+;	Calls:		None.
+;
+;	On entry:	a0 - addr of Preflight routine (used for recursive calls)					<v1.2>
+;				a4 - ptr to SCSI Mgr globals
+;				a5 - ptr to parameter block in question
+;
+;	On exit:	d0 - result code
+;
+;	Function:
+;		This routine checks that the parameter block is consistent.
+;
+Preflight:
+@initResult
+			moveq.l	#noErr,d0					; assume a good parameter block
+@prelimCheck
+			tst.l	scsiQLink(a5)				; is link NIL ?
+			bne.w	@errorExit					; if not, get out
+			tst.l	scsiPrivate(a5)				; is private storage link NIL ?
+			bne.w	@errorExit					; if not, get out
+			tst.w	scsiVersion(a5)				; is the version number greater than zero ?
+			beq.w	@errorExit					; valid version numbers > zero
+@checkLink
+			tst.l	scsiLinkCmd(a5)				; are we pointing to a linked command ?
+			beq.s	@checkPB					; if not, continue to check PB				<v1.2>
+			bra.w	@errorExit					; not allowed in the initial release		<v1.2>
+			movem.l	a0/a5,-(sp)					; save pointer to the PB
+			movea.l	scsiLinkCmd(a5),a5			; point to linked command PB
+			jsr		(a0)						; call Preflight recursively
+			movem.l	(sp)+,a0/a5					; restore pointer to the parameter block
+@checkPB
+			tst.l	scsiReqTO(a5)				; check for a nonzero request timeout
+			beq.w	@errorExit					; no timeout provided
+			tst.w	scsiSelTO(a5)				; check for a nonzero selection timeout
+			beq.w	@errorExit					; no timeout provided
+			cmpi.w	#mgrVersion,scsiVersion(a5)	; is this a level-1 PB ?
+			bne.s	@1							; if not, we can't preflight the reserved fields
+			move.l	scsiMgrFlags(a5),d2			; get a copy of the flags
+
+			btst.b	#sSCSIDMAExists,G_Reserved0+3(a4)	; do we have a SCSI DMA chip ?	<2.8><v1.1>
+			beq.s	@noDMA						; if not, different check				<2.8>
+			andi.l	#$FFFFFF00,d2				; if anything else is on, it's bad			<v1.2>
+			bra.s	@univDone					; done with the check
+@noDMA
+			andi.l	#$FFFFFF10,d2				; if "physical" or anything else on, error	<v1.2>
+@univDone
+			bne.w	@errorExit					; a reserved bit was non-zero
+@1
+			moveq.l	#LUNMask,d2					; mask to check for valid ID and LUN
+			cmp.b	scsiReqID(a5),d2			; check for a valid target ID
+			blo.w	@errorExit					; get out (ID > 7)
+			cmp.b	scsiReqLUN(a5),d2			; check for a valid logical unit number
+			blo.w	@errorExit					; get out (LUN > 7)
+			tst.l	scsiCmdBuf(a5)				; check that command pointer is non-nil
+			beq.s	@errorExit					; nil command buffer ptr - get out
+			cmp.l	scsiSnsBuf(a5),zeroReg		; is auto-sense being requested ?
+			beq.s	@noSense					; if not, continue
+			cmpi.b	#minSnsLen,scsiSnsLen(a5)	; is sense buffer of minimum length ?
+			blo.s	@errorExit					; it's too short - error
+@noSense
+			cmp.l	scsiDataLen(a5),zeroReg		; is a data transfer expected ?
+			bne.s	@dataTransfer				; if non-zero, data transfer is expected
+@noDataTransfer
+			cmp.l	scsiDCInstr(a5),zeroReg		; if no data transfer, this must be nil
+			bne.s	@errorExit					; if non-nil, error
+			moveq.l	#noErr,d0					; no error
+			bra.s	@initialize					; go initialize rest of PB
+@dataTransfer
+			move.l	scsiDCInstr(a5),a0			; get ptr to data-chaining instructions
+			cmp.l	a0,zeroReg					; check that data chaining is requested
+			beq.s	@errorExit					; no data-chaining instr provided - error
+@repeatInstr
+			tst.l	dcAddr(a0)					; is it a dcStop instruction ?
+			beq.s	@chkStop					; check if it is a valid dcStop (dcCount=dcOffset=0)
+			adda.w	#dcSize,a0					; point to next data-chaining instruction
+			bra.s	@repeatInstr				; check next instruction
+@chkStop
+			tst.l	dcCount(a0)					; is the dcCount field zero ?
+			bne.s	@errorExit					; if not, error
+			tst.l	dcOffset(a0)				; is the dcOffset field zero ?
+			bne.s	@errorExit					; if not, error
+@initialize
+			;
+			;	NOTE: "scsiCompletion","scsiUsrData", and "scsiCmdLen" are always untouched
+			;
+			move.w	#scsiEnqueued,scsiResult(a5)	; mark async request in progress
+			move.b	zeroReg,scsiSnsXfer(a5)			; no sense bytes returned, yet
+			move.l	zeroReg,scsiDataXfer(a5)		; no data bytes transferred, yet
+			move.b	#statusInitial,scsiStatus(a5)	; initialize status byte to "invalid" value
+			tst.l	scsiDataLen(a5)					; data transfer expected ?
+			beq.s	@exit							; if not, we're done
+			;
+			;	In order to implement the "Save Data Pointer" message, it is necessary to
+			;	save a copy of the entire data-chaining instruction block.  The data-chaining
+			;	instructions combined with the DCOffs pointer make up the data pointer for
+			;	the request.
+			;
+@datachaining
+			move.l	scsiDCInstr(a5),a0			; point to data-chaining instructions
+			moveq.l	#dcLoop,d2					; used for comparison
+@repeat
+			move.l	dcAddr(a0),d1				; get the address or opcode
+			beq.s	@dcStop						; if "dcStop", then we're done
+			cmp.l	d2,d1						; is it a "dcLoop" instruction ?
+			bne.s	@save						; if not, save the address in "dcStore"
+			move.l	dcCount(a0),d1				; the loop count needs to be saved
+@save
+			move.l	d1,dcStore(a0)				; save the necessary value
+			adda.w	#dcSize,a0					; point to next data-chaining instruction
+			bra.s	@repeat						; copy another instruction
+@dcStop
+			move.l	zeroReg,dcStore(a0)			; clear out dcStore field in dcStop instruction
+			bra.s	@exit						; everything is fine, no error
+@errorExit
+			move.w	#scsiBadPBErr,d0			; a bad SCSI parameter block				<v1.2>
+@exit
+			tst.w	d0							; set condition codes
+			rts
+;
+;	Setup
+;
+;	Called by:	SCSIDT
+;
+;	Calls:		SetTimer.
+;
+;	On entry:	a4 - ptr to SCSI Mgr globals
+;				a5 - ptr to parameter block in question
+;
+;	On exit:	d0 - result code
+;
+;	Function:
+;		This routine sets up the SCSI Manager globals and the CPU registers to handle
+;		a SCSI request.  It is the "standard entry" routine used by the rest of the 
+;		new SCSI Manager code.
+;
+Setup:
+			move.l	a5,activeReq(a4)			; record the active request
+@calcTimeout
+			move.l	Ticks,d2					; get the current time
+			move.l	scsiReqTO(a5),d1			; get the request timeout value
+			asr.l	#4,d1						; convert to ticks (using msec timebase if possible)
+			move.l	scsiPrivate(a5),a0			; point to private storage for this request
+			move.l	scsiTime(a0),d0				; check the deadline for the request
+			bne.s	@calculated					; if non-zero, it's already calculated
+			move.l	d2,d0						; get the current time
+			add.l	d1,d0						; calculate the time it should timeout
+			move.l	d0,scsiTime(a0)				; save timeout
+			bra.s	@default					; let's go
+@calculated
+			sub.l	d2,d0						; calculate the differential
+			bcs.s	@default					; current time past timeout, use default
+			cmp.l	d1,d0						; compare default and calculated timeouts
+			bls.s	@default					; if lower, use the default timeout
+			move.l	d0,d1						; else, use the calculated timeout
+@default
+			move.l	d2,d0						; get current time
+			add.l	d1,d0						; add time differential
+			move.l	d0,timeout(a4)				; next timeout time
+			mulu.w	#17,d1						; convert ticks to milliseconds
+			move.l	d1,d0						; milliseconds to the timeout
+			movea.l	jvSetTimer(a4),a0			; set the timer (no error possible)
+			jsr		(a0)						; go to the routine
+			rts
+;
+;	Find
+;
+;	Called by:	SCSIDT
+;
+;	Calls:		None.
+;
+;	On entry:	d0.l - contains a mask of SCSI ID's to check.
+;					bit 31		: if set, find any request
+;					bits 7-0	: bitmap of possible ID(s)
+;					(Time to start a new request.)
+;
+;					bit 31		: if clear, find the first request (A reselection has occurred.)
+;					bits 15-8	: bitmap with ID to find
+;					bits 7-0	: bitmap with LUN to find (Zero, if reselected without an Identify)
+;
+;	On exit:	d0 	- points to the request that was found.  (Set to zero if none was found.)
+;
+;	Function:
+;		This routine is used in two ways: (1) it searches for the first request that is not
+;		disconnected, and is not queued behind a disconnected request, or (2) find the first
+;		disconnected request for a given ID and LUN.  It stops when it hits the end of the
+;		queue, or the dummy parameter block used by an old SCSI Mgr call.
+;
+;		If an Identify message is not sent after a Reselection, the LUN bitmap will zero.
+;		(It is assumed that the LUN, if any, was passed in the command buffer.)
+;		In this case, the target does not implement the Identify message, and so the LUN
+;		is forced to zero.  This means that only one LUN at a time may be used at a given
+;		ID if the Identify message is not implemented.  ("scsiReqLUN" must be set to zero.)
+;
+;		ActiveReq, by convention, is always cleared at the end of a SCSI request.
+;		Find does nothing if ActiveReq is set.
+;
+Find
+			movem.l	a0-a3/d1-d2,-(sp)			; save registers
+			move.w	sr,-(sp)					; save the status register contents
+			ori.w	#HiIntMask,sr				; disable interrupts temporarily
+			tst.l	activeReq(a4)				; are we currently servicing a request ?
+			bne.s	@notFound					; if so, act as if nothing was found
+			lea.l	discLUN(a4),a1				; ptr to base of the disconnected LUN table
+			lea.l	scsiQHead(a4),a0			; get the head pointer
+			move.l	zeroReg,d2					; clear out d2 to use it as an offset
+			
+			btst.l	#findAnyFlag,d0				; which type of search are we doing ?
+			beq.s	@setupGiven					; go find first request for given ID mask
+			move.b	discID(a4),d1				; get mask of disconnected ID's
+			eor.b	d1,d0						; remove disconnected ID's from the running
+			bra.s	@nextReq					; start searching
+@setupGiven
+			move.b	d0,d1						; get LUN bitmap into d1
+			bne.s	@fixID						; nonzero LUN bitmap is correct
+			bset.l	zeroReg,d0					; LUN is in scsiCmdBuf (no Identify - force to LUN 0)
+@fixID
+			rol.w	#8,d0						; get ID bitmap into d0.b
+			;
+			;	Bit 31 set:		d0.b contains a bitmap of possible ID's (1 or more)
+			;					d1.b is unused
+			;
+			;	Bit 31 clear:	d0.b contains an ID bitmap
+			;					d1.b contains an LUN bitmap to use:
+			;						ID 3, LUN 6 : d0.b = 00001000 d1.b = 01000000
+			;
+@nextReq
+			move.l	scsiQLink(a0),a0			; get next request
+			cmp.l	a0,zeroReg					; are we at the end ?
+			beq.s	@notFound					; if so, we didn't find the request
+@chkSearchType
+			btst.l	#findAnyFlag,d0				; what type of search was requested ?
+			bne.s	@findAny					; find first request for any non-disc ID
+@findGiven
+			move.b	scsiReqID(a0),d2			; get the ID of the parameter block
+			blt.s	@dummy						; if ID < 0, this is the dummy param block
+			btst.l	d2,d0						; is the ID the same as the given ID ?
+			beq.s	@nextReq					; if not, check the next request
+			move.b	scsiReqLUN(a0),d2			; get the LUN of the parameter block
+			btst.l	d2,d1						; is the LUN the same ?
+			beq.s	@nextReq					; if not, keep looking
+			bra.s	@found						; we found the request we were looking for
+@findAny
+			move.b	scsiReqID(a0),d2			; get the ID that we wish to use
+			blt.s	@dummy						; if ID < 0, this is the dummy parameter block
+			btst.l	d2,d0						; is this ID still in the running ?
+			beq.s	@nextReq					; if not, check the next request
+@okID
+			move.b	0(a1,d2.w),d1				; get the LUN bitmap for the current ID
+			move.b	scsiReqLUN(a0),d2			; get the LUN to check
+			btst.l	d2,d1						; check if this LUN is disconnected
+			bne.s	@nextReq					; if it is, it is not a possible candidate
+@found											; we found it -- fall through from above
+			move.l	a0,d0						; return the pointer in d0
+			bra.s	@exit						; we found our request
+@notFound
+@dummy
+			move.l	zeroReg,d0					; no requests in front of the dummy parameter block
+@exit
+			move.w	(sp)+,sr					; restore status register contents
+			movem.l	(sp)+,a0-a3/d1-d2			; restore register contents
+			tst.l	d0
+			rts
+;
+;	SetTimer
+;
+;	Called by:	Setup, MsgIn
+;
+;	Calls:		_RmvTime, _InsTime, _PrimeTime
+;
+;	On entry:	a3 - ptr to SCSI read base address
+;				a4 - ptr to SCSI Manager globals
+;				d0 - number of milliseconds to wait (0 means stop the timer)
+;
+;	Function:	Provides a timer facility for the SCSI Mgr.  It contains the use of the
+;				Time Manager traps in one routine.  (This makes it easier for A/UX to use
+;				the new SCSI Manager.)
+;
+SetTimer:
+			lea.l	timer(a4),a0				; point to timer task
+			tst.l	d0							; is there a need to re-arm the timer ?
+			bne.s	@arm						; if count <> 0, re-arm the timer
+@stop
+			_RmvTime							; stop the timer (ignore error)
+			rts									; we're done (we've stopped the timer)		<v1.2>
+@arm
+			move.l	d0,-(sp)					; hold on to timeout value
+			_RmvTime							; just for safety's sake (ignore error)
+			_InsTime							; put it back in the queue (ignore error)
+			move.l	(sp)+,d0					; restore timeout value
+			_PrimeTime							; set the timer
+			rts
+;
+;	TimeTask
+;
+;	Called by:	Time Manager
+;
+;	Calls:		ClearState
+;
+;	On exit:	Timed-out requests are removed from the queue.
+;
+;	Function:	This routine handles timeouts on the SCSI bus.
+;
+;	Algorithm:	if (queue nonempty) {
+;					if (curtime > timeout) {
+;						for (each element) {
+;							if (tagged)
+;								ClearState(element, saTimeOutErr);
+;							else if (scsiTime < curtime)
+;								tag element;
+;						}
+;					}
+;					rearm timer;
+;				}
+;
+
+TimeTask:
+		 IF	dbSymbols THEN
+			link	a6,#0						; MacsBug stack frame
+			nop									; filler
+		 ENDIF
+			movem.l	intrRegs,-(sp)				; save registers
+			movea.l	SCSIGlobals,a4				; get pointer to SCSI Manager globals		<v1.7>
+
+TimeTaskCommon									;											<v1.2>
+			move.l	base5380(a4),a3				; point to the SCSI base read address
+			moveq.l	#0,zeroReg					; set up the "zero" register
+@timer
+			move.l	scsiQHead(a4),d0			; is there anything in the queue ?
+			beq.s	@exit						; if empty, leave without resetting the timer
+			move.l	Ticks,d0					; get the current "time"
+			cmp.l	timeout(a4),d0				; have we hit the first possible timeout ?
+			blo.s	@rearmTimer					; not yet, it's a spurious watchdog interrupt
+			
+			move.l	activeReq(a4),a5			; get the active request, if any
+			cmp.l	a5,zeroReg					; is there a currently active request ?
+			beq.s	@watchdogTimeout			; if not, then the watchdog timer went off
+@requestTimeout
+			movea.l	scsiPrivate(a5),a0			; point to private storage for this request
+			cmp.l	scsiTime(a0),d0				; check timeout time against current time
+			blo.s	@rearmTimer					; if less, then it has not timed out
+@timedOut
+			move.w	#scsiTimeOutErr,d0			; it took too long							<v1.2>
+			movea.l	jvClearState(a4),a0			; clear SCSI Mgr and SCSI bus, if necessary
+			jsr		(a0)						; go to the routine
+			;movea.ljvClearBus(a4),a0
+			;jsr	(a0)
+			bra.s	@rearmTimer					; set up the next timeout
+@watchdogTimeout
+			move.l	d0,d1						; hold on to the current time
+			move.w	#scsiTimeOutErr,d0			; walk queue, killing requests
+			lea.l	scsiQHead(a4),a5			; ptr to start of SCSI request queue
+@loop
+			move.l	a5,a1						; hold onto current parameter block
+			movea.l	scsiQLink(a5),a5			; point to the next parameter block
+			cmp.l	a5,zeroReg					; are we done ?
+			beq.s	@rearmTimer					; if so, get out
+			movea.l	scsiPrivate(a5),a0			; point to private storage for this request
+			cmp.l	a0,zeroReg					; is it in progress ?
+			beq.s	@loop						; if not, check next request
+			cmp.l	scsiTime(a0),d1				; else, has this request timed out ?
+			blo.s	@loop						; if not, check the next request
+			movea.l	jvClearState(a4),a0			; get address of ClearState routine
+			jsr		(a0)						; kill off this request
+			move.l	a1,a5						; continue with the next parameter block
+			bra.s	@loop						; continue until all PB's are checked
+@rearmTimer
+			move.l	zeroReg,d0					; clear high word of count
+			move.w	#WDTO,d0					; set timeout
+			movea.l	jvSetTimer(a4),a0			; set the timer
+			jsr		(a0)						; go to the routine
+@exit
+			movem.l	(sp)+,intrRegs				; restore registers
+		 IF	dbSymbols THEN
+			unlk	a6
+			rts
+			dc.b	'TIMETASK'
+		 ELSE
+			rts
+		 ENDIF
+
+;
+;	SCSIDT
+;
+;	Called by:	Deferred Task Dispatcher, SCSIIntHnd, TimeTask, Message
+;
+;	Calls:		
+;
+;	On entry:	"dtParm" (a1) reflects the type(s) of interrupts.
+;
+;	Function:
+;		This is the remainder of the SCSI interrupt handler.  It also handles the Time Manager
+;		interrupts that provide the watchdog timer feature.  (On the Mac Plus, a second timer
+;		is used to monitor the SCSI chip's interrupt line.)  It is called with all interrupts
+;		enabled, except possibly during a page-fault.
+;
+
+SCSIDT:
+		 if	dbSymbols then
+			link	a6,#0
+			nop									; filler for debugging purposes
+		 endif
+@setup
+			movem.l	intrRegs,-(sp)				; save registers
+			movea.l	SCSIGlobals,a4				; get pointer to SCSI Manager globals		<v1.7>
+
+SCSIDTCommon									;											<v1.2>
+			moveq.l	#0,zeroReg					; clear out the zero register				<v1.2>
+			move.l	base5380(a4),a3				; SCSI read base address
+			move.l	activeReq(a4),a5			; point to active request, if any			<v1.2>
+@clrDTEnqueued
+			move.l	zeroReg,dTask(a4)			; clear out the link for safety
+			bclr.b	#dtEnqueued,state1(a4)		; tell Message that dTask is not enqueued
+@doWhile										; start of giant loop
+@intrPoll	;
+			;	If interrupts are disabled, and there are no interrupts to process, then
+			;	we will have to poll for interrupts, and call IntHnd to post them.
+			;	(This only happens while servicing a page fault with interrupts disabled.)
+			;
+			tst.l	dTask+dtParm(a4)			; are there any interrupts to process ?
+			bne.s	@chkBusReset				; if there are, service them first
+			move.w	sr,d0						; get a copy of the status register
+			andi.w	#HiIntMask,d0				; get the CPU interrupt level
+			cmpi.w	#scsiIntMask,d0				; check against the SCSI chip's interrupt level
+			blo.s	@chkBusReset				; if CPU level is lower, interrupts will get through
+@waitForIRQ
+			btst.b	#bIREQ,sBSR(a3)				; is an interrupt pending ?
+			beq.s	@waitForIRQ					; if not, keep waiting
+			movea.l	jvIntHnd(a4),a0				; get address of interrupt handler
+			jsr		(a0)						; call SCSIIntHnd to post interrupt for service
+			;
+			;	At this point, we have an interrupt to service.
+			;
+@chkBusReset
+			bclr.b	#scBusReset,dTask+dtParm(a4)	; is it a SCSI Bus Reset interrupt ?
+			beq.s	@notBusReset					; if not, check other interrupts
+			;
+			;	Send "bus was reset" message to all the requests in the queue
+			;
+@busReset
+			lea.l	scsiQHead(a4),a5			; load pointer to first request in the queue
+			lea.l	dummy(a4),a1				; point to dummy parameter block
+			move.w	#scsiBusResetErr,d0			; report that SCSI bus was reset			<v1.2>
+@brLoop
+			movea.l	jvClearState(a4),a0			; addr of clear request routine
+			movea.l	scsiQLink(a5),a5			; point to the next request					<v1.2>
+			cmp.l	a5,zeroReg					; are we done ?
+			beq.w	@endWhile					; if so, see if anything needs to be done
+			cmpa.l	a1,a5						; are we pointing at the dummy PB ?
+			beq.s	@killOldPB					; if so, kill it differently
+			jsr		(a0)						; kill off the new SCSI Mgr PB
+			bra.s	@brLoop						; keep going
+@killOldPB
+			moveq.l	#scsiOldSCSIErr,d1			; pretend old SCSI Mgr is killing this request
+			exg.l	d0,d1						; switch error messages
+			jsr		(a0)						; kill the request
+			exg.l	d0,d1						; restore the error message
+			bra.s	@brLoop						; keep going
+		IF	padForOverPatch		THEN			; padding									<v1.3>
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+		ENDIF
+			;
+			;	Handle any of the other interrupts.  The algorithm is as follows:
+			;
+			;		If (Reselect or EOP or PhaseMm) {
+			;			do what is necessary to handle the interrupt
+			;		} elseif (newRequest or requestsToProcess or LossOfBSY or Parity) {
+			;			do what is necessary to handle the interrupt,
+			;			start up a new request if possible
+			;		}
+			;		if necessary, handle phases until a Bus Free condition exists
+			;
+@notBusReset			
+@Reselect
+			bclr.b	#scResel,dTask+dtParm(a4)	; is it a Reselection interrupt ?
+			beq.s	@EOP						; if not, check for EOP
+@Resel1
+			btst.b	#bSEL,sCSR(a3)				; wait for *SEL to go away (infinite loop)
+			bne.s	@Resel1
+			move.b	zeroReg,sICR+WrOffs(a3)		; release *BSY
+@validResel										; bypass check for "activeReq" because
+			bra.w	@noActiveReq				; "activeReq" is set after an Identify message
+@EOP
+			bclr.b	#scEOP,dTask+dtParm(a4)		; is it an End Of Process interrupt ?
+			beq.w	@PhaseMm					; if not, check if Phase Mismatch			<v1.2>
+
+			btst.b	#sSCSIDMAExists,G_Reserved0+3(a4)	; do we have a SCSI DMA chip ?
+			beq.s	@nonDMA								; if not, no processing required
+
+			bclr.b	#waitingForIRQ,state1(a4)	; we've been kicked out of DMA				<v1.5>
+			move.l	sDCTRL(a3),d0				; look at the DMA control register			<v1.2>
+			btst.l	#bDMABERR,d0				; did we get a DMA bus error ?				<v1.2>
+			bne.s	@eopDMABERR					; if so, handle it							<v1.2>
+			move.l	sDCNT(a3),d0				; did we transfer all the data ?			<v1.2>
+			beq.s	@eopSuccess					; if so, clean up after the DMA				<v1.2>
+@eopDMABERR
+@eopError
+		 if	dbSymbols then
+			_Debugger
+		 endif
+		IF	padForOverPatch		THEN			; padding									<v1.3>
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+		 ENDIF
+			bra.w	@nextPhase					; just exit for now							<v1.2>
+@eopSuccess
+			movea.l	jvDataDMA(a4),a0			; addr of DMA data-chaining interpreter		<v1.2>
+			jsr		(a0)						; start up the next DMA, if necessary		<v1.2>
+			btst.b	#waitingForIRQ,state1(a4)	; did we start a new DMA ? (waiting for intr)	<v1.5>
+			bne.w	@endWhile					; if so, bail out for now, if possible		<v1.2>
+			;
+			; fall through - we moved all the data requested, so it should be a new phase	<v1.2>
+			;
+@nonDMA
+
+			bra.w	@nextPhase					; finished - resume handling phases			<v1.2>
+@PhaseMm
+			bclr.b	#scPhaseMm,dTask+dtParm(a4)	; is it a Phase Mismatch interrupt ?
+			beq.w	@newRequest					; if not, check for a new request
+		if	dbSymbols then
+			_Debugger
+		endif
+
+			btst.b	#sSCSIDMAExists,G_Reserved0+3(a4)	; do we have a SCSI DMA chip ?		<v1.5>
+			beq.s	@nonDMA2							; if not, no processing required	<start>
+
+			cmp.l	a5,zeroReg					; do we have an active request ?
+			beq.w	@pmmCleanup					; if not, just clean up the interrupt
+			bclr.b	#waitingForIRQ,state1(a4)	; are we awaiting an interrupt ?
+			beq.s	@pmmCleanup					; if not, just clean up the interrupt
+			movea.l	scsiPrivate(a5),a0			; point to private storage for request
+			move.l	scsiPCount(a0),d0			; length of DMA transfer request
+			sub.l	sDCNT(a3),d0				; subtract number of bytes left to transfer
+			;
+			;	On the SCSI DMA chip, if a Disconnect occurs during a long DMA transfer, the
+			;	sDCNT register will be off by one.  (It reports that one too many bytes were
+			;	transferred.)  To correct this, we need to subtract one from the number of
+			;	bytes to be transferred only if it is a write operation.					<v1.5>
+			;
+			move.l	scsiMgrFlags(a5),d1			; get the flags for this transaction
+			btst.l	#scsiBWrite,d1				; test the Write flag
+			beq.s	@pmmUpdate					; if it's a read operation, just continue
+			subq.l	#1,d0						; adjust the number of bytes transferred
+@pmmUpdate
+			add.l	d0,scsiMoveOffs(a0)			; save number of bytes transferred
+			add.l	d0,scsiDataXfer(a5)			; update number of bytes transferred
+			move.b	zeroReg,sICR+WrOffs(a3)		; disable data bus (mainly for writes)
+			move.l	#iINTREN,sDCTRL(a3)			; turn off hhsk		<C914>					<end>
+												; finish cleaning up						<v1.5> <7>
+@nonDMA2
+
+@pmmCleanup
+			move.b	zeroReg,sMR+WrOffs(a3)		; disable phase mismatch interrupts
+			bra.w	@nextPhase					; finished - resume handling phases
+			;
+			;	These interrupts happen outside of a transaction, so after servicing
+			;	the interrupt, we start up another request, if possible.
+			;
+@newRequest
+			bclr.b	#scNewRequest,dTask+dtParm(a4)	; is it a new request to process ?
+			beq.s	@LossBsy					; if not, check for Loss of BSY
+			bra.s	@startSCSI					; start up a request, if possible
+@LossBsy
+			bclr.b	#scLossBsy,dTask+dtParm(a4)	; is it a Loss of BSY interrupt ?
+			beq.s	@Parity						; if not, check for Parity Error
+			bclr.b	#waitingForIRQ,state1(a4)	; we got the interrupt we were waiting for	<v1.5>
+			move.b	zeroReg,sMR+WrOffs(a3)		; disable Loss of BSY interrupts
+			bra.s	@startSCSI					; finished - start up a request, if possible
+@Parity	
+			bclr.b	#scParity,dTask+dtParm(a4)	; is it a Parity Error interrupt ?
+		
+		IF	dbSymbols	THEN
+			beq.s	@startSCSI					; if not, start up a request, if possible <7>
+			_Debugger							; we got a parity interrupt (never enabled)
+		ENDIF
+			;	Fall through to "@startSCSI"
+			;
+			;	Start up another request, if possible
+			;
+@startSCSI
+			move.w	sr,-(sp)					; save status register contents
+			ori.w	#HiIntMask,sr				; bump up the interrupt level (critical section)
+			moveq.l	#findAny,d0					; find the first available request to process
+			movea.l	jvFind(a4),a0				; get address of Find routine
+			jsr		(a0)						; is there a request to process ?
+			beq.w	@failed						; there is nothing to process, so exit
+@foundRequest
+			movea.l	d0,a5						; point at the request to process
+			tst.l	scsiPrivate(a5)				; does it have private storage ?
+			bne.s	@arbitrate					; if so, then it's an autosense PB - just start it up
+			move.l	nextPrivate(a4),d0			; is there a private storage record available ?
+			beq.s	@failed						; if not, we can't process, so exit
+@havePrivate
+			movea.l	d0,a0						; point to private storage record
+			move.l	a0,scsiPrivate(a5)			; point to SCSI Mgr private storage record
+			move.b	#scsiFInUse,scsiFlags(a0)	; clear SCSI Mgr flags and mark record as in use
+@findNextPrivate
+			move.l	zeroReg,nextPrivate(a4)		; assume no more records are available
+			lea.l	firstPrivate(a4),a1			; point to head of private storage queue
+@loop
+			movea.l	scsiPrivLink(a1),a1			; look at the next record
+			cmp.l	a1,zeroReg					; are we done ?
+			beq.s	@arbitrate					; nothing free ("nextPrivate" = nil), try to arbitrate
+			tst.b	scsiFlags(a1)				; is this record in use ?
+			bne.s	@loop						; it's in use, so check the next record
+@setNextPrivate
+			move.l	a1,nextPrivate(a4)			; this is the next available record
+@arbitrate
+
+			btst.b	#shwCbPwrMgr,G_Reserved0+3(a4)		; see if we have a Power Mgr
+			beq.s	@PwrDone					; if not, exit
+
+			;
+			;	This portion of code freezes the "Spin Down" timer for the hard disk, preventing
+			;	the Power Mgr from cutting hard disk power during ANY SCSI transaction.		<v1.1>
+			;
+			movea.l	PmgrBase,a0					; point to Pmgr locals
+			move.l	zeroReg,LastHd(a0)			; always freeze the spin down timer			<v1.1>
+@startItUp										; power up the hard drive					<v1.1>
+			with 	pmCommandRec
+			link	a6,#-14						; Power Mgr task, and 2-byte buffer			<v1.1>
+			lea.l	-14(a6),a0					; point to the parameter block				<v1.1>
+			move.w	#powerCntl,pmCommand(a0)	; power up the SCSI +5V and +12V			<v1.1>
+			move.w	#1,pmLength(a0)				; one byte of data in buffer				<v1.1>
+			move.w	#hdOn*256,-2(a6)			; hdOn command								<v1.1>
+			pea.l	-2(a6)						; address of the send buffer				<v1.1>
+			move.l	(sp)+,pmSBuffer(a0)			; save the send buffer pointer				<v1.1>
+			move.l	zeroReg,pmRBuffer(a0)		; no data to be received					<v1.1>
+			_PmgrOp								; send it off to the Power Mgr				<v1.1>
+			unlk	a6							; release local storage						<v1.1>
+			endwith
+@PwrDone
+			movea.l	jvArb(a4),a0				; arbitrate for the SCSI bus
+			jsr		(a0)						; go to the routine
+			beq.s	@success					; arbitration succeeded, so we can continue
+@arbFailed										; arbitration failed, but we'll get a LossOfBSY intr
+			move.l	scsiPrivate(a5),a0			; get pointer to private storage record
+			move.b	zeroReg,scsiFlags(a0)		; mark this private storage record available
+			move.l	zeroReg,scsiPrivate(a5)		; since it failed, release the private storage
+			tst.l	nextPrivate(a4)				; check for a free private storage record
+			bne.s	@failed						; there is already a free record
+			move.l	a0,nextPrivate(a4)			; this record is free
+@failed
+			move.w	(sp)+,sr					; restore the status register (end critical section)
+			bra.s	@afterPhase					; no phase handling will be necessary - no request
+@success
+			move.w	(sp)+,sr						; restore status register (end critical section)
+			move.l	scsiPrivate(a5),a0				; get pointer to private storage record
+			move.l	scsiCmdBuf(a5),scsiCmdOffs(a0)	; copy of command buf ptr between interrupts
+			movea.l	jvSetup(a4),a0					; get address of Setup routine
+			jsr		(a0)							; set up the current request (activeReq)
+			movea.l	jvSel(a4),a0				; select the target device
+			jsr		(a0)						; go to the routine
+			beq.s	@nextPhase					; selection succeeded, so start handling phases
+@failedSelection
+			movea.l	jvClearState(a4),a0			; error in d0								<v1.5>
+			jsr		(a0)						; blow away the SCSI PB						<v1.5>
+			movea.l	zeroReg,a5					; no active request							<v1.5>
+			bra.s	@afterPhase					; no phase handling will be necessary - no request
+@noActiveReq
+@nextPhase
+		IF	phaseLogging	THEN
+			nop									; good place to jump to phase-logging routine
+		ENDIF
+			move.l	zeroReg,d0					; clear jump table offset in d0
+@wfREQ
+			move.b	sCSR(a3),d0					; get current state
+			btst.l	#bBSY,d0					; is *BSY asserted ?
+			beq.s	@afterPhase					; if not, we're done
+			btst.l	#bREQ,d0					; do we have a REQ (valid phase)
+			beq.s	@wfREQ						; if not, wait
+			andi.b	#aMSG+aCD+aIO,d0			; d0 = {0,4,8,12,24,28} (16,20 undefined)	<v1.2>
+			lea.l	phaseTable(a4),a0			; point to phase jump table in globals
+			movea.l	0(a0,d0),a0					; get phase handler address from phase jump table
+			lsr.b	#2,d0						; set TCR so phase match bit is correct
+			move.b	d0,sTCR+WrOffs(a3)			; set phase to match
+			addi.w	#scsiDataOut,d0				; create the constant for phase logging		<v1.2>
+			cmp.l	a5,zeroReg					; are we pointing to a request ?			<v1.2>
+			beq.s	@skip						; if not, can't log phase					<v1.2>
+			move.w	d0,scsiResult(a5)			; reflect the current phase in the PB
+@skip
+			jsr		(a0)						; go to phase-handling routine
+			btst.b	#waitingForIRQ,state1(a4)	; is DMA in progress ? (waiting for an intr)	<v1.5>
+			bne.s	@afterPhase					; if so, then we should exit
+			tst.l	activeReq(a4)				; is there still a current request ?
+			bne.s	@nextPhase					; if so, handle next phase
+@afterPhase
+			tst.b	discID(a4)					; are any ID's disconnected ?
+			beq.s	@endWhile					; if not, no need to enable reselection interrupts
+
+			move.b	G_ID(a4),sSER+WrOffs(a3)	; enable reselection interrupts
+			;
+			;	do {
+			;	} while ( (pageFault && noInterrupts) || (dTask.dtParm != 0) ||
+			;		(!waitingForIRQ && nextPrivate && scsiQHead && !Find(any,discID)) );		<v1.5>
+			;
+@endWhile
+			tst.l	pageFault(a4)				; check pointer to page-fault parameter block
+			beq.s	@chkIntrPending				; if no page fault, any other interrupts pending ?
+			move.w	sr,d0						; get a copy of the CPU's interrupt level
+			andi.w	#HiIntMask,d0				; get CPU's interrupt level
+			cmpi.w	#scsiIntMask,d0				; compare SCSI interrupt level to the CPU's
+			bhs.s	@goBack						; no interrupts, so keep looping
+@chkIntrPending
+			tst.l	dTask+dtParm(a4)			; are there any interrupt to be serviced ?
+			bne.s	@goBack						; there are interrupts left to service (keep looping)
+@chkOtherRequests
+			btst.b	#waitingForIRQ,state1(a4)	; are we "waiting for interrupt" ?				<v1.5>
+			bne.s	@exit						; if so, we should exit (we'll get an intr)		<v1.5>
+			tst.l	nextPrivate(a4)				; do we have private storage for a new request ?
+			beq.s	@exit						; if not, we can't start up a new request
+			tst.l	scsiQHead(a4)				; any requests left ?
+			beq.s	@exit						; no requests in the queue
+			moveq.l	#findAny,d0					; find the first available request to process
+			movea.l	jvFind(a4),a0				; get address of Find routine
+			jsr		(a0)						; is there a request to process ?
+			beq.s	@exit						; there is nothing to process
+@goBack
+			bra.w	@doWhile					; keep going (don't exit the "while" loop)
+@exit
+			tst.l	activeReq(a4)				; are we processing a request ?
+			bne.s	@enableIntr					; if so, the timer was already set (by "Setup")
+			movea.l	jvSetTimer(a4),a0			; addr of timer setup routine
+			move.l	zeroReg,d0					; assume no more timing needed
+			tst.l	scsiQHead(a4)				; are there any more requests ?
+			beq.s	@setTimer					; if there are not, stop the timer
+			move.w	#WDTO,d0					; watchdog timeout
+@setTimer
+			jsr		(a0)						; set the timer
+
+			btst.b	#shwCbPwrMgr,G_Reserved0+3(a4)		; do we have a Power Mgr chip ?
+			beq.s	@PwrDone2					; if not, skip
+
+			;
+			;	This portion of code "starts" the "Spin Down" timer for the hard disk.
+			;	The timer value is the value of Ticks when the last SCSI I/O completed.
+			;	Whenever the SCSI bus is used, the timer is reset.							<v1.1>
+			;	When it goes off, "DoSpinDown" turns off the hard drive power.				<v1.1>
+			;
+			;	If there are any requests in the queue, leave the hard disk power on.		<v1.1>
+			;
+@chkPower
+			tst.l	scsiQHead(a4)				; anything left in the queue ?				<v1.1>
+			bne.s	@PwrDone2					; if so, don't start the timer				<v1.1>
+			move.l	PmgrBase,a0					; point to Pmgr locals					<v1.4>
+			move.l	Ticks,LastHd(A0)			; indicate last activity for ID 0		<v1.4>
+@PwrDone2
+
+@enableIntr
+			moveq.l	#1,d0						; enable interrupts
+
+			move.l	jvDisEnable(a4),a0			; addr of interrupt disable/enable routine
+			jsr		(a0)						; enable all SCSI interrupts
+			movem.l	(sp)+,intrRegs				; restore registers
+		IF	dbSymbols	THEN
+			unlk	a6
+			rts									; finished
+			dc.b	'SCSIDT  '
+		ELSE
+			rts
+		ENDIF
+;
+;	Command
+;
+;	Called by:	SCSIDT
+;
+;	Function:	Sends "scsiCmdLen" command bytes to the target.								<v1.2>
+;				If BSY disappears, it's assumed we timed out and the bus was reset to recover.
+;
+Command:
+			move.l	scsiPrivate(a5),a0			; get ptr to private storage				<v1.3>
+			move.l	scsiCmdOffs(a0),a2			; get the current command buffer ptr		<v1.3>
+			move.l	zeroReg,d2					; clear lower word of count					<v1.2>
+			move.b	scsiCmdLen(a5),d2			; get number of command bytes				<v1.2>
+			subq.l	#1,d2						; setup for a DBRA							<v1.2>
+@nextCmdByte
+@wfREQ
+			move.b	sCSR(a3),d0					; look at the bus
+			btst.l	#bBSY,d0					; is BSY asserted ?
+			beq.s	@errExit					; if not, won't send command (a5 may be invalid)<v1.3>
+			btst.l	#bREQ,d0					; wait for REQ
+			beq.s	@wfREQ
+			btst.b	#bPM,sBSR(a3)				; check for phase match
+			beq.s	@exit						; out of phase, so exit						<v1.2>
+@inPhase
+			move.b	(a2)+,sODR+WrOffs(a3)		; load byte
+			move.b	#iDB,sICR+WrOffs(a3)		; assert the data bus
+			move.b	#iACK+iDB,sICR+WrOffs(a3)	; set *ACK
+@wfnREQ
+			btst.b	#bBSY,sCSR(a3)				; do we still have BSY ?					<v1.2>
+			beq.s	@errExit					; if not, get out							<v1.3>
+			btst.b	#bREQ,sCSR(a3)				; wait for no REQ
+			bne.s	@wfnREQ
+			move.b	zeroReg,sICR+WrOffs(a3)		; deassert *ACK and *DB
+			dbra.w	d2,@nextCmdByte				; send the next command byte				<v1.2>
+
+			;
+			;	This is a hack for the Tape Backup 40SC drive.  It asserts an extra REQ on
+			;	10-byte commands, which appears as a request for an 11th byte (that's what
+			;	the SCSI standard says!)  We shouldn't leave until this extra REQ goes away.<v1.2>
+			;	This delay will wait at least 256ms for a phase change before continuing.	<start>
+			;
+			move.l	zeroReg,d0					; clear upper word
+			move.w	TimeSCSIDB,d0				; get SCSI DBRA's/ms timing constant
+			lsl.l	#8,d0						; wait at least 256ms for the tape drive
+			move.l	d0,d2						; set up d2 as high word
+			swap	d2 
+@cmdHack
+			btst.b	#bBSY,sCSR(a3)				; is BSY still asserted ?
+			beq.s	@exit						; if not, leave
+			btst.b	#bPM,sBSR(a3)				; are we still in phase ?
+			dbeq.w	d0,@cmdHack					; loop until phase mismatch or timeout		<v1.2>
+			dbeq.w	d2,@cmdHack					; high word of timeout						<end>
+
+@exit
+			move.l	a2,scsiCmdOffs(a0)			; save current offset into the cmd buffer	<v1.3>
+@errExit										; if we lost BSY, a5 may be invalid			<v1.3>
+			rts
+
+;
+;	StatusPhase
+;
+;	Called by:	SCSIDT
+;
+;	On entry:	a4 - ptr to SCSI Mgr globals
+;				a5 - ptr to active SCSI request parameter block
+;	
+;	Function:	Reads only 1 status byte from the target.
+;
+StatusPhase:
+@wfREQ
+			move.b	sCSR(a3),d0					; look at the bus
+			btst.l	#bBSY,d0					; is BSY asserted ?
+			beq.s	@exit						; no BSY - we won't get status (a5 may be invalid)
+			btst.l	#bREQ,d0					; wait for REQ
+			beq.s	@wfREQ
+			btst.b	#bPM,sBSR(a3)				; check for phase match
+			beq.s	@exit						; we're out of phase
+@inPhase
+			move.b	sCDR(a3),d0					; get the status byte
+			move.b	#iACK,sICR+WrOffs(a3)		; set *ACK
+@wfnREQ
+			btst.b	#bBSY,sCSR(a3)				; do we have BSY ?							<v1.2>
+			beq.s	@exit						; if not, exit								<v1.2>
+			btst.b	#bREQ,sCSR(a3)				; wait for no REQ
+			bne.s	@wfnREQ
+			move.b	zeroReg,sICR+WrOffs(a3)		; deassert *ACK
+@done
+			move.b	d0,scsiStatus(a5)			; store the status byte
+			movea.l	scsiPrivate(a5),a0			; point at private storage for this request
+			btst.b	#scsiBAutoSns,scsiFlags(a0)	; is this the auto sense param block ?
+			bne.s	@exit						; don't note passage through Status phase
+@normal
+			bset.b	#scsiBStatus,scsiFlags(a0)	; note passage through status phase
+@exit
+			rts
+
+;
+;	MsgIn and MsgOut - handle the "Message In" and "Message Out" phases
+;
+;	Called by:	PhaseHnd
+;
+;	Calls:		None.
+;
+;	Function:	Transfers message bytes to and from the target in programmed I/O mode.
+;
+;	Note:		In the new SCSI Manager, the message support is as follows:
+;
+;										Message In:				Message Out:
+;
+;				Command Complete		Supported
+;				Extended Messages
+;					Extended Identify	Msg Reject				Never sent
+;					Modify Data Ptr		Msg Reject
+;					Synchronous DTR		Msg Reject				Never sent
+;					Wide DTR			Msg Reject				Never sent
+;					Reserved			Msg Reject				Never sent
+;					Vendor Unique		Msg Reject				Never sent
+;				Save Data Pointer		Supported
+;				Restore Pointers		Supported
+;				Disconnect (In)			Supported
+;				Disconnect (Out)								Never sent
+;				Init Detected Err		Msg Reject				Never sent
+;				Abort					Msg Reject				Supported
+;				Message Reject			Supported				Supported
+;				No Operation			Msg Reject				Supported
+;				Message Parity Err		Msg Reject				Never sent
+;				Linked Cmd Complete		Msg Reject (Currently)
+;				Lnkd Cmd Cmpl w/Flag	Msg Reject (Currently)
+;				Bus Device Reset		Msg Reject				Supported
+;				Clear Queue				Msg Reject				Never sent
+;				Initiate Recovery		Msg Reject				Never sent
+;				Release Recovery		Msg Reject				Never sent
+;				Mundane Queue Tag		Msg Reject				Never sent
+;				Head of Queue Tag		Msg Reject				Never sent
+;				Ordered Queue Tag		Msg Reject				Never sent
+;				Abort Tag				Msg Reject				Never sent
+;				Ignore Wide Residue		Msg Reject
+;				Identify				Supported				Supported
+;				Reserved (0D)			Msg Reject				Never sent
+;				Reserved (11-1F)		Msg Reject				Never sent
+;				Reserved (25-7F)		Msg Reject				Never sent
+;		
+
+;
+;	This is the Message In phase handler.
+;
+MsgIn:
+@getNextByte
+			move.l	zeroReg,d0					; clear out offset
+@wfREQ
+			move.b	sCSR(a3),d0					; look at the bus
+			btst.l	#bBSY,d0					; is BSY asserted ?
+			beq.s	@msgInDone					; BSY is gone -- we won't get a message byte
+			btst.l	#bREQ,d0					; wait for REQ
+			beq.s	@wfREQ
+			btst.b	#bPM,sBSR(a3)				; check for phase match
+			beq.s	@msgInDone					; lost phase match
+@inPhase
+			move.b	sCDR(a3),d0					; get byte
+			move.b	#iACK,sICR+WrOffs(a3)		; set *ACK
+@wfnREQ
+			btst.b	#bREQ,sCSR(a3)				; wait for no REQ <from C846/PA081/03Mar87>
+			bne.s	@wfnREQ
+@chkIdentify
+			btst.l	#scsiIdentBit,d0			; check for "Identify" message (bit 7 set)
+			beq.s	@chkInvalid					; if not "Identify", is it valid ?
+			move.b	d0,d1						; hold onto the "Identify" message byte
+			movea.l	jvIdentifyIn(a4),a0			; address of Identify (In) message handler
+			jsr		(a0)						; handle the Identify message
+			bra.s	@msgHandled					; check if there is another message to handle
+@chkInvalid
+			cmpi.b	#numMsgVct-1,d0				; is it in range of the message routing table ?
+			bhi.s	@msgInvalid					; if not, it's invalid
+@msgValid
+			lea.l	msgInTbl(a4),a0				; point to base of message byte routing table
+			move.b	0(a0,d0.l),d0				; get offset into msgTable
+			lea.l	msgTable(a4),a0				; point to message handler jump table
+			movea.l	0(a0,d0.l),a0				; get address of message byte handler
+			jsr		(a0)						; go handle the message byte
+@msgHandled
+			btst.b	#bPM,sBSR(a3)				; still in message in phase ?
+			bne.s	@getNextByte				; keep going
+@msgInDone
+			rts
+
+@msgInvalid
+			movea.l	jvInvalidIn(a4),a0			; otherwise, start sending a Message Reject
+			jsr		(a0)						; go to the routine
+			bra.s	@msgHandled					; see if there is anything else to do
+		
+
+msgInvalidIn:
+			movea.l	scsiPrivate(a5),a0			; point at SCSI Mgr private storage
+			move.b	#scsiMOMR,scsiState(a0)		; set state machine to "Msg Reject" state
+			move.b	#iATN+iACK,sICR+wrOffs(a3)	; assert ATN to start Msg Reject sequence
+			move.b	#iATN,sICR+wrOffs(a3)		; release ACK to complete handshake
+			rts
+			
+			
+msgIdentifyIn:
+			move.l	zeroReg,d0					; clear the "findAnyFlag" in d0
+			move.b	dTask+dtParm+3(a4),d0		; get the reselection ID mask from SCSIIntHnd
+			move.b	zeroReg,dTask+dtParm+3(a4)	; clear reselect ID mask (this intr has been serviced)
+			rol.w	#8,d0						; upper byte of d0.w = ID mask; d0.b = 0
+			andi.b	#LUNMask,d1					; leave LUN in d1
+			bset.l	d1,d0						; set the bit in the LUN bitmap for Find
+			movea.l	jvFind(a4),a0				; get address of Find routine
+			jsr		(a0)						; go find that request
+			movea.l	d0,a5						; point to the parameter block
+			bne.s	@clearDiscLUN				; we found a real parameter block
+@PBTimedOut	;	A timed-out target has reconnected.
+			move.l	jvClearBus(a4),a0			; get address of ClearBus routine
+			jsr		(a0)						; abort this target (a5=0) (go to a BUS FREE)
+			rts									; get out of here (BUS FREE condition)
+@clearDiscLUN
+			move.l	zeroReg,d0					; clear out d0 (including the "findAnyFlag")
+			move.b	scsiReqID(a5),d0			; use ID in d0 as offset into "discLUN[]"
+			move.b	scsiReqLUN(a5),d1			; restore the LUN in d1 as offset into bitmap
+			lea.l	discLUN(a4),a0				; point at disconnected LUN bitmap
+			bclr.b	d1,0(a0,d0.w)				; mark LUN as no longer disconnected
+			tst.b	0(a0,d0.w)					; are any more LUN's disconnected for this ID ?
+			bne.s	@continue					; if so, don't clear the disconnected ID bit
+			bclr.b	d0,discID(a4)				; this is no longer a valid reselecting ID
+@continue
+			movea.l	jvSetup(a4),a0				; get address of Setup routine
+			jsr		(a0)						; setup the current request
+			movea.l	jvRestorePtrs(a4),a0		; implied Restore Pointers message
+			jmp		(a0)						; perform the Restore Pointers message
+
+
+msgCmdComplete:
+			movea.l	scsiPrivate(a5),a0			; point at private storage for this request
+			btst.b	#scsiBAutoSns,scsiFlags(a0)	; is this an auto Request Sense PB ?
+			bne.w	@autoSense					; if so, restore original contents
+			cmp.l	scsiSnsBuf(a5),zeroReg		; was automatic sense disabled ?
+			beq.w	@completed					; if disabled, just leave
+@checkStat
+			move.b	scsiStatus(a5),d0			; get the status byte
+			andi.b	#statusByteCode,d0			; mask off vendor-unique bits in status byte
+			btst.l	#statusRsrvBit,d0			; is the reserved bit set ?
+			bne.w	@completed					; if so, might not be "Check Condition" - exit
+			cmpi.b	#statusChkCond,d0			; "Check Condition" status ?
+			bne.w	@completed					; no, so we're done
+			;
+			;	At this point, the user wants an automatic REQUEST SENSE command, and the
+			;	original command has failed.  It is necessary to save all the fields in the
+			;	user's parameter block that will be altered when handling the Request Sense
+			;	command.  The fields are saved in a portion of the dummy parameter block.
+			;
+@startAutoSense
+			lea.l	dummy(a4),a0						; ptr to the dummy parameter block
+			;
+			;	scsiQLink, scsiVersion, and scsiResult are not saved or changed.
+			;	scsiBus, scsiReqID, and scsiReqLUN are not saved or changed.
+			;	This leaves the auto Request Sense parameter block in its original
+			;	position in the request queue.
+			;
+			move.l	scsiCompletion(a5),scsiCompletion(a0)	; save the completion address
+			move.l	zeroReg,scsiCompletion(a5)			; no completion routine for Req Sense
+			;
+			;	scsiUsrData, scsiReqTO, scsiUsrFlags, and scsiSelTO are not saved or changed.
+			;
+			move.l	scsiMgrFlags(a5),scsiMgrFlags(a0)	; save original SCSI flags
+			move.l	#scsiFNoDisc,scsiMgrFlags(a5)		; sync virtual slow read, no disconnect
+			move.l	scsiLinkCmd(a5),scsiLinkCmd(a0)		; save linked command pointer
+			move.l	zeroReg,scsiLinkCmd(a5)				; no linked commands
+@setupCmd
+			lea.l	RSCmd(a4),a1						; point to "Request Sense" command
+			move.b	scsiSnsLen(a5),allocLen(a1)			; fill in allocation length
+			move.l	scsiCmdBuf(a5),scsiCmdBuf(a0)		; save the command buffer pointer
+			move.l	a1,scsiCmdBuf(a5)					; perform a "Request Sense"
+@setupDC
+			move.l	scsiDataLen(a5),scsiDataLen(a0)		; save the original data byte count
+			move.l	zeroReg,d0							; clear out d0
+			move.b	scsiSnsLen(a5),d0					; length of sense buffer
+			move.l	d0,scsiDataLen(a5)					; sense buf length is data buf length
+			move.l	scsiDataXfer(a5),scsiDataXfer(a0)	; save # of data bytes transferred
+			move.l	zeroReg,scsiDataXfer(a5)			; no data bytes transferred, yet
+			lea.l	RSDC(a4),a1							; ptr to Req Sense data-chaining instr
+			move.l	scsiDCInstr(a5),scsiDCInstr(a0)		; save data-chaining instruction ptr
+			move.l	a1,scsiDCInstr(a5)					; data-chaining instr for Req Sense
+			move.l	scsiSnsBuf(a5),d0					; address of request's sense buffer
+			move.l	d0,dcAddr(a1)						; buffer address in "dcAddr" field
+			move.l	d0,dcStore(a1)						; buffer address in "dcStore" field
+			adda.w	#dcSize,a1							; point to next instruction
+			move.l	scsiDataLen(a5),d0					; number of bytes to transfer (set previously)
+			move.l	d0,dcCount(a1)						; store in the "dcCount" field
+			move.l	d0,dcStore(a1)						; store in the "dcStore" field
+@setupAutoSense
+			move.l	scsiSnsBuf(a5),scsiSnsBuf(a0)		; save the sense buffer pointer
+			move.l	zeroReg,scsiSnsBuf(a5)				; disable auto Request Sense
+			move.b	scsiSnsLen(a5),scsiSnsLen(a0)		; save the sense buffer length
+			move.b	zeroReg,scsiSnsLen(a5)				; no sense buffer
+			;
+			;	scsiSnsXfer is zero at this point, so it doesn't need initialization.
+			;
+			move.b	scsiStatus(a5),scsiStatus(a0)		; hold on to the status byte
+			move.b	#statusInitial,scsiStatus(a5)		; initial status byte value
+@setupPrivate
+			;
+			;	scsiTime, scsiMgrFlag1, scsiMgrFlag2, scsiMoveOffs,
+			;	and the virtual/physical tranlation record are not changed or saved
+			;
+			movea.l	scsiPrivate(a5),a1					; point to private storage for this request
+			lea.l	dummyPriv(a4),a0					; point to dummy PB's private storage record
+			bset.b	#scsiBAutoSns,scsiFlags(a1)			; mark this as the auto-Req Sense PB
+			move.b	scsiState(a1),scsiState(a0)			; save the Message Out state variable
+			move.b	#scsiMOID,scsiState(a1)				; back to normal "Identify" state
+			move.l	scsiCmdOffs(a1),scsiCmdOffs(a0)		; save the temp command buffer ptr
+			move.l	scsiCmdBuf(a5),scsiCmdOffs(a1)		; copy of scsiCmdBuf
+			move.l	scsiDCSaved(a1),scsiDCSaved(a0)		; save the saved data pointer value
+			move.l	zeroReg,scsiDCSaved(a1)				; start at beginning of table
+			move.l	scsiDCOffs(a1),scsiDCOffs(a0)		; save the temp saved data pointer
+			move.l	zeroReg,scsiDCOffs(a1)				; start at beginning of table
+			move.l	zeroReg,activeReq(a4)				; the bus is currently free
+			move.b	zeroReg,sICR+WrOffs(a3)				; deassert *ACK
+			bra.w	@done								; done for now
+@autoSense
+			;
+			;	At this point, a5 is pointing at a "Auto Request Sense" parameter block.
+			;	It is necessary to restore the fields in the parameter block to their
+			;	original values.
+			;
+@restorePB
+			lea.l	dummy(a4),a0						; point to the dummy parameter block
+			move.l	scsiCompletion(a0),scsiCompletion(a5)	; restore completion routine ptr
+			move.l	scsiMgrFlags(a0),scsiMgrFlags(a5)	; restore SCSI flags
+			move.l	scsiLinkCmd(a0),scsiLinkCmd(a5)		; restore linked command pointer
+			move.l	scsiCmdBuf(a0),scsiCmdBuf(a5)		; restore command buffer pointer
+			move.l	scsiSnsBuf(a0),scsiSnsBuf(a5)		; restore sense buffer ptr
+			move.b	scsiSnsLen(a0),scsiSnsLen(a5)		; restore sense buffer length
+			move.l	scsiDataXfer(a5),d0					; get number of bytes transferred
+			move.b	d0,scsiSnsXfer(a5)					; save sense byte count in original PB
+			move.l	scsiDataLen(a0),scsiDataLen(a5)		; restore data buffer length
+			move.l	scsiDataXfer(a0),scsiDataXfer(a5)	; restore data transfer byte count
+			move.l	scsiDCInstr(a0),scsiDCInstr(a5)		; restore data-chaining instruction ptr
+			move.b	scsiStatus(a5),d0					; get the status byte
+			move.b	scsiStatus(a0),scsiStatus(a5)		; restore original status byte
+			andi.b	#statusByteCode,d0					; mask vendor-unique bits in Req Sense status
+			btst.l	#statusRsrvBit,d0					; is the reserved bit set ?
+			bne.s	@restorePrivate						; if so, might not be "Check Cond" - continue
+			cmpi.b	#statusChkCond,d0					; "Check Condition" status ?
+			bne.s	@restorePrivate						; no, so continue
+			move.b	zeroReg,scsiSnsXfer(a5)				; Req Sense failed - report "no sense data"
+@restorePrivate
+			movea.l	scsiPrivate(a5),a1					; point to private storage for this request
+			lea.l	dummyPriv(a4),a0					; point to dummy PB's private storage record
+			bclr.b	#scsiBAutoSns,scsiFlags(a1)			; restore SCSI Mgr flags
+			move.b	scsiState(a0),scsiState(a1)			; restore Message Out state variable
+			move.l	scsiCmdOffs(a0),scsiCmdOffs(a1)		; restore temp command buffer ptr
+			move.l	scsiDCSaved(a0),scsiDCSaved(a1)		; restore saved data ptr value
+			move.l	scsiDCOffs(a0),scsiDCOffs(a1)		; restore temp saved data ptr value
+@completed
+			moveq.l	#noErr,d0						; assume all is well
+			movea.l	scsiPrivate(a5),a0				; point to private storage for this request
+			btst.b	#scsiBStatus,scsiFlags(a0)		; is the Status byte valid ?
+			bne.s	@validStatus					; if so, then exit
+@noStatus
+			move.w	#scsiNoStatusErr,d0				; never received a Status byte				<v1.2>
+@validStatus
+			move.b	zeroReg,sICR+WrOffs(a3)			; deassert ACK (avoids completion-routine deadlock)
+			movea.l	jvClearState(a4),a0				; clear SCSI Mgr state
+			jsr		(a0)							; go to the routine
+@linkLoop
+			move.l	scsiLinkCmd(a5),d0				; any linked commands left to be executed ?
+			movea.l	d0,a5							; point to the linked command				<v1.5>
+			beq.s	@done							; if not, we're truly done					<v1.5>
+			move.w	#scsiLinkFailErr,d0				; this linked command was never started		<v1.2>
+			jsr		(a0)							; remove this request
+			bra.s	@linkLoop						; keep checking
+@done
+			rts										; continue
+
+
+msgExtendedMsg:
+			;
+			;	Currently, no extended messages are supported
+			;
+
+
+msgSaveDataPtr:
+			move.l	scsiDCInstr(a5),a0			; point to data-chaining instructions
+			cmp.l	a0,zeroReg					; is it nil ?
+			beq.s	@dcStop						; if so, there is nothing to save
+			movea.l	scsiPrivate(a5),a1			; point to private storage for this request
+			move.l	scsiDCOffs(a1),scsiDCSaved(a1)	; save the active "data" pointer state
+			moveq.l	#dcLoop,d0					; used for comparison
+@repeat
+			move.l	dcAddr(a0),d1				; get the address or opcode
+			beq.s	@dcStop						; if "dcStop", then we're done
+			cmp.l	d0,d1						; is it a "dcLoop" instruction ?
+			bne.s	@save						; if not, save the address in "dcStore"
+			move.l	dcCount(a0),d1				; the loop count needs to be saved
+@save
+			move.l	d1,dcStore(a0)				; save the necessary value
+			adda.w	#dcSize,a0					; point to next data-chaining instruction
+			bra.s	@repeat						; copy another instruction
+@dcStop
+			move.b	zeroReg,sICR+wrOffs(a3)		; deassert *ACK
+			rts									; continue
+
+
+msgRestorePtrs:
+			movea.l	scsiPrivate(a5),a0				; point to private storage for this request
+			move.l	scsiCmdBuf(a5),scsiCmdOffs(a0)	; restore command buffer pointer
+			move.l	scsiDCSaved(a0),scsiDCOffs(a0)	; restore the active "data" pointer state
+			move.l	scsiDCInstr(a5),a0			; point to data-chaining instructions
+			cmp.l	a0,zeroReg					; are there data-chaining instructions ?
+			beq.s	@dcStop						; if not, then we're done
+			moveq.l	#dcLoop,d0					; used for comparison
+@repeat
+			move.l	dcStore(a0),d3				; get the saved value
+			move.l	dcAddr(a0),d1				; get the address or opcode
+			beq.s	@dcStop						; if "dcStop", then we're done
+			cmp.l	d0,d1						; is it a "dcLoop" instruction ?
+			bne.s	@dcMove						; if not, it is a "dcMove" instruction
+@dcLoop
+			move.l	d3,dcCount(a0)				; restore the old count
+			bra.s	@continue					; go to next instruction
+@dcMove
+			move.l	d3,dcAddr(a0)				; restore the old address
+@continue
+			adda.w	#dcSize,a0					; point at next instruction
+			bra.s	@repeat						; handle next instruction
+@dcStop
+			move.b	zeroReg,sICR+WrOffs(a3)		; deassert *ACK
+			rts									; continue
+
+			
+msgDisconnect:
+			move.l	zeroReg,d1					; clear out d1 for use as an offset
+			move.b	scsiReqID(a5),d1			; get ID of request
+			move.b	scsiReqLUN(a5),d0			; get the LUN of request
+			bset.b	d1,discID(a4)				; mark ID as disconnected
+			lea.l	discLUN(a4),a0				; point to base of disconnected LUN table
+			bset.b	d0,0(a0,d1.w)				; mark bit "scsiReqLUN" of "discLUN[scsiReqID]"
+			move.l	zeroReg,activeReq(a4)		; no active request
+			move.w	#scsiDisc,scsiResult(a5)	; mark this PB as disconnected
+			move.b	zeroReg,sICR+WrOffs(a3)		; deassert *ACK
+			rts									; continue
+
+			
+msgMsgRejIn:									; for now, no processing if a Msg Rej occurs
+		IF	dbSymbols	THEN
+			_Debugger
+		ENDIF
+			move.b	zeroReg,sICR+wrOffs(a3)		; deassert *ACK
+			rts
+		IF	padForOverPatch		THEN			; padding									<v1.3>
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+		ENDIF
+
+
+msgLCCF:										; Linked Command Complete with (or without) Flag
+			moveq.l	#noErr,d0					; assume all is well
+			movea.l	scsiPrivate(a5),a0			; point to private storage for this request
+			btst.b	#scsiBStatus,scsiFlags(a0)	; is the Status byte valid ?
+			bne.s	@validStatus				; if so, then continue
+@noStatus
+			move.w	#scsiNoStatusErr,d0			; never received a Status byte				<v1.2>
+@validStatus
+			move.b	zeroReg,sICR+WrOffs(a3)		; deassert ACK (avoids completion-routine deadlock)
+			movea.l	jvClearState(a4),a0			; clear SCSI Mgr state
+			jsr		(a0)						; go to the routine
+		IF	dbSymbols	THEN
+			_Debugger							; what now ??? (find a private record, Setup, etc.)
+		ENDIF
+			rts									; continue
+		IF	padForOverPatch		THEN			; padding									<v1.3>
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+		ENDIF
+
+;
+;	This is the Message Out phase handler
+;
+MsgOut:
+@loop
+			moveq.l	#scsiMONOP,d0				; assume unexpected Message Out phase		<v1.2>
+			tst.l	activeReq(a4)				; check if we're processing a request		<v1.2>
+			beq.s	@handleMsgOut				; send No Op's - unexpected Msg Out phase 	<v1.2>
+
+			movea.l	scsiPrivate(a5),a0			; point at private storage for this request
+			move.l	zeroReg,d0					; clear out the offset in d0
+			move.b	scsiState(a0),d0			; get the Message Out state for this request
+			cmpi.b	#numMsgVct-1,d0				; is it in range of the Msg Out state routing table ?
+			bls.s	@handleMsgOut				; if so, call the Msg Out handler
+@invalid
+			moveq.l	#scsiMOInvalid,d0			; Msg Out state machine messed up - kill the request
+@handleMsgOut
+			lea.l	msgOutTbl(a4),a0			; point to base of Message Out routing table
+			move.b	0(a0,d0.l),d0				; get offset into msgTable
+			lea.l	msgTable(a4),a0				; point to msgTable
+			movea.l	0(a0,d0.l),a0				; get address of message out state handler
+			jsr		(a0)						; go handle the message out state
+@wfReq
+			move.b	sCSR(a3),d0					; get a snapshot of the bus					<v1.5>
+			btst.l	#bBSY,d0					; do we have BSY ?							<v1.5>
+			beq.s	@msgOutDone					; if not, get out							<v1.2>
+			btst.l	#bREQ,d0					; wait for REQ before checking phase		<v1.5>
+			beq.s	@wfReq						; no REQ yet
+			btst.b	#bPM,sBSR(a3)				; are we still in Message Out phase ?
+			bne.s	@loop						; if so, continue running the state machine	<v1.5>
+
+@msgOutDone
+			rts
+
+
+
+msgIdentifyOut:
+			;
+			; first send an Identify message to the appropriate LUN
+			;
+			move.b	scsiReqLUN(a5),d1				; set up "Identify" message
+			ori.b	#scsiIdentFlg+scsiReselFlg,d1	; "Identify and Disconnect" message
+			move.l	scsiMgrFlags(a5),d0				; get SCSI flags
+			btst.l	#scsiBImmed,d0					; is it a page-fault request ?			<v1.1>
+			bne.s	@discNotOK						; sorry, page-faults can't disconnect
+			btst.l	#scsiBNoDisc,d0					; check if disconnect is disabled
+			beq.s	@discOK							; we may disconnect
+@discNotOK
+			bclr.l	#scsiReselBit,d1				; no disconnect -- simple "Identify" message
+@discOK
+			move.b	d1,sODR+wrOffs(a3)				; send out Identify message
+@chkBusDevReset
+			btst.l	#scsiBBusDevRst,d0				; should we send a Bus Device Reset msg ?	<v1.5>
+			beq.s	@noMessagesLeft					; if not, we're done						<start>
+			move.b	#iATN+iDB,sICR+wrOffs(a3)		; assert data bus - keep ATN on
+			move.b	#iATN+iACK+iDB,sICR+wrOffs(a3)	; assert ACK and data bus
+@wfnREQ0
+			btst.b	#bREQ,sCSR(a3)					; wait for REQ to go away
+			bne.s	@wfnREQ0						; keep waiting
+			move.b	#iATN,sICR+wrOffs(a3)			; keep ATN on - release data bus and ACK
+			move.l	scsiPrivate(a5),a0				; point to private storage
+			move.b	#scsiMOBDR,scsiState(a0)		; set state machine to Bus Device Reset		<end>
+			rts										; we're done for now						<v1.5>
+
+@noMessagesLeft
+			move.b	zeroReg,sICR+wrOffs(a3)		; deassert ATN line - no messages left
+			move.b	#iDB,sICR+wrOffs(a3)		; assert data bus
+			move.b	#iACK+iDB,sICR+wrOffs(a3)	; assert ACK and data bus
+@wfnREQ1
+			btst.b	#bREQ,sCSR(a3)				; wait for REQ to go away
+			bne.s	@wfnREQ1					; keep waiting
+			move.b	zeroReg,sICR+wrOffs(a3)		; deassert data bus and release ACK - we're done
+			move.l	scsiPrivate(a5),a0			; point to private storage
+			move.b	#scsiMONOP,scsiState(a0)	; set state machine to No Operation
+			rts									; we're done for now
+
+
+msgBusDevRst:
+			;																					<v1.5>
+			; send a Bus Device Reset message													<start>
+			;
+			move.b	#scsiBusDevReset,sODR+wrOffs(a3)	; send out a Bus Device Reset message
+@noMessagesLeft
+			move.b	zeroReg,sICR+wrOffs(a3)		; deassert ATN line - no messages left
+			move.b	#iDB,sICR+wrOffs(a3)		; assert data bus
+			move.b	#iACK+iDB,sICR+wrOffs(a3)	; assert ACK and data bus
+@wfnREQ1
+			btst.b	#bREQ,sCSR(a3)				; wait for REQ to go away
+			bne.s	@wfnREQ1					; keep waiting
+			move.b	zeroReg,sICR+wrOffs(a3)		; deassert data bus and release ACK - we're done
+@wfBusFree
+			move.b	sCSR(a3),d0					; get a snapshot of the bus
+			btst.l	#bBSY,d0					; is BSY still asserted ?
+			beq.s	@accepted					; the device took the Bus Dev Reset message
+			btst.l	#bREQ,d0					; do we have a REQ ?
+			beq.s	@wfBusFree					; if not, keep waiting for Bus Free
+@rejected
+			;
+			; The target has asserted REQ, which probably means it is preparing to send a
+			; Message Reject in response to the Bus Device Reset message.  We simply let the
+			; phase handler take care of this case.
+			;
+			move.l	scsiPrivate(a5),a0			; point to private storage
+			move.b	#scsiMONOP,scsiState(a0)	; set state machine to No Operation
+			rts									; we're done for now
+
+@accepted
+			move.w	#scsiNoStatusErr,d0			; error indicating the device took the BDR message
+			movea.l	jvClearState(a4),a0			; remove this request
+			jsr		(a0)
+			movea.l	zeroReg,a5					; no active request								<end>
+			rts									; we're done									<v1.5>
+
+
+			
+msgMsgRejOut:
+		IF	dbSymbols	THEN
+			_Debugger							; performing a Message Reject sequence
+		ENDIF
+			move.b	#scsiMsgReject,sODR+wrOffs(a3)	; send out a Message Reject message
+			move.b	zeroReg,sICR+wrOffs(a3)		; deassert ATN line - no messages left
+			move.b	#iDB,sICR+wrOffs(a3)		; assert data bus
+			move.b	#iACK+iDB,sICR+wrOffs(a3)	; assert ACK and data bus
+@wfnREQ1
+			btst.b	#bREQ,sCSR(a3)				; wait for REQ to go away
+			bne.s	@wfnREQ1					; keep waiting
+			move.b	zeroReg,sICR+wrOffs(a3)		; deassert data bus and release ACK - we're done
+			move.l	scsiPrivate(a5),a0			; point to private storage
+			move.b	#scsiMONOP,scsiState(a0)	; set state machine to No Operation
+			rts									; see what happens next
+
+			
+msgInvalidOut:
+		IF	dbSymbols	THEN
+			_Debugger							; bad state machine state
+		ENDIF
+			rts									; get out
+		IF	padForOverPatch		THEN			; padding									<v1.3>
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+		ENDIF
+
+
+msgKillio:										; could be more elegant ???
+		IF	dbSymbols 	THEN
+			_Debugger							; Send an Abort and/or Bus Device Reset message
+		ENDIF
+			movea.l	jvResetBus(a4),a0			; addr of reset SCSI bus routine
+			jsr		(a0)						; reset the bus, killing all requests
+			rts									; we're done
+		IF	padForOverPatch		THEN			; padding									<v1.3>
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+			dc.w	$4e71, $4e71, $4e71, $4e71	; nop's
+		ENDIF
+
+
+msgNoOp:	;	If the target still wants message bytes, we send "No Operation" bytes.
+			move.b	#scsiNoOperation,sODR+wrOffs(a3)	; send out a No Op message
+			move.b	#iDB,sICR+wrOffs(a3)			; assert data bus
+			move.b	#iACK+iDB,sICR+wrOffs(a3)		; assert ACK and data bus
+@wfnREQ3
+			btst.b	#bREQ,sCSR(a3)				; wait for REQ to go away
+			bne.s	@wfnREQ3					; keep waiting
+			move.b	zeroReg,sICR+wrOffs(a3)		; release ACK and data bus
+			rts									; check phase, and repeat, if necessary
+
+;
+;	DataIO -- data-chaining instruction interpreter
+;
+;	Called by:	PhaseHnd
+;
+;	Calls:		Transfer and the data transfer routines.
+;
+;	On entry:	a3 - ptr to SCSI read base address
+;				a4 - ptr to SCSI Mgr globals
+;				a5 - ptr to active request
+;				d5 - offset into the data-chaining instructions
+;	
+;	Function:	Performs the data-chaining interpretation and calls the data transfer routines.
+;
+DataIO:
+			move.w	#scsiOverrunErr,d0			; assume we shouldn't be in a data phase	<v1.2>
+			tst.l	scsiDataLen(a5)				; is a data phase expected ?				<v1.2>
+			beq.s	@errorExit					; if not, exit								<v1.2>
+@expected
+			moveq.l	#scsiFFast+scsiFWrite+scsiFPhysical,d4	; d4 = mask data transfer bits	<v1.2>
+			and.l	scsiMgrFlags(a5),d4			; d4 = {0,4,...,24,28} jump table offset	<v1.2>
+			movea.l	scsiPrivate(a5),a0			; point to private storage for this request
+			move.l	scsiDCOffs(a0),d5			; get offset into data-chaining instr
+
+			btst.b	#bIO,sCSR(a3)				; check if I/O is asserted
+			bne.s	@input						; if asserted, we're in Data In phase
+@output
+			btst.l	#scsiBWrite,d4				; test the write flag
+			bne.s	@dc_interpreter				; we're in the correct phase - start data transfer
+@badPhase
+			move.w	#scsiTransferErr,d0			; data phase doesn't match read/write flag	<v1.2>
+@errorExit
+			movea.l	jvLogError(a4),a0			; note SCSI error in PB						<v1.2>
+			jsr		(a0)						; go to the routine							<v1.2>
+			bra.w	@exit						; exit
+@input
+			btst.l	#scsiBWrite,d4				; test the write flag
+			bne.s	@badPhase					; we're in the wrong phase
+			move.b	#iDMA,sMR+WrOffs(a3)		; set DMA mode		<C478/10Dec86>
+
+			btst.b	#sSCSIDMAExists,G_Reserved0+3(a4)	; do we have a SCSI DMA chip ?	<2.8>
+			beq.s	@DMAdone					; if not, skip it						<2.8>
+
+			move.l	#iHSKEN,sDCTRL(a3)			; turn on hhsk 		<C914>
+@DMAdone
+			move.b	zeroReg,sIDMArx+WrOffs(a3)	; start read DMA	<C478/10Dec86>
+@dc_interpreter
+			move.l	scsiDCInstr(a5),a1			; point to the data-chaining buffer
+@start
+			move.l	dcCount(a1,d5.l),d2			; get count
+			move.l	dcAddr(a1,d5.l),d0			; get the data-chaining instruction
+			beq.w	@dcStop						; if d0 is 0, then it is "dcStop"
+			move.l	d0,a2						; hold on to it in case it's an address
+			addq.l	#1,d0						; check if it is a "dcLoop" instruction
+			beq.w	@dcLoop						; if d0 was -1, then it is "dcLoop"
+
+@dcMove		; a2 contains the address
+			btst.b	#bDMAR,sBSR(a3)				; do we have a DRQ ?					<v1.1><v1.2>
+			bne.s	@chkPhase					; if so, we can check the phase
+			btst.b	#bREQ,sCSR(a3)				; do we have a REQ ?
+			beq.s	@dcMove						; if not, we can't accurately check the phase
+@chkPhase
+			btst.b	#bPM,sBSR(a3)				; are we still in phase ?
+			beq.w	@dcStop						; if not, get out
+@adjust
+			;
+			;	If a data-chaining instruction was only partially executed (due to a Disconnect),
+			;	then the "scsiMoveOffs" field in the private storage will be nonzero, reflecting
+			;	the number of bytes already transferred during the instruction.  If it is nonzero,
+			;	then the residual data to be transferred is the DCInstr value minus the amount
+			;	already transferred, and the address pointer is incremented by the amount of data
+			;	already transferred.														<v1.1>
+			; 
+			move.l	scsiMoveOffs(a0),d0			; have we partially executed this DCInstr ?	<v1.1>
+			beq.s	@chkOverrun					; if not, no adjustment necessary			<v1.1>
+			sub.l	d0,d2						; transfer only residual amount of data		<v1.1>
+			adda.l	d0,a2						; place data in the remaining buffer space	<v1.1>
+@chkOverrun
+			move.l	scsiDataXfer(a5),d0			; get number of bytes transferred already
+			add.l	d2,d0						; expected bytes transferred after "dcMove"
+			cmp.l	scsiDataLen(a5),d0			; will we go over the limit ?
+			bls.s	@noOverrun					; if not, start the transfer
+			move.w	#scsiOverrunErr,d0			; possible overrun condition				<v1.2>
+			movea.l	jvLogError(a4),a0			; note SCSI error information in the PB		<v1.2>
+			jsr		(a0)						; go to the routine							<v1.2>
+			bra.s	@dcStop						; exit
+@noOverrun
+			movea.l	jvTransfer(a4),a0			; transfer the data
+			jsr		(a0)						; go to the routine
+@update
+			tst.w	d0							; check if an error occurred
+			bne.s	@dcStop						; we're finished for now
+			btst.b	#waitingForIRQ,state1(a4)	; are we DMA-ing ?							<v1.5>
+			bne.s	@exit						; if so, bail for now					<v1.1><v1.2>
+			movea.l	scsiPrivate(a5),a0			; point to private storage				<v1.1><v1.2>
+			add.l	d1,scsiDataXfer(a5)			; update bytes transferred				<v1.1><v1.2>
+			cmp.l	d1,d2						; did we transfer everything ?				<v1.1>
+			beq.s	@all						; if so, update PB and start next DCInstr	<v1.1>
+@notAll
+			add.l	d1,scsiMoveOffs(a0)			; update the amount of data transferred	<v1.1><v1.2>
+			bra.s	@start						; restart current instruction				<v1.2>
+@all
+			move.l	dcOffset(a1,d5.l),d0		; get offset for the buffer address			<v1.2>
+			add.l	d0,dcAddr(a1,d5.l)			; add the offset to the buffer address		<v1.2>
+			move.l	zeroReg,scsiMoveOffs(a0)	; clear the amount of data transferred		<v1.1>
+@nextInstr
+			moveq.l	#dcSize,d0
+			add.l	d0,d5						; point to next instruction
+			movea.l	scsiPrivate(a5),a0			; point to private storage for this request
+			move.l	d5,scsiDCOffs(a0)			; save value in PB for consistency
+			bra.s	@start						; handle next instruction
+
+@dcLoop
+			tst.l	d2							; check for loop count of zero
+			beq.s	@nextInstr					; count exhausted, go to the next instr
+			subq.l	#1,d2						; decrement
+			move.l	d2,dcCount(a1,d5.l)			; update count
+			beq.s	@nextInstr					; if 0, count exhausted, go to next instr
+			move.l	dcOffset(a1,d5.l),d0		; get offset
+			asl.l	#4,d0						; multiply by 16
+			add.l	d0,d5						; adjust ptr to next instruction
+			movea.l	scsiPrivate(a5),a0			; point to private storage for this request
+			move.l	d5,scsiDCOffs(a0)			; save value in PB for consistency
+			bra.s	@start						; handle next instruction
+
+@dcStop
+			move.b	zeroReg,sMR+WrOffs(a3)		; turn off pDMA to be safe
+
+			btst.b	#sSCSIDMAExists,G_Reserved0+3(a4)	; do we have a SCSI DMA chip ?	<2.8>
+			beq.s	@DMAdone2					; if not, skip it						<2.8>
+
+			move.l	#iINTREN,sDCTRL(a3)			; turn off hardware-handshaking				<v1.2>
+@DMAdone2
+@exit
+			moveq.l	#noErr,d0					; no problem								<v1.2>
+			rts
+			
+;
+;	DataDMA -- DMA-related data-chaining interpreter for use after first DMA				<v1.2>
+;																							<start>
+;	Called by:	SCSIDT
+;
+;	Calls:		The data transfer routines.
+;
+;	On entry:	a3 - ptr to SCSI read base address
+;				a4 - ptr to SCSI Mgr globals
+;				a5 - ptr to active request
+;	
+;	Function:	Performs the data-chaining interpretation and calls the data transfer routines.
+;
+DataDMA:
+			move.l	scsiDCInstr(a5),a1			; point to data-chaining instructions
+			move.l	scsiPrivate(a5),a0			; point to private storage for the request
+			lea.l	scsiVAddr(a0),a2			; point to GetPhysical translation table
+			move.l	scsiDCOffs(a0),d5			; get offset into data-chaining instructions
+			move.l	12(a2),d1					; get number of bytes transferred by DMA
+			add.l	d1,scsiDataXfer(a5)			; update bytes transferred
+			tst.l	4(a2)						; is the residual equal to zero ?
+			beq.s	@all						; if so, we're done with this dcInstr
+@notAll											; not at data-chaining instruction boundary
+			add.l	d1,scsiMoveOffs(a0)			; add DMA bytes to form new offset into dcInstr
+			bra.s	@start						; restart the current instruction
+@all											; at data-chaining instruction boundary
+			move.l	dcOffset(a1,d5.l),d0		; get offset for buffer address
+			add.l	d0,dcAddr(a1,d5.l)			; add offset to buffer address
+			move.l	zeroReg,scsiMoveOffs(a0)	; clear the amount of data transferred
+@nextInstr
+			moveq.l	#dcSize,d0					; point to next dcInstr
+			add.l	d0,d5
+			move.l	d5,scsiDCOffs(a0)			; save offset into data-chaining table
+
+@start
+			move.l	dcCount(a1,d5.l),d2			; get count
+			move.l	dcAddr(a1,d5.l),d0			; get the data-chaining instruction
+			beq.w	@dcStop						; if d0 is 0, then it is "dcStop"
+			move.l	d0,a2						; hold on to it in case it's an address
+			addq.l	#1,d0						; check if it is a "dcLoop" instruction
+			beq.w	@dcLoop						; if d0 was -1, then it is "dcLoop"
+
+@dcMove		; a2 contains the address
+			btst.b	#bDMAR,sBSR(a3)				; do we have a DRQ ?
+			bne.s	@chkPhase					; if so, we can check the phase
+			btst.b	#bREQ,sCSR(a3)				; do we have a REQ ?
+			beq.s	@dcMove						; if not, we can't accurately check the phase
+@chkPhase
+			btst.b	#bPM,sBSR(a3)				; are we still in phase ?
+			beq.w	@dcStop						; if not, get out
+@adjust
+			;
+			;	If a data-chaining instruction was only partially executed (due to a Disconnect),
+			;	then the "scsiMoveOffs" field in the private storage will be nonzero, reflecting
+			;	the number of bytes already transferred during the instruction.  If it is nonzero,
+			;	then the residual data to be transferred is the DCInstr value minus the amount
+			;	already transferred, and the address pointer is incremented by the amount of data
+			;	already transferred.
+			; 
+			move.l	scsiMoveOffs(a0),d0			; have we partially executed this DCInstr ?
+			beq.s	@chkOverrun					; if not, no adjustment necessary
+			sub.l	d0,d2						; transfer only residual amount of data
+			adda.l	d0,a2						; place data in the remaining buffer space
+@chkOverrun
+			move.l	scsiDataXfer(a5),d0			; get number of bytes transferred already
+			add.l	d2,d0						; expected bytes transferred after "dcMove"
+			cmp.l	scsiDataLen(a5),d0			; will we go over the limit ?
+			bls.s	@noOverrun					; if not, start the transfer
+			move.w	#scsiOverrunErr,d0			; possible overrun condition
+			movea.l	jvLogError(a4),a0			; note SCSI error information in the PB
+			jsr		(a0)						; go to the routine
+			bra.s	@dcStop						; exit
+@noOverrun
+			moveq.l	#noErr,d0					; assume no error
+			move.l	d2,d1						; make a copy of the count - is it zero ?
+			beq.w	@all						; if so, we've finished this instruction
+
+			moveq.l	#scsiFFast+scsiFWrite+scsiFPhysical,d4	; d4 = mask to leave data transfer bits
+			and.l	scsiMgrFlags(a5),d4			; d4 = {0,4,...,24,28} jump table offset
+			lea.l	dataTable(a4),a0			; point to data transfer table in globals
+			movea.l	0(a0,d4.l),a0				; get the routine address
+			jmp		(a0)						; go to the routine - it will return to SCSIDT
+
+
+@dcLoop
+			tst.l	d2							; check for loop count of zero
+			beq.w	@nextInstr					; count exhausted, go to the next instr
+			subq.l	#1,d2						; decrement
+			move.l	d2,dcCount(a1,d5.l)			; update count
+			beq.w	@nextInstr					; if 0, count exhausted, go to next instr
+			move.l	dcOffset(a1,d5.l),d0		; get offset
+			asl.l	#4,d0						; multiply by 16
+			add.l	d0,d5						; adjust ptr to next instruction
+			movea.l	scsiPrivate(a5),a0			; point to private storage for this request
+			move.l	d5,scsiDCOffs(a0)			; save value in PB for consistency
+			bra.w	@start						; handle next instruction
+
+@dcStop
+			move.b	zeroReg,sMR+WrOffs(a3)		; turn off pDMA to be safe
+			move.l	#iINTREN,sDCTRL(a3)			; turn off hardware-handshaking
+			moveq.l	#noErr,d0					; no problem								<end>
+
+			rts
+			
+		ENDWITH
+
+		END 
+

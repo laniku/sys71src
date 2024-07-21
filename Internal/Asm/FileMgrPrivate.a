@@ -1,0 +1,277 @@
+;
+;	File:		FileMgrPrivate.a
+;
+;	Contains:	Truly private equates for the file manager
+;
+;	Copyright:	© 1990-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		<22>	10/28/92	DTY		In FSVars record, use the defined size of a deferred task queue
+;									element instead of hardcoding the size at 20 bytes.
+;		<21>	  4/4/92	FM		#1021881,<DTY>: Add two new calls to turn the ProcessMgr's file
+;									tracking on and off. SuspendFileTracking and ResumeFileTracking.
+;									These wil be internal calls for a while. Also added macro for
+;									FSpGetCatInfo Because I couldn't find it in any header file.
+;		<20>	11/25/91	DTY		Add macro for _ParallelFCBFromRefNum.
+;		<19>	 8/22/91	JSM		Clean up header.
+;		<18>	 2/26/91	dnf		gbm,bbm,#83780: Define a new equate for the size of the file
+;									system stack.
+;		<17>	 2/25/91	dnf		dty, #Don'tBeABoneHead: Comments work better with semicolons.
+;		<16>	 2/25/91	dnf		dfh, #80720,#82672: Add globals for the FCB fix.
+;		<15>	  2/7/91	dnf		kst, #79676: Add dsRecoverVCBPtr to FSVars to store the volume
+;									we're attempting to do a disk switch recovery on.
+;		<14>	 1/16/91	dnf		(kst) Add cacheAdvise and fsNoAllocate bits. Move FSControl,
+;									SetupWDCB, SetupDef and ReadWDCB back into traps.a
+;		<13>	  1/4/91	KST		With dnf: Adding FSM hook in FSVar (fsSelector).
+;		<12>	12/16/90	dnf		Add a field to FSVars to hold the nextVRefnum value.
+;		<11>	12/15/90	dnf		<gbm> Add another flag bit to FSBusy
+;		<10>	11/12/90	dnf		Move FSVars into this truly private file
+;		 <9>	10/30/90	dnf		dnf/(tim harrington) change xFFFilAttrLockMask to a byte to
+;									match new definition of FXInfo.  Add macro for _FSUprString.
+;		 <8>	 9/15/90	dnf		Add an _FSCompareString macro so we'll never have to guess again
+;									on case and marks.
+;		 <7>	 8/10/90	KST		Renaming NuLenBTH and NuLenBTCB.
+;		 <6>	  7/2/90	dnf		Add xFFFilAttrLockMask (defined somewhere off in afp land, too)
+;		 <4>	 3/17/90	dnf		Move _SetPMSP back to traps.a
+;		 <3>	 2/22/90	dnf		Delete selectDTClose
+;		 <2>	  2/4/90	DNF		Move some stuff in from FSPrivate.a
+;		 <1>	  2/1/90	DNF		first checked in
+;
+
+	IF &TYPE('__IncludingFileMgrPrivate__') = 'UNDEFINED' THEN
+__IncludingFileMgrPrivate__	SET	1
+
+; File System busy flag:
+; Bit zero of FSBusy (lomem $360) is true when the file system is running.
+; The word at $360 is cleared when the file system is exited. The
+; bits defined here are for additional flags in the FSBusy word that are
+; valid only when the file system is running.
+fsBusyBit		equ		0							; file system is running; other FSBusy bits are valid
+fsSCSIDefer		equ		1							; file system is waiting for SCSI transaction to complete
+fsIntMaskDefer	equ		2							; file system is waiting until the interrupt mask is lowered
+
+; HFS and friends low memory block <10>
+; This block is pointed to by FSVars and is set up at linked patch time
+; XFS depends on its pointer being at offset 6. Yuck.
+; FileShare depends on dtOwnCall being at offset $38.
+
+FSVarsPtr		equ		$bb8						; lomem that points to file system variable block
+
+FSVars			record	0, increment
+length				ds.w	1							; length (bytes) of FSVars
+obsolete			ds.l	1							; no longer used
+XFS					ds.l	1							; pointer to XFS's storage (must be at offset 6!)
+BTMgr				ds.l	1							; pointer to BTree manager's storage
+DTDBMgr				ds.l	1							; pointer to DTDBase manager's storage
+FSMgr				ds.l	1							; pointer to File System Manager's storage
+QMgr				ds.l	1							; pointer to internal Queue Manager's storage
+fcbPBuf				ds.l	1							; fcb  parallel array
+wdcbPBuf			ds.l	1							; wdcb parallel array
+reserve1			ds.w	1							; reserved/alignment fodder
+fsDefer				ds.b	dtQElSize					; a deferred task pb		<15 in private.a>
+dtOwnCall			ds.l	1							; pointer to pb of call coming from within the dtdb mgr
+FSMHook				ds.l	1							; called after every un-answered call down toExtFSHook
+fsSelector			ds.w	1
+fsFlags				ds.b	1							; holds interesting flags
+reserve2			ds.b	1							; reserved/alignment fodder
+dsRecoverVCBPtr		ds.l	1							; pointer to VCB of volume we're doing a disk switch for <14>
+dsRecoverNamePtr	ds.l	1							; points to name of volume we're doing a disk switch for <14>
+fsFCBBurst			ds.w	1							; # of FCBs that we'd like to keep free					 <38>
+fsFCBGrow			ds.w	1							; # of FCBs to make free when we grow the array			 <38>
+fsFCBMax			ds.w	1							; max # of FCBs to allow								 <38>
+fsFCBCounter		ds.w	1							; counts down as files are opened						 <38>
+later				ds.l	8							; and a few more for later
+size				equ		*-FSVars					; so we know how long FSVars is
+				endr
+
+; private bit for ioPosMode
+fsCacheAdvise		equ		4							; set in ioPosMode indicates request for extra caching
+
+; fsFlags bit values
+fsNoAllocate		equ		0							; true when allocating memory is a very bad idea
+fsNeedFCBs			equ		1							; true when a local FCB couldn't be found				 <38>
+fsNoFCBExpansion	equ		2							; true if no FCB expansion logic is desired				 <38>
+
+; some private equates
+selectGetParallelFCBFromRefnum	equ	$50
+selectFSCleanUp			EQU		$62
+selectAllocateFCBs		EQU		$63						;														 <38>	
+
+; <18>
+; Define a new equate for the size of the file system stack.
+; HFSStkLen (in FSPrivate.a) used by the ROM, so we won't change it so
+; as to keep consistency between the ROM header files and the ROM objects.
+; Note that the file system stack is HFSStkLen+HFSTmpSize in
+; length until linked patch time when we grow it to fsLargerStackLength+HFSTempSize.
+; Although there is code in TFS.a to check for stack overflow, it was not included
+; in any ROM build to date (i.e. IIci-class ROMs).
+fsLargerStackLength		equ		HFSStkLen+512			; give us more breathing room
+
+; specific param block fields for AllocateFCBs
+ioFCBBurst  		EQU 		$20   					; requested burst headroom [input, word]				 <38>
+ioFCBGrow		   	EQU 		$22   					; requested free if allocation triggered [input, word]	 <38>
+ioTotalFCBs			EQU			$24						; returns number of FCBs present [ouput, word]			 <38>
+ioTotalFreeFCBs		EQU			$26						; returns number of free FCBs [output, word]			 <38>
+ioFCBsAdded			EQU			$2A						; returns number allocated this time [output, word]		 <38>
+
+; Private calls currently implemented only in AppleShare or FileShare
+selectShare				equ		$42
+selectUnshare			equ		$43
+selectGetUGEntry		equ		$44
+selectServerControl		equ		$45
+selectServerStartup		equ		$46
+
+
+		macro
+		_GetParallelFCBFromRefnum &async1,&async2
+			DoHFSDispatch selectGetParallelFCBFromRefnum,&async1,&async2,hfsBit=0
+		endm
+
+		macro
+		_FSCleanUp &async1,&async2
+			DoHFSDispatch selectFSCleanUp,&async1,&async2,hfsBit=0
+		endm
+
+		macro											;														 <38>
+		_AllocateFCBs &async1,&async2			
+			DoHFSDispatch selectAllocateFCBs,&async1,&async2,hfsBit=0
+		endm
+
+		macro
+		_Share &async1,&async2
+			DoHFSDispatch selectShare,&async1,&async2,hfsBit=0
+		endm
+
+		macro
+		_Unshare &async1,&async2
+			DoHFSDispatch selectUnshare,&async1,&async2,hfsBit=0
+		endm
+		
+		macro
+		_GetUGEntry &async1,&async2
+			DoHFSDispatch selectGetUGEntry,&async1,&async2,hfsBit=0
+		endm
+		
+		macro
+		_ServerControl &async1,&async2
+			DoHFSDispatch selectServerControl,&async1,&async2,hfsBit=0
+		endm
+		
+		macro
+		_ServerStartup &async1,&async2
+			DoHFSDispatch selectServerStartup,&async1,&async2,hfsBit=0
+		endm
+
+; These two little macros are so we'll never get paranoid about the right
+; modifier bits for file system-style string comparison.
+		macro
+		_FSRelString
+		_RelString
+		endm
+		
+		macro
+		_FSCmpString
+		_CmpString
+		endm
+
+; a macro for the right way to upper strings
+		macro
+		_FSUprString
+		_UprString	marks
+		endm
+
+;
+;	Internal calls on HighLevelDispatch that will hopefully	<21>
+;	be public someday!										<21>
+
+selectFSpGetCatInfo					EQU		$10				;<21>
+selectSuspendProcessMgrFileTracking	EQU		$11				;<21>
+selectResumeProcessMgrFileTracking	EQU		$12				;<21>
+
+		macro													;<21>
+		_FSpGetCatInfo											;<21>
+			DoDispatch _HighLevelFSDispatch,selectFSpGetCatInfo	;<21>
+		endm													;<21>
+
+		macro																	;<21>
+		_SuspendProcessMgrFileTracking																;<21>
+			DoDispatch _HighLevelFSDispatch,selectSuspendProcessMgrFileTracking	;<21>
+		endm																	;<21>
+
+		macro																	;<21>
+		_ResumeProcessMgrFileTracking															;<21>
+			DoDispatch _HighLevelFSDispatch,selectResumeProcessMgrFileTracking	;<21>
+		endm																	;<21>
+
+
+		
+; mask bits for afp's three inhibit bits which live in fdXFlags in xFndrInfo <9>
+xFFFilAttrLockMask 	equ		$70
+
+; the base (static) set of attributes for local hfs volumes
+localvMAttribs	equ		(1<<bHasCatSearch)|(1<<bHasFileIDs)|(1<<bHasBtreeMgr)
+localVolGrade	equ		0
+
+
+;; Addition for system 7.0 	<KST 1/22/90>
+;; the general structure of the WDCB/FCB parallel array:
+;	--+--
+;	  |		Buf Count
+;	--+--
+;	  |		Unit Length
+;	--+--
+;	  |		PID1 (data starts)
+;	--+--
+;	  |		PID2
+;	--+--
+;	  |		.....more PIDs
+;	--+--
+cbPBufCount		EQU		0			; number of FCBs
+cbPBufULen		EQU		2			; each Ext FCB unit size
+
+;; addition to FCB:
+fcbPBufData		EQU		4			; fcb parallel array data starts
+ExtFCBLen		EQU		8			; extended FCB unit size.
+L2ExtFCBLen		EQU		3			; log2 of ExtFCBLen.
+;; each of the FCB extension:		; only PID for now
+xFCBPid1		EQU		0
+xFCBPid2		EQU		4
+
+;; addition to WDCB: (currently it is the same as FCB extension)
+wdcbPBufData	EQU		4			; wdcb parallel array data starts
+ExtWDCBLen		EQU		8			; extended WDCB unit size.
+L2ExtWDCBLen	EQU		3			; log2 of ExtWDCBLen.
+;; each of the WDCB extension:
+xWDCBPid1		EQU		0
+xWDCBPid2		EQU		4
+
+
+fsDesiredFCBBurst	equ		20		; we'd like to allow for this many burst async _Opens		<38>
+fsDesiredFCBFree	equ		2*fsDesiredFCBBurst	; we'll grow to this many free when we do grow	<38>
+
+fsWDCBExtendCount	equ		8		; # of WDCB's to add when we run out						<38>
+ioWDCreated		equ		24			; unused field in the ioWDPB
+fscpbLen		equ		28			; param length used for cleanup
+
+
+;; addition to BTHeader: (KST for B*Tree Manager)
+bthResv1		EQU		30			;(2 bytes)	=> btcType related (reserved)
+bthClumpSize	EQU		32			;(long)		=> up to this long are copied into BTCB
+bthBTType		EQU		36			;(byte)
+lenMemBTH70		EQU		36			; copy 36 bytes (memory resident portion of BTH)
+
+;; addition to BTCB: (KST for B*Tree Manager)
+btcType			EQU		1			;(byte) Btree type => bthBTType related
+btcResv1		EQU		54			;(2 bytes) (reserved)
+btcClump		EQU		56			;(long) => up to this long are copied from BTH
+btcWCount		EQU		60			;(long) => write count
+btcKDPtr		EQU		64			;(long) => key descriptor pointer
+btcRCount		EQU		68			;(byte) => reference count
+btcL2NSize		EQU		69			;(byte) => log2 of node size
+btcRsrvUID		EQU		70			;(long) => for access control	<1/4/90>
+lenBTCB70		EQU		74			;total new length for 7.0
+
+WCSigLong		EQU		$04B5400	; write count starts
+
+	ENDIF	; ...already included 

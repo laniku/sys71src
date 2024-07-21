@@ -1,0 +1,357 @@
+;
+;	File:		TFSCOMMON.a
+;
+;	Contains:	This file contains common utility routines
+;
+;	Copyright:	© 1985-1991, 1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	  8/3/93	BH		Changed MarkVCB and FlushMDB to keep an eye on the
+;									vcbFlushCritBit flag for manual-eject drives.
+;		 <2>	 9/12/91	JSM		Add a header.
+;	   <1.2>	  3/2/89	DNF		removed references to forROM; HFS now builds identically for ram
+;									or rom
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				 2/19/87	BB		Vectored FlushMDB.
+;				11/20/85	BB		FlushMDB now clears FCB dirty flag for the Extents and Catalog
+;									file FCBs. (ROM75 patch).
+;				 11/6/85	PWD		Changed RoundAlloc to call DivUp by BSR.S **** changes since
+;									ROM75 release ****
+;				10/20/85	LAK		Preserve D0 in MarkVCBDirty debug code (CVFlgs was trashing it).
+;				10/16/85	PWD		Changed FlushMDB to not set LsMod time on dirty VCBs.
+;				10/10/85	LAK		Added routine MarkVCBDirty to mark VCB dirty without changing
+;									its mod date (special for eject).
+;				 10/1/85	LAK		Modified GetVCBDrv to look for OffLine and Ejected volumes.
+;				 9/22/85	PWD		Changed FlushMDB to update VCBXTAlBks and VCBCTAlBks in VCB from
+;									FCB information
+;				 8/22/85	PWD		Added RoundAlloc.
+;				 7/11/85	PWD		New today
+;
+
+;_______________________________________________________________________
+;
+; External Routines:	 DivUp,RoundAlloc,FlushMDB
+;
+; Internal Routines:
+;
+; Called By:			 FlushVol,XFFlush,CMFlush
+;
+;_______________________________________________________________________
+
+
+
+;_______________________________________________________________________
+;
+; DivUp subroutine: compute the minimum number of allocation blocks necessary
+;					to store a given number of bytes (a division followed by
+;					a round-up).
+;
+; Inputs:
+;	D0.L	- Byte length of run on disk
+;	D1.W	- Allocation block size
+;
+; Outputs:
+;	D0.L	- Number of allocation blocks required (top word is zeroed)
+;_______________________________________________________________________
+;
+
+		BLANKS	ON
+		STRING	ASIS
+
+DivUp:	DIVU	D1,D0					; Divide by allocation blocks size
+		SWAP	D0						; Examine the remainder
+		TST.W	D0						;
+		BEQ.S	@10 					; If zero, we have a perfect fit.
+		CLR.W	D0						; If not, clear the remainder
+		SWAP	D0						; Restore the quotient
+		ADDQ.W	#1,D0					; and add one
+		BRA.S	@20 					;
+@10:	SWAP	D0						; Restore quotient to lower word
+@20:	RTS 							; And call it a day.
+
+;_______________________________________________________________________
+;
+; RoundAlloc:		Compute the size in bytes of a byte length in allocation
+;					blocks, rounded up to a given clump-size boundary.
+;
+; Inputs:
+;	D0.L	- Size in bytes
+;	D1.L	- Clump size in bytes (must be 512 multiple)
+;	A2.L	- VCB pointer (for AlBlkSiz)
+;
+; Outputs:
+;	D0.L	- Rounded size in allocation blocks (always 16 bits, top word clear)
+;_______________________________________________________________________
+;
+RoundAlloc:
+		  MOVE.L	D1,-(SP)			; Save across call
+		  MOVE.L	D0,-(SP)			; Save original byte length
+		  MOVE.L	D1,D0				; Set up to compute ClpSiz in AlBlks
+		  MOVE.L	VCBAlBlkSiz(A2),D1	; Pick up allocation block size in bytes
+		  BSR.S 	DivUp				; Divide, yielding ClpSize in AlBlks			<06Nov85>
+		  MOVE.L	D0,D1				; Stash away temporarily
+		  MOVE.L	(SP)+,D0			; Now then, let's get to work
+		  MOVE.L	D1,-(SP)			; Move this divisor out of the way
+		  MOVE.L	VCBAlBlkSiz(A2),D1	; Pick up alloc. block size again
+		  BSR.S 	DivUp				; Divide, yielding length in AlBlks 			<06Nov85>
+		  MOVE.L	(SP)+,D1			; Recover clump size in AlBlks again
+		  BSR.S 	DivUp				; Get size in Clumps							<06Nov85>
+		  MULU		D1,D0				; And mult. back out -> size in AlBlks
+										; (guaranteed to be word magnitude)
+*PWD*	 MOVE.L    VCBAlBlkSiz(A2),D1  ; Pick up alloc. block size again
+*PWD*	 MULU	   D1,D0			   ; Get size in bytes again
+		  MOVE.L	(SP)+,D1			; Recover original D1
+		  RTS
+
+;_______________________________________________________________________
+;
+; Routine:		QWordSearch
+; Arguments:	  A0.L (input)	-- pointer to queue header
+;				  D0.W (input)	-- word parameter to look for
+;				  D1.W (input)	-- field offset for compare
+;				  A0.L (output) -- pointer to queue element which matched
+;				  D0.W (output) -- 0=success, -1=failure
+;				  D1, other regs are preserved
+; Called By:	FindDrive,GetVCBDrv,GetVCBRfn
+; Function: 	General queue search routine.
+;
+; Modification History:
+;  06 Dec 82  LAK  New today.
+;_______________________________________________________________________
+
+QWordSearch:
+			MOVE.L	D2,-(SP)			; save D2
+			MOVE.L	QHead(A0),D2		; get first element
+
+@1			BEQ.S	@4					; exit if no match
+			MOVE.L	D2,A0				; next element pointer
+			CMP.W	0(A0,D1),D0 		; match?
+			BEQ.S	@2					; then take the good exit . . .
+			MOVE.L	QLink(A0),D2
+			BRA.S	@1
+
+@2			MOVEQ	#0,D0
+@3			MOVE.L	(SP)+,D2			; restore D2
+			TST.W	D0
+			RTS
+@4			MOVEQ	#-1,D0
+			BRA.S	@3
+
+;_______________________________________________________________________
+;
+; Routine:		GetVCBRfn,GetVCBDrv,GetWDCBRfn
+; Arguments:	  D0.W (input)	-- IODrvNum(A0) = IOVRefNum(A0) (for VCB or WD)
+;				  D0.W (output) -- error code (no such volume) or 0
+;				  A2.L (output) -- VCB pointer or WDCB pointer
+;				  All other regs are preserved
+; Calls:		QWordSearch
+; Called By:	DtrmV3,MountVol(make sure no volume already mounted on a drive)
+; Function: 	Determine VCB from DriveNum/VRefNum field.
+;
+; Modification History:
+;  01 Jun 83  LAK  New today.
+;  22 Feb 85  GJC  Added support for WDCB search (GetWDCBRfn).
+;  28-Feb-85  PWD  Changed GetWDCBRfn to store WDCB pointer in A3.
+;  14-Mar-85  PWD  Changed WDCB search algorithm to mimick FCB logic; WDCB's are
+;				   allocated from a pre-allocated array a la FCBs.
+;  23-Feb-85  PWD  Fixed bug in GetWDCBRfn resulting from (A3)+ on CMP to D0
+;	1-May-85  PWD  Added WDVCBPtr check to GetWDCBRfn.
+;  <01Oct85>  LAK  Modified GetVCBDrv to look for OffLine volumes.
+;  <16Oct85>  PWD  Changed FlushMDB to not set LsMod time on dirty VCBs
+;_______________________________________________________________________
+
+GetVCBRfn:
+			MOVEM.L D1/A0,-(SP) 		; save regs
+			MOVEQ	#VCBVRefNum,D1
+			LEA 	VCBQHdr,A0			; search the queue of VCBs
+			BSR.S 	QWordSearch
+			BNE.S	@2
+			MOVE.L	A0,A2				; return VCB ptr in A2
+@1			MOVEM.L (SP)+,D1/A0
+			RTS
+
+@2			MOVEQ	#NSVErr,D0			; no such volume
+			BRA.S	@1
+
+GetVCBDrv:
+			MOVEM.L D1-D2,-(SP) 		; save regs other than A2/D0			<01Oct85>
+			MOVE.W	D0,D1				; save drive parameter in D1			<01Oct85>
+			MOVE.W	D0,D2				; save negated value in D2 for			<01Oct85>
+			NEG.W	D2					;	offline volume check				<01Oct85>
+
+			MOVE.L	VCBQHdr+QHead,A2	; get first VCB ptr
+@1			MOVE.L	A2,D0				; see if it's there
+			BEQ.S	@5					; fail									<01Oct85>
+			CMP.W	VCBDrvNum(A2),D1	; this one? 							<01Oct85>
+			BEQ.S	@3					; br if so								<01Oct85>
+			TST.W	VCBDrvNum(A2)		; offline?								<01Oct85>
+			BNE.S	@2					; br if not 							<01Oct85>
+			CMP.W	VCBDRefNum(A2),D2	; match?								<01Oct85>
+			BEQ.S	@3					; br if found							<01Oct85>
+@2			MOVE.L	QLink(A2),A2		; go to next VCB						<01Oct85>
+			BRA.S	@1					;										<01Oct85>
+
+@3			MOVEQ	#0,D0				; success!								<01Oct85>
+@4			MOVEM.L (SP)+,D1-D2 		; restore regs							<01Oct85>
+			RTS 						;										<01Oct85>
+
+@5			MOVEQ	#NSVErr,D0			; no such volume						<01Oct85>
+			BRA.S	@4					;										<01Oct85>
+
+; Set up A3->WDCB, A2->VCB, D0=0
+; If error, D0=NSVErr or RFNumErr . . .
+
+GetWDCBRfn	MOVEA.L WDCBsPtr,A3 		; Point to WDCB array
+			MOVEM.L A1/D1,-(SP) 		; Save A1/D1 away for use as scratch
+			MOVEQ	#0,D1				; Clear top half of D1
+			MOVE.W	D0,D1				; Set up for check
+			BSR 	CkWDRefNum			; Use check subroutine . (sets D0, blows A1)  <29Aug85>
+			BNE.S	@1					; Br if error							<29Aug85>
+
+			SUB.W	#WDRfnMin,D1		; Offset to form index into WDCB array
+			ADDA.W	D1,A3				; Offset to point to WDCB
+			MOVEQ	#NSVErr,D0			; Expect the worst
+			MOVE.L	WDVCBPtr(A3),D1 	; Pick up the VCB pointer
+			BEQ.S	@1					; If clear, this WDCB was actually unused
+
+			MOVEA.L D1,A2				; Otherwise, this is a fine VCB pointer
+			MOVEQ	#0,D0				; Indicate success
+
+@1			MOVEM.L (SP)+,A1/D1 		; Restore A1/D1 						<29Aug85>
+			TST.W	D0					; Set CCR								<29Aug85>
+			RTS 						;										<29Aug85>
+
+;_______________________________________;
+;
+; MarkVCB utility...					;
+;_______________________________________;
+
+MarkVCB:
+			BSR.S	MarkVCBDirty		; Mark the VCB dirty						<18Oct85>
+MarkVCBTime:
+			MOVE.L	Time,VCBLsMod(A2)	; Set the time of death
+			
+	IF hasManEject THEN		; the mod date is critical volume info, used to identify a volume in a remount
+							; we need to update this change to the disk ASAP if it is in a manual-eject drive,
+							; since it may be removed at any time and we need to be able to tell if it is remounted
+							; <SM3> <BH 03Aug93>
+			MOVE.L	D0,-(SP)			; save D0									<SM3> <BH 03Aug93>
+			MOVE.W	vcbFlags(A2),D0		;											<SM3> <BH 03Aug93>
+			BTST	#vcbManEjBit,D0		; volume in a manual-eject drive?			<SM3> <BH 03Aug93>
+			BEQ.S	@noflush			; no, skip this								<SM3> <BH 03Aug93>
+			BSET	#vcbFlushCritBit,D0	; signal need to flush the critical info	<SM3> <BH 03Aug93>
+			MOVE.W	D0,vcbFlags(A2)		;											<SM3> <BH 03Aug93>
+@noflush	MOVE.L	(SP)+,D0			; restore D0								<SM3> <BH 03Aug93>
+	ENDIF								;											<SM3> <BH 03Aug93>
+			RTS 						; And return to more important things
+
+MarkVCBDirty
+			IF	HFSDebug THEN
+			MOVE.L	D0,-(SP)			; Preserve D0								<20Oct85>
+			BSR 	CVFlgs				; Can we actually write this volume?		<18Oct85>
+			BEQ.S	@1					; Yes.										<18Oct85>
+			_HFSDebug $127				; No - this MDB cannot be flushed... and you<18Oct85>
+										; may say to yourself "How did I get here?" <18Oct85>
+@1			MOVE.L	(SP)+,D0			; Restore D0								<20Oct85>
+			ENDIF
+
+			ST		VCBFlags(A2)		; Mark the VCB dirty (special for eject)	<10Oct85>
+			RTS 						;											<10Oct85>
+
+FlushMDB:
+			MOVE.L	jFlushMDB,-(SP)		; jump table entry for vFlushMDB			<19Feb87>
+			RTS 						; go there								<19Feb87>
+vFlushMDB								; 'vectored' FlushMDB routine				<19Feb87>
+			
+			MOVE.L	(SP)+,-(A6) 		; Save return address across ,ASYNC calls
+			MOVEM.L D0-D2/A0-A1,-(A6)	; Save scratch registers
+
+; Write out the MDB, if dirty:
+
+			IF		HFSDebug THEN		; *** ONLY INCLUDE WHEN DEBUGGING ***
+			TST.W	VCBDRVNUM(A2)		; Make sure the volume's on-line.
+			BNE.S	@1
+			DC.W	$FAAA
+@1
+			ENDIF
+
+			TST.B	VCBFlags(A2)		; VCB Dirty?
+			BPL 	FlMDBExit			; If not, don't bother writing it out
+
+			MOVEA.L VCBBufAdr(A2),A1	; Point to volume cache queue header
+			MOVE.W	VCBVRefNum(A2),D0	; Volume refNum
+			MOVEQ	#0,D1				; Clear flag byte
+
+; *PWD*: Read in a fresh copy of the MDB to allow other programs to write the
+;		 last half of the MDB and not be clobbered by our writing of the MDB:
+; *LAK*: Not such a good idea. Other programs should leave our MDB alone.  Let them
+;		 use the last block on disk if they must (we don't touch it).
+
+			MOVEQ	#2,D2				; MDB is block 2 (third block on disk)
+			JSR 	GetBlock			; Point A0 to cache buffer
+			BNE 	FlMDBExit			; Punt on errors
+			MOVEA.L A0,A1				; Set up as destination for _BlockMoves
+			LEA 	VCBDInfoSt(A2),A0	; Point to MDB info in VCB
+			MOVE.L	#LenMDB,D0			; Length to copy
+			_BlockMove					; Copy VCB info
+
+; Add some TFS-specific information:
+
+			LEA 	VCBTDInfoSt(A2),A0	; Point to additional info
+			LEA 	DrTInfoSt(A1),A1	; Point to tail end of MDB
+			MOVEQ	#VCBTDILen,D0		; Length of TFS info
+			_BlockMove					; Copy it into the MDB Buffer
+			SUBA.L	#DrTInfoSt,A1		; Point A1 back to start of buffer
+
+			MOVEA.L FCBsPtr,A3			; Point to FCB array
+			MOVE.W	VCBXTRef(A2),D1 	; Get extent file refNum
+			MOVEM.L A0-A1,-(SP) 		; Free up some scratch registers
+			MOVEQ	#lenXDR,D0			; Length of extent record
+			LEA 	FCBExtRec(A3,D1),A0 ; Point to extent record in FCB
+			LEA 	DrXTExtRec(A1),A1	; Point to first (and only) XT extent record
+			_BlockMove					; Copy in the extent record
+			MOVEM.L (SP)+,A0-A1 		; Restore originals
+			MOVE.L	FCBPLen(A3,D1.W),D0 ; Pick up length of extent B*-Tree			 <22Sep85>
+			MOVE.L	D0,DrXTFlSize(A1)	; Store length of extent tree in MDB buffer  <22Sep85>
+			BCLR	#FCBModBit,FCBMdRByt(A3,D1.W) ; clear the FCB dirty flag		 <20Nov85>
+			MOVE.L	VCBAlBlkSiz(A2),D1	; Pick up volume's allocation block size     <22Sep85>
+			JSR 	DivUp				; Compute extent B*-Tree size in AlBlks 	 <22Sep85>
+			MOVE.W	D0,VCBXTAlBks(A2)	; And save it for posterity 				 <22Sep85>
+
+			MOVE.W	VCBCTRef(A2),D1 	; Get catalog file RefNum
+			MOVEM.L A0-A1,-(SP) 		; Free up some scratch registers (again)
+			MOVEQ	#lenXDR,D0			; Length of extent record
+			LEA 	FCBExtRec(A3,D1),A0 ; Point to extent record in FCB
+			LEA 	DrCTExtRec(A1),A1	; Point to first (and only) XT extent record
+			_BlockMove					; Copy in the extent record
+			MOVEM.L (SP)+,A0-A1 		; Restore originals
+			MOVE.L	FCBPLen(A3,D1.W),D0 ; Pick up length of catalog B*-Tree 		 <22Sep85>
+			MOVE.L	D0,DRCTFlSize(A1)	; Store length of catalog tree				 <22Sep85>
+			BCLR	#FCBModBit,FCBMdRByt(A3,D1.W) ; clear the FCB dirty flag		 <20Nov85>
+			MOVE.L	VCBAlBlkSiz(A2),D1	; Pick up volume's allocation block size     <22Sep85>
+			JSR 	DivUp				; Compute allocation in alloc. blocks		 <22Sep85>
+			MOVE.W	D0,VCBCTAlBks(A2)	; And save the result for posterity 		 <22Sep85>
+
+; Write the MDB out by releasing the block dirty
+
+			MOVEQ	#kRBWrite,D1		; Force it to be written . . .			<01Oct85>
+			MOVEA.L A1,A0				; Point to MDB buffer
+			MOVEA.L VCBBufAdr(A2),A1	; Point to volume Cache Queue Header
+			JSR 	RelBlock			; Release the cache block
+		IF hasManEject THEN				; the critical volume info that needs to be maintained	<SM3> <BH 03Aug93>
+										; for volumes in manual-eject drives has been flushed.	<SM3> <BH 03Aug93>
+			BNE.S	FlMDBExit			; don't clear either dirty bit if an error occurred		<SM3> <BH 03Aug93>
+			MOVE.W	vcbFlags(A2),D0		; do this properly...get the whole flags word			<SM3> <BH 03Aug93>
+			BCLR	#vcbFlushCritBit,D0	; clear the correct bit									<SM3> <BH 03Aug93>
+			MOVE.W	D0,vcbFlags(A2)		; and restore the flags									<SM3> <BH 03Aug93>
+		ENDIF; v--------------------------note naughty alternate flag-clearing method here.		<SM3> <BH 03Aug93>
+			CLR.B	VCBFlags(A2)		; VCB is not dirty any longer . . . 	<28Aug85>
+
+FlMDBExit	MOVEM.L (A6)+,D0-D2/A0-A1	; Restore scratch registers
+			MOVE.L	(A6)+,-(A7) 		; Restore return address
+			TST.W	D0
+			RTS
+			

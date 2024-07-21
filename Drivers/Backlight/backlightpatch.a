@@ -1,0 +1,265 @@
+;
+;	File:		backlightpatch.a
+;
+;	Contains:	patches backlight
+;
+;	Copyright:	© 1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <3>	10/28/91	SAM		Rolled in Regatta file.
+;
+;	Regatta Change History:
+;
+;		 <4>	 8/19/91	SAM		(ag) removed code to patch rom driver (not needed any more).
+;		 <3>	  8/8/91	SAM		Changed the InstallProc conditional so that it only installs on
+;									original portables only.
+;		 <2>	  8/8/91	SAM		(ag) Changed something. It's not clear what, exactly.
+;		 <1>	 5/15/91	SAM		Split off from TERRORProj.
+;
+;
+;
+
+				load		'StandardEqu.d'
+				include		'LinkedPatchMacros.a'
+				include		'HardwarePrivateEqu.a'
+				include		'ATalkEqu.a'
+				include		'UniversalEqu.a'
+
+				STRING	PASCAL
+
+
+;------------------------------------------------------------------------------------------
+;
+;	BklightInstall - install and open the backlight driver if available
+;
+;------------------------------------------------------------------------------------------
+
+SignatureReg	equ			$FC0200				; address of backlight signature
+SignatureAruba	equ			$A5					; signature for aruba backlight
+SignatureUpgrd	equ			$A3					; signature for upgrade backlight
+SignatureAsahi	equ			$AD					; signature for asahi backlight
+
+DriverID		equ			-16511				; id of driver resource
+DriverType		equ			'DRVR'				; resource type of driver
+
+				ROMs		Portable
+				
+BklightInstall	InstallProc		(Portable)
+
+				TestFor	hwCbPwrMgr
+				beq.s	@exit						; if not power manager, exit
+
+				lea		#'.Backlight',A1			; load pointer to driver name
+
+; is there a driver to patch ???
+;				bsr		OpenDRVR					; attempt to open backlight driver (a1/d0)
+;				beq		patchDriver
+				
+; should we install a driver from the system file ???
+				move.l	#DriverType,d1				; load resource type in d1
+				move.w	#DriverID,d2				; load resource id in d2
+
+				move.l	#SignatureReg,a0			; point a0 to signature register
+				cmpi.b	#SignatureAruba,(a0)		; check for aruba signature
+				beq.s	installDriver
+				cmpi.b	#SignatureUpgrd,(a0)		; check for upgrade signature
+				beq.s	installDriver
+				cmpi.b	#SignatureAsahi,(a0)		; check for derringer signature
+				beq.s	installDriver
+				
+@exit			rts									; no backlight, exit		
+
+
+;------------------------------------------------------------------------------------------
+;
+;	installDriver - get the backlight driver from the system file.  install and open the
+;				driver in the first available slot after entry 48
+;
+;	input
+;		a1 - pointer to pascal name string
+;		d1 - Resource Type
+;		d2 - Resource ID
+;
+;	output
+;		none
+;
+;	usage
+;	d	a0 - utable ptr/dce pointer
+;	d	a1 - Handle to resource
+;	d	a2 - pointer to pascal name string
+;	d	d0 - Resource Type
+;		d1 - Resource Type
+;		d2 - Resource ID
+;
+installDriver	move.l	a1,a2						; move name ptr to a2 for safe keeping
+				bsr.s	GetDetachRes				; get and detach resource (d1,d1/a1)
+				beq.s	@exit						; exit if no handle
+
+				bsr.s	FirstEntryFree				; get ref num of first free entry (/d0,d1)
+				_DrvrInstall						; create dce (d0/d0)
+				tst.l	d0							; test for error
+				bne.s	@releaseDrvr				; ... exit if error
+				
+				move.l	UTableBase,a0				; point to utable array
+				move.l	(a0,d1),a0					; get handle to dce in a3
+				move.l	(a0),a0						; get pointer to dce
+				move.l	a1,dCtlDriver(a0)			; load driver
+
+				move.l	(a1),a1						; get pointer to driver
+				move.w	drvrFlags(a1),dCtlFlags(a0)	; copy data to dce
+				move.w	drvrDelay(a1),dCtlDelay(a0)
+				move.w	drvrEMask(a1),dCtlEMask(a0)
+				move.w	drvrMenu(a1),dCtlMenu(a0)
+
+				bset.b	#dNeedLock,dCtlFlags+1(a0)	; set the handle bit
+
+@openDrvr		move.l	a2,a1						; load pointer to driver name
+				bsr.s	OpenDRVR					; open the driver (a1/)
+@exit			rts
+
+@releaseDrvr	move.l	a1,a0						; move handle to a0
+				_disposHandle						; release the memory
+				rts
+
+;------------------------------------------------------------------------------------------
+;
+;	FirstEntryFree - Find the first free entry
+;
+;	input
+;		none
+;
+;	output
+;		d0.l - driver ref num
+;		d1.l - offset in table
+;
+;	usage
+;	 	a0 - pointer to unit table base
+;	 	d0 - table address offset
+;
+;------------------------------------------------------------------------------------------
+
+StartEntry		equ			(48-1)				; this avoids appletalk area
+		
+FirstEntryFree	move.l	a0,-(SP)					; save a0
+
+@findEntry		move.l	UTableBase,a0				; point to utable array
+				move.l	#(StartEntry*4),d0			; start at entry (48-1)
+				
+@testEntry		addq.l	#4,d0						; increment to next entry
+				tst.l	0(a0,d0)					; test entry
+				bne.s	@testEntry					; if != 0, next entry
+				
+@calcRefnum		move.l	d0,d1
+				lsr.l	#2,d0						; divide by 4 to get entry number
+				addq.l	#1,d0						; add 1 (refnum is -(entry number + 1)
+				neg.l	d0							; negate to get reference number				
+				
+				move.l	(SP)+,a0					; restore a0
+				rts
+				
+
+
+;------------------------------------------------------------------------------------------
+;
+;	GetDetachRes - Gets and detaches a resource.
+;
+;	input
+;		d1	Resource Type
+;		d2	Resource ID
+;
+;	output
+;		a1	Handle to resource
+;
+;	usage
+;	d	a1 - Handle to resource
+;	d	d0 - Resource Type
+;		d1 - Resource Type
+;		d2 - Resource ID
+;
+;------------------------------------------------------------------------------------------
+
+GetDetachRes
+				SUBQ.L	#4, SP			; For return address
+				MOVE.L	D1, -(SP)		; Resource type
+				MOVE.W	D2, -(SP)		; Resource ID
+				_GetResource
+				MOVE.L	(SP), A1		; Get resource handle to return
+				_DetachResource
+				MOVE.L	A1,D0			; Set result code
+				RTS
+
+;------------------------------------------------------------------------------------------
+;
+;	OpenDRVR - routine used to open a driver 
+;
+;	input
+;		a1 - pointer to driver name
+;
+;	output
+;		d0.l - refnum/ioResult of open
+;
+;	usage
+;		a0 - pointer to iopb
+;		a1 - pointer to driver name
+;
+;------------------------------------------------------------------------------------------
+OpenRegs		reg		A0-A3/D1-D2
+
+OpenDRVR		MOVEM.L	OpenRegs,-(SP)
+				SUB.W	#ioQElSize,SP			; Allocate IO stack frame
+
+				MOVE.L	SP,A0					; set a0 to point to the pb
+				MOVE.L	A1,ioVNPtr(A0)			; load pointer to name
+				MOVE.B	#fsCurPerm,ioPermssn(A0); set permission (not used)
+				_Open
+
+				MOVE.W	ioRefNum(A0),D0			; return ioRefNum (D0.W:HI)
+				SWAP	D0						; move ioRefNum HI
+				MOVE.W	ioResult(A0),D0			; return result (D0.W:LO)
+				ADD.W	#ioQElSize,SP			; Release stack frame
+				
+				TST.W	D0						; set condition codes based on errors
+				MOVEM.L	(SP)+,OpenRegs
+				RTS								; Sucess returned in status
+				
+				EndProc
+
+;------------------------------------------------------------------------------------------
+;
+;	NewBKLTHeader - new header for backlight driver
+;
+;------------------------------------------------------------------------------------------
+BacklightOpen				ROMBind		(IIci,$e63f2)		;										<r8> djw
+BacklightPrime				ROMBind		(IIci,$e63f6)		;										<r8> djw
+BacklightControl			ROMBind		(IIci,$e63fa)		;										<r8> djw
+BacklightStatus				ROMBind		(IIci,$e63fe)		;										<r8> djw
+BacklightClose				ROMBind		(IIci,$e6402)		;										<r8> djw
+
+NewBKLTHeader	PROC	
+				dc.w	$4e00							; write,ctl,status,needslock
+				dc.w	0,0,0
+	
+				dc.w	OpenPatch-NewBKLTHeader			; open
+				dc.w	PrimePatch-NewBKLTHeader		; prime
+				dc.w	CtlPatch-NewBKLTHeader			; control
+				dc.w	StatusPatch-NewBKLTHeader		; status
+				dc.w	ClosePatch-NewBKLTHeader		; close
+	
+				DC.B	'.Backlight'
+				align	2
+
+;	Entry points back into rom
+
+OpenPatch		jmpROM	BacklightOpen						; open the driver
+
+PrimePatch		jmpROM	BacklightPrime
+
+CtlPatch		jmpROM	BacklightControl					; continue in rom
+
+StatusPatch		jmpROM	BacklightStatus
+
+ClosePatch		jmpROM	BacklightClose
+				EndProc
+				
+				End

@@ -1,0 +1,574 @@
+;
+;	File:		StartFail.a
+;
+;	Copyright:	© 1983-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM5>	10/11/93	RC		Roll in fix from Jesus
+;	   <MC2>	10/11/93	RC		Fixing code which was last checked in... When updating the
+;									scrnBase in LoMem need to do a Move.l	csBaseAddr(A2),ScrnBase
+;									instead of a Move.l	csBaseAddr(A0),ScrnBase
+;	   <SM4>	 8/16/93	fau		When doing a cscSetMode to change to 1bpp, update the ScrnBase
+;									lowmem with the new base address (as returned by the _Control
+;									call).  This fixes a problem with Cyclone where the base address
+;									can change when going to 1bpp.
+;	   <SM3>	11/12/92	PN		Get rid of ≥ 020 conditionals for ROM builds
+;	   <SM2>	 11/3/92	SWC		Changed VideoEqu.a->Video.a.
+;		 <3>	 9/16/91	JSM		Cleanup header.
+;		 <2>	 6/12/91	LN		Changed #include 'HardwareEqu.a' to 'HardwarePrivateEqu.a'
+;	   <2.1>	 8/22/89	SES		Removed references to nFiles. Removed changes from v2.0, now
+;									calls TMRestart.
+;	   <2.0>	 6/26/89	GMR		CritError now calls U_TMRestart, which decides which Test
+;									Manager to call (Fremonts or universal Test Manager)
+;	   <1.9>	 6/14/89	SWC		Played with the DeadMac code to take out the machine-based
+;									conditionals.
+;	   <1.8>	 6/13/89	DAF		Moved DeadMacTL calculation inline.
+;	   <1.5>	 6/13/89	DAF		Fixed CritErr to find boot card’s 1-bit video mode.
+;	   <1.7>	 6/13/89	GGD		Added hasMMU conditionals around the _SwapMmuMode's in previous
+;									change so that the 16 bit machines will work again. Added
+;									conditionals in DeadMac to only do long word moves if Cpu ≥ 020,
+;									to prevent address errors on 16 bit machines. Moved call to
+;									DeadMacTL so that it gets called for 16 bit machines too.
+;	   <1.6>	 6/13/89	DAF		(completing previous comment). Corrected CritErr to flip to
+;									1-bit mode via Control call rather than do an ineffective
+;									PrimaryInit. Fixed dead mac blitting to be 32-bit friendly.
+;									Moved dead mac icon calculations here from StartInit.a
+;	   <1.4>	 6/11/89	GMR		Made call to TMRestart to be a BigJmp, as Fremonts code is now
+;									at end of ROM.
+;	   <1.3>	 6/10/89	SWC		Removed Mac Plus/SE references to HappyMac because it's now
+;									handled the same way for all machines in StartBoot (it even uses
+;									QuickDraw!). Rewrote DeadMac to use a standard ICON since it no
+;									longer has to draw the HappyMac too. Removed PutSymbol code and
+;									EXPORT since it's not used by anyone. Removed nEqu.d load from
+;									include file list.
+;	   <1.2>	 5/24/89	GGD		Converted to feature based conditionals. Deleted the code to
+;									turn off the floppy disk motor, because it doesn't work with
+;									SWIMs or IOPs and used an absolute base address.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.4>	 10/7/88	rwh		made IWM address name uniform on all machines.
+;	  <•1.3>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.2>	 9/10/88	rwh		remove obsolete check for Rev 8 board.
+;	   <1.1>	  6/7/88	MSH		HcMac now uses HappyMac from startboot instead.
+;	   <1.0>	 2/10/88	BBM		Adding file for the first time into EASE…
+;	  <C914>	10/29/87	rwh		Port to Modern Victorian (on MvMac)
+;	  <C876>	  9/1/87	MSH		Port to HcMac (Laguna)
+;	  <C682>	 1/24/87	WRL		[NuMac] Moved HappyMac to StartSearch so that it can use a real
+;									icon.
+;	  <C651>	 1/19/87	GWN		Added test for VideoInfoOk, Perform sPrimaryInit if it is
+;									(Resets Slot HW). Added sad mac equates for CritErr.
+;	  <C586>	  1/2/87	GWN		Added code to center happy & sad mac.
+;	  <A355>	 11/5/86	DAH		Make some procedures not use ScreenBytes RAM global.
+;	  <C317>	10/31/86	RDC		Added change for new rev8 hardware on NuMac
+;	  <C206>	 10/9/86	bbm		Modified to mpw aincludes.
+;	  <C152>	 9/17/86	WRL		Fixed CritErr to display 2 lines for all machines.
+;	   <C84>	 7/29/86	WRL		Removed NuMac version of BlackScreen - it wasn't being used.
+;	   <C28>	  6/3/86	CSL		Added changes for Aladdin (onMacPP).
+;	   <C27>	 5/30/86	WRL		Changed TMEntry1 to TMRestart to ignore register contents. Made
+;									second longword of Sad Mac info appear below first.
+;
+
+			PRINT	OFF
+			
+			LOAD	'StandardEqu.d'
+			INCLUDE	'HardwarePrivateEqu.a'
+			INCLUDE	'Video.a'
+			INCLUDE	'ROMEqu.a'
+
+		IF	hasSlotMgr	THEN					;											<C46><C914><1.2>
+			INCLUDE	'SlotMgrEqu.a'
+		ENDIF
+			PRINT	ON
+
+
+			PROC
+
+			IMPORT	TMRestart					; Test Manager entry point					<2.1>
+
+			EXPORT	CritErr						; Critical Error entry point
+			EXPORT	PutIcon						; Subroutine to plot a Capps-compressed icon.
+
+
+;----------------
+; Critical Error
+;----------------
+
+; This routine is called in case of a critical hardware error.
+;
+; The hasSlotMgr variant uses RAM pretty heavily.  This is generally OK since the stack
+;	is used earlier when finding and initializing the card.  So generally, this code
+;	assumes that if VideoMagic has been set, then minimal stack is usable.
+;
+; First, it generates an ugly tone to indicate the failure.
+; Then, it displays the dead Mac icon and two 32-bit error codes on the screen.
+;
+; The Major error code contains Test Manager state information in the high order word,
+; and a code indicating which test failed in the low order word.
+;
+; The Minor code contains additional information which applies to the test that failed.
+; For example, for a memory test failure, the Minor code would indicate which memory chip is at fault.
+;
+; D7.L	->	The Major error code - to be displayed on the first row.
+; D6.L	->	The Minor error code - to be displayed on the second row.
+
+			
+CritErr		MOVEM.L A0-A7/D0-D7,SERegs			; save all regs for debug					<26Aug85>
+
+	; @@@ Generate an error tone here.
+
+	; We need to amass the following information about the screen:
+	;	A2		<-	pointer to the start of the screen.
+	;	D0.W	<-	the number of pixels visible vertically.
+	;	D1.W	<-	the number of pixels visible horizontally.
+	;	D2.W	<-	the number of bytes per row.
+	;	D3.L	<-	the number of bytes occupied by the whole screen.
+	
+
+		IF hasSlotMgr THEN						;											<C152><C914><1.2><1.9>
+
+			WITH	spBlock
+
+			CMP.L	#VideoMagic,VideoInfoOK		; Is the video info available?				<C152>
+			BNE		SkipDisplay					; If not, don't display anything.			<C152>
+
+; get the screen into 1-bit mode, if available.  If it's not available, exit to SkipDisplay (as if
+;	video were not present).  Note that the first video mode in the video sRsrc list is not necessarily
+;	1-bit mode (although it usually is), so we need to search through the available modes in the
+;	sRsrc list to find 1-bit.  We will also set up the screen size information since the lomems reflect
+;	the default mode's size and shape.
+
+		WITH spBlock, vpBlock, VDPageInfo
+		
+			SUBQ	#2,SP						; make a parameter block for GetVideoDefault
+			MOVE.L	SP,A0						; get a pointer to it
+			_GetVideoDefault					; get the slot number of the default video card
+			MOVE.B	(A0)+,D0					; get the slot number
+			
+			SUBA	#spBlockSize-2,SP			; allocate spBlock (and eliminate the 2 bytes from GetVideoDefault)
+			MOVE.L	SP,A0						; point to the parameter block
+			MOVE.B	D0,spSlot(A0)				; get info for the default slot
+			CLR.W	spID(A0)					; zero the spID.B,spExtDev.B
+			MOVE.W	#CatDisplay,spCategory(A0)	; look for this slot's card
+			MOVE.W	#TypVideo,spCType(A0)
+			MOVE.W	#DrSwApple,spDrvrSW(A0)
+			MOVE.B	#1,spTBMask(A0)				; mark spDrvrHw field as don’t care
+			_sNextTypesRsrc						; get the spsPointer
+			BNE.S	@OhOh1						; if error, then don't display anything
+			
+; save the spsPointer for the video sRsrc list for later
+
+		 	MOVE.L	spsPointer(A0),-(SP)		; save the spsPointer
+			MOVE.W	#$80,D3						; setup D3 with the default video mode spID
+
+@GetLoop
+			MOVE.B	D3,spID(A0)					; look for video mode info
+			_sFindStruct						; get pointer to this mode's structure
+			BNE.S	@OhOh						; if there was an error, then there is no 1-bit mode on this card
+			MOVE.B	#mVidParams,spID(A0)		; get the device parameter block
+			_SGetBlock							; 
+			MOVE.L	spResult(A0),A1				; get pointer to device pixmap-like thing
+			CMP.W	#1,vpPixelSize(A1)			; is this one-bit mode?			
+			BEQ.S	@GotIt						; if it is, then continue with setup
+			
+			ADDQ	#1,D3						; increment to the next mode
+			MOVE.L	(SP),spsPointer(A0)			; point back to video sRsrc list
+			BRA.S	@GetLoop					; and continue
+
+; if we get here, we either had a card with no 1-bit mode, or memory has been catastrophically wiped out
+
+@OhOh		ADDA	#4,SP						; get rid of the spsPointer on stack
+@OhOh1		ADDA	#spBlockSize,SP				; get rid of the spBlock on stack
+			BRA 	SkipDisplay					; and hop out
+
+; if we get here, then A1 is a pointer to the device pixmap (in vpBlock form), and D3 has the mode number
+@GotIt		
+			SUBA	#IOVQElSize+12-spBlockSize-4,SP	; allocate an iopb and VDPageInfo, less the spBlock and saved spsPointer
+			LEA		IOVQElSize(SP),A0			; get pointer to video parameter block
+			MOVE.W	D3,csMode(A0)				; insert id for 1-bit mode
+			CLR.L	csData(A0)					; clear the data field
+			CLR.W	csPage(A0)					; select page zero
+			CLR.L	csBaseAddr(A0)				; clear the result
+			MOVE.L	A0,csParam(SP)				; point the IOPB to this block
+			MOVE.L	SP,A0						; get IOPB pointer in A0
+			CLR.L	ioCompletion(A0)			; no completion routine
+			CLR.W	ioVRefNum(A0)				; no volume refnum
+			
+			MOVE.L	DeviceList,A2				; get the boot device's gdevice handle (boot always first)
+			MOVE.L	(A2),A2						; get pointer to gdevice
+			
+			MOVE.W	gdRefNum(A2),ioRefNum(A0)	; set up refnum
+			MOVE.W	#cscSetMode,csCode(A0)		; make it a SetMode call
+			
+			_Control							; set 1-bit mode
+			
+			Move.l	csParam(A0),A2				; Get a pointer to our parameters
+			Tst.l	csBaseAddr(A2)				; If it didn't get updated
+			Beq.s	@1							; don't update the screen base
+			Move.l	csBaseAddr(A2),ScrnBase		; Update screen base with														<sm5>
+@1
+
+; we need to set the color table, too, since SetEntries turns everything to gray
+
+			MOVE.L	csParam(A0),A2				; point to parameter block
+			LEA		TinyTable,A3				; get pointer to tiny black and white cSpecArray
+			MOVE.L	A3,csTable(A2)				; put cSpecArray in the parameter block
+			MOVE.W	#0,csStart(A2)				; sequential blast 
+			MOVE.W	#1,csCount(A2)				; of black and white
+			MOVE.W	#cscSetEntries,csCode(A0)	;
+			
+			_Control
+			
+			ADDA	#IOVQElSize+12,SP			; release the IOPB and video parameter block
+
+; update some registers for upcoming code
+
+			MOVE.W	bottom+vpBounds(A1),-(SP)	; number of lines (can't put in D0 yet)
+			MOVE.W	right+vpBounds(A1),D1		; number of columns
+			MOVE.W	vpRowBytes(A1),D2			; rowbytes for 1-bit mode
+			
+			MOVE.L	A1,A0						; move sBlock ptr to A0
+			_DisposPtr							; release this block
+			
+			MOVE.W	(SP)+,D0					; get number of lines in D0
+
+			ENDWITH								; 											<C651>
+			
+		ELSE
+			MOVE.W	ColLines,D0					; number of pixels vertically.				<1.9>
+			MOVE.W	RowBits,D1					; number of pixels horizontally.			<1.9>
+			MOVE.W	ScreenRow,D2				; number of bytes between scan lines.		<1.9>
+		ENDIF
+			
+; a couple of the lomems actually ARE correct for all machine types!
+			MOVE.L	ScrnBase,A2					; Find the start of the screen
+			MOVE.L	ScreenBytes,D3				; total number of bytes in screen
+
+; Calculate the screen address (in 1-bit B&W mode) of the top-left							<1.8> moved inline
+; corner where the sad Mac icon should be blasted onto the screen.
+; This routine is the evil spawn of CalcIconTL which used to be
+; in StartInit.a.  It's moved here and became register-based to do
+; the right thing in more situations.
+
+			MOVEM.L	D0/D1/A2,-(SP)					; preserve some registers
+			LSR.W	#1,D0							; divide number of rows by 2
+			SUB		#22,D0							; adjust for icon (Vert) (where did this number come from?)
+			BSET	#0,D0							; align it
+			MULU	D2,D0							; convert to number of bytes offset
+			ADDA.L	D0,A2							; move halfway down the screen
+			LSR.W	#4,D1							; # of bytes horizontally divided by 2 (one-bit mode, remember?)
+			SUBQ.W	#2,D1							; adjust for icon (Horiz)
+			ADDA.W	D1,A2							; Move halfway across the screen
+			MOVE.L	A2,IconTLAddr					; Save pointer
+			MOVEM.L	(SP)+,D0/D1/A2					;										<1.8> moved inline
+
+;	A3		<-	pointer to the center of the screen.
+
+			MOVE.L	A2,A3						; Point to the start of the screen.			<C152>
+
+			LSR.W	#1,D0						; Divide number of rows by 2.				<C152>
+			MULU	D2,D0						; Convert to number of bytes offset.		<C152>
+			ADDA.L	D0,A3						; Move halfway down the screen.				<C152>
+
+			LSR.W	#4,D1						; # of bytes horizontally divided by 2		<C152>
+			ADDA.W	D1,A3						; Move halfway across the screen.			<C152>
+
+; Okay, here are the values we still consider important at this point:
+;
+;	A2		=	pointer to the start of the screen.
+;	A3		=	pointer to the center of the screen.
+;	D2.W	=	the number of bytes per row.
+;	D3.L	=	the number of bytes occupied by the whole screen.
+
+
+;-----------------------------
+; Fill the screen with black.
+;-----------------------------
+
+			LSR.L	#2,D3						; Compute number of longs on screen.		<C152>
+
+		if hasMMU then							;											<1.7>
+			MOVEQ	#true32b,D0					; set 32-bit addressing mode	
+			_SwapMMUMode						;
+			MOVE.B	D0,-(SP)					; save the previous mode
+		endif									;											<1.7>
+
+			MOVEQ	#-1,D0						; This should be black.						<C152>
+
+@FillLoop	MOVE.L	D0,(A2)+					; Fill a long.								<C152>
+			SUBQ.L	#1,D3						; Countdown.								<C152>
+			BHI.S	@FillLoop					; Loop until done.							<C152>
+
+		if hasMMU then							;									<1.7>
+			MOVE.B	(SP)+,D0					; get the previous addressing mode back
+			_SwapMMUMode						; flip back to previous addressing mode
+		endif									;									<1.7>
+			
+; Okay, here are the values we still consider important at this point:
+;
+;	A3		=	pointer to the center of the screen.
+;	D2.W	=	the number of bytes per row.
+
+;---------------------
+; Display Major code.
+;---------------------
+
+			MOVE.L	A3,A2						; Start at the center of the screen.		<C152>
+			MOVEQ	#24,D0						; compute the length of 24 lines			<1.3>
+			MULU	D2,D0						;											<1.3>
+			ADD.L	D0,A2						; Move down 24 lines.						<C152>
+			SUBQ	#32/8,A2					; Move left 32 pixels (4 tiny characters).	<C152><1.3>
+
+			MOVE.L	D7,D0						; Get major code.							<C152>
+			MOVEQ	#8-1,D4						; (number of chars to display) - 1			<1.3>
+			BSR6	FailData					; Plot the major code at this position		<C152>
+
+;---------------------
+; Display Minor code.
+;---------------------
+
+			MOVE.L	A3,A2						; Start at the center of the screen.		<C152>
+			MOVEQ	#36,D0						; compute the length of 36 lines			<1.3>
+			MULU	D2,D0						;											<1.3>
+			ADD.L	D0,A2						; Move down 36 lines.						<C152>
+			SUBQ	#32/8,A2					; Move left 32 pixels (4 tiny characters).	<C152><1.3>
+
+			MOVE.L	D6,D0						; Get minor code.							<C152>
+			MOVEQ	#8-1,D4						; (number of chars to display) - 1			<1.3>
+			BSR6	FailData					; plot the major/minor codes
+
+;-----------------
+; Display Sad Mac
+;-----------------
+
+			BSR6	DeadMac 					; plot the dead Mac icon
+
+SkipDisplay	BigJmp	TMRestart,a0				; go to Test Manager entry point			<C27/30may86><1.4><2.0><2.1>
+
+TinyTable	DC.W	$0000,$FFFF,$FFFF,$FFFF		; whiteColor
+			DC.W	$0000,$0000,$0000,$0000		; black
+
+
+
+***************
+* Subroutines *
+***************
+
+;-----------------------------------------------------------------------------
+; Display a failure code as a series of hex characters on the screen.
+;
+; *** Called by BSR6 ***
+;
+; D0.L	->	the nybbles to display - left justified
+; D2.W	->	number of bytes between scan lines
+; D4.W	->	number of hex characters of D0 to display
+; A2	->	pointer to screen area to put characters
+; A6	->	return address (we don't want to use any RAM, now do we?)
+;
+; Destroys D0-D1/D3-D5/A1/A2.
+;
+;-----------------------------------------------------------------------------
+
+FailData	
+		if hasMMU then							;									<1.7>
+			MOVEQ	#true32b,D1					; put in D1 for a second
+			EXG		D1,D0						; get true32b in D0, save D0 in D1
+			_SwapMMUMode						; switch to 32-bit addressing
+			MOVE.B	D0,-(SP)					; save the previous addressing mode
+			EXG		D1,D0						; get D0 back in D0
+		endif									;									<1.7>
+FailLoop
+			ROL.L	#4,D0						; get nibble in low order
+
+			MOVEQ	#$0F,D5						; isolate the lower nibble					<1.3>
+			AND.B	D0,D5						;  in the working register					<1.3>
+			MULU	#3,D5						; 3 bytes per digit
+			LEA 	numFont(D5),A1				; point to start of digit's map
+
+			MOVEQ	#$C3-256,D1 				; now mask off extras with $C3				<1.3>
+			MOVEQ	#3-1,D3						;											<1.3>
+
+chLoop		MOVE.B	(A1),D5 					; get the next byte
+			LSR 	#2,D5						; get high nibble
+			OR		D1,D5
+			MOVE.B	D5,(A2)
+			ADD		D2,A2						; next scan line
+
+			MOVE.B	(A1)+,D5					; get the next byte
+			LSL 	#2,D5						; get low nibble
+			OR		D1,D5
+			MOVE.B	D5,(A2)
+			ADDA.W	D2,A2						; Move to the next scan line.				<C152>
+
+			DBRA	D3,chLoop					; Loop until character is done.				<C152>
+
+			MOVEQ	#6,D1						; calculate 6*[bytes/row]					<1.3>
+			MULU	D2,D1						;											<1.3>
+			SUBA.L	D1,A2						; move back to the top of this character	<1.3>
+			ADDQ.W	#1,A2						; point to the next character's position	<1.3>
+
+			DBRA	D4,FailLoop					; loop until all characters are drawn
+			
+		if hasMMU then							;									<1.7>
+			MOVE.B	(SP)+,D0					; get the old addressing mode back
+			_SwapMMUMode						; restore the addressing mode
+		endif									;									<1.7>
+			
+			JMP		(A6)						; return to caller
+						
+;----------------------------------------------------------------------------
+; The digits 0-F are 4x6 bitmaps stored as 3 bytes/digit
+;----------------------------------------------------------------------------
+
+numFont		DC.B	$96,$42,$69 				; 0
+			DC.B	$B3,$BB,$B1 				; 1
+			DC.B	$96,$ED,$B0 				; 2
+			DC.B	$0E,$9E,$69 				; 3
+
+			DC.B	$66,$60,$EE 				; 4
+			DC.B	$07,$1E,$69 				; 5
+			DC.B	$87,$16,$69 				; 6
+			DC.B	$0E,$DD,$BB 				; 7
+
+			DC.B	$96,$96,$69 				; 8
+			DC.B	$96,$68,$E1 				; 9
+			DC.B	$96,$60,$66 				; A
+			DC.B	$16,$16,$61 				; B
+
+			DC.B	$87,$77,$78 				; C
+			DC.B	$16,$66,$61 				; D
+			DC.B	$07,$17,$70 				; E
+			DC.B	$07,$17,$77 				; F
+
+
+
+;---------------------------------------------------------------------------- (rewritten)	<1.3>
+;  DeadMac is used by all systems to display an icon indicating the Mac
+;  has died at boot time, following power on tests.
+;
+;  Called by BSR6
+;
+;  D2.W contains rowbytes on entry
+;
+;  Registers used:	D1,D2,A0,A2
+;
+;----------------------------------------------------------------------------
+
+DeadMac		
+			LEA		SadMacIcon,A0				;point to the "Sad Mac" icon				<1.3>
+			MOVE.L	IconTLAddr,A2				; figure out where the topLeft corner is	<1.3>
+
+		if hasMMU then							;											<1.7>
+			MOVEQ	#true32b,D0					; flip to 32-bit mode						
+			_SwapMMUMode						; switch to 32-bit addressing			
+			MOVE.B	D0,-(SP)					; save the previous mode
+		endif									;											<1.7>
+
+			MOVEQ	#6,D1						; move the icon down 6 lines				<1.9>
+			MULU	D2,D1						; 											<1.9>
+			ADDA.L	D1,A2						;											<1.3><1.9>
+
+			SUBQ.W	#4,D2						; adjust for auto-increment in blit loop	<1.9>
+
+			MOVEQ	#32-1,D1					; set up counter							<1.9>
+@BlastIcon	
+			MOVE.L	(A0)+,(A2)+					; copy one scanline of the icon				
+			ADDA.W	D2,A2						; move down to the next screen line			<1.3><1.9>
+			DBRA	D1,@BlastIcon				; keep looping until all 32 lines are copied<1.3><1.9>
+
+		if hasMMU then							;											<1.7>
+			MOVE.B	(SP)+,D0					; switch back to previous addressing mode
+			_SwapMMUMode						; flip back
+		endif									;											<1.7>
+			RTS6								; return to caller							<1.3>
+
+
+;_______________________________________________________________________
+;
+;  Routines PutIcon,PutIcon1 are used to display a compressed icon on
+;  the screen.  They are based on Steve Capps' bitmap compression technique.
+;
+;  Arguments:	A2 = screen address
+;				A3 = Ram offset pointer
+;				A4 = address of icon
+;				A6 = holds return address
+;
+;  Called by BSR6
+;
+;  Registers used:	D2,D3,D4,A0,a1,A2,A4
+;_______________________________________________________________________
+
+PutIcon		MOVEQ	#16-1,D3					; There are 16 octals in an icon			<1.3>
+UNCOMP1		MOVE.L	A2,A0						; save screen start address
+			MOVEQ	#4-1,D2						; reset row bytes counter					<1.3>
+
+UILOOP		MOVE	#$100,D4					; prime D0 for 8 bit count count
+			MOVE.B	(A4)+,D4					; load map byte from compressed image
+
+MLOOP		LSR.W	#1,D4						; shift off map bit
+			BEQ.S	DONE						; byte done when = 0
+			BCC.S	IBLACK						; dispatch on the bit
+			CLR.B	(A2)+						; store zero in new
+			BRA.S	CHECK						; continue for all 8 bits
+			
+IBLACK		MOVE.B	(A4)+,(A2)+ 				; store byte in new
+CHECK		DBF 	D2,MLOOP					; see if on scanline seam (every 4 bytes)
+				
+			ADDA	ScreenRow,A2				; bump to next scanline 					<C1/14Apr86>
+			SUBQ	#4,A2						;											<C1/14Apr86>
+			MOVEQ	#3,D2						; reset row bytes counter
+			BRA.S	MLOOP						; continue for all 8 bits
+
+DONE		DBF 	D3,UILOOP					; do the rest of the octals in ICON
+
+; Now unXOR the icon on the screen
+
+			MOVE.L	A0,A1						; second pointer
+			MOVEQ	#31-1,D3					; do 31 scanlines							<1.3>
+
+XLOOP		ADDA	ScreenRow,A1				; bump to next scanline 					<C1/14Apr86>
+			MOVE.L	(A0),D4 					; get long from previous scanline
+			EOR.L	D4,(A1) 					; xor into this scanline
+			MOVE.L	A1,A0						; "add" rowBytes to a2
+			DBF 	D3,XLOOP
+			RTS6
+
+
+; "Sad Mac" icon for when the Mac croaks (this is new as of <1.3>)
+
+SadMacIcon	DC.L	$FFFFFFFF					; ••••••••••••••••••••••••••••••••
+			DC.L	$F800003F					; •••••                     ••••••
+			DC.L	$F000001F					; ••••                       •••••
+			DC.L	$F1FFFF1F					; ••••   •••••••••••••••••   •••••
+			DC.L	$F200009F					; ••••  •                 •  •••••
+			DC.L	$F200009F					; ••••  •                 •  •••••
+			DC.L	$F228289F					; ••••  •   • •     • •   •  •••••
+			DC.L	$F210109F					; ••••  •    •       •    •  •••••
+			DC.L	$F228289F					; ••••  •   • •     • •   •  •••••
+			DC.L	$F200009F					; ••••  •                 •  •••••
+			DC.L	$F204809F					; ••••  •      •  •       •  •••••
+			DC.L	$F203009F					; ••••  •       ••        •  •••••
+			DC.L	$F200009F					; ••••  •                 •  •••••
+			DC.L	$F20FC09F					; ••••  •     ••••••      •  •••••
+			DC.L	$F210309F					; ••••  •    •      ••    •  •••••
+			DC.L	$F200089F					; ••••  •             •   •  •••••
+			DC.L	$F200009F					; ••••  •                 •  •••••
+			DC.L	$F1FFFF1F					; ••••   •••••••••••••••••   •••••
+			DC.L	$F000001F					; ••••                       •••••
+			DC.L	$F000001F					; ••••                       •••••
+			DC.L	$F000001F					; ••••                       •••••
+			DC.L	$F000001F					; ••••                       •••••
+			DC.L	$F3001F9F					; ••••  ••           ••••••  •••••
+			DC.L	$F000001F					; ••••                       •••••
+			DC.L	$F000001F					; ••••                       •••••
+			DC.L	$F000001F					; ••••                       •••••
+			DC.L	$F000001F					; ••••                       •••••
+			DC.L	$FFFFFFFF					; ••••••••••••••••••••••••••••••••
+			DC.L	$F800003F					; •••••                     ••••••
+			DC.L	$F800003F					; •••••                     ••••••
+			DC.L	$F800003F					; •••••                     ••••••
+			DC.L	$FFFFFFFF					; ••••••••••••••••••••••••••••••••
+
+
+			END
+

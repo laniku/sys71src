@@ -1,0 +1,3218 @@
+;
+;	File:		DiskCache.a
+;
+;	Contains:	an LRU cache of disk blocks
+;
+;	Written by:	Larry Kenyon
+;	Major rewrite for 7.0 by:	Kenny SC. Tung
+;
+;	Copyright:	© 1985-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM4>	11/23/93	rab		In the previous checkin a !forROM conditional was added to
+;									FlushCache to strip out a check for the Mac+ ROM. Unforutnately
+;									the conditional was added a few lines too soon and eliminated
+;									all of the logic which decided if the cache should be flushed
+;									based on CacheFlag and noFlushBit. The result was that the cache
+;									always flushed which causes a performance hit. Moved the
+;									conditional and added a bra fcExit so things will work like they
+;									used to.
+;	   <SM3>	11/18/92	RB		Made some changes forROM so that we have the disk cache code in
+;									ROM and not installed as a patch from the system file. This code
+;									is now installed as the cache from ROM, but we do not prevent
+;									the file system cache from being installed (yet), so we will let
+;									this cache do cleanup.
+;		<24>	 12/3/91	KST		Clean up the equates. Remove cbHqAge and use cbHqDevNum
+;									consistently.
+;		<23>	  7/9/91	JSM		Remove obsolete SysVers conditionals, turn off a label unless
+;									ktDebugCache is defined, remove include of GestaltEqu.a.
+;		<22>	 6/12/91	LN		added #include 'InternalOnlyEqu.a'
+;		<21>	 2/13/91	KST		dfn, #notabug: Took out _debugger trap.
+;		<20>	 1/15/91	KST		With Scott T.B: Changed "verifyCacheSize". Don't reserve 32K for
+;									others.
+;		<19>	  1/2/91	KST		With Scott T.B. Removed the cache limit imposed by <13>. This
+;									fix is a coordinated effort between Boot Mgr, VM, and Cache Mgr.
+;		<18>	10/31/90	KST		Fixing a bug in Init700cacheQs.
+;		<17>	10/29/90	KST		Make DiskCache.a build for Sys606.
+;		<16>	10/29/90	KST		Fixed a bug that can't mount CD ROM drive with 32K cache. I am
+;									now using logical AND to calculate the hash key. (code read by
+;									Bill Bruffey).
+;		<15>	 9/22/90	KST		Used in BigBang build. (Didn't specify this file is for which
+;									build and BBS checked it in.)
+;		<14>	 9/22/90	KST		Save D0 across TrashVBlks call for MountVol. Yes D0.
+;		<13>	 9/20/90	KST		For B1, DiskCache can only have 256K bytes maximum because of
+;									BufPtr problem under VM and 24 bit mode.
+;		<12>	 9/18/90	KST		Fixing a bug in clearMem which should do LSR.L not LSR.W
+;		<11>	 8/31/90	KST		Put empty buffers at the end of free queue, non-empty buffers at
+;									the front. GetBlock will always take a buffer from the end of
+;									the queue.
+;		<10>	 8/28/90	KST		Make fCFreeBit override fCTrash option.
+;		 <9>	 8/27/90	KST		Adding new options to RelBlock and FlushCache calls for the new
+;									DiskCache scheme.
+;		 <8>	 8/27/90	KST		RelBlock should trash the block for bad mount.
+;		 <7>	  8/6/90	KST		Some documentation changes.
+;		 <6>	  8/6/90	KST		Major rewrite for 7.0. See description below.
+;		 <5>	 7/26/90	gbm		dirtyBit conflicts with PaletteMgr... changing it to
+;									cacheDirtyBit (also in DiskCachePriv.a)
+;		 <4>	 6/29/90	gbm		make 7.0 use cache size setting, no matter what cacheEnabled
+;									says
+;		 <3>	  2/4/90	DNF		Add include of FileMgrPrivate.a
+;		 <2>	12/28/89	dba		made this a MAIN instead of a PROC so we get dead code
+;									stripping; made CacheDebug default to 0; got rid of OKToAdjust
+;									routine which always returned true
+;	   <1.3>	11/14/89	KST		Patch 1.2 change for 7.0 forgot to set up Oldbufptr. This fixes
+;									that problem.
+;	   <1.2>	10/14/89	EMT		For System 7: Allocate locals and buffers as per LoadPatches.a.
+;									Remove dynamic resizing as it is unavailable with MultiFinder.
+;	   <1.1>	 9/29/89	KST		Changed "FlushCache" call to honor D1 option flag, ie. to trash
+;									buffers after flushing. This is compatible with RomCache and
+;									also fixes a problem that breaks "ExchangeFile".
+;	   <1.0>	11/16/88	CCH		Added to EASE.
+;				12/14/87	JB		(PMAB331) Changed setting of CurConfig so that re-sizing is
+;									attempted on each launch. If size change requested in
+;									CacheConfig is not attainable, then CurConfig is zeroed.
+;				11/20/87	JB		(PMAB331) Changed from using 'minApplZone' constant to
+;									'CacheMinZn' variable for minimum appl zone size calculation.
+;									Added test of 'noCacheBit' in ioPosMode to allow file
+;									read/write's to bypass the cache on a per-request basis.
+;									Non-integral block sized data transfer will see cache activity
+;									for the tail of the transfer only.
+;				12/11/86	LAK		Fixed bug introduced in <02Dec86> fix which was trashing A0 for
+;									segloader. Qualify direct ROM address compares with a ROM
+;									version check (this code was needed to patch ROM 75 bugs). Made
+;									cache adjust size more robust a la CacheInstall.a code. Also do
+;									RestoreCaches routine after synchronization with the file
+;									system.
+;				 12/9/86	LAK		Don't take over jSegStack (someone else may have already done
+;									this and we would be cutting them out). Use INITSegVect instead.
+;				 12/2/86	LAK		Stop using file system stack during cache adjust. Sync with file
+;									system before adjusting buffer usage and do a low-level flush
+;									since flush at launch time might not be valid (an async write
+;									might have come thru afterwards).
+;				 7/23/86	DLD		Converted source to MPW.
+;				  1/1/86	LAK		Fixed bug in file-order queueing in GetBlock: if Lg2Phys call
+;									causes A5 block to be recycled for extents file, A5 is no longer
+;									valid. Check A5 validity by checking that element's queue ptr
+;									instead (this is simpler anyway). When buffers are put into the
+;									free queue, the file-order queue header is set to point to
+;									itself to avoid queueing confusions on later errors.
+;				12/31/85	LAK		Added check of back links in CacheCheck routine. Now call
+;									CacheCheck whenever we queue up a new element in GetBlock (for
+;									debug option).
+;				 12/9/85	LAK		Added fix to TrashVBlks code: remember last queue element when
+;									calling TrashFCache since the latter routine now recycles blocks
+;									to the end of the queue.
+;				 12/8/85	LAK		Fixed bug with flush-skipping: the flush should be done when
+;									called from FileRead (which is the read verify case) so that all
+;									writes are done at once rather than a flush for the in-place
+;									read and separate ones for any GetBlock calls for partial
+;									blocks. There was also an equate bug in GetBlock. When trashing
+;									a file queue, requeue the header at the end (TrashFCache) so
+;									GetBlock will recycle the empties first.
+;				 12/6/85	LAK		Skip all flushes if CacheFlag is not set (see if this goes over
+;									ok). Set CacheFlag when calling FlushCache from CacheRdIP (we
+;									have to flush here). Minor coding speedup in FindFileCache. Set
+;									BufTgFNum to $CACD at getblock: this will show in tags of FEdit
+;									if block was not read from disk. Added version header.
+;				 12/4/85	LAK		Added age field to each cache block (stamped into cache block at
+;									GetBlock exit), to be used in LRU block determination for
+;									recycling blocks. Increment age when new file queue is moved to
+;									MRU position. Changed buffer recycle routine to use this new
+;									field. Clear CacheCom at launch time. If noRWIPBit is set, don't
+;									cache ip requests. This can be set by Finder during disk copy
+;									I/O to prevent needless caching. Temporarily include new TFSEQU
+;									from cache- directory. Allocate file headers from cache space.
+;									Use old cache space for new cache buffers as well. Cache code is
+;									now located in cache space as well.
+;				 12/2/85	LAK		Added caching of writeIP blocks. Put in patch of FlushMDB bug in
+;									RelBlock. Preserve D3 in CacheWrIP (fix that was lost). Moved
+;									RestoreCaches here to minimize size of INIT. Added file-order
+;									search at GetBlock for all but control files; the file position
+;									is remembered if the block is not found to avoid another search
+;									for file-order queueing the new block. Added caching of write IP
+;									blocks. Limit of r/w IP requests to cache is now dynamic, based
+;									upon size of cache (the larger the cache, the larger the request
+;									cached).
+;				 12/1/85	LAK		Changed alternate queue to be in File order, instead of Disk
+;									order (since GetBlock, TrashBlock searches need file order).
+;									Added CheckCache routine for debug. Free Queue now has header
+;									backpointers in each block (for DQCacheBlks to use in
+;									determining to which queue an element belongs).
+;				11/15/85	LAK		New today (from TFS-Cache.Text, TFS-CacheIO.Text).
+;
+; Cache Install/Adjust
+;	Routines:
+;				CacheInstall/CacheInSub
+;				 RestoreCaches/RestoreProc ------ cache remove code
+;				 RestCVect
+;				CacheAdjust
+;				InstCVect
+;				EQCacheBufs
+;				DQCacheBufs
+;
+; Cache
+;  Routines:	FlushCache	-  Flushes a cache queue to disk.
+;				GetBlock	-  Gets a specified disk block.
+;				MarkBlock	-  Marks a specified disk block dirty.
+;				RelBlock	-  Releases use of a specified disk block.
+;				TrashVBlks	-	Trashes all blocks belonging to a volume.
+;				TBStartSearch:
+;				 TrashBlocks - Trashes a specified range of file blocks.
+;				 TrashFBlocks- Trashes all blocks of a specified file.
+;				CacheRdIP	- Multiblock read into user-buffer.
+;				CacheWrIP	- Multiblock write from user-buffer.
+;
+; Internal
+;  Subroutines: TFSVCBTst	- Checks A2 VCB for TFS/MFS.
+;				Lg2Phys 	- (ROM hook)
+;				WrBlocks	- (ROM hook)
+;				RdBlocks	- (ROM hook)
+;				ReadBlock
+;				WriteBlock
+;				BasicIO 	- (ROM hook)
+;
+;				FindFileCache - Find cache queue for specified file.
+;				FlushFCache - Flush specified cache queue.
+;				TrashFCache - Trash specified cache queue (blks moved to free q).
+;				FreeCBlk	- Move a cache block to free queue.
+;				EQCBlkDO	- Enqueue a cache buffer in disk order.
+;				GetLPBuf	- Return lowest-priority buffer.
+;
+;				DQElement	- Dequeue a queue element.
+;				EQElement	- Enqueue a queue element at spec'd position.
+;				AddQToQ 	- Add all of a queue's blocks to another queue.
+;
+;	MEMORY
+;
+;	The cache code is loaded temporarily into the application heap by the cache INIT resource
+;	when caching has been enabled; this is done at launch time.  The code is then copied
+;	to the top of the space allocated for caching (by moving BufPtr down).
+;
+;	The remainder of the space under BufPtr is allocated to cache buffers.	This may be
+;	adjusted at launch time if the user has changed the setting of the cache size.
+;
+;	The old File System cache space in the System heap is retained; this is for two
+;	reasons: (1) it guarantees us space to restore the old cache if the user disables caching,
+;	and (2) the cache pointers have already been stored in VCBs and B-Tree control blocks.
+;	We might want to go patch these and move the old cache up under BufPtr (don't get rid
+;	of all our space when disabled) in another release.  We do use the old cache space for
+;	additional new cache buffers, so it's not lost to the world . . .
+;
+;	QUEUES
+;
+;	All queues in this cache are doubly linked queues.	A single queue is used for all
+;	'empties': blocks when they are initially allocated and when they are freed up.
+;
+;	There are 36 file queues, each caching blocks for a unique file fork; the headers for
+;	these file queues are in a File Queue, kept in MRU order:
+;
+;		FileQHdr -> FQHead <--> FQ1 <--> FQ2 . . . . . FQ36 <--> (FQHead)
+;
+;	Each file queue header is actually the header for two queues: a queue of its file blocks
+;	linked in file order, and a queue of its file blocks links in MRU order.  The file
+;	system tries to allocate file blocks in disk order, and so the file block order approximates
+;	disk order; therefore, when blocks are flushed, they are flushed in the order they appear
+;	in this queue.	Blocks are accessed by file block number, and because of the usually sequential
+;	accessing of a file, the file order queueing is also useful for searches.
+;
+;	AGING OF CACHE BLOCKS
+;
+;	Global age count is incremented whenever GetBlock file is not at MRU position; this keeps all
+;	r/w ip blocks at the same age, and generally all blocks of a file related to a particular
+;	operation (e.g., OpenResFile) at the same age.	The current age is stamped on each buffer
+;	header when it is passed back from GetBlock.  When there is a need to recycle buffers, those
+;	with an age less than or equal (earlier in time) than that of the LRU buffer in the LRU file
+;	with any buffers, are recycled.  Note that the use of a global age rather than time or ticks
+;	prevents any screwup if someone happened to change those globals.  By only incrementing age
+;	global when a file comes to the front of the queue, all r/w ip blocks for a particular request
+;	will get the same stamp and be recycled at the same time.
+;
+;	CACHECOM
+;
+;	The low-memory global CacheCom is cleared at launch time.  The Finder can signal us there when file
+;	copy is being done by setting bit 7.  This prevents unnecessary usage of the cache for the
+;	high-bandwidth copy/verify operations (I never cache r/w ip operations when the verify bit
+;	is set).  By setting bit 6 (diskRdBit), GetBlock will be forced to go to disk for
+;	the block (this will cause things to go very slow).
+;
+;	FILE TAGS
+;
+;	File tags are supported. The extra 8 bytes for HD20 as well as the file number, file
+;	block number, and file attributes are kept in the file header.	It may appear that tags
+;	are messed up when viewing blocks with FEdit or similar utilities: this is because the
+;	block may not actually be read from disk, but from the cache; these blocks will have
+;	'CACD' stamped in the first longword of the tags so they may be distinguished.	I considered
+;	formulating tags, but this is misleading because they may not really be on the disk.
+;	The CACHECOM diskRdBit may be set by these utilities to force a disk read.
+;
+;
+;
+; Cache To Do, Notes:
+; * Put in some check for copy-protection: if read-data vector has been intercepted,
+;	 read block from disk regardless (for drives 1 and 2).
+; - Bump Sony timeout if on at GetBlock (extend power-off timeout) to avoid power-on
+;	 penalty.
+; - Make file-order searches smarter - figure distance to front or back block and
+;	 search backwards when convenient.
+; - Add better multiblock read/write support (need to group these blocks to avoid
+;	 long linear searches . . .)
+; - When Switcher is in, we really won't ever see any launch traps (launch is
+;	  completely intercepted).
+; - Don't call GetLRUBlk if we've max'ed out in our own cache queue.  Recycle the last 8
+;	buffers or so. - let's wait on this one: we already have the limit on r/w ip request
+;	size to cache, and this may be enough of a throttle.  Jazz seems to suck up about 256
+;	blocks or more and not suffer: it also does small r/w requests.  With the new file-order
+;	search option and the better LRU recycling, it may not be so bad after all to keep a large
+;	number of blocks in a particular file cache.  It might be reasonable to monitor the
+;	cache for a particular file and throttle it down by limiting the size of r/w IP blocks
+;	cached for it.
+; - Add a checksum option for debug? this is fairly complicated since the file system
+;	  will sometimes modify released blocks (only do for r/w ip blocks?).
+; - Perhaps have a second queue for file headers in VCB order (and maybe file-order
+;	  within a VCB, based on first file-order block within the queue).	This would
+;	  probably speed many flushing operations.
+; - We could tighten up some loops: use word compare for preliminary check.
+; - Add some other file priority than LRU; use file type?  How about caching files in
+;	  system folder with higher priority?  We have access to a file's type and directory
+;	  for TFS volumes in the FCB.
+;
+;			type	creator 	file						 flush at flushvol only
+;			CLIP	MACS		clipboard							X
+;			ZSYS	MACS		system (refnum=2)
+;			FNDR	MACS		finder
+;			PRER	LWRT		laserwriter
+;			FNDR	ERIK		desktop
+;			APPL				applications
+;			TEMP				special for temp files? 			X
+;
+; To test:
+; - test against monkey.
+; - test with switcher, finder keeper, RAM Disk.
+; - look at all uses of SP rather than A6 and verify that no async action can
+;		happen at that time.
+; - try a number of copy-protected applications.
+;_________________________________________________________________________________
+
+;	What's new for Sys7.0bc1:	<Kenny SC. Tung>
+;		1. Memory allocated by ROM is released.
+;		2. Data buffers are separated from headers.
+;		3. Data buffers will not cross page boundary.
+;		4. Added new bit "fqDirtyBit" in file header to optimize FlushFCache and FlushVol.
+;		   This is very essential because "FlushVol" calls "FlushCache" three times in a row
+;		   (while 2 of them are unnecessary !!)
+;		   and "FlushCache" calls "FlushFCache" 40 times !
+;		5. translation cache to map data buffer => header
+;		6. New dontInstRC bit in cachecom. (fsPrivate.a)
+;		7. Adding the code to check upper bound limit against actual physical 
+;		   memory that Ramcache can allocate. Fixing bug BRC#62288.
+;		8. When a file is closed, its buffers are released. They are put onto the free queue
+;		   however, their volume level information, ie., volume refnum and disk block number,
+;		   is preserved in the hope that the file will be used again. In this case, if the 
+;		   block is still in the free queue, we just remove it from the free queue and add it
+;		   to the file queue. There is no disk access required. When a buffer is returned to 
+;		   the free pool, it is linked to the end of the queue. When we take a buffer from the
+;		   free pool, the buffer is taken from the head of the free queue. To make the search
+;		   of the free queue more efficient, a hash mechanism is used.
+;		9. There is a mysterious anomaly using RamCache: If you increase the size of RamCache,
+;		   it will degredate the performance of the file system. Myth had it that the linear
+;		   search of GetBlock is the culprit to blame. As a matter of fact, the search algorithm
+;		   is quite efficient. The real problem is in CacheRdIP. CacheRdIP will try to save
+;		   blocks in the cache if the number of blocks to read falls within a limit. That limit
+;		   is calculated based on the size of the cache. Which means the larger the cache size,
+;		   more blocks are saved in cache. The problem happens here, CacheRdIP doesn't do multi-
+;		   block read as it is advertized when it decides to save the blocks in cache, it does
+;		   single block read thru GetBlock. As you can see, now a single disk access has fragamented
+;		   into many disk accesses. Because disk access is a mechanical movement, the time it
+;		   takes is significant. The degredation is even worse on some disks which doesn't do
+;		   hadrware level disk cache.
+;		10.Rewrote CacheRdIP to search the cache first, searching both the file queue and free queue.
+;		   The previously said hashing scheme makes this feasible. If all blocks are already in the cache,
+;		   data is copied into user's buffer. Note in this case, I don't remove buffers from the free queue
+;		   and put them in the file queue. 
+;		   If during the search, once I found a block that is not in the cache, I will do multiple block
+;		   read, starting from the missing block, directly into user's buffer and then copy the data from
+;		   user's buffer to the cache. Of course we only need to copy iff the block is not in the cache.
+;		11.So what's the big deal of rewriting these routines? You should now be able to "SEE" the difference
+;		   between this DiskCache(7.0bc1) and DiskCache(7.0a12). A 7.0 system build with 1024K cache on 
+;		   MacII showed 30% performance improvement !!
+;
+;	Todo:
+;		1. Don't cache RAMDisk if the driver says so. Right now, there is no way to
+;		   know the type of the disk. -- bad !!
+;		2. Read ahead is a nice feature we should do, but without scatter/gather I/O
+;		   this is impractical to implement it. (DMA will help too)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+			STRING		ASIS
+
+			LOAD		'StandardEqu.d'
+			INCLUDE		'DiskCachePriv.a'
+			INCLUDE		'InternalOnlyEqu.a'
+			INCLUDE		'FileMgrPrivate.a'
+
+		if &type('CacheDebug') = 'UNDEFINED' then
+CacheDebug:		equ		0
+		endif
+
+		if &type('NewInit70') = 'UNDEFINED' then
+NewInit70		equ		0			; set if building '7.0 INIT'
+		endif
+
+		if &type('ktDebugCache') = 'UNDEFINED' then
+ktDebugCache	equ		0
+		endif
+
+		if &type('ktDebugHash') = 'UNDEFINED' then
+ktDebugHash	equ		0
+		endif
+
+RAMCache	PROC	EXPORT			;												<SM3> rb
+
+; The following absolute addresses are needed to patch problems in the version 75 ROM:
+
+FReadCall	EQU		$404F56			; ROM75 FileRead return address (read-verify flush)
+FlMDBCall	EQU		$402DD8			; ROM75 FlushMDB return address (used for patch)
+
+;_______________________________________;
+;
+; If we are compiling forROM, this code is simply part of the ROM code and not a	<SM3> rb
+; resource installed by a patch.													<SM3> rb
+;
+; Otherwise:																		<SM3> rb
+;
+; The following code is made into
+;	a separate resource of type CACH.
+;	It is loaded by the CacheLoad (PTCH 0 in 7.0 world)
+;	routine of the cache INIT resource
+;	when caching is enabled.
+;_______________________________________;
+
+CacheStart
+	
+	IF NOT forROM THEN					;											<SM3> rb
+	
+			BRA		 CacheInstall		;										<06Dec85>
+			DC.L	('CACH')			; CACH resource 						<06Dec85>
+			DC.W	1					; res is 1								<06Dec85>
+			DC.W	3					; <17Apr90> version 3					<17Apr90>
+	ENDIF								;											<SM3> rb
+	
+;_________________________________________________________________________________
+;
+; Routine:		FlushCache
+;
+; Function: 	Flushes cache buffers for specified file or volume.
+;
+; Input:		D0.W  -  file or volume refnum
+;				D1.B  -  option flags (default = don’t trash buffers after flush)
+;							fCTrash   - trash buffers after flush
+;							fCfreeBit - trash buffers but save in the free queue hash
+;				A2.L  -  VCB ptr if D0=volume refnum
+;
+; Output:		D0.W  -  result code (always zero)
+;
+; Called by:	FileRead: (flush all blocks before read-verify) => has to be done for partial blks
+;				MyReadIP: (flush all blocks of a file before a read-in-place) => has to be done.
+;				Close, FlushFile: (flush all blocks of a file) => skippable
+;				FlushVol: (flush all volume blocks) => has to be done (CacheFlag=$FF for this case)
+;				BTFlush, BTClose: (flush control cache B-Tree blocks) => skip if possible (we flush too often)
+; Revision History:
+; 28Sep89	KSCT	Make FlushCache to honor D1 option flag, ie. trash the cache.
+;					Note: 1. flush and trash can be done in one call on RamCache.
+;						  2. Only buffers are removed from FCQueue not the FileQHeader. Therefore,
+;							 this call is for interim flush/trash (eg. ExchangeFile) not for FClose.
+; 29Sep89	KSCT	Some optimization: exit if no buffer cached.
+; 28Aug90	KSCT	Added fCfreeBit option.
+;_________________________________________________________________________________
+
+FlushCache
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1-D6/A1-A4,-(A6)	; save registers
+			MOVE	D1,D5				; save option flag						<28Sep89>
+			MOVEA.L FileQHdr,A3 		; A3 = ptr(FQH)
+			MOVE.W	D0,D1				; D1 = refnum
+			BLE.S	fcVolume			; br if volume flush
+
+; Find the file cache for this file/fork (if any) and flush it.
+
+fcFile		MOVEA.L FCBSPtr,A1			; A1 = FCB ptr
+			MOVEA.L FCBVPtr(A1,D1),A2	; A2 = VCB ptr
+			MOVE.L	FCBFlNm(A1,D1),D3	; D3 = file number
+			BTST	#FCBRscBit,FCBMdRByt(A1,D1) ; resource fork?
+			SNE 	D6					; $FF=resource fork, $00=data fork
+			BSR 	FindFileCache		; get the file cache ptr in A4
+			BEQ		fcExit				; exit if no blocks cached
+
+			TST 	FHBufCnt(A4)		; anything to flush?					<29Sep89>
+			BEQ.S	fcExit				; no -> (no buffer allocated)			<29Sep89>
+		;; if cacheFlag <> 0, then force flush, (it really should be called FlushFlag)
+		;; if cacheFlag == 0, and this is NOT a control file then we always flush.
+		;; if cacheFlag == 0, and this IS a control file then we delay flushing.<24Apr90>
+			TST.B	CacheFlag			; flushing time?
+			BNE.S	@1					; br if so (go flush)
+			BTST	#noFlushBit,FHFlags(A4) ; avoid intermediate flushes?		<08Dec85>
+			BEQ.S	@1					; br if not (go flush)					<08Dec85>
+			bra.s	fcExit				; exit if so (skip flush)				<SM4>
+
+	IF NOT forROM THEN					; We don't need MacPlus ROM check		<SM3> rb <SM4>
+			MOVE.L	ROMBase,A3			;<11Dec86> make sure we have the correct ROM
+			CMP.W	#$0075,8(A3)		;<11Dec86>
+			BNE.S	fcExit				;<11Dec86> exit if not
+			CMP.L	#FReadCall,$28(A6)	; FileRead flush before verify? 		<08Dec85>
+			BNE.S	fcExit				; exit if not (skip flush)				<08Dec85>
+	ELSE								;										<SM3> rb
+			; if FlushFlag is 0, then if this file is control file skip flushing
+	ENDIF								;										<SM3> rb
+	
+@1			BSR 	FlushFCache 		; flush the A4 cache
+			BRA.S	fcExitTrash 		; trash and exit						<28Sep89>
+
+; Flush all file caches belonging to this volume.
+fcVolume
+			MOVEA.L  A3,A4				; start at top of queue
+
+@1			MOVEA.L FHFlink(A4),A4		; position to next file queue
+			CMPA.L	A3,A4				; back to top of queue ?
+			BEQ.S	fcExit				; exit if so
+			CMPA.L	FHVCBPtr(A4),A2 	; same volume?
+			BNE.S	@1					; no, continue search
+			BSR 	FlushFCache 		; flush the queue
+			BRA.S	@1
+
+fcExitTrash ;; buffers flushed, trash them if requested so						<28Sep89>
+	;; A1=FCB array, A2=VCB ptr, A4=FQheader, D1=refnum, D5=option				<28Sep89>
+	;; If option = fCfree,  we will free the buffers without trashing them.		<28Aug90>
+	;; If option = fCtrash, we will give FClose a chance to keep the buffers	<28Aug90>
+			BTST	#fCfreeBit,D5 		; free and save in DHT requested?		<28Aug90>
+			BNE.S	@freeit				; yes, free the buffers					<28Aug90>
+			BTST	#FCtrash,D5 		; trash option requested?				<28Sep89>
+			BEQ.S	fcExit				; no, keep it around -> 				<28Sep89>
+@freeit
+			MOVE	D1,D0				; D0=refnum,volume won’t branch to here <28Sep89>
+			MOVEQ	#0,D1				; D1=from block 0						<28Sep89>
+			MOVEQ	#-1,D2				; D2=to the end 						<28Sep89>
+
+			MOVE.L	D7,-(SP)			; save D7								<04Jun90>
+			MOVEQ	#0,D7				; clear flag, really TRASH it			<04Jun90>
+			BTST	#fCfreeBit,D5 		; free and save in DHT requested?		<04Jun90>
+			BNE.S	@hashit				; yes									<04Jun90>
+
+	;; fclose flushes and/or trashes cache, but we should keep them in freeq for reuse
+	;; Since FCtbSave bit is not implemented, I do a come from check:			<22Aug90>
+	;; ** (This is really just a hack for the current cache interface)			<22Aug90>
+	;; assume D1-D6/A1-A4 registers saved by this routine and					<22Aug90>
+	;; A1(FCB)/D0.L(error code)/D1 registers saved by FClose on A6 stack.		<22Aug90>
+	;;		-- A1.L (52) FCB array												<22Aug90>
+	;;		-- D1.L (48) refnum													<22Aug90>
+	;;		-- D0.L (44) keep the buffers only if D0.L = 0						<22Aug90>
+	;;		-- .........														<22Aug90>
+	;;	A6 => low memory														<22Aug90>
+
+			MOVE.L	52(A6),D5			; D5 = FCBsptr							<04Jun90>
+			CMPA.L	D5,A1				; D5 = FCBsptr?							<04Jun90>
+			BNE.S	@trashit			; no, not from FClose					<04Jun90>
+			CMP.W	50(A6),D0			; for this file?						<22Aug90>
+			BNE.S	@trashit			; no,									<22Aug90>
+			TST.L	44(A6)				; error?								<04Jun90>
+			BNE.S	@trashit			; yes									<04Jun90>
+	;; Now, we are from a successful FClose, save the buffers in the hash		<22Aug90>
+@hashit		MOVE.L	#SaveinHash,D7		; save in DHT							<04Jun90>
+@trashit	BSR 	TrashBlocks 		; free all buffers but the fileQ header <28Sep89>
+			MOVE.L	(SP)+,D7			; restore D7							<04Jun90>
+fcExit
+			IF		CacheDebug THEN
+			BSR 	CacheCheck
+			ENDIF
+			MOVEM.L (A6)+,D1-D6/A1-A4	; restore registers
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			MOVEQ	#0,D0				; never an error
+			RTS 						; exit Flush Cache
+		IF ktDebugCache THEN
+			DC.B	$80, 'FlushCache'
+			ALIGN
+			DC.W	0
+		ENDIF
+
+;_________________________________________________________________________________
+;
+; Routine:		GetBlock
+;
+; Function: 	Gets a specified disk block. The desired block may be
+;				specified either by file refnum and file block number, or by
+;				volume refnum and logical block number.
+;
+; Input:		D0.W  -  file or volume refnum
+;				A2.L  -  VCB ptr if D0=volume refnum
+;				D1.B  -  option flags (default = read from disk if not found):
+;							 GBRead   - read from disk (forced read)
+;							 GBnoRead - don’t read from disk if not found
+;							 GBexist  - get existing cache block
+;							 GBrelease - release block immediately
+;				D2.L  -  file block number or logical block number
+;
+; Output:		A0.L  -  addr(cache buffer) containing desired block
+;				D0.W  -  result code
+;						 0 = ok
+;						 other = error
+; Called By:
+;	 TFSCommon:
+;	 TFSRfn1:
+;	 TFSRfn2:
+;	 TFSVol:
+;	 VSM:
+;	 BTINTF:
+;	 BTSVCS:
+;	 BTALLOC:
+;	 BTMAINT1:
+;	 BTMAINT2:
+;_________________________________________________________________________________
+
+GetBlock
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1-D7/A1-A5,-(A6)	; save regs
+			MOVE.B	D1,D7				; D7 = option flags
+			MOVEA.L FileQHdr,A3 		; A3 = ptr(FQH)
+			MOVE.L	#$CAC11ED1,BufTgFNum  ; if we don’t read it, mark tag 'CAChED'    <06Dec85>
+
+			MOVE.L	CacheVars,A1		; first									<01Aug90>
+			CLR.W	LcGBinCache(A1)		; clear the incache flag WORD			<01Aug90>
+
+			MOVEQ	#0,D3				; use file number=0 for vol blks
+			MOVEQ	#0,D6				; and fork type 0
+			MOVE.W	D0,D1				; D1 = volume or file refnum?
+			BLE.S	@1					; br if vol refnum
+
+			MOVEA.L FCBSPtr,A1			; A1 = ptr(1st FCB)
+			MOVEA.L FCBVPtr(A1,D1.W),A2 ; A2 = ptr(VCB)
+
+			MOVE.L	FCBFlNm(A1,D1.W),D3 ; D3 = file number
+			BTST	#FCBRscBit,FCBMdRByt(A1,D1.W) ; resource fork?
+			SNE 	D6					; $FF=res fork, $00=data fork
+
+; (1) Find appropriate file queue. If none, reallocate a free one
+;	or use LRU one.  Requeue file queue header to keep MRU order.
+
+@1			BSR 	FindFileCache		; get the file cache ptr in A4
+			BNE.S	@2					; br if we found it
+			MOVEA.L FHBlink(A3),A4		; use LRU file cache
+			BSR 	FlushFCache 		; flush the LRU one
+			BSR 	TrashFCache 		; and put any blocks in the free queue
+
+			MOVE.L	A2,FHVCBPtr(A4) 	; initialize this file cache queue hdr
+			MOVE.L	D3,FHFlNum(A4)
+			MOVE.B	D6,FHFkType(A4)
+
+			TST.W	D1					; file?
+			BLE.S	@2					; br if not
+			MOVE.B	FCBMdRByt(A1,D1),FHAttrib(A4)
+
+			BSR 	TFSVCBTst			; TFS volume?
+			BNE.S	@2					; br if not
+
+			MOVE.L	FCBFType(A1,D1),FHFlType(A4)  ; set Finder file type
+			MOVE.L	FCBDirID(A1,D1),FHParDID(A4)  ; ...and parent DirID
+
+			MOVEQ	#FSUsrCNID,D0		;
+			CMP.L	D0,D3				; control file?
+			BCC.S	@2					; br if not
+			BSET	#mruSrchBit,FHFlags(A4) ; search for these in MRU order (we tend to
+										;  cluster catalog requests for the same set of blocks)
+			BSET	#noFlushBit,FHFlags(A4) ;<11Dec86> don’t flush until flush time
+
+@2			CMP.L	FQHFlink(A3),A4 	; already first?
+			BEQ.S	gbSearchQ			; br if so
+
+			MOVE.L	CacheVars,A0		; since we had to requeue, time to increment
+			ADDQ.L	#1,CacheAge(A0) 	;  the age of cache world . . .
+
+			BSR 	DQElement			; first ReQueue it to keep file
+			MOVEA.L A3,A0				;  queue in MRU order
+			BSR 	EQElement			;
+
+; (2) Search queue for requested block, return it if found. We search in
+;		either MRU order (for control files), or in file order (from start
+;		or MRU block).
+
+gbSearchQ
+			SUB.L	A5,A5				; set this to file-order position if not found
+			MOVE.B	FHFlags(A4),D0		; save file header flags
+
+; Always look at MRU block in any case.
+			
+			LEA 	FHMQHFlink(A4),A3	; MRU queue header (set up for gbGetLPBuf)
+			MOVEA.L A3,A4				; start at top of queue
+			MOVEA.L MCBFlink(A4),A4 	; position to next buffer, MRU order
+			CMPA.L	A3,A4				; empty queue?
+			BEQ.S	gbMapBlk			; branch if so (have to map it)
+			CMP.L	MCBFlBlk(A4),D2 	; same file block?
+			BEQ 	gbFoundIt			; br if so (we found it)
+
+			BTST	#mruSrchBit,D0		; search in MRU order?
+			BNE.S	gbMRUSearch 		; br if so
+
+			LEA 	MCBDQFlink(A3),A5	; first queue position (for loop)
+
+			CMP.L	MCBFlBlk(A4),D2 	; before MRU block?
+			BCC.S	@1					; br if not
+
+			MOVE.L	A5,A4				; Not the MRU block, but before it in file
+			BRA.S	gbFOLoop			;  order, so start from the beginning
+		;; After or equal to MRU block ...
+@1			MOVE.L	MCBDQBlink(A3),A4	; last file-order buffer
+			CMP.L	DCBFlBlk(A4),D2 	; before the last one?
+			BCS.S	@2					; br if so
+			BEQ.S	gbFOFound			; br if it is the last one
+		;; After the last block => not in the cache. (A4 = last buffer)
+			MOVE.L	A4,A5				; want to queue it after the last one
+			BRA.S	gbMapBlk			; have to map it
+
+; Not before MRU block, or after last, so start search from MRU block
+
+@2			MOVEA.L MCBFlink(A3),A4 	; get MRU block
+			LEA 	MCBDQFlink(A4),A4	; get into file-order queue mode
+
+gbFOLoop	MOVE.L	DCBFlink(A4),A4 	; get next buffer in file order
+			CMP.L	A4,A5				; reached start?
+			BEQ.S	@1					; br if so (we’ll have to map it)
+			CMP.L	DCBFlBlk(A4),D2 	; after this block?
+			BHI.S	gbFOLoop			; loop if so
+
+			BEQ.S	gbFOFound			; br if we found it
+
+@1			MOVE.L	DCBBlink(A4),A5 	; queue after here
+			BRA.S	gbMapBlk			; go map it
+
+gbFOFound	LEA 	-MCBDQFlink(A4),A4	; point to buffer header
+			BRA 	gbFoundIt			; we found it!
+
+; Search in MRU order until entire queue has been searched, or we find it.
+
+gbMRUSearch
+
+@1			MOVEA.L MCBFlink(A4),A4 	; position to next buffer, MRU order
+			CMPA.L	A3,A4				; back to top of queue?
+			BEQ.S	gbMapBlk			; branch if so
+			CMP.L	MCBFlBlk(A4),D2 	; same file block?
+			BNE.S	@1					; br if not (continue search)
+			BRA 	gbFoundIt			; br if so (we found it)
+
+; (3) Map requested file block to disk block (since it was not in the
+;		cache, it will have to be read from the disk).
+
+gbMapBlk
+			BTST	#GBexist,D7 		; request for an existing block?
+			BEQ.S	@1					; br if not
+			MOVEQ	#Chnotfound,D0		; result = 'not found'
+			BRA 	gbFail				; exit
+
+@1			MOVE.L	D2,D3				; MCBDBlk=MCBFlBlk for volume blocks
+			TST.W	D1					; mapping volume block?
+			BLE.S	gbGetLPBuf			; br if so (clear A5 if recycle blk in this cache)
+
+			MOVE.L	#BufSiz,D4			; request 512 bytes
+			MOVE.L	D2,D5				; file block number
+			LSL.L	#8,D5				; file block number x 512
+			ADD.L	D5,D5				; ... = file position
+
+; NOTE: (A1,D1)=FCB Ptr, A2=VCB ptr, D5=byte position (block boundary), D4=$200
+
+			BSR 	Lg2Phys 			; get disk block in D3
+			MOVE.L	CacheVars,A1		; Lg2Phys could change the inCache flag	<02Aug90>
+			CLR.W	LcGBinCache(A1)		; clear the incache flag WORD			<02Aug90>
+										; block has not been found yet			<02Aug90>
+			BNE 	gbFail				; exit if we were unable to map block
+
+; (4) Get lowest-priority block and recycle it.
+
+gbGetLPBuf	
+			BSR 	GetLPBuf			; get A4->cache buffer to reuse
+
+			;; need to store the fork type in CB hdr				<13Jun90>
+			MOVE.B	MQHFkType(A3),MCBFkType(A4)	; copy fork type	<13Jun90>
+
+			MOVE.L	D3,MCBDBlk(A4)		; disk block number
+			CLR.B	MCBFlags(A4)		; set not empty, not dirty
+			BSET	#inuseBit,MCBFlags(A4) ; set in use
+
+			MOVE.W	D1,MCBRefNum(A4)	; file refnum
+			MOVE.L	D2,MCBFlBlk(A4) 	; file block number
+
+			MOVE.L	A5,D0				; file order pos already determined?
+			BEQ.S	@1					; br if not
+
+			LEA 	-MCBDQFlink(A5),A0	; get pointer to MRU queue				<01Jan86>
+			CMP.L	A3,A0				; file header?							<01Jan86>
+			BEQ.S	@3					; br if so (we’re still ok)             <01Jan86>
+
+			CMP.L	DCBFQPtr(A5),A3 	; A5 buffer still in this cache queue?	<01Jan86>
+			BNE.S	@1					; br if not (was recycled in Lg2Phys	<01Jan86>
+										;  mapping or by GetLPBuf)				<01Jan86>
+
+@3			LEA 	MCBDQFlink(A4),A4	; adjust for regular queueing routines
+			MOVE.L	A5,A0				; queue up after this block
+			BSR 	EQElement			; queue up after A0 element
+			LEA 	-MCBDQFlink(A4),A4
+			BRA.S	@2
+
+@1			BSR 	EQCBlkFO			; queue A4 block up in file order
+
+@2			MOVE.L	A3,MCBFQPtr(A4) 	; ptr to file queue head				<01Jan86>
+			MOVE.L	A3,A0
+			BSR 	EQElement			; put it at head of MRU queue
+			ADDQ.W	#1,MQHBufCnt(A3)	; bump buffer count for this queue
+
+			IF		CacheDebug THEN
+			MOVE.L	CacheVars,A0		; stamp with age for cachecheck routine <31Dec85>
+			MOVE.L	CacheAge(A0),MCBAge(A4) ;									<31Dec85>
+			BSR 	CacheCheck			;										<31Dec85>
+			ENDIF
+
+			BTST	#GBnoRead,D7		; no-read requested ?
+			BNE		gbReQueue			; ...yes, skip read ->
+
+; (5) Read from disk into the chosen buffer.
+
+gbReadBlk	CLR.L	BufTgDate			; always clear tag date
+
+			BSR 	ReadBlock			; read node from disk
+			BNE.S	@1					; exit on errors
+
+; we scavenge the VCB write count whenever we read a block . . . this may be
+; overkill (doing it at volume mount scan should be sufficient . . . )
+
+			BSR 	TFSVCBTst			; TFS volume?
+			BNE.S	gbReQueue			; skip write-count scavenge if not
+			MOVE.L	BufTgDate,D0		; get tag write-count
+			CMP.L	VCBWrCnt(A2),D0 	; make sure it’s <= VCB write count
+			BLS.S	gbReQueue			; br if so
+			MOVE.L	D0,VCBWrCnt(A2) 	; update VCB write count if not  . . .
+			BRA.S	gbReQueue			; go re-queue the buffer ->
+
+@1		;;	ST		D7					; D7.B = FF, don't save	in DHT	<04Jun90>
+			BSR 	FreeCBlk			; trash the block and put it in free Q
+			BRA		gbFail				; take the error exit
+
+; (6) Found requested buffer. Check for 'in-use' error. Check for
+;		forced read option.
+
+gbFoundIt
+			MOVE.L	CacheVars,A1		; set the incache flag				<01Aug90>
+			ST		LcGBinFQueue(A1)	; buffer found in file queue		<01Aug90>
+			BSET	#inuseBit,MCBFlags(A4) ; buffer in use?
+			BEQ.S	@1					; ...no ->
+			_CacheDebug StrBufUse
+			MOVEQ	#ChInUse,D0 		; error, buffer in use
+			BRA.S	gbFail				; exit ->
+
+@1			BTST	#diskRdBit,CacheCom ; force read?
+			BNE.S	@2					; br if so
+			BTST	#GBread,D7			; forced read requested
+			BEQ.S	gbReQueue			; br if not
+
+; This option is only used for read-verify which flushes all blocks first.
+;
+; We still check for a dirty block for the 'forced-read' external option.
+
+@2			BCLR	#cacheDirtyBit,MCBFlags(A4)	; is it dirty?				<08Dec85>
+			BEQ		gbReadBlk			; just go read it if not
+			BSR 	WriteBlock			; otherwise, flush it first
+			BRA		gbReadBlk			; then go read it again
+
+; (7) Re-queue the buffer for MRU, then return at last.
+
+gbReQueue	; A3 = File Header as MRU Queue Header
+			MOVE.L	CacheVars,A0			; x stamp with age
+			MOVE.L	CacheAge(A0),MCBAge(A4) ; x
+			CMP.L	MQHFlink(A3),A4 	; already first?
+			BEQ.S	@1					; br if so
+			BSR 	DQElement			; detach it
+			MOVEA.L A3,A0				; put on top
+			BSR 	EQElement			; ...of queue
+
+@1			BTST	#GBrelease,D7		; immediate release requested?
+			BEQ.S	gbExitOK			; br if not
+			BCLR	#inuseBit,MCBFlags(A4) ; set not in-use
+
+gbExitOK	MOVE.W	D1,MCBRefNum(A4)	; label with latest file refnum (for debug only now)
+
+										; save the translation map		<20Apr90>
+			MOVEA.L	MCBDataPtr(A4),A0	; it's a pointer now			<20Apr90>
+			MOVEA.L	CacheVars,A1		; we have a new mapping			<26Apr90>
+			MOVE.L	A0,LcXCacheKey(A1)	; save the new key				<26Apr90>
+			MOVE.L	A4,LcXCacheData(A1)	; save the translation			<26Apr90>
+
+			MOVEQ	#0,D0				; indicate no error
+
+gbExit		MOVEM.L (A6)+,D1-D7/A1-A5	; restore regs
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set up condition codes
+			RTS 						; exit GetBlock
+
+		IF ktDebugCache THEN
+			DC.B	$80, 'GetBlock'
+			ALIGN
+			DC.W	0
+		ENDIF
+
+gbFail		MOVE.L	MinusOne,A0 		; return bogus pointer (odd to incite
+			BRA.S	GBExit				;  address errors if used)
+
+
+;_________________________________________________________________________________
+;
+; Routine:		MarkBlock (Mark Block Dirty)
+;
+; Function: 	Marks a specified disk block dirty.  This is really a special case
+;				of RelBlock in which the block is not released (though it may have
+;				already been released) but always marked dirty. This routine is
+;				synchronous.
+;
+; Input:		A0.L  -  addr(cache buffer) containing disk block
+;
+; Output:		none
+;
+; Called By:	MarkA5Block: MFSDir1 (FndFilSpc - MFSCreate/ReName), MFSVol (CkFilLen,
+;					MFSFlush), TFSRfn1 (FileWrite), TFSRfn2 (MFSClose).
+;				MarkBlock: MFSDir2 (MFS delete), MFSDir3 (MFS Set/Reset file lock,
+;					SetFileInfo, SetFilType), VSM (5 times).
+;_________________________________________________________________________________
+
+MarkBlock
+			MOVE.L	A4,-(SP)					; save buffer ptr				<29May90>
+
+												; now we have pointer			<29May90>
+			BSR		mapCBHeader					; map buffer to header			<29May90>
+	
+			BSET	#cacheDirtyBit,MCBFlags(A4)	; mark buffer dirty				<29May90>
+			MOVEA.L	MCBFQPtr(A4),A4				; get  its filequeue hdr		<29May90>
+			BSET	#fqDirtyBit,MQHFlags(A4)	; mark the filequeue dirty		<29May90>
+			MOVEA.L	(SP)+,A4					; restore A4					<29May90>
+			RTS 								; exit MarkBlock
+
+;_________________________________________________________________________________
+;
+; Routine:		RelBlock (Release Block)
+;
+; Function: 	Releases use of a specified disk block; optionally marks block dirty,
+;				trashes block, and/or writes block to disk. Note: this routine may be
+;				called for an already released block to mark it dirty, trashed, or to
+;				write it.
+;
+; Input:		D1.B  -  option flags:
+;							RBdirty - mark buffer dirty
+;							RBtrash - trash buffer contents (set empty)
+;							RBwrite - force write buffer to disk
+;							RBfreeBit - trash buffers but save in the free queue hash
+;				A0.L  -  addr(cache buffer) containing disk block
+;				A1.L  -  pointer to cache queue header (if RBWrite specified)
+;						 (not used in RamCache)
+; Output:		D0.W  -  result code
+;							0 = ok
+;							other = error (can only occur if RBwrite option specified)
+; Called by:	BTIntf (D1=0, Control cache block)
+;				BTMaint2 (D1=0, Control cache block)
+;				MFSVol (D1=kRBTrash, A1 not set up) - trash empty dir blks on scan
+;				TFSCommon (D1=kRBTrash, A1 = volume cache queue)
+;				TFSRfn2 (D1=kRBDirty, A1 = volume cache queue) - Res fork block 0
+;				TFSVol (D1=kRBTrash, A1 = volume cache queue)
+;
+; Revision History:
+; 27Aug90	KSCT	Added RBfreeBit option.
+;_________________________________________________________________________________
+
+RelBlock
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVE.L	A4,-(A6)			; save registers
+
+	IF NOT forROM THEN					; Not for the new ROMs					<SM3> rb
+	
+; The next nine lines patch a bug in ROM 75 (FlushMDB never cleared dirty bits
+;  on control file FCBs . . .)
+
+			MOVE.L	ROMBase,A4			; make sure we have the correct ROM
+			CMP.W	#$0075,8(A4)
+			BNE.S	@4					; br if not
+			CMP.L	#FlMDBCall,4(A6)	; from FlushMDB?
+			BNE.S	@4					; br if not
+
+			MOVE.W	VCBXTRef(A2),D0 	; Get extent file refNum
+			BCLR	#FCBModBit,FCBMdRByt(A3,D0) ; clear the dirty flag
+			MOVE.W	VCBCTRef(A2),D0 	; Get catalog file refNum
+			BCLR	#FCBModBit,FCBMdRByt(A3,D0) ; clear the dirty flag
+	ENDIF								;										<SM3> rb
+
+@4			
+										; now we have pointer to data buffer	<23Apr90>
+			BSR		mapCBHeader			; map buffer to header					<23Apr90>
+
+			BCLR	#inuseBit,MCBFlags(A4) ; set not-in-use
+
+			BTST	#RBfreeBit,D1 		; free and save in DHT requested?		<27Aug90>
+			BEQ.S	@0					; no									<27Aug90>
+			MOVE.L	D7,-(SP)			; save D7								<27Aug90>
+			MOVE.L	#SaveinHash,D7		; set flag								<27Aug90>
+			BRA.S	@1					; use common code						<27Aug90>
+
+@0			BTST	#RBtrash,D1 		; buffer to be trashed?
+			BEQ.S	@2					; br if not
+			MOVE.L	D7,-(SP)			; save D7								<04Jun90>
+			MOVEQ	#0,D7				; clear flag, really TRASH it			<04Jun90>
+@1			BSR 	FreeCBlk			; trash the block and put it in free Q
+			MOVE.L	(SP)+,D7			; restore D7							<04Jun90>
+			BRA.S	rbExit				; exit ok
+
+@2			BTST	#RBdirty,D1 		; buffer dirty?
+			BEQ.S	@3					; br if not
+			BSET	#cacheDirtyBit,MCBFlags(A4)	; set dirty flag
+
+			MOVE.L	A1,-(SP)					; free A1						<26Apr90>
+			MOVEA.L	MCBFQPtr(A4),A1				; get  its filequeue hdr		<26Apr90>
+			BSET	#fqDirtyBit,MQHFlags(A1)	; mark the filequeue dirty		<26Apr90>
+			MOVEA.L	(SP)+,A1					; restore A1					<26Apr90>
+
+@3			BTST	#RBwrite,D1 		; force write requested ?
+			BEQ.S	RBExit				; br if not
+			BSR 	WriteBlock			; write A4 block to disk
+			BCLR	#cacheDirtyBit,MCBFlags(A4)	; set cache buffer not dirty
+			BRA.S	rbExit1 			; all done ->
+
+rbExit		MOVEQ	#0,D0				; indicate no error
+
+rbExit1 	MOVE.L	(A6)+,A4			; restore registers
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set up condition codes
+			RTS 						; exit RelBlock
+
+;_________________________________________________________________________________
+;
+; Routine:		TrashVBlks
+;
+; Function: 	Trashes all buffers for the specified volume.  When the volume is
+;				unmounted this is essential: recycled VCBs can cause real headaches
+;				otherwise. This routine is synchronous.
+;
+; Input:		A2.L  -  VCB pointer
+;				A1.L  -  ignored
+; Output:		none
+;
+; Called By:	UnMountVol (when VCB goes away), MountVol (errors), Eject/OffLine (it’s
+;				 best not to keep the buggers around . . .).
+; Modification history:
+;	06Jun90	KST	We now need to invalidate the free queue hash.
+;	22Sep90	KST	Need to preserve D0 across the call. MountVol depends on it???!!!
+;				Called by DsposVBlks.
+;
+; ToDo:			Unmount calls FlushBuffers and it in turns calls TrashVBlks 3 times
+;				in a row. Since RamCache has only 1 cache buffer, 2 out of the 3 TrashVBlks
+;				calls are redundant. (Need to fix the high level code)
+;_________________________________________________________________________________
+
+TrashVBlks
+			MOVEM.L D0/D3/A3-A4,-(SP) 	; save registers
+
+			MOVEQ	#0,D3				; D3 = 0, invalidate the whole volume		<06Jun90>
+			BSR		invalidDHash		; trash dev hash associated with this volume<06Jun90>
+
+			MOVEA.L FileQHdr,A3 		; A3 = ptr(FQH)
+			MOVEA.L A3,A4				; start at top of queue
+
+@1			MOVEA.L FHFlink(A4),A4		; position to next file queue
+			CMPA.L	A3,A4				; back to top of queue ?
+			BEQ.S	tvbExit 			; exit if so
+			CMPA.L	FHVCBPtr(A4),A2 	; same volume?
+			BNE.S	@1					; no, continue search
+			MOVE.L	FHBlink(A4),-(SP)	; remember previous queue element				<09Dec85>
+			BSR 	TrashFCache 		; trash this file cache (recycles it to the end)<09Dec85>
+			MOVE.L	(SP)+,A4			; start from previous element					<09Dec85>
+			BRA.S	@1
+
+tvbExit 	MOVEM.L (SP)+,D0/D3/A3-A4 	; restore registers
+			RTS 						; exit TrashVBlks (ALL regs preserved)
+
+;_________________________________________________________________________________
+;
+; Routine:		TrashBlocks, TrashFBlocks
+;
+; Function: 	Trashes a specified range of disk blocks for a given file.
+;				TrashFBlocks trashes all blocks of a file. This routine is
+;				synchronous.
+;
+; TrashBlocks	(Device hash table is trashed also depends on the D7 flag)
+; Input:		D0.W  -  file refnum
+;				D1.L  -  beginning file byte position (should be a 512-byte multiple . . .)
+;				D2.L  -  number of bytes (should be a 512-byte multiple or -1 to trash to end of file)
+;				A2.L  -  VCB ptr
+;				D7.L  -  If D7.L == 'hash' then add buffer to the hash table (used by freeCBlk)	<04Jun90>
+; Called by:	FileWrite (write-in-place), SetEOF (truncating a file),
+;				CacheWrIP and FlushCache.
+;
+; TrashFBlocks	(trash all cache things of the file)
+; Input:		D0.L  -  file number
+;				A2.L  -  VCB ptr
+; Called by:	FileDelete (TFS), MFSDelete.
+;
+; Output:		none
+; Modification history:
+;	02Aug90		KST		Now takes D7 as an input parameter for TrashBlocks.
+;_________________________________________________________________________________
+
+;TrashFBlocks
+;			 MOVEM.L D0-D6/A0-A4,-(SP)	 ; save registers
+;			 MOVE.L  D0,D3				 ; file number
+;			 MOVEQ	 #0,D1				 ; zero means trash all blocks
+;			 BRA.S	 TBStartSearch		 ; go start the search
+
+; NOTE: TrashBlocks down to TBStartSearch is needed by the CacheWrIP routine.
+; D7.L is the hash flag and should not be used		-- KSCT			<08May90>
+TrashBlocks
+			MOVEM.L D0-D6/A0-A4,-(SP)	; save registers
+			MOVEQ	#9,D3				; divide-by-512 factor
+			MOVE.L	D1,D4				; starting byte number
+			LSR.L	D3,D4				; D4 = beginning block #
+
+			MOVEQ	#-1,D5				;
+			CMP.L	D2,D5				; trash to end of file? (if D2=-1)
+			BEQ.S	@1					; br if so
+			MOVE.L	D2,D5				; number of bytes
+			ADD.L	D1,D5				; add in starting position
+			SUBQ.L	#1,D5				; adjust so we get last blk
+@1			LSR.L	D3,D5				; 'divide' by 512 to get end block #
+										; (if D5 was -1, it is now $007FFFFF,
+										;  largest possible file block number)
+			MOVE.W	D0,D1				; D1 = refnum
+			BLE		tbErr				; exit if not a valid refnum
+
+			MOVEA.L FCBSPtr,A1			; A1 = FCB ptr
+			MOVEA.L FCBVPtr(A1,D1),A2	; A2 = VCB ptr
+			MOVE.L	FCBFlNm(A1,D1),D3	; D3 = file number
+			BTST	#FCBRscBit,FCBMdRByt(A1,D1) ; resource fork?
+			SNE 	D6					; $FF = resource fork, $00 = data fork
+
+TBStartSearch							; common code for TrashBlocks, TrashFBlocks
+			MOVE.L	FileQHdr,A3 		; file queue header
+			TST.W	D1					; trash all blocks?
+			BEQ.S	tbDelete			; br if so . . . (special for FileDelete)
+
+			BSR 	FindFileCache		; search for file block cache
+			BEQ.S	tbExit				; br if not found
+			LEA 	FHDQHFLink(A4),A3	; traverse this queue in disk order
+			MOVE.L	A3,A4				; start at the top
+
+; For resource files, SetEOF is a common action, and it should be more efficient to look
+; at the last block in the queue and skip if the start block to trash is past this . . .
+
+			MOVE.L	DCBBlink(A4),A4 	; point to last buffer
+			CMP.L	A3,A4				; empty queue?
+			BEQ.S	tbExit				; exit if so
+
+			MOVE.L	DCBFlBlk(A4),D0 	; D0 = file block #
+			CMP.L	D4,D0				; last block in file order < beginning block to trash?
+			BLT.S	tbExit				; then skip all this nonsense
+
+			MOVE.L	A3,A4				; otherwise, start at the top (might want to look at MRU block?)
+
+@1			MOVE.L	DCBFlink(A4),A4 	; point to next buffer
+			CMP.L	A3,A4				; back to start?
+			BEQ.S	tbExit				; exit if so
+
+			MOVE.L	DCBFlBlk(A4),D0 	; D0 = file block #
+			CMP.L	D4,D0				; block < beginning block?
+			BLT.S	@1					; br if so, continue search
+			CMP.L	D5,D0				; block > ending block?
+			BGT.S	tbExit				; exit if so
+
+			MOVE.L	DCBBLink(A4),-(SP)	; save previous buffer ptr
+			LEA 	-MCBDQFlink(A4),A4	; point to MRU queue header
+		;; D7.L is the hash flag, set to preserve buffer in DHT		-- KSCT		<08May90>
+			BSR 	FreeCBlk			; trash the block and put it in free queue
+			MOVE.L	(SP)+,A4			; start again with previous element
+			BRA.S	@1					; continue search
+
+tbDelete	;; trash both forks
+			MOVEQ	#-1,D6				; look for resource fork first
+
+@1			BSR 	FindFileCache		; search for file block cache
+			BEQ.S	@2					; br if none found
+			BSR 	TrashFCache 		; trash this file cache
+@2			NOT.B	D6					; try the other fork
+			BEQ.S	@1					; loop for data fork
+		;; file has been deleted, we should remove buffers associated with this file in DHT
+			BSR		invalidDHash		; A2.L=VCB, A3.L=cachevars, D3.L=Filenum
+			BRA.S	tbRet				; clean up the hash too
+
+tbExit	;; clean up and exit
+
+			CMPI.L	#SaveinHash,D7		; user wants to save it in DHT?
+			BEQ.S	tbRet				; yes, then it's all done
+										; else, remove from DHT
+		;; this happens at filedelete, setEOF, writeIP, and at bad fclose
+			BSR		invDHTRange			; invalidate a range, A3.L = cachevars
+
+tbRet
+		;; debug code here
+tbErr
+			MOVEM.L (SP)+,D0-D6/A0-A4	; restore registers
+			RTS 						; exit TrashBlocks
+
+;_________________________________________________________________________________
+;
+; Routine:		CacheWrIP, CacheRdIP
+;
+; Function: 	Read/write a consecutive number of blocks from/to the disk.  The I/O
+;				is done directly to/from the user’s buffer.  This routine is in the
+;				cache to allow future caching schemes to buffer entire files if the
+;				room exists.
+;
+; Input:		A0.L  - user parameter block ptr
+;		   (A1,D1.W)  - FCB pointer
+;				D4.L  - maximum number of bytes to read/write
+;				D5.L  - current file position
+;				A2.L  - VCB Ptr
+;
+; Output:		D0.W  - error code
+;				D3.L  - trashed for readIP, preserved for writeIP
+;				D6.L  - bytes actually read/written (set up by Lg2Phys)
+;				All other registers preserved
+;
+; Called by:	FileRead,FileWrite
+;
+;				By having these routines call Lg2Phys, it would be possible in the
+;				future to skip the call and deal with file block numbers in the cache
+;				(like GetBlock does), as well as do more than a consecutive block’s
+;				worth of I/O with one call (maybe even figure all blocks in advance
+;				and then do the I/O in disk order).
+;
+;
+;_________________________________________________________________________________
+
+; See if we want to go the cache route for this one.
+
+IPLimCheck
+			MOVE.L	A0,-(SP)
+			MOVE.L	CacheVars,A0
+			MOVE.L	CacheByteLim(A0),D0 ; get max bytesize request to cache
+			MOVE.L	(SP)+,A0
+			CMP.L	D0,D4				; more than this size?
+			BHI.S	@1					; br if so (do the disk I/O)
+			btst	#noCacheBit,IOPosMode+1(A0) ; disabling cache for this request? <20Nov87>
+			bne.s	@1					; xfer if so... 							<20Nov87>
+			BTST	#noRWIPBit,CacheCom ; do disk I/O anyway? Finder will set for disk copy r/w
+@1			RTS 						; BNE to disk I/O
+
+CacheRdIP:
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVE.L	D3,-(A6)			; preserve D3 also
+
+			BSR.S	IPLimCheck			; is this request too large to cache?
+			BNE		regRdIP 			; br if so (read from disk)
+			MOVEQ	#rdVerify,D0		; get read-verify option bit				<20Nov87>
+			AND.B	IOPosMode+1(A0),D0	; check verify mode bit
+			BNE		regRdIP 			; br if verify (read from disk)
+
+; Quick hack: treat 1-8 block reads as separate GetBlock calls . . . we want to build the
+;  GetBlock function in here eventually to save the multiple queue searches and file block
+;  mapping.
+
+			CMPI.L	#bufSiz,D4			; read 1 block?							<18Jun90>
+			BNE.S	rdIPloop			; no, more than 1 block					<18Jun90>
+		;; we can do read ahead here											<18Jun90>
+			BSR		rwIPSetUp			; save regs, set up A5=buf addr, D7=refnum, D3=buf size,
+										;  D4=block count, D5=start file block
+			MOVE.L	D5,D2				; file block number to read
+			MOVEQ	#kGBrelease,D1		; release immediately
+			MOVE.W	D7,D0				; refnum
+			BSR 	GetBlock			; get it
+			BNE		rdIPErr				; exit on errors
+			MOVE.L	A5,A1				; destination
+			MOVE.L	D3,D0				; bytecount=bufsiz
+			_BlockMove
+			BRA		rdIPok				; that's all for single block			<18Jun90>
+
+rdIPloop
+		;; here, we should do multi-block read		-- KSCT						<18Jun90>
+		;; First find out how many blocks are really contiguous					<18Jun90>
+			
+			JSR 	Lg2Phys 			; get D6=byte count, D3=disk start blk
+			BNE		rdIPExit			; punt on errors; only D3 on A6 stack
+			CMP.L	D4,D6				; D6 > user size?
+			BLE.S	@0					; no, can't read them all
+			MOVE.L	D4,D6				; D6>D4, we’ll do only this many bytes
+@0			MOVEM.L D1-D7/A0-A5,-(A6)	; Save away almost all registers on TFS stack
+										; note here original D4 preserved on stack
+			MOVE.L	D6,D4				; only these many bytes are contiguous
+			MOVE.L	IOBuffer(A0),A5 	; user buffer address
+			ADD.L	IOActCount(A0),A5	; buffer start + count so far = target
+			MOVEQ	#9,D0
+			LSR.L	D0,D4				; block count
+			LSR.L	D0,D5				; starting file block
+			MOVE.L	D4,D7				; save block count in D7
+
+			BSR		inCachep			; all data in the cache?
+			BEQ.S	rdIPok				; yes, don't need to read/copy (how nice)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; new code here							<18Jun90>
+
+		;; else, read blocks from disk, D6= total bytes to be read, 
+		;; D4.L = remaining number of blks to be read.
+			MOVEM.L A1/D1,-(A6) 		; save registers over cache call
+			MOVE.W	D1,D0				; file refnum for flushcache call
+			MOVEQ	#0,D1				; no options on FlushCache
+			ST		CacheFlag			; make sure we flush this one!
+			BSR 	FlushCache			; flush all the blocks of the file
+			MOVEM.L (A6)+,A1/D1 		; restore registers for our use
+			BNE.S	rdIPErr				; fail on errors
+
+			SUB.L	D4,D7				; any blk in the cache?
+			BEQ.S	@1					; no, the world hasn't been changed
+			MOVEQ	#9,D0				; D7=number of blks found in the cache
+			LSL.L	D0,D7				; convert to bytes
+			ADD.L	D7,IOActCount(A0)	; update param
+			SUB.L	D7,D6				; D6=remaining number of bytes to be read
+
+@1			MOVE.L	D7,D2				; D2=bytes we added to IOActCount
+			MOVE.W	D1,D7				; save refnum
+			JSR 	RdBlocks			; keep low-level I/O in its place
+			BNE.S	rdIPErr				; punt on errors
+			TST.L	D2					; have we changed IOActCount
+			BEQ.S	@no					; no =>
+			SUB.L	D2,IOActCount(A0)	; undo it
+@no			MOVE.L	#BufSiz,D3			; transfer one buffer at a time
+
+@copyloop	MOVE.L	D5,D2				; starting file block
+			MOVEQ	#kGBrelease+kGBnoread,D1	; release immediately and don't read
+			MOVE.W	D7,D0				; refnum
+			BSR 	GetBlock			; get it
+			BNE.S	rdIPok				; exit on errors, but user got his data
+
+			MOVE.L	CacheVars,A1		; newly allocated buffer?
+			TST.W	LcGBinCache(A1)		; data already in cache buffer?
+			BNE.S	@4					; yes, don't need copy
+			MOVE.L	A5,A1				; A1=user buffer
+			EXG		A0,A1				; exg for blockmove
+			MOVE.L	D3,D0				; bytecount=bufsiz
+			_BlockMove
+@4
+			ADD.L	D3,A5				; bump to next buffer
+			ADDQ.L	#1,D5				; bump file block number
+			SUBQ	#1,D4				; decr block count
+			BGT.S	@copyloop			; loop until done
+			
+rdIPok
+			MOVEQ	#0,D0				; success!
+
+rdIPErr		MOVEM.L (A6)+,D1-D7/A0-A5
+			BRA.S	rdIPExit			; back to caller
+
+;; read directly into user's buffer, no cache involved ...
+regRdIP 	MOVEM.L A1/D1,-(A6) 		; save registers over cache call
+			MOVE.W	D1,D0				; file refnum for flushcache call
+			MOVEQ	#0,D1				; no options on FlushCache
+			ST		CacheFlag			; make sure we flush this one!				<06Dec85>
+			BSR 	FlushCache			; flush all the blocks of the file
+			MOVEM.L (A6)+,A1/D1 		; restore registers for our use
+			BNE.S	rdIPExit			; fail on errors
+
+			JSR 	Lg2Phys 			; get D6=byte count, D3=disk start blk
+			BNE.S	rdIPExit			; punt on errors
+
+			JSR 	RdBlocks			; keep low-level I/O in its place
+
+rdIPExit	MOVE.L	(A6)+,D3			; restore D3
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+			TST.W	D0					; set CCR on result code
+			RTS 						;
+
+rwIPSetUp
+			MOVE.L	D4,D6				; we’ll do this many bytes
+			MOVEM.L D1-D7/A0-A5,-(A6)	; Save away almost all registers on TFS stack
+			MOVE.L	IOBuffer(A0),A5 	; user buffer address
+			ADD.L	IOActCount(A0),A5	; buffer start + count so far = target
+			MOVE.W	D1,D7				; save refnum
+			MOVEQ	#9,D3
+			LSR.L	D3,D4				; block count
+			LSR.L	D3,D5				; starting file block
+			MOVE.L	#BufSiz,D3			; transfer one buffer at a time
+			RTS
+
+CacheWrIP:
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVE.L	D3,-(A6)			; preserve D3 also
+
+			BSR 	IPLimCheck			; is this request too large to cache?
+			BNE.S	regWrIP 			; br if so (write to disk)
+
+; Quick hack: treat 1-8 block writes as separate GetBlock calls . . . we want to build the
+;  GetBlock function in here eventually to save the multiple queue searches and file block
+;  mapping.
+
+			BSR.S	rwIPSetUp			; save regs, set up A5=buf addr, D7=refnum, D3=buf size,
+										;  D4=block count, D5=start file block
+wrIPloop	MOVE.L	D5,D2				; file block
+			MOVEQ	#(kGBrelease+kGBnoread),D1 ; release immediately, don’t read it if not found
+			MOVE.W	D7,D0				; refnum
+			BSR 	GetBlock			; get it
+			BNE.S	@3					; exit on errors
+			BSR 	MarkBlock			; mark it dirty
+			MOVE.L	A0,A1				; buffer is the destination
+			MOVE.L	A5,A0				; source is user buffer
+			MOVE.L	D3,D0				; bytecount=bufsiz
+			_BlockMove					; write to cache !
+			ADD.L	D3,A5				; bump to next buffer
+			ADDQ.L	#1,D5				; bump file block number
+			SUBQ	#1,D4				; decr block count
+			BGT.S	wrIPloop			; loop until done
+
+			MOVEQ	#0,D0				; success!
+
+@3			MOVEM.L (A6)+,D1-D7/A0-A5	; all done
+			BRA.S	wrIPExit			; back to caller
+
+regWrIP 	JSR 	Lg2Phys 			; get D6=byte count, D3=disk start blk
+			BNE.S	wrIPExit			; punt on error
+
+; Trash the volume cache if it contains a block in the range about to be written:
+			MOVEM.L D1-D2/D7,-(A6) 		; save registers over cache call		<09Jun90>
+			MOVE.W	D1,D0				; File RefNum
+			MOVE.L	D5,D1				; Starting pos is current file pos
+			MOVE.L	D6,D2				; Number of bytes . . .
+		;;don't save in DHT, could there be left over buffers?					<09Jun90>
+		;; D7 is the flag used in FreeCBlks										<09Jun90>
+			MOVE.L	#fromWriteIP,D7		; don't save in DHT but mark where from	<09Jun90>			
+			BSR 	Trashblocks 		; trash the file blocks (we don't really want to trash)
+
+			MOVEM.L (A6)+,D1-D2/D7 		; no errors for now						<09Jun90>
+			JSR 	WrBlocks			;
+wrIPExit	BRA		rdIPExit			; share exit with read-in-place
+
+;_________________________________________________________________________________
+;
+; Cache subroutines
+;_________________________________________________________________________________
+
+
+;_______________________________________;
+;
+; TFS or MFS?
+;_______________________________________;
+
+TFSVCBTst:
+			CMP.W	#TSigWord,VCBSigWord(A2)  ; TFS volume?
+			RTS 						;
+
+;_______________________________________;
+;
+; File mapping routine . . .
+;_______________________________________;
+
+Lg2Phys:
+			MOVE.L	jLg2Phys,-(SP)		; let the FS do the mapping
+			RTS 						;
+
+;_________________________________________________________________________________
+;
+; Routine:		RdBlocks, WrBlocks
+;
+; Function: 	Read/write a consecutive number of blocks from/to the disk.  The I/O
+;				is done directly to/from the user’s buffer.  This routine is in the
+;				cache to allow future caching schemes to buffer entire files if the
+;				room exists.
+;
+; Input:		A0.L  - user parameter block ptr
+;		   (A1,D1.W)  - FCB pointer
+;				A2.L  - VCB Ptr
+;				D3.L  - disk start block
+;				D6.L  - bytecount to read/write
+;
+; Output:		D0.W  - error code
+;				All other registers preserved
+;
+; Called by:	CacheRdIP,CacheWrIP
+;
+;_________________________________________________________________________________
+
+;_______________________________________;
+;
+; Multi-block write routine . . .
+;_______________________________________;
+
+WrBlocks:
+			MOVE.L	jWrBlocks,-(SP) 	; jumptable entry for vWrBlocks
+			RTS 						; go there
+
+;_______________________________________;
+;
+; Multi-block read routine . . .
+;_______________________________________;
+
+RdBlocks:
+			MOVE.L	jRdBlocks,-(SP) 	; jumptable entry for vRdBlocks
+			RTS 						; go there
+
+;_________________________________________________________________________________
+;
+; Routine		ReadBlock (Read Block)
+;
+; Function: 	Reads a block from disk into a specified cache buffer.
+;
+; Input:		A4.L - Cache Buffer pointer
+;
+; Output:		D0.W - error code
+;						  0 = ok
+;						  other = error
+;
+; Called by:	GetBlock
+;_________________________________________________________________________________
+
+ReadBlock
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1-D7/A0-A5,-(A6)	; Save away almost all registers on TFS stack
+
+			MOVEQ	#0,D1				; indicate 'read' operation
+			BRA.S	RWSetup 			; use common code ->
+
+;_________________________________________________________________________________
+;
+; Routine		WriteBlock (Write Block)
+;
+; Function: 	Writes contents of cache buffer to disk
+;
+; Input:		A4.L - Cache Buffer pointer
+;
+; Output:		D0.W - error code
+;						  0 = ok
+;						  other = error
+;
+; Called by:	FlushCache,GetBlock,RelBlock
+;_________________________________________________________________________________
+
+WriteBlock
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L D1-D7/A0-A5,-(A6)	; Save away almost all registers on TFS stack
+
+; set up tag data
+
+			MOVE.L	MCBFQPtr(A4),A3 	; point to queue header
+			MOVEA.L MQHVCBPtr(A3),A2	; A2 = VCB ptr
+			MOVE.L	MQHFlNum(A3),D0 	; file number (0 for vol blks)
+			BEQ.S	@1					; br if volume blk
+
+			MOVE.L	MCBFlBlk(A4),BufTgFFlg	; ...file block number
+			MOVE.B	MQHAttrib(A3),BufTgFFlg  ; ...flags byte
+			BRA.S	@2
+
+@1			MOVEQ	#-1,D0				; pass -1 as file blk for vol blks
+			MOVE.L	D0,BufTgFFlg
+			MOVEQ	#FSRtParID,D0
+
+@2			MOVE.L	D0,BufTgFNum		; set up file number
+			MOVE.L	MQHFlType(A3),HFSTagData ; set Finder file type (0 for MFS, vol blks)
+			MOVE.L	MQHParDID(A3),HFSTagData+4 ; ...and parent DirID (ibid)
+
+			MOVE.L	Time,BufTgDate		; use date for MFS
+			BSR.S	TFSVCBTst			; is it MFS or is it TFS?
+			BNE.S	@3					; br if not Memorex
+			MOVE.L	VCBWrCnt(A2),BufTgDate	; set write count in tag data	<01Oct85>
+			ADDQ.L	#1,VCBWrCnt(A2) 	; bump volume write count		<01Oct85>
+
+@3			MOVEQ	#1,D1				; indicate 'write' operation
+
+; set up IO parameter block (ReadBlock code joins here)
+
+RWSetUp
+			LEA 	Params,A0			; use FS IO param block
+
+			MOVE.W	VCBDrvNum(A2),IODrvNum(A0) ; drive number
+			MOVE.W	VCBDRefNum(A2),IORefNum(A0) ; driver refnum
+
+			MOVEA.L	MCBDataPtr(A4),A1	; it's a pointer now			<20Apr90>
+			MOVE.L	A1,IOBuffer(A0) 	;
+			MOVE.W	#1,IOPosMode(A0)	; position mode 1 (from disk start)
+			MOVE.L	#BufSiz,IOByteCount(A0) ; always r/w 512 bytes
+
+			MOVE.L	MCBDBlk(A4),D0		; physical disk block
+			IF		CacheDebug THEN
+			BNE.S	@1					; should never be zero
+			_CacheDebug  StrBlk0
+			ENDIF
+
+@1			LSL.L	#8,D0				; ...x 512
+			ADD.L	D0,D0				;
+			MOVE.L	D0,IOPosOffset(A0)	; ... gives disk address
+
+;_______________________________________;
+;
+; All I/O goes through this routine . . .
+;_______________________________________;
+
+BasicIO:
+			MOVE.L	jBasicIO,-(SP)		; jumptable entry for BasicIO
+			RTS 						; go there
+
+;__________________________________________________________________________;
+;
+; Subroutine:	FindFileCache
+; Function: 	Search file queue for the file header for a particular file
+;				fork. (There should only be one).
+;
+; Arguments:
+;	(input) 	A3.L -- FileQHdr
+;				A2.L -- VCB ptr
+;				D3.L -- file number
+;				D6.B -- fork type
+;
+;	(output)	D0	 -- non-zero if found (CCR set on A4)
+;				A4.L -- queue ptr if found
+;
+; Note: 		We check the file number first since it is the most unique:
+;				this keeps the loop to 5 instructions typically.  We could
+;				use the file count in the header and use a DBRA loop instead?
+;
+;__________________________________________________________________________;
+
+FindFileCache
+			MOVEA.L  A3,A4				; start at top of queue
+
+@1			MOVEA.L FHFlink(A4),A4		; position to next file queue
+			CMPA.L	A3,A4				; back to top of queue ?
+			BEQ.S	@2					; fail if so
+
+			CMP.L	FHFlNum(A4),D3		; same file number?
+			BNE.S	@1					; br if not, continue search
+			CMP.L  FHVCBPtr(A4),A2		; same volume?							<06Dec85>
+			BNE.S	@1					; br if not, continue search			<06Dec85>
+			CMP.B	FHFkType(A4),D6 	; same fork?
+			BNE.S	@1					; br if not, continue search
+
+			BRA.S	@3					; exit if found
+
+@2			SUB.L	A4,A4				; not found
+@3			MOVE.L	A4,D0				; set CCR
+			RTS 						; BEQ for not found
+
+;__________________________________________________________________________;
+;
+; Subroutine:	FlushFCache
+; Function: 	This routine actually flushes out a cache queue. For a volume
+;				flush, it is called one time for each file cache belonging
+;				to that volume.
+; Arguments:
+;	(input) 	A4.L -- File Queue Header
+;
+;	(output)	D0	 -- result of last WriteBlock call.
+;
+; Called By:	FlushCache, GetBlock (when it needs a new File Queue),
+;				 GetCQBlk (flush a low-priority queue).
+; Modification history:
+;	25Apr90		KST		Don't flush unless something in the file queue is dirty. 
+;						We call this too often.
+;__________________________________________________________________________;
+
+FlushFCache
+			BCLR	#fqDirtyBit,FHFlags(A4) ; queue dirty?				<25Apr90>
+			BEQ.S	ffExit				; no, don't need to flush		<25Apr90>
+										; don't even need to save regs	<25Apr90>
+
+			MOVE.L	(SP)+,-(A6) 		; save return address on A6 stack
+			MOVEM.L A3-A4,-(A6) 		; save registers
+
+			LEA 	FHDQHFLink(A4),A3	; disk-ordered queue header
+			MOVEA.L A3,A4				; start at top of queue
+
+tfcLoop 	MOVEA.L DCBFlink(A4),A4 	; position to next buffer, disk order
+			CMPA.L	A3,A4				; back to top of queue ?
+			BEQ.S	@1					; exit if so
+
+			BCLR	#cacheDirtyBit,DCBFlags(A4) ; buffer dirty?
+			BEQ.S	tfcLoop 			; no, continue search
+
+			LEA 	-MCBDQFlink(A4),A4
+			JSR 	WriteBlock			; flush next buffer in disk order
+			LEA 	MCBDQFlink(A4),A4
+			BRA.S	tfcLoop 			; and keep searching
+
+@1			MOVEM.L (A6)+,A3-A4 		; restore registers
+			MOVE.L	(A6)+,-(SP) 		; put return address back on stack
+ffExit
+			RTS 						; exit Flush Cache
+
+;__________________________________________________________________________;
+;
+; Subroutine:	TrashFCache (internal routine)
+; Function: 	This routine trashes a cache queue. All blocks are transferred
+;				to the free queue. (doesn't touch DHT)
+; Arguments:
+;	(input) 	A3.L -- FileQHdr
+;				A4.L -- File Queue Header
+;	(output)	none
+;
+; Called By:	GetBlock (when it needs a new File Queue), TrashVBlks,
+;				 GetLPBuf (flush a low-priority queue).
+; Modification history:
+;	27Aug90		KST		Some optimization here, if the file queue is never used,
+;						skip all the nonsense.
+;__________________________________________________________________________;
+
+; Also called by GetBlock to recycle a file cache queue.
+
+TrashFCache
+			MOVEM.L A0-A1,-(SP) 		; save registers
+			TST.L	FHVCBPtr(A4)		; is this cache queue free?				<27Aug90>
+			BEQ.S	@Qnotused			; yes, skip the rest					<27Aug90>
+
+			CLR.L	FHVCBPtr(A4)		; mark this cache queue free
+			MOVE.L	FreeQHdr,A0 		; get free queue header
+			LEA 	FHMQHFlink(A4),A1	; add these buffers to free queue
+			BSR 	AddQToQ 			; add A1 queue buffers to A0 queue
+
+			LEA 	FHMQHFlink(A4),A0	; MRU-ordered queue header
+			MOVE.L	A0,FLink(A0)		; init header
+			MOVE.L	A0,BLink(A0)
+
+			LEA 	FHDQHFLink(A4),A0	; disk-ordered queue header
+			MOVE.L	A0,FLink(A0)		; init header
+			MOVE.L	A0,BLink(A0)
+
+			CLR.L	FHBufCnt(A4)		; no buffers in this queue, no max
+			CLR.W	FHFlags(A4) 		; zero flags, fork type
+			CLR.W	FHAttrib(A4)		; zero attributes, extra
+			CLR.L	FHFlType(A4)		; clear Finder file type
+			CLR.L	FHParDID(A4)		; ...and parent DirID
+@tfcRequeue
+			BSR 	DQElement			; DeQueue the element					<08Dec85>
+			MOVEA.L FQHBlink(A3),A0 	;  and ReQueue it on the end			<08Dec85>
+			BSR 	EQElement			;										<08Dec85>
+@tfcRet
+			MOVEM.L (SP)+,A0-A1 		; restore registers
+			RTS
+@Qnotused								; file queue is not used				<27Aug90>
+			CMPA.L	FQHBlink(A3),A4	 	; already at the end?					<27Aug90>
+			BEQ.S	@tfcRet				; yes, all done							<27Aug90>
+			BRA.S	@tfcRequeue			; no, requeue it						<27Aug90>
+
+;_________________________________________________________________________________
+;
+; FreeCBlk (Free cache block) subroutine
+;
+; Function: 	Detaches a cache buffer from a cache queue and requeues
+;				it in the free queue.
+;
+; Input:		A4.L - element pointer
+;				D7.L - If D7.L == 'hash' then add buffer to the hash table.		<04Jun90>
+; Output:		none, A4/D7 unchanged
+; 02Aug90		KSCT	Now takes D7 as an input parameter.
+; 28Aug90		KSCT	Put empty buffer at the end of the free queue, (GetBlock will take
+;						one from the end), non-empty buffer in the front.
+;_________________________________________________________________________________
+
+FreeCBlk
+			MOVEM.L	D6/A0,-(SP)			; save D6 also							<06Jun90>
+			BSET	#emptyBit,MCBFlags(A4) ; mark buffer empty
+			
+			MOVE.L	MCBFQPtr(A4),A0 	; get queue header
+			SUBQ.W	#1,MQHBufCnt(A0)	; decr element count in header
+			MOVE.L	MQHFlNum(A0),D6		; D6.L = file number
+			BSR 	DQElement			; dequeue it from MRU (fqHdr) queue
+
+			LEA 	MCBDQFlink(A4),A4
+			BSR 	DQElement			; dequeue it from Disk-order queue
+			MOVE.L	A4,FLink(A4)		; init disk-ordered queue header to 	<01Jan86>
+			MOVE.L	A4,BLink(A4)		;  point to itself						<01Jan86>
+			LEA 	-MCBDQFlink(A4),A4
+
+			MOVE.L	FreeQHdr,A0 		; get free queue header
+			MOVE.L	A0,MCBFQPtr(A4) 	; update header pointer for DQCacheBufs
+			ADDQ.W	#1,FreeQBufCnt(A0)	; increment count in free queue
+		
+			CLR.L	MCBAge(A4)			; age = 0 means not in DHT				<06Jun90>
+			CMPI.L	#SaveinHash,D7		; save in DHT?							<06Jun90>
+			BEQ.S	@1					; yes									<06Jun90>
+		;; put EMPTY buffer at the end of the free queue:						<28Aug90>
+			MOVE.L	FreeQBLink(A0),A0	; point to last buffer in free queue	<28Aug90>
+			BSR 	EQElement			; put it to the end						<28Aug90>
+			BRA.S	@2					; done									<28Aug90>
+			
+@1		;; put buffer in the front of the queue and add it to device hash table.<06Jun90>
+			BSR 	EQElement			; enqueue it 							<28Aug90>
+		;; here, A4 = ptr(buffer header) and is on freeQ.						<06Jun90>
+			BCLR	#emptyBit,MCBFlags(A4) ; mark non-empty (contents valid)	<28Aug90>
+			BSR		addToDhash			; add to dev hash						<06Jun90>
+@2
+			MOVEM.L	(SP)+,D6/A0			; restore								<06Jun90>
+			RTS
+
+;_________________________________________________________________________________
+;
+; EQCBlkFO (Enqueue Cache Block in File Order)
+;
+; Function: 	Inserts CBlk queue element into A3 queue in
+;				file order.
+;
+; Input:		A4.L - Cache Buffer ptr
+;				A3.L - MCB position in FileQueue header
+;				CBlkFlBlk(A4) - file block of buffer to be queued
+;				A4 block must not be in A3 MRU queue yet.
+;
+; Output:		none
+;
+; Note: 		Let {a}=first block in file order
+;					{b}=first block in MRU order
+;					{c}=last block in file order
+;
+;				Then {a} ≤ {b} ≤ {c}.  To speed the queuing up,
+;				we look at all three cases to get the nearest
+;				lower-block.
+;
+;				To get this to work, the block must be queued up
+;				in file order before it is queued in MRU order.
+;_________________________________________________________________________________
+
+EQCBlkFO
+			MOVEM.L D0/A0-A2,-(SP)		; save regs
+			MOVE.L	MCBFlBlk(A4),D0 	; file block of element to be queued
+
+; First we check to see if this block is past {c}, the last queue block
+; (this should be a common case, as files tend to be read sequentially).
+
+			LEA 	MCBDQFlink(A3),A0	; first queue position
+			MOVE.L	DCBBlink(A0),A1 	; A1 -> {c}
+			CMP.L	A0,A1				; empty queue?
+			BEQ.S	@4					; br if so (queue at start)
+			CMP.L	DCBFlBlk(A1),D0 	; after last block?
+			BCS.S	@1					; br if not
+			MOVE.L	A1,A0				; queue up after {c} (A4 is the last file blk)
+			BRA.S	@4
+
+; Next we check if it is before the first block.
+
+@1			MOVE.L	DCBFlink(A0),A1 	; A1 -> {a}
+			CMP.L	DCBFlBlk(A1),D0 	; before first block?
+			BCS.S	@4					; br if so (queue at start)
+
+; OK, it was neither of the boundary cases (before first or after last).
+; Check MRU block (block {b}), and then start search from {a} or {b}.
+
+			MOVE.L	MCBFlink(A3),A2 	; check if after MRU block
+			CMP.L	MCBFlBlk(A2),D0 	; after MRU block?
+			BCS.S	@2					; br if not (search from {a})
+			LEA 	MCBDQFlink(A2),A1	; search from {b}, the MRU block
+
+@2			MOVE.L	A0,A2				; save queue start ptr
+
+@3			MOVE.L	A1,A0				; save last blk ptr
+			MOVE.L	DCBFlink(A1),A1 	; look at next block
+			CMP.L	A1,A2				; reached start? error??
+			BEQ.S	@4					; br if so (queue right after {c})
+			CMP.L	DCBFlBlk(A1),D0 	; after this block?
+			BHI.S	@3					; loop if so
+
+; OK, we queue it up after the position pointed to by A0.
+
+@4			LEA 	MCBDQFlink(A4),A4	; adjust for regular queueing routines
+			BSR 	EQElement			; queue up after A0 element
+			LEA 	-MCBDQFlink(A4),A4
+			MOVEM.L (SP)+,D0/A0-A2		; restore regs
+			RTS 						; exit EQCBlkFO
+
+;_________________________________________________________________________________
+;
+; GetLPBuf (Get low priority buffer) subroutine
+;
+; Function: 	Gets the least needed buffer and recycles it.
+;
+; Input:		D3.L -- disk block
+;				A2.L -- VCB ptr
+; Output:		A4.L - CB header ptr
+;				D0.L - error if all are busy?
+;
+;				Return free block, if any.
+;				If not, recycle all buffers with an age the same or earlier than that of the
+;					age of the LRU buffer in the LRU file queue.
+;
+;				This algorithm will make this routine more efficient: since it recycles
+;				a number of blocks, it will have to do this recycling less often.
+;				By getting rid of all LRU blocks in all files, it prevents a buildup
+;				of old blocks in a file queue which may be hit fairly often (e.g., a
+;				directory file may have all blocks in it from a scavenge operation at
+;				mount, but only the first few may actually be used on a dynamic basis).
+;
+; MODIFICATION HISTORY:
+; 05Jun90		KSCT	Searches device hash table for a possible reuse
+;_________________________________________________________________________________
+
+GetLPBuf
+			MOVE.L	(SP)+,-(A6)
+			MOVE.L	A3,-(A6)			; save regs
+
+; (0) First check if the requested block is in the dev hash table.			<05Jun90>
+
+			BSR		srchDevhash			; give hash a chance				<05Jun90>
+			BEQ.S	gLPBuf1				; not in the hash table				<05Jun90>
+		;; found it in the hash, A4 = CBhdr									<05Jun90>
+			MOVE.L	CacheVars,A3		; set the incache flag				<01Aug90>
+			ST		LcGBinDHTable(A3)	; buffer found in free queue		<01Aug90>
+
+			BTST	#GBread,D7			; forced read requested?			<05Jun90>
+			BNE.S	@4					; br if yes							<05Jun90>
+		;; if user doesn't specify forced read, then we skip read			<05Jun90>
+			BSET	#GBnoRead,D7		; no-read 'cause we found it in DHT	<05Jun90>
+@4			MOVE.L	FreeQHdr,A3 		; A3 = free queue header			<05Jun90>
+			BRA.S	gLinHash			; found it in DHT					<05Jun90>
+										; D2.L = file blk!!					<05Jun90>
+
+; (1) and then check the free queue, the lowest priority blocks.
+gLPBuf1 	MOVE.L	FreeQHdr,A3 		; check the free queue first
+			MOVE.L	FreeQBlink(A3),A4	; get last buffer (these are initially highest in memory)
+			CMP.L	A3,A4				; empty queue?
+			BEQ.S	gLPBuf2 			; br if so
+
+gLinHash									; hash code joins here			<05Jun90>
+			TST.L	MCBAge(A4)				; in the hash table too?		<05Jun90>
+			BEQ.S	@2						; no							<05Jun90>
+			LEA		MCBHashqFlink(A4),A4	; A4 = hashq header				<07Jun90>
+			BSR		DQfromDHash				; yes, remove it from hash		<05Jun90>
+			LEA		-MCBHashqFlink(A4),A4	; A4 = CB header				<07Jun90>
+
+@2			BSR 	DQElement			; dequeue A4 element from free queue
+			SUBQ.W	#1,FreeQBufCnt(A3)	; one less buffer
+			BRA		gLPbufExit			; and exit
+
+; (2) Flush the LRU buffers and recycle them.  LRU buffers are those with an age the same
+;		or older than that of the age of the LRU buffer in the LRU file.  We invalidate
+;		file-order position since we may touch first file queue.
+
+gLPBuf2 	MOVEM.L D0-D3/A0-A2,-(A6)	; save all regs
+
+; First, find the LRU file queue which has a buffer in it.
+
+			MOVE.L	FileQHdr,A3 		; go through the file queue
+			MOVEA.L A3,A4				; start at top of queue
+
+@1			MOVEA.L FHBlink(A4),A4		; position to previous file queue
+			MOVE.L	FHVCBPtr(A4),D0 	; queue free?
+			BEQ.S	@1					; br if so
+			TST.W	FHBufCnt(A4)		; any buffers?
+			BEQ.S	@1					; br if not
+
+; OK, the age of the LRU buffer in this queue will determine which buffers to recycle.
+
+			MOVE.L	FHMQHBlink(A4),A2	; MRU queue LRU buffer
+			MOVE.L	MCBAge(A2),D2		; this is our cutoff age
+
+GLPFilLoop	MOVEM.L A3-A4,-(A6) 		; save the current file queue head, file queue header
+
+			LEA 	FHMQHFlink(A4),A3	; MRU queue header
+			MOVEA.L A3,A4				; start at top of queue
+			;<01Jan86>;MOVEQ   #0,D3	; clear flag indicating buffer was recycled
+
+GLPBufLoop	MOVEA.L MCBBlink(A4),A4 	; position to next buffer, LRU order
+			CMPA.L	A3,A4				; end of queue?
+			BEQ.S	@2					; exit if so
+			CMP.L	MCBAge(A4),D2		; same age or older?
+		;; if age > D2 then this buffer is RUsed, leave it in the cache.
+			BCS.S	@2					; exit if not (other MRU buffers will also not be)
+			BTST	#inuseBit,MCBFlags(A4) ; in-use?
+			BNE.S	@2					; exit if so
+			BTST	#cacheDirtyBit,MCBFlags(A4) ; dirty?
+			BNE.S	@1					; exit if so (flush it, recycle it next time around)
+
+			MOVE.L	MCBFLink(A4),A2 	; save previous buffer ptr
+		;; since we involuntarily give up the buffer, so keep it in the DHT	<04Jun90>
+			MOVE.L	D7,-(SP)			; save D7						<04Jun90>
+			MOVE.L	#SaveinHash,D7		; save in DHT					<04Jun90>
+			BSR 	FreeCBlk			; dequeue buffer and put it in free queue
+			MOVE.L	(SP)+,D7			; restore D7					<04Jun90>
+
+			MOVE.L	A2,A4				; start again with previous element
+			BRA.S	GLPBufLoop			; continue search
+
+@1			LEA 	-FHMQHFlink(A3),A4	; pass file queue header
+			BSR 	FlushFCache 		; flush this queue (it had a dirty old block)
+			BTST	#noFlushBit,FHFlags(A4) ; were we avoiding intermediate flushes on this one?
+			BEQ.S	@2					; br if not
+			ST		CacheFlag			; it’s flushing time till we exit this FS call
+
+@2			MOVEM.L (A6)+,A3-A4 		; retrieve the current file queue head, file queue header
+			MOVE.L	FHBlink(A4),A4		; go to next previous file queue
+			CMP.L	A3,A4				; back to header?
+			BNE.S	GLPFilLoop			; loop if not
+
+			;<01Jan86>;TST	   D3		; did we recycle a buffer in the last file queue (the current queue)?
+			;<01Jan86>;BEQ.S   @3		; br if not
+			;<01Jan86>;SUB.L   A5,A5	; note that file-order position may be invalid
+
+@3			MOVEM.L (A6)+,D0-D3/A0-A2	; restore regs
+			BRA 	gLPBuf1 			; go get one off free queue now
+
+gLPbufExit	MOVE.L	(A6)+,A3			; restore A3
+			MOVE.L	(A6)+,-(SP)
+			RTS
+
+
+;_________________________________________________________________________________
+;
+; EQElement (Enqueue Element) subroutine
+;
+; Function: 	Inserts a queue element into a queue at a specified position.
+;
+; Input:		A4.L - element pointer
+;				A0.L - position pointer (previous queue element)
+;
+; Output:		none
+;_________________________________________________________________________________
+
+EQElement	;; A0 -> A4 -> A1 ......	(insert A4 after A0)
+			MOVE.L	A1,-(SP)			; save reg
+
+			MOVEA.L Flink(A0),A1		; addr of next	Q element
+			MOVE.L	A1,Flink(A4)		; link to next element
+			MOVE.L	A4,Blink(A1)		; ...
+
+			MOVE.L	A4,Flink(A0)		; link to previous element
+			MOVE.L	A0,Blink(A4)		; ...
+
+			MOVE.L	(SP)+,A1			; restore reg
+			RTS 						; exit EQElement
+
+;_________________________________________________________________________________
+;
+; DQElement (Dequeue Element) subroutine
+;
+; Function: 	Detaches a queue element from a queue.
+;
+; Input:		A4.L - element pointer
+;
+; Output:		none
+;_________________________________________________________________________________
+
+DQElement	MOVEM.L A0-A1,-(SP) 		; save regs
+
+			MOVEA.L Blink(A4),A0		; addr of previous Q element
+			MOVEA.L Flink(A4),A1		; addr of next Q element
+			MOVE.L	A1,Flink(A0)		; link to next element
+			MOVE.L	A0,Blink(A1)		; link to previous element
+
+			MOVEM.L (SP)+,A0-A1 		; restore regs
+			RTS 						; exit DQCBuf
+
+;_________________________________________________________________________________
+;
+; AddQToQ (Add Queue to Queue) subroutine
+;
+; Function: 	Takes all cache buffers from one queue, detaches them
+;				from the queue header, and adds them to the end of
+;				another queue. (Only used by TrashFCache)
+;
+; Input:		A1.L - queue header of source queue
+;				A0.L - queue header of destination queue (freeqhdr)
+;
+; Output:		none
+;
+; Before:		{DQH} <-> {DQ1} <-> {DQE} <-> {DQH
+;				{SQH} <-> {SQ1} <-> {SQE} <-> {SQH
+;
+; After:		{DQH} <-> {DQ1} <-> {DQE} <-> {SQ1} <-> {SQE} <-> {DQH
+;				{SQH} <-> {SQH
+;
+; Note: 		This was made more specific to the free queue as destination queue
+;				since queue header backpointers needed to be filled in.
+;_________________________________________________________________________________
+
+AddQToQ 								; add A1 queue buffers to A0 queue
+			MOVEM.L D0/A0-A4,-(SP)		; save regs
+
+			MOVE.W	QCount(A1),D0		; get count of buffers we are adding
+			ADD.W	D0,QCount(A0)		; add to dest q count
+
+; Check to see if the source queue is empty.
+
+			MOVE.L	Flink(A1),A3		; A3 -> {SQ1}
+			CMP.L	A1,A3				; {SQ1}={SQH}? any buffers at all?
+			BEQ.S	addQExit			; exit if empty
+
+; Fill in A0 as the new queue header backpointer in the source queue elements.
+
+			MOVE.L	A1,A3				; start at beginning
+@1			MOVE.L	Flink(A3),A3		; get next element
+			CMP.L	A1,A3				; back to start?
+			BEQ.S	@2					; exit loop if so
+			MOVE.L	A0,MCBFQPtr(A3) 	; fill in new header
+			CLR.L	MCBAge(A3)			; clear age so we know it's not in DHT	<07Jun90>
+			LEA 	MCBDQFlink(A3),A2	; point to disk-ordered queue			<01Jan86>
+			MOVE.L	A2,FLink(A2)		; init disk-ordered queue header to 	<01Jan86>
+			MOVE.L	A2,BLink(A2)		;  point to itself						<01Jan86>
+			BRA.S	@1
+
+@2			MOVE.L	Flink(A1),A3		; A3 -> {SQ1}
+
+; Unlink the source header from its elements
+
+			MOVE.L	A1,A4				; A4 -> {SQH}
+			BSR.S	DQElement			; {SQ1} <-> {SQE} <-> {SQ1
+										; {SQH} -> {SQ1} <-> {SQE} <- {SQH
+
+; Link end of dest queue to first buffer in src queue, and
+; link end of src queue to header of of dest queue
+;
+; note: A3 -> {SQ1}, A0 -> {DQH}
+
+			MOVE.L	Blink(A0),A2		; A2 -> {DQE}
+			MOVE.L	Blink(A3),A4		; A4 -> {SQE}
+
+			MOVE.L	A3,Flink(A2)		; {DQE} <-> {SQ1}
+			MOVE.L	A2,Blink(A3)		;
+
+			MOVE.L	A4,Blink(A0)		; {SQE} <-> {DQH
+			MOVE.L	A0,Flink(A4)		;
+
+; Init src queue header to point to itself (since it’s empty)
+
+			MOVE.L	A1,Flink(A1)		; {SQH} <-> {SQH
+			MOVE.L	A1,Blink(A1)		;
+
+addQExit	MOVEM.L (SP)+,D0/A0-A4		; restore regs
+			RTS
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; hash code shared by 6.0 and 7.0
+
+
+;_______________________________________________________________________
+; Function: 	Copy data from cache to user's buffer
+; Input:		A4=CB header, A5=buf addr, Assume D2 to be free.
+; Output:		A5/D3-D5 updated. D4.L = number of blocks remain to be read
+;_______________________________________________________________________
+copyTOuserbuf
+			MOVEM.L	A0-A1,-(SP)			; save A0-A1
+			MOVEA.L	MCBDataPtr(A4),A0	; it's a pointer now
+			MOVE.L	#bufSiz,D2			; D2 = 512
+			MOVEA.L	A5,A1				; A1 = dest
+			MOVE.L	D2,D0
+			_BlockMove
+			ADD.L	D2,A5				; bump to next buffer
+			ADDQ.L	#1,D3				; bump disk block number
+			ADDQ.L	#1,D5				; bump file block number
+			SUBQ	#1,D4				; decr block count
+			MOVEM.L	(SP)+,A0-A1
+			RTS
+
+;_______________________________________________________________________
+; Function: 	Search if block is already in the cache. If it is in the cache we copy
+;				it into user's buffer as much as we can. Once we find a block that is not
+;				in the cache, we stop immediately. We'll then do multiblock read from there.
+; Input:		A2=VCB, A5=buf addr, D1.W=refnum, D3=disk block number,
+;  				D4=block count, D5=start file block, D6.L=bytes to read
+;				(A1,D1.W)  - FCB pointer
+;				Assume D0-D2/A3-A4 to be free
+; Output:		if all found in the cache, then they are copied into A5 and return 
+;				D0 = 0. BNE if need to read (D0=block count) and A5/D3-D5 maybe changed.
+;_______________________________________________________________________
+inCachep	MOVE.L	(SP)+,-(A6)
+			MOVEM.L	D3/D6,-(A6)
+			MOVEA.L FileQHdr,A3 		; A3 = ptr(FQH)
+		;	MOVEA.L FCBSPtr,A1			; A1 = ptr(1st FCB)
+		;	MOVEA.L FCBVPtr(A1,D1.W),A2 ; A2 = ptr(VCB)
+
+			MOVE.L	FCBFlNm(A1,D1.W),D3 ; D3 = file number
+			BTST	#FCBRscBit,FCBMdRByt(A1,D1.W) ; resource fork?
+			SNE 	D6					; $FF=res fork, $00=data fork
+
+; (1) Find appropriate file queue.
+@1			BSR 	FindFileCache		; get the file cache ptr in A4
+			MOVEM.L	(A6)+,D3/D6
+			BEQ.S	@7					; br if we don't find it
+		;; A4 = file queue header
+			TST.W	FHBufCnt(A4)		; any buffers?
+			BEQ.S	@7					; no, it's empty
+			LEA 	FHDQHFlink(A4),A3	; file ordered queue header
+			MOVEA.L	BLINK(A3),A4		; last file buffer
+		;;	MOVE.L	D5,D0				; D0 = start file block
+		;;	ADD.L	D4,D0				; D0 = last file block (exclusive)
+			CMP.L	DCBFlBlk(A4),D5 	; after the last one?
+			BHI.S	@7					; yes, none in the file queue
+			MOVEA.L A3,A4				; start at top of queue
+
+@3			MOVEA.L Flink(A4),A4 		; position to next buffer, file order
+			CMPA.L	A3,A4				; back to the top?
+			BEQ.S	@7					; yes, we searched the whole queue =>
+@4			CMP.L	DCBFlBlk(A4),D5 	; same file block?
+			BHI.S	@3					; after current block, BHI before BEQ
+			BEQ.S	@found1				; br if so (we found it)
+			MOVE.L	A4,-(SP)			; not in file queue, try free queue
+			BSR		srchDevhash			; D3.L=disk blk
+			BEQ.S	@restoreA4			; not found, stop searching
+			BSR.S	copyTOuserbuf		; A4=MCB header
+			MOVEA.L	(SP)+,A4			; A4=file order queue hdr
+			BGT.S	@4					; loop until we pass the block
+			BRA.S	@done				; all done
+@found1	;; found the buffer in file queue
+			LEA		-MCBDQFlink(A4),A4	; A4=MCB header
+			BSR.S	copyTOuserbuf		; A4=MCB header
+			LEA.L	MCBDQFlink(A4),A4	; A4=file order queue hdr
+			BGT.S	@3					; loop until done
+			BRA.S	@done				; all done
+
+@7		;; none of the buffers is in the file queue, serach DHT ...
+			BSR		srchDevhash			; D3.L=disk blk
+			BEQ.S	@notfnd				; not found, stop searching
+			BSR		copyTOuserbuf		; just copy the data without enqueueing the buffer,
+										; multi-blocks read usually is read once only
+			BGT.S	@7					; loop until done
+@done		MOVEQ	#0,D0				; all in cache
+
+@ret		MOVE.L	(A6)+,-(SP)
+			TST		D0
+			RTS
+@restoreA4	MOVEA.L	(SP)+,A4
+@notfnd		MOVE.L	D4,D0				; not in the cache, D0=block count
+			BRA.S	@ret
+
+
+;_______________________________________________________________________
+; Routine:		invDHTRange
+; Function: 	trash dev hash associated with this file/fork in a certain range.
+; Input:		A1.L = FCB pointer
+;				A2.L = VCB pointer		; assume A3 to be free
+;				D1.W = file refnum
+;				D3.L = vol/file flag. If file, D3.L = file number
+;					If D3 = 0, invalidate the whole volume, else just a file
+;				D4.L = beginning file block #
+;				D5.L = ending    file block #
+;				D6.B = fork type, $FF = resource fork, $00 = data fork
+; Output:		none. Assume D0-D2/A0/A3/A4 to be free
+;				Called by trashblocks from setEOF.
+;_______________________________________________________________________
+invDHTRange
+			MOVE.W	vcbVRefNum(A2),D0	; D0 = vol refnum
+			MOVEA.L	freeqHdr,A3			; A3 = free q
+			MOVEA.L	A3,A4
+@5			MOVEA.L	FLink(A4),A4		; get next CB hdr
+			CMPA.L	A3,A4				; to the top?
+			BEQ.S	@end				; yes
+			TST.L	mcbAge(A4)			; in the hash?
+			BEQ.S	@5					; no
+			CMP.W	MCBDevNum(A4),D0	; same volume?
+			BNE.S	@5					; no
+			CMP.L	MCBFileNum(A4),D3	; same file number? 
+			BNE.S	@5					; no
+			CMP.B	MCBFkType(A4),D6	; same fork type?
+			BNE.S	@5					; no
+			CMP.L	MCBFlBlk(A4),D4		; block to be trashed? 
+			BHI.S	@5					; no, before start blk
+			CMP.L	MCBFlBlk(A4),D5		; block to be trashed? 
+			BLO.S	@5					; no, after ending blk
+										; this buffer to be removed
+			LEA		MCBHashqFlink(A4),A4	; A4 = hashq header			<13Jun90>
+			BSR.S	DQfromDHash				; yes, dequeue it			<13Jun90>
+			LEA		-MCBHashqFlink(A4),A4	; A4 = CB header			<13Jun90>
+			BRA.S	@5
+@end
+			RTS
+
+;_____________________________________________________________________
+; Function:	remove buffer from hash table (using vrefnum for now)
+; Input:	A4 = ptr(hashq header)
+; Output:	none, A4 preserved
+;_____________________________________________________________________
+DQfromDHash	MOVEM.L	A0,-(SP)
+			MOVEA.L	CacheVars,A0
+			MOVEA.L	LcDevHTPtr(A0),A0	; A0 = hash table
+			SUBQ.W	#1,htCount(A0)		; decrement counter
+@2			CLR.L	cbHqDevNum(A4)		; clear hash flag (was cbHqAge)		<03Dec91 #24>
+			BSR		DQElement			; remove it
+			MOVE.L	A4,FLink(A4)		; init hash queue header to
+			MOVE.L	A4,BLink(A4)		;  point to itself
+			MOVEM.L	(SP)+,A0
+			RTS
+
+;_______________________________________________________________________
+; Routine:		invalidDHash
+; Function: 	Trash dev hash associated with this file/volume.
+;				For a file, both forks are trashed.
+; Input:		A2.L = VCB pointer,		; D0/A3/A4 assume to be free
+;				D3.L = vol/file flag. 
+;					If D3 = 0, invalidate the whole volume, else just a file
+; Output:		none. A3/A4 trashed
+;				Called by trashVblks, and trashFblocks.
+;_______________________________________________________________________
+invalidDHash
+			MOVE.W	vcbVRefNum(A2),D0	; D0 = vol refnum
+			MOVEA.L	freeqHdr,A3			; A3 = free q
+			MOVEA.L	A3,A4
+@loop		MOVEA.L	FLink(A4),A4		; get next CB hdr
+			CMPA.L	A3,A4				; to the top?
+			BEQ.S	@end				; yes
+			TST.L	mcbAge(A4)			; in the hash?
+			BEQ.S	@loop				; no
+		;; A4 is in the hash, if it belongs to this volume then we need to remove it
+			CMP.W	MCBDevNum(A4),D0	; same volume?
+			BNE.S	@loop				; no, not for us
+										; checking my code
+			TST.L	D3					; whole volume?
+			BEQ.S	@3					; yes
+			CMP.L	MCBFileNum(A4),D3	; belongs to THE file?
+			BNE.S	@loop				; no, not for us
+			
+@3			LEA		MCBHashqFlink(A4),A4; A4 = hashq header
+			BSR.S	DQfromDHash			; yes, dequeue it
+			LEA		-MCBHashqFlink(A4),A4; A4 = CB header
+			BRA.S	@loop				; and continue
+
+@end		RTS
+
+;_____________________________________________________________________
+; Function:	convert refnum to vrefnum and store in CB HDr (using vrefnum for now)
+;			Save vol refnum and file number if we store this buffer in DHT.
+; Input:	A4.L = ptr(buffer header)
+;			D6.L = file number, for volume this will be 0. (this is all right
+;					because file number is only used by trash file blocks in DHT)
+; Output:	none, A4 preserved
+;_____________________________________________________________________
+;getdrvnum	MOVEM.L	D0/A0,-(SP)
+;			move.w	MCBRefNum(A4),D0	; file refnum?
+;			BLE.S	@vol				; no
+;
+;			MOVEA.L FCBsPtr,A0			; Point to FCB array
+;			MOVEA.L	FCBVptr(A0,D0),A0	; Point to VCB
+;			MOVE.W	vcbVRefNum(A0),D0	; D0 = vol refnum
+;@vol
+;			move.w	D0,MCBDevNum(A4)	; save it in header
+;			MOVE.L	D6,MCBFileNum(A4)	; save filenumber too
+;			MOVEM.L	(SP)+,D0/A0
+;			RTS
+
+;_____________________________________________________________________
+; Function:	save the buffer in the device hash table
+; Input:	A4 = ptr(buffer header)
+;			D6.L = file number, for volume this will be 0. (this is all right
+;					because file number is only used by trash file blocks in DHT)
+; Output:	none, A4 preserved
+;_____________________________________________________________________
+addToDhash	MOVEM.L	D0-D1/A0/A4,-(SP)
+		;; First, convert refnum to VRefnum and store in CB Hdr
+			MOVEQ	#0,D0				; clear high word
+			move.w	MCBRefNum(A4),D0	; file refnum?
+			BLE.S	@vol				; no, volume
+
+			MOVEA.L FCBsPtr,A0			; Point to FCB array
+			MOVEA.L	FCBVptr(A0,D0),A0	; Point to VCB
+			MOVE.W	vcbVRefNum(A0),D0	; D0 = vol refnum
+@vol	;; Save vol Refnum and file number if we store this buffer in DHashTable.
+			move.w	D0,MCBDevNum(A4)	; save VRefnum in CB header
+			MOVE.L	D6,MCBFileNum(A4)	; save filenumber too
+
+			MOVEA.L	CacheVars,A0
+			MOVEA.L	LcDevHTPtr(A0),A0	; A0 = hash table
+			ADDQ.W	#1,htCount(A0)		; add one entry
+			MOVE.L	MCBDBlk(A4),D1		; D1 = disk blk number
+			BSR.S	getHashKey			; D0 = VRefnum
+			MOVE.W	D1,MCBHashKey(A4)	; save hash table position for dequeueing
+			LEA		(A0,D1.W),A0		; A0 = table entry
+			LEA		MCBHashqFlink(A4),A4
+			BSR		EQelement
+			
+			MOVEM.L	(SP)+,D0-D1/A0/A4
+			RTS
+
+
+;_____________________________________________________________________
+; Function:	Get hash key and convert to offset into the hash table.
+;			Note: the first key starts from 1 because 0 is the table header.
+; Input:	D0.L -- vol refnum, top word cleared
+;			D1.L -- disk block
+;			A0.L -- ptr(hash table)
+; Output:	D1.W = key (convert to offset), offset is only a word 'cause max. entry is 512.
+;			D0 trashed, A0 preserved.
+;
+; 04Jul90	KST		New today
+; 15Oct90	KST		Changed to use logical AND to compute hash key. This is faster
+;					than DIVU and we don't need to worry about divide overflow.
+;_____________________________________________________________________
+getHashKey
+			ADD.L	D0,D1				; D1 = D0+D1
+			MOVE.W	htKeyMask(A0),D0	; D0.W = bucket number mask
+getFHKey	; get file hash key
+		;;	DIVU.W	D0,D1				; if overflow, operand unchanged !!!
+		;;	SWAP	D1					; take reminder as key
+			AND.W	D0,D1				; D1 is reminder (always a WORD), use it as key
+			ADDQ.W	#1,D1				; but 0 is the header
+			LSL.W	#htEntryLog2,D1		; convert to offset
+			RTS
+
+;_____________________________________________________________________
+; Function:	search the buffer in the device hash table
+; Input:		D3.L -- disk block
+;				A2.L -- VCB ptr
+; Output:	D0 = 0 if not found, else D0=A4.L = CB header
+;_____________________________________________________________________
+srchDevhash	MOVEM.L	D1/A0-A1,-(SP)
+
+			MOVEA.L	CacheVars,A0
+			MOVE.L	LcDevHTPtr(A0),D0	; D0 = dev. hash table
+			BEQ.S	srchend				; no hash table
+			MOVEA.L	D0,A0				; A0 = hash table
+			MOVE.W	htCount(A0),D0		; any entry?
+			BEQ.S	srchend				; empty
+			MOVEQ	#0,D0
+			MOVE.W	vcbVRefNum(A2),D0	; D0.L = vol refnum
+			MOVE.L	D3,D1				; D1.L = disk block
+			
+			BSR.S	getHashKey
+			MOVE.W	vcbVRefNum(A2),D0	; D0 = vol refnum
+			LEA		(A0,D1.W),A1		; A1 = hashq header
+			MOVEA.L	A1,A4
+@loop		MOVEA.L	(A4),A4				; next cb hdr
+			CMP.L	A1,A4				; that's all?
+			BEQ.S	srchnotfnd			; yes
+			CMP.L	cbHqDevBlk(A4),D3	; same disk block?
+			BNE.S	@loop				; no
+			CMP.W	cbHqDevNum(A4),D0	; same refnum?
+			BNE.S	@loop				; no
+
+srchFnd		LEA		-MCBHashqFlink(A4),A4
+			MOVE.L	A4,D0				; return MCBhdr
+srchend		MOVEM.L	(SP)+,D1/A0-A1
+			RTS
+
+srchnotfnd	MOVEQ	#0,D0
+			BRA.S	srchend
+
+
+;; hash code end
+
+;_____________________________________________________________________
+; Function:	Map a buffer ptr into CB header ptr
+; Input:	A0.L = ptr(data buffer), assume A4 is free.
+; Output:	A4.L = ptr(CBheader), all other registers unchanged
+;_____________________________________________________________________
+mapCBHeader
+			MOVEM.L	D0-D1/A0-A1,-(SP)
+			MOVEA.L	CacheVars,A4
+
+			MOVE.L	LcXCacheKey(A4),D0
+			CMPA.L	D0,A0				; in the cache?
+			BEQ.S	@incache			; yes
+		;; not in cache, need to do some computation
+			MOVE.L	BufStart(A4),A1		; data buf start
+			SUBA.L	A1,A0				; A0 = delta
+			MOVE.L	A0,D0
+			BEQ.S	@0					; D0 = 0
+			MOVEQ	#log2Bsize,D1
+			LSR.L	D1,D0				; get buffer index
+			MULU	#MCBHLength,D0		; offset into CB header array
+
+@0			MOVE.L	CBHdrStart(A4),A4
+			ADDA.L	D0,A4				; this is the header
+			BRA.S	@ret
+@incache
+			MOVEA.L	LcXCacheData(A4),A4
+
+@ret		MOVEM.L	(SP)+,D0-D1/A0-A1
+			RTS
+
+;__________________________________________________________________________;
+;
+; Subroutine:	CacheCheck
+; Function: 	Verify that the cache buffers are cool.  This is for debug only.
+; Arguments:	none.  Traps if error detected.
+;__________________________________________________________________________;
+
+			IF		CacheDebug THEN
+
+CacheCheck
+			MOVEM.L D0-D4/A0-A4,-(SP)	; save all regs
+
+			MOVEA.L FileQHdr,A3 		; step through the file queue
+			MOVEQ	#0,D4				; total # buffers
+			MOVEA.L A3,A4				; start at top of file queue
+
+fqLoop		MOVE.L	A4,A0				; save ptr to current element			<31Dec85>
+			MOVEA.L FHFlink(A4),A4		; position to next file queue
+			CMPA.L	FHBlink(A4),A0		; back link cool?						<31Dec85>
+			BEQ.S	@0					; br if so								<31Dec85>
+			_CacheDebug   StrFQBad
+
+@0			CMPA.L	A3,A4				; back to top of queue ?				<31Dec85>
+			BEQ 	fqLoopEnd			; exit loop if so
+			MOVE.L	FHVCBPtr(A4),D0 	; queue free?
+			BEQ.S	fqLoop				; loop if so
+			MOVE.L	D0,A2				; get VCB ptr
+			TST.W	VCBDrvNum(A2)		; better be an on-line volume
+			BGT.S	@1					; br if so
+			_CacheDebug   StrFQBad
+
+@1			LEA 	FHMQHFlink(A4),A1
+			MOVE.L	A1,A2				; start at top of mru queue
+			MOVEQ	#0,D0				; count of buffers we find
+			MOVEQ	#-1,D1				; all blocks should have age < this
+
+mruLoop 	MOVE.L	A2,A0				; save ptr to current element			<31Dec85>
+			MOVEA.L MCBFlink(A2),A2 	; position to next file buffer, mru order
+			CMPA.L	MCBBlink(A2),A0 	; back link cool?						<31Dec85>
+			BEQ.S	@4					; br if so								<31Dec85>
+			_CacheDebug   StrMRUQBad
+
+@4			CMPA.L	A1,A2				; back to top of queue ?				<31Dec85>
+			BEQ.S	@2					; exit loop if so
+			ADDQ	#1,D0				; incr buffer count
+			CMP.L	MCBFQPtr(A2),A1 	; queue head ptr ok?
+			BEQ.S	@0
+			_CacheDebug   StrMRUQBad
+
+@0			MOVE.L	MCBAge(A2),D3		; make sure block ages are decreasing
+			CMP.L	D1,D3
+			BLS.S	@1					; br if so
+			_CacheDebug   StrAgeProb
+
+@1			MOVE.L	D3,D1
+			BRA.S	mruLoop 			; and keep looping
+
+@2			CMP.W	MQHBufCnt(A1),D0	; buffer count ok?
+			BEQ.S	@3
+			_CacheDebug   StrMRUCnt
+
+@3			ADD 	D0,D4				; keep total count ok
+			LEA 	FHDQHFLink(A4),A1	; file-ordered queue header
+			MOVEA.L A1,A2				; start at top of queue
+			MOVEQ	#-1,D1				; all blocks should be > this
+			MOVEQ	#0,D2				; buffer count
+
+foLoop		MOVE.L	A2,A0				; save ptr to current element			<31Dec85>
+			MOVEA.L DCBFlink(A2),A2 	; position to next buffer, file order
+			CMPA.L	DCBBlink(A2),A0 	; back link cool?						<31Dec85>
+			BEQ.S	@4					; br if so								<31Dec85>
+			_CacheDebug   StrDQBad
+
+@4			CMPA.L	A1,A2				; back to top of queue ?				<31Dec85>
+			BEQ.S	@2					; exit loop if so
+			ADDQ	#1,D2				; incr buffer count
+			MOVE.L	DCBFlBlk(A2),D3 	; make sure file block numbers are increasing
+			CMP.L	D1,D3
+			BGT.S	@1					; br if so
+			_CacheDebug   StrDQBad
+@1			MOVE.L	D3,D1
+			BRA.S	foLoop				; and keep looping
+
+@2			CMP 	D0,D2				; same buffer count as mru queue?
+			BEQ.S	@3					; br if so
+			_CacheDebug   StrDQCnt
+
+@3			BRA 	fqLoop				; go for the next file
+
+fqLoopEnd	MOVE.L	FreeQHdr,A3 		; now check the free queue
+			MOVEQ	#0,D3				; total # buffers
+			MOVEA.L A3,A4				; start at top of file queue
+
+freeLoop	MOVE.L	A4,A0				; save ptr to current element			<31Dec85>
+			MOVEA.L FreeQFlink(A4),A4	; position to next free buffer
+			CMPA.L	FreeQBlink(A4),A0	; back link cool?						<31Dec85>
+			BEQ.S	@4					; br if so								<31Dec85>
+			_CacheDebug   StrFreeQ
+
+@4			CMPA.L	A3,A4				; back to top of queue ?				<31Dec85>
+			BEQ.S	@1					; exit loop if so
+			ADDQ	#1,D3				; bump buffer count
+			CMP.L	MCBFQPtr(A4),A3 	; header ptr ok?
+			BEQ.S	@0
+			_CacheDebug   StrFreeQ
+
+@0			LEA 	MCBDQFlink(A4),A0	;										<01Jan86>
+			CMP.L	FLink(A0),A0		; file-ordered queue header should		<01Jan86>
+			BNE.S	@5					;  point to itself						<01Jan86>
+			CMP.L	BLink(A0),A0		;										<01Jan86>
+			BEQ.S	@6					;										<01Jan86>
+@5			_CacheDebug   StrFreeQ		;										<01Jan86>
+@6			BRA.S	freeLoop			;										<01Jan86>
+
+@1			CMP.W	FreeQBufCnt(A3),D3	; does the total add up?
+			BEQ.S	@2					; br if so
+			_CacheDebug   StrFreeQCnt
+
+@2			ADD.W	D3,D4				; add to get total buffer count
+			CMP.W	TotalBufCnt(A3),D4	; check?
+			BEQ.S	@3					; br if so
+			_CacheDebug   StrTotalCnt
+
+@3			MOVEM.L (SP)+,D0-D4/A0-A4	; restore regs
+			RTS 						; return if nothing wrong
+
+			ENDIF
+
+			STRING	PASCAL
+			IF CacheDebug THEN
+StrDQErr	DC.B	'Cache: DQ Dirty'
+StrBufUse	DC.B	'Cache: Buf in use'
+StrBlk0 	DC.B	'Cache: Disk Block 0'
+StrFQBad	DC.B	'Cache: FQ Bad'
+StrMRUQBad	DC.B	'Cache: MRU Bad'
+StrMRUCnt	DC.B	'Cache: MRU Cnt Bad'
+StrAgeProb	DC.B	'Cache: Aging Bad'
+StrDQBad	DC.B	'Cache: DQ Bad'
+StrDQCnt	DC.B	'Cache: DQ Cnt Bad'
+StrFreeQ	DC.B	'Cache: Free Q Bad'
+StrFreeQCnt DC.B	'Cache: Free Q Cnt Bad'
+StrTotalCnt DC.B	'Cache: Total Cnt Bad'
+			ENDIF
+
+	IF NOT forROM THEN					;										<SM3> rb
+	
+CutBack
+			_SetHandleSize				; adjust our size
+
+		IF NewInit70 THEN				; detach for INIT
+			MOVE.L	A0,-(SP)			; A0 = handle
+			_DetachResource				; pass it to resource manager
+		ENDIF
+
+			RTS
+EndResident
+
+	ENDIF								;										<SM3> rb
+	
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Code after this point will be discarded !!
+
+;_________________________________________________________________________________
+; Routine:	verifyCacheSize (System 7 only!)
+; Function: Make sure cache size is not too big for 7.0 system to boot.
+;			1. We require at least 16K for the DiskCache to boot this MAC!
+;			2. We reserve 32K for other INITs that move 'Bufptr' such as AppleShare.
+;		••  This code is not efficient, but it's all right since we only run it once at install time.
+; Input:	A0.L	- Ptr to cache locals.
+;			D0.L	- User requested cache size in 32K multiple.
+;			D2.L	- The lower bound of BufPtr (from 7.0b4+). Preserved on return.
+;			Assume D1 to be free.
+; Output:	D0.L	- verified cache size in number of bytes.
+; Modification History:
+;	15May90	KST		Adding the code to check upper bound limit against actual
+;					physical memory that Ramcache can allocate. The max size
+;					is calculated based on memory CDEV and may be changed later.
+;	20Dec90	KST		In B4, Boot code passes me the lower bound of BufPtr in D2.
+;_________________________________________________________________________________
+verifyCacheSize
+		;; from B4, we use parameter D2 to calculate the max. cache size.
+			MOVEM.L	D2-D3,-(SP)			; do we need to save ??
+			MOVE.L	BufPtr,D1			; current bufptr
+			SUB.L	D2,D1				; D1 is the available memory
+		;;	SUB.L	#n32K,D1			; reserve 32K for other INITs that move 'Bufptr'
+			MOVE.L	D1,D2				; move to D2
+		;; but we can't grab them all, some more arithmetics required:
+			MOVE.L	#fileHdrCnt,D1		; # of file headers
+			MULU	#FHlength,D1		; size of file Hdrs
+			ADD.W	#FreeQHlen+FQHlength,D1	; some bytes for freeQ header record
+										; and some bytes for fileQ header record
+			SUB.L	D1,D2				; reserve memory for file header
+			
+		;; D2.L = memory available - file headers - 32K reserved
+		;; D0.L = n*32K, D1,D3 are free
+			MOVEQ	#Byteto32K,D1		; shift by this many bits
+			LSL.L	D1,D0				; D0.L = max bytes
+			MOVEQ	#log2Bsize,D1		; D1.L = log2 of buffer size
+
+@2			MOVE.L	D0,D3				; save in D3
+			LSR.L	D1,D3				; D3 = number of buffers
+			MULU	#MCBHLength,D3		; total memory for CB headers
+			ADD.L	D0,D3				; total memory for DiskCache
+			
+			CMP.L	D2,D3				; do we have enough memory?
+			BLT.S	@4					; yes
+			SUB.L	#n32K,D0			; else, reduce cache size by 32K
+			BLE.S	@6					; can't be negative or zero
+			BRA.S	@2					; and check again
+
+@4			CMP.L	#n256K,D0			; D0 > 256K?
+			BLE.S	@5					; no
+			ANDI.L	#$FFFF0000,D0		; ignore lower 32K if size is above 256K
+										; to be consistent with memory CDEV
+@5			MOVEM.L	(SP)+,D2-D3			; restore regs and
+			RTS							; return size in D0
+
+@6			BMI		noMemDead			; if < 0, no memory to boot
+			MOVE.L	#kMinBootSize,D0	; if = 0, try minimum boot size
+			BRA.S	@2					; give it one last try
+
+;_________________________________________________________________________________
+;
+; Routine:		CacheInstall
+;
+; Function: 	This routine is called by the CacheLoad routine in the cache
+;				INIT resource.	It installs RAM-caching.
+;
+; Input:	(Pre-System 7 only!)
+;				A0.L	- Ptr to cache locals.
+;				NewBufPtr(A0) - base  of RAM cache space
+;				OldBufPtr(A0) - limit of RAM cache space
+;			(System 7 only!)
+;				D2.L	- The lower bound of BufPtr (from 7.0b4+).
+; Modification History:
+;	21May90		KST		Adding the code to check upper bound limit against actual
+;						physical memory that Ramcache can allocate. The max size
+;						is calculated based on memory CDEV and may be changed later.
+;_________________________________________________________________________________
+			EXPORT	CacheInstall		;											<SM3> rb
+CacheInstall
+
+										; assume A0/A1 to be free
+			MOVEQ	#CacheLclLen,D0 	; get space for locals
+			_NewPtr ,SYS,CLEAR			;	off system heap (it MUST not fail)
+			MOVE.L	A0,CacheVars		; save for later
+
+; Determine size of cache and allocate the space above BufPtr.
+			MOVEQ	#0,D0				; clear high bytes
+			MOVE.B	CacheConfig,D0		; get size configuration
+			BEQ.S	@useMinCache		; use minimum size if zero
+			BSR.S	verifyCacheSize		; make sure cachesize is not too big for 7.0?
+			BRA.S	@gotSize
+@useMinCache
+			MOVE.W	#kMinCacheSize,D0	; current minimum is 32K		<23Apr90>
+			BSET	#5,CacheEnable		; enable ramcache				<23Apr90>
+
+@gotSize
+	;; D0.L = DiskCache size in number of bytes.
+	;; Since we are not going to use the memory allocated by ROM, we need to do some
+	;; calculation to figure out how much more memory we need to grab from above BufPtr.
+	;;	(low mem)
+	
+	;	--+-------------	=> LcNewBufPtr(A0)
+	;	  |	FreeQ hdr -> FreeQHdr ($378)
+	;	--+-------------
+	;	  |	FileQ buf -> FileQHdr ($37C)
+	;	--+-------------
+	;	  |
+	;	  |	File Headers
+	;	  |
+	;	--+-------------	=> LcCBHdrStart(A0)
+	;	  |
+	;	  |	CBlock Headers
+	;	  |
+	;	--+-------------	=> LcBufStart(A0)
+	;	  |
+	;	  |
+	;	  |	Data buffers
+	;	  |
+	;	  |
+	;	--+-------------
+	;	  | possible unused mem
+	;	--+-------------	=> LcOldBufPtr(A0)
+
+;;	(high mem)
+
+			MOVE.L	BufPtr,A3			; get current value of BufPtr
+			MOVE.L	A3,OldBufPtr(A0)	; save value of BufPtr at enable time
+			SUBA.L	D0,A3				; <02Dec86> (BufPtr)-(configured cache size)
+		;; make data buffer on page boundary ???
+			MOVE.L	A3,D1
+			ANDI.L	#BufSiz-1,D1		; buffer on page boundary ???
+			MOVE.W	D1,LcFreeMemSize(A0); bytes unused
+			beq.s	@2					; yes
+			SUBA.L	D1,A3				; make it on page boundary
+										; yes, we waste some memory
+@2			MOVE.L	A3,BufStart(A0)		; start of data Buffers			<20Apr90>
+			MOVEQ	#log2Bsize,D1		;								<20Apr90>
+			LSR.L	D1,D0				; get number of buffers			<20Apr90>
+			MOVE.W	D0,TotalBufN(A0)	; save total number				<20Apr90>
+			MULU	#MCBHLength,D0		; size of CB headers			<20Apr90>
+			SUB.L	D0,A3				; allocate mem for headers		<20Apr90>
+			MOVE.L	A3,CBHdrStart(A0)	; remember it					<20Apr90>
+			BSR		clearMem			; header default to 0			<20Apr90>
+
+			MOVE.L	#fileHdrCnt,D0		; # of file headers				<20Apr90>
+			MULU	#FHlength,D0		; size of file Hdrs				<20Apr90>
+			ADD.W	#FreeQHlen,D0		; some bytes for freeQ record	<20Apr90>
+			ADD.W	#FQHlength,D0		; and some bytes for fileQ rec	<20Apr90>
+			SUB.L	D0,A3				; allocate mem for all three	<20Apr90>
+		;; final check against lower bound:								<21Dec90>
+			CMP.L	D2,A3				; do we have enough memory?		<21Dec90>
+			BLT		noMemdead			; can't get lower than D2		<21Dec90>
+
+@4			BSR		clearMem			; default to 0					<20Apr90>
+			MOVE.L	A3,BufPtr			; set new value of BufPtr
+			MOVE.L	A3,NewBufPtr(A0)	; remember it
+			MOVE.W	#19284,LcReserved1(A0)	; for debugging
+
+			lea		CacheInSub,A1		; <17APR90>
+			move.l	A1,D0				; <17APR90> Clean up the address
+			_StripAddress				; <17APR90>
+			MOVE.L 	D0,-(SP)			; <17APR90> pass routine address
+
+			BSR		SyncFSCall			; <02Dec86> synchronize with fs and call below
+	
+	IF NOT forROM THEN					;										<SM3> rb
+	
+			LEA		CacheStart,A0		; get beginning of resident code
+			LEA		EndResident,A1		; get end of resident code
+			SUB.L	A0,A1				; calculate size
+			_RecoverHandle				; recover handle to code (pointed to by A0)
+			MOVE.L	A1,D0				; put size in D0 for SetHandleSize
+			BRA		CutBack				; and slice away.
+			
+	ELSE								;	we are the ROM, this is no patch	<SM3> rb
+			RTS							;										<SM3> rb
+	ENDIF								;										<SM3> rb
+
+; The following code is executed while the file system is in a suspended state.
+; Input:	A0.L = ptr(cachevar)
+CacheInSub
+			ST		CurEnable(A0)		; mark enabled
+
+			BSR		Init700CacheQs		; init for new memory scheme			<20Apr90>
+			BSR		InstDHTable			; install device hash table				<04Aug90>
+			BSR 	InstCVect			; install the RAM cache vectors
+
+			MOVE.B	CacheConfig,CurConfig(A0) ; save configuration
+			CLR.L	CacheAge(A0)		; start age at 0 again (counts up)
+			CLR.B	CacheCom			; init Cache communication word
+
+	IF NewInit70 THEN					; <17Apr90>
+			BSET	#dontInstRC,CacheCom; don't do RamCacheInstall in the system file
+	ENDIF								; <17Apr90>
+
+			move.l	#minApplZone,CacheMinZn(a0) ; set initial min zone size 	<20Nov87>
+
+	IF	CacheDebug THEN
+			BSR 	CacheCheck			; see if we installed correctly
+	ENDIF
+
+			RTS
+
+;; Init code
+;_________________________________________________________________________________
+; Function: install device hash table -- bucket number = 1/8 buffer number
+; Input:	A0 - cache locals ptr
+; Output:	none, A0 preserved
+;
+; 04Jul90	KST		New today
+; 15Oct90	KST		Make minimum bucket to be 16. Allocate one more entry for the header
+;					so we can use logical AND to compute hash key.
+;_________________________________________________________________________________
+InstDHTable
+			MOVEM.L D0-D1/A0-A1,-(SP)	; free some regs
+			MOVEA.L	A0,A1				; A1 = ptr(cachevars)
+		;; allocate memory here for the free queue device hash table.
+			MOVEQ	#0,D0				; bucket = bufN/8
+			MOVE.W	TotalBufN(A1),D0	; buf number
+		
+		;; D0.L = number of buckets of the hash table, check bounds
+			LSR.L	#DevHTsize,D0		; bucket number = 1/8 buffer number
+			CMPI.L	#minDHTnum,D0		; >= 16?
+			BEQ.S	@sizeOK				; skip next 2 checkS
+			BHI.S	@3					; yes,
+			MOVE.L	#minDHTnum,D0		; or else, use minimum
+			BRA.S	@sizeOK				; skip next check
+@3			CMPI.L	#maxDHTnum,D0		; too big?
+			BLO.S	@5					; no
+			MOVE.L	#maxDHTnum,D0		; or else, use maximum
+			BRA.S	@sizeOK				; skip next check
+@5		;; need to make sure D0 is power of 2 for the key mask to work correctly.
+		;; we know D0 is 16 < D0 < 512, it has to be 32,64,128, or 256.
+			MOVEQ	#minDHTnum,D1		; start from minimum
+@7			LSL.W	#1,D1				; * 2
+			CMP.W	D1,D0				; <= D1?
+			BEQ.S	@11					; right on
+			BHI.S	@7					; D0 > D1, check next level
+		;; upperbound (D1) > D0 > lowerbound, max will be 512
+			MOVE.W	D1,D0				; use upper bound
+@sizeOK		MOVE.W	D0,D1				; save in D1 (WORD)
+@11			ADDQ.L	#1,D0				; one more entry for the hash table header 
+			LSL.L	#htEntryLog2,D0		; convert to bytes of the hash table
+		;; D0.L = byte size of the hash table (upper word = 0)
+			_NewPtr ,SYS,CLEAR			;	off system heap (it MUST not fail)
+			BNE.S	noMemdead			; something's wrong
+			MOVE.L	A0,LcDevHTPtr(A1)	; save it in cachevars
+
+;_____________________________________________________________________
+; Function:	initialize hash table
+; Input:	A0.L = ptr(hash table)
+;			D1.W = total number of buckets of the hash table excluding header
+; OutPut:	none, all other registers unchanged
+;_____________________________________________________________________
+;initHashTable
+			MOVE.L	D1,htReserved(A0)	; save for debugging only (as LONG)
+			SUBQ	#1,D1				; for Dbraing, also is the key mask
+			MOVE.W	D1,htKeyMask(A0)	; save bucket count-1 as mask (word)
+			CLR.W	htCount(A0)			; empty state
+			LEA		htStart(A0),A0		; table actually starts here
+@initHQloop
+			MOVE.L	A0,FLink(A0)		; init hash queue to 		<04May90>
+			MOVE.L	A0,BLink(A0)		;    point to itself		<04May90>
+			ADDA.L	#htEntrysize,A0		; points to next entry
+			DBRA	D1,@initHQloop
+			MOVEM.L (SP)+,D0-D1/A0-A1
+			RTS
+
+noMemdead	moveq.l	#dsMemFullErr, d0	; sys heap must screw up, so punt
+			_SysError
+
+;_________________________________________________________________________________
+;
+; Routine:		SyncFSCall
+;
+; Function: 	This routine is used to synchronize with the file system, disable it,
+;				call the passed routine, then reenable the file system.
+;
+; Arguments:	Routine address is on the stack.
+;
+; - get in at cmd done hook since file system busy is cleared before the
+;	completion routine takes over.
+;_________________________________________________________________________________
+
+SyncStkFrame RECORD {A6Link},DECR
+ParamTop	DS.W	1
+routine 	DS.L	1					; pointer to routine to call
+ParamSize	EQU 	ParamTop-*
+Return		DS.L	1
+A6Link		DS.L	1
+lclIOBlk	DS.B	ioHFQElSiz			; local i/o block
+LocalSize	EQU 	*
+			ENDR
+
+SyncFSCall								;<02Dec86>
+			WITH	SyncStkFrame
+			LINK	A6,#LocalSize
+
+			MOVE.L	CacheVars,A0		; get ptr to cache locals
+			LEA 	lclIOBlk(A6),A1 	; pass I/O block
+			MOVE.L	A1,CacheIOBlk(A0)	; this tells us when the call comes thru
+			MOVE.L	routine(A6),CacheRoutine(A0) ; also pass the routine to call
+			MOVE.L	ExtFSHook,SavedHook(A0) ; save CmdDone file system hook
+
+			LEA 	Intercept,A0		; <17APR90>
+			move.l	A0,D0				; <17APR90> Clean up the address
+			_StripAddress				; <17APR90>
+			MOVE.L	D0,ExtFSHook		; now install our own intercept at fs done
+
+			MOVE.L	A1,A0
+			MOVEQ  #(ioHFQElSiz/2-1),D0 ; DBRA word loop index
+@1			CLR.W	(A1)+				; ...cleared.
+			DBRA	D0,@1
+
+			_FSControl					; call FS synchronously
+
+			MOVE.L	CacheVars,A0		; get ptr to cache locals
+			MOVE.L	SavedHook(A0),ExtFSHook ; restore old hook
+
+			MOVEQ	#ParamSize,D0		; and exit
+			UNLK	A6
+			MOVE.L	(SP)+,A0			; get return address
+			ADD 	D0,SP				; strip parameters
+			JMP 	(A0)
+
+HookRegs	REG 	D0-D1/D3-D7/A0/A2-A6 ; save all but D2/A1
+
+Intercept	;; called in CmdDone to install RamCache	-- KST
+			MOVEM.L HookRegs,-(SP)			
+			MOVE.L	CacheVars,A0		; get ptr to cache locals
+			MOVE.L	FSQHead,A1			; A1 -> current request
+			CMP.L	CacheIOBlk(A0),A1	; is this our call?
+			BNE.S	@next
+
+			BSR.S	FlushAll			; <02Dec86> do a low-level flush
+										; clear old cache buffers
+			MOVE.L	CacheVars,A0		; get ptr to cache locals
+			MOVE.L	CacheRoutine(A0),A1 ; get routine
+			JSR 	(A1)				; call it, passing A0
+
+@next
+			MOVE.L	CacheVars,A0		; get ptr to cache locals
+			MOVE.L	SavedHook(A0),D2	; save CmdDone file system hook
+			MOVEM.L (SP)+,HookRegs		; restore regs
+			BLE.S	@1					; br if no other hook . . .
+			MOVE.L	D2,A1				;
+			JMP 	(A1)				; call it in turn
+@1
+			RTS
+
+			ENDWITH 					; SyncStkFrame
+
+;_________________________________________________________________________________
+;
+; Routine:		FlushAll
+;
+; Function: 	This routine is used flush out all cache buffers.  It is called
+;				before adding or deleting buffers, or installing or removing
+;				the RAM cache.	It must be called with the file system suspended
+;				since it uses the file system’s A6 stack.
+;
+; Arguments:	None.
+;
+; NOTE: 		This flush needs to work regardless of which cache is currently
+;				installed.	It may not use a FlushVolume call since the file system
+;				is currently suspended.
+;
+;_________________________________________________________________________________
+
+vFlushCache
+			MOVE.L	jFlushCache,-(SP)	; always go thru vector
+			RTS
+
+FlushAll								;<02Dec86>
+			MOVEM.L AllRegs,-(SP)
+			CLR.B	FSCallAsync 		; do it sync!
+			MOVEA.L HFSStkTop,A6		; Set up A6 for use as stack pointer
+			MOVE.L	VCBQHdr+QHead,D0	; zip thru all VCBs
+
+@loop
+			BEQ.S	@exit				; exit if no more VCBs.
+			MOVE.L	D0,A2				; VCB ptr
+			BSR.S	FlushOne			; flush it
+			MOVE.L	QLink(A2),D0		; advance to next VCB
+			BRA.S	@loop				; go check this one
+@exit
+			MOVEM.L (SP)+,AllRegs
+			RTS
+
+FlushOne
+			MOVEQ	#0,D1				; Clear options byte (we’ll trash later)
+			ST		CacheFlag			; Yes, REALLY flush . . .
+
+			MOVE.L	SysBMCPtr,A1		; System-wide bitmap cache pointer
+			MOVE.W	VCBVRefNum(A2),D0	; Volume refnum
+			BSR.S	vFlushCache 		; A2=VCB ptr
+
+			MOVE.L	SysCtlCPtr,A1		; System-wide control cache pointer
+			MOVE.W	VCBVRefNum(A2),D0	; Volume refnum
+			BSR.S	vFlushCache 		; A2=VCB ptr
+
+			MOVE.L	SysVolCPtr,A1		; System-wide volume cache pointer
+			MOVE.W	VCBVRefNum(A2),D0	; Volume refnum
+			BSR.S	vFlushCache 		; A2=VCB ptr
+			RTS
+
+;_________________________________________________________________________________
+;
+; Routine:		AdjByteLim
+;
+; Arguments:	A0 (in ) -- cache locals ptr
+;
+; Function: 	Sets up CacheByteLim(A0).
+;
+; 128K cache has about 256 buffers.  Caching 8 block requests seems to work fine here,
+; so, 256/8=32.  We divide buffer count by 32 then multiply by 512 to get byte count:
+; equivalent to just a x16 multiply.
+;
+;							Buffers 			Max Size Cached
+;	cache size	32K 		60					960 - 1 block
+;				64K 		120 				1920 - 3 blocks
+;				128K		240 				3840 - 7 blocks
+;				256K		481 				7696 - 15 blocks
+;				384K		721 				11536 - 22 blocks
+;				512K		962 				15392 - 30 blocks
+;				768K		1443				23088 - 45 blocks
+;
+; It might be better to have some limit on this since the cache is not set up
+; yet to efficiently handle very large requests . . .
+;_________________________________________________________________________________
+
+AdjByteLim
+			MOVEM.L A1/D0,-(SP) 		; save all regs
+
+			MOVE.L	FreeQHdr,A1
+			MOVEQ	#0,D0
+			MOVE.W	TotalBufCnt(A1),D0	; get cache size in buffers
+			SUBQ.W	#1,D0				; 7.0 has more buffers than 6.0
+			LSL.L	#4,D0				; X16 = max byte size to cache
+			MOVE.L	D0,CacheByteLim(A0) ; set limit on size of request to cache
+
+			MOVEM.L (SP)+,A1/D0
+			RTS
+
+;_________________________________________________________________________________
+;
+; InstCVect subroutine.
+;
+; Function: 	Installs 8 cache routines by replacement of appropriate
+;				trap vectors.
+;
+; Input:		A0 - cache locals ptr
+; Output:		none
+;_________________________________________________________________________________
+
+InstTbl
+			DC.W	FlushCache-InstTbl
+			DC.W	GetBlock-InstTbl
+			DC.W	MarkBlock-InstTbl
+			DC.W	RelBlock-InstTbl
+			DC.W	TBStartSearch-InstTbl
+			DC.W	TrashVBlks-InstTbl
+			DC.W	CacheWrIP-InstTbl
+			DC.W	CacheRdIP-InstTbl
+
+InstCVect
+			MOVEM.L D0-D1/A1-A4,-(SP)	; preserve all regs
+			LEA 	InstTbl,A3			; get base address
+			MOVE.L	A3,A4				; save it
+			LEA 	jFlushCache,A2		; first vector address
+			MOVEQ	#CacheVCnt-1,D0 	; set up loop count
+
+@1
+			MOVE.W	(A3)+,D1			; get next offset
+			EXT.L	D1					; extend it
+			ADD.L	A4,D1				; add base address
+			MOVE.L	D1,(A2)+			; install the new routine
+			DBRA	D0,@1
+
+			MOVEM.L (SP)+,D0-D1/A1-A4	; restore regs
+			RTS 						; return
+
+			_AssumeEq  jFlushCache+4,jGetBlock
+			_AssumeEq  jGetBlock+4,jMarkBlock
+			_AssumeEq  jMarkBlock+4,jRelBlock
+			_AssumeEq  jRelBlock+4,jTrashBlocks
+			_AssumeEq  jTrashBlocks+4,jTrashVBlks
+			_AssumeEq  jTrashVBlks+4,jCacheWrIP
+			_AssumeEq  jCacheWrIP+4,jCacheRdIP
+
+;_____________________________________________________________________
+; Function:	clear memory in a fast way
+; Input:	A3.L = ptr(buffer)		D0.L = size
+; OutPut:	none, all registers unchanged
+;_____________________________________________________________________
+clearMem	MOVEM.L	A3/D0-D2,-(SP)
+			MOVE.L	D0,D1
+			BEQ.S	@6					; 0 bytes
+			LSR.L	#2,D0				; D0 = # of long words			<18Sep90>
+			BEQ.S	@4					; < 4 bytes
+			MOVE.L	D0,D2				; D2 = # of long words
+			LSL.L	#2,D2				; *4 = # of bytes				<18Sep90>
+			SUB.L	D2,D1				; D1 = bytes left
+			SUBQ	#1,D0				; for DBRing
+@1			CLR.L	(A3)+
+			DBRA	D0,@1
+
+			BRA.S	@4					; D1 will decrement first
+@3			CLR.B	(A3)+
+@4			DBRA	D1,@3
+@6			MOVEM.L	(SP)+,A3/D0-D2
+			RTS
+
+;_________________________________________________________________________________
+; Routine:	Init700CacheQs
+; Function: This routine initializes the File and Free queues.
+;			The old cache space are released !!
+; Input:	A0.L = Ptr to cache locals.
+; Output:	none
+; Modification history:
+;	20Apr90		KST		New Today
+;_________________________________________________________________________________
+Init700CacheQs
+			MOVEM.L D0-D3/A0-A4,-(SP)	; save all regs
+			MOVEA.L	A0,A1				; A1 = ptr(cachevars)
+
+		;; release ROM cache memory. Check for interrupt
+			MOVE.W	SR,D0				; can't release memory if called from interrupt
+			ANDI.W	#$0700,D0			; interrupt masked?			<31Oct90>
+			BEQ.S	@0					; no, it's not
+		;;	_DEBUGGER					; interrupt masked
+
+@dead		moveq.l	#dsMemFullErr, d0	; sys heap must screw up, so punt
+			_SysError
+
+@0
+			MOVEA.L	FileQHdr,A0 		; free data cache
+			_disposePtr
+			MOVEA.L	FreeQHdr,A0 		; free BitMap buffer
+			_disposePtr
+			MOVEA.L	SysCtlCPtr,A0		; free control cache
+			_disposePtr
+
+		;; initialize free queue header ...
+			MOVEA.L	NewBufPtr(A1),A0	; start of freeQ Hdr
+			MOVE.L	A0,FreeQHdr			; save it in the right place
+			MOVE.L	A0,FreeQFlink(A0)	; and initialize it
+			MOVE.L	A0,FreeQBlink(A0)
+			CLR.L	FreeQBufCnt(A0) 	; clear FreeQBufCnt and TotalBufCnt
+			_AssumeEq  FreeQBufCnt+2,TotalBufCnt
+			
+		;; initialize file queue header ...
+			LEA		FreeQHlen(A0),A0	; go to fileQ Hdr
+			MOVE.L	A0,FileQHdr			; save it in the right place
+			MOVE.L	A0,FQHFlink(A0)		; and initialize it too
+			MOVE.L	A0,FQHBlink(A0)
+			CLR.L	FQHFileCnt(A0)		; clear FQHFileCnt and FQHExtra
+			_AssumeEq  FQHFileCnt+2,FQHExtra
+
+										; init file queue headers (FHxxx)
+			LEA		FQHlength(A0),A4	; go to file Hdr buffer
+			MOVEQ	#fileHdrCnt-1,D2	; init loop count for file headers
+@initFQloop	
+			BSR 	EQElement			; enqueue A4 element in A0 file queue
+			LEA 	FHMQHFlink(A4),A3
+			MOVE.L	A3,MQHFlink(A3)
+			MOVE.L	A3,MQHBlink(A3)
+			LEA 	FHDQHFLink(A4),A3
+			MOVE.L	A3,DQHFLink(A3)
+			MOVE.L	A3,DQHBLink(A3)
+			ADDA.L	#FHlength,A4		; move to the next header
+			ADDQ.W	#1,FQHFileCnt(A0)	; bump header count
+			DBRA	D2,@initFQloop
+	IF ktDebugCache THEN
+			MOVEA.L	CBHdrStart(A1),A3
+			MOVEQ	#1,D3				; note where are we coming from
+			BSR.S	ckMemQueue			; so far so good
+	ENDIF
+
+			MOVEA.L	FreeQHdr,A0
+			MOVE.L	BufStart(A1),A3		; start of data Buffers
+			MOVEA.L	CBHdrStart(A1),A4	; CB header
+			MOVE.W	TotalBufN(A1),D2	; # of cache buffers
+			SUBQ	#1,D2				; for DBRing
+@initBQloop								; init buffer headers
+			BSR 	EQElement			; enqueue A4 element in A0 free queue
+			MOVE.L	A3,MCBDataPtr(A4)	; link data buffer w/ header
+			BSET	#emptyBit,MCBFlags(A4) ; mark it empty
+			CLR.L	MCBAge(A4)			; clear age since it's not in DHT	<02Aug90>
+			MOVE.L	A0,MCBFQPtr(A4) 	; put in back pointer
+
+		;; init hash queue pointers: (buffer is not in the hash)	<04May90>
+			LEA 	MCBHashqFlink(A4),A2; point to hash queue		<04May90>
+			MOVE.L	A2,FLink(A2)		; init hash queue to 		<04May90>
+			MOVE.L	A2,BLink(A2)		; point to itself			<04May90>
+		
+		;; init disk-ordered queue pointers:
+			LEA 	MCBDQFlink(A4),A2	; point to disk-ordered queue
+			MOVE.L	A2,FLink(A2)		; init disk-ordered queue header to 
+			MOVE.L	A2,BLink(A2)		; point to itself
+
+			ADDQ	#1,FreeQBufCnt(A0)	; incr number of buffers in free queue
+			ADDQ	#1,TotalBufCnt(A0)	; incr total number of buffers
+			ADDA	#BufSiz,A3			; next data buf
+			ADDA	#MCBHLength,A4		; next CBhdr
+			DBRA	D2,@initBQloop
+
+	IF ktDebugCache THEN
+			MOVE.W	TotalBufCnt(A0),D1
+			MOVE.L	BufStart(A1),A3
+			MOVEQ	#2,D3				; note where are we coming from
+			BSR.S	ckMemQueue
+	ENDIF
+
+			MOVEM.L (SP)+,D0-D3/A0-A4	; restore regs
+			JMP		AdjByteLim			; readjust size limit for multi-block caching
+
+
+	IF ktDebugCache THEN			; this should deleted in the future
+;_________________________________________________________________________________
+; Routine:		ckMemQueue
+; Function: 	This routine verifies cache queue at INIT time.
+; Input:		A1.L = Ptr to cache locals.		D3.W = flag
+;				if D3 = 2 then D1.W = total number of buffers in free queue
+;				A3.L = someone's ceiling,		A4.L = someone's floor
+;_________________________________________________________________________________
+ckMemQueue
+			MOVEA.L	CacheVars,A0
+			CMPA.L	A0,A1				; A1 should = CacheVars
+			BNE.S	@debugErr
+			CMP.W	#2,D3				; check number of buffers?
+			BNE.S	@no					; no
+			CMP.W	TotalBufN(A1),D1	; total count match?
+			BNE.S	@debugErr			; no
+@no			CMPA.L	A3,A4
+			BEQ.S	@debugNoErr
+
+@debugErr	_debugger
+@debugNoErr
+			RTS
+
+	ENDIF		;; end IF ktDebugCache
+
+			END
+

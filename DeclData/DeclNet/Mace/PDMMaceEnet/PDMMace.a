@@ -1,0 +1,1715 @@
+;
+;	File:		PDMMace.a
+;
+;	Contains:	routines to support MACE when coupled with a AMIC-style DMA model
+;
+;	Written by:	Sean Findley, Mark A. Law, Gary Rensberger
+;
+;	Copyright:	© 1990-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM25>	 10/6/93	RC		Took out PDM EVT1 support
+;	  <SM24>	 9/20/93	GMR		Fixed a bug where we might count a xmit frame twice, if we got
+;									an underflow interrupt in the middle of transmission.
+;	  <SM23>	  9/9/93	pdw		Changed installation of MACE int to maceVector in
+;									DMADispatchGlobals instead of ddMACEÉ.
+;	  <SMG3>	  9/2/93	chp		Change MaceVarPtr from DC.L 1 to DC.L 0 so that the MACE
+;									variables are initialized to Ònone.Ó
+;	  <SMG2>	 8/30/93	chp		InterruptHandlers.a now supports MACE interrupts on PDM.
+;									Modified the MACEInterrupt exception handler to run as a
+;									subroutine to the system interrupt dispatcher, so deferred tasks
+;									can now run following a MACE interrupt. Modified MACE and Enet
+;									DMA interrupt routines to save and restore only those registers
+;									not saved by the interrupt dispatcher. Modified the install code
+;									to install interrupt handlers into the AMIC dispatch table
+;									rather than AutoInt3, and to do so directly rather than calling
+;									_DMAIntInstall.
+;	  <SM21>	 8/20/93	GMR		Added AMIC4 support (don't apply AMIC headPtr hack if on AMIC4).
+;	  <SM20>	  8/4/93	GMR		Fixed a bug that caused the xmit routine to count a packet as
+;									going out, but which didn't go out because of a bad length.
+;	  <SM19>	  7/1/93	GMR		Backed out a couple of the changes in <SM18> which were
+;									unnecessary; the branch to the wrong label was the only change
+;									needed to fix the problem.
+;	  <SM18>	  7/1/93	pdw		Fixed the "Blowed up after Macsbug" bug which was due to not
+;									handling MACE Overflow problems correctly which were due to AMIC
+;									overflows caused by the deferred task processing of packets
+;									which was not happening because Macsbug turns off the Deferred
+;									Task Manager which was...  It was late one night... Actually we
+;									just moved the @done label up one line.
+;	  <SM17>	 6/28/93	GMR		Made receive handling use deferred tasks now, instead of
+;									processing at level 4.
+;	  <SM16>	 6/10/93	GMR		Fixed a couple bugs (found by test tool) in the level 3 Mace
+;									handler, and in handling transmit completions.
+;	  <SM15>	  6/8/93	GMR		Added support for EVT1. Temporarily fixed privilage violation
+;									when running VM; the level 3 handler installation really needs
+;									support from Inthandlers.a.
+;	  <SM14>	  6/3/93	GMR		Remove debugger on receive overflow.
+;	  <SM13>	  6/2/93	GMR		Now, defer transmits until we get a MACE interrupt indicating
+;									the previous packet went out.
+;	  <SM12>	  6/2/93	GMR		Rewrote the interrupt handlers and cleaned up parts of the code.
+;	  <SM11>	  6/1/93	dwc		Fix init code, add code to wait for MACE transmit status valid
+;									to work around MACE's not returning it in a timely manner.
+;	  <SM10>	 5/27/93	dwc		Added work-around code to wait for AMIC to finish writing a
+;									packet into the receive DMA buffer before handling it.
+;	   <SM9>	 5/25/93	dwc		Cleaned uo for Alpha.  Removed some more debug code and hardware
+;									patches.  Added simple work around for AMICs' incrementing the
+;									head pointer before it has finished writing the packet into the
+;									DMA buffer.  This is a kluge, but it is the fastest one I
+;									tried, and throws away the fewest packets.
+;	   <SM8>	  5/4/93	dwc		Added debug code to work around AMIC's returning  FF's on the
+;									first read.  Added test for EVT1/EVT2.
+;	   <SM7>	  4/6/93	dwc		Updated for level #4 DMA interrupts.
+;	   <SM6>	 3/24/93	dwc		Remove obsolete code and added code to try to recover from
+;									lowered interrupt level during packet handling.
+;	   <SM5>	  3/5/93	dwc		Removed some more debugging and obsolete code and comments.
+;	   <SM3>	 2/25/93	dwc		Enabled receive, removed some debug code and obsolete routines.
+;	   <SM2>	 2/24/93	dwc		Cleaned up transmit, disabled receive for PDM D5 ROM build.
+;				11/30/92	dwc		Moved INTLockOut, DMALockOut to PDMMaceEqu.a.
+;				11/20/92	dwc		Convert to PDM.
+;
+;	To Do:		Look into AMIC not properly detecting receive overflow (head continues to wrap past
+;				the tail without error).
+;
+;	Notes:		This version supports EVT2 and later machines.
+;
+;
+
+
+
+			PRINT		OFF
+			INCLUDE 	'SysEqu.a'						; System definitions
+			INCLUDE 	'SysErr.a'						; System errors
+			INCLUDE 	'Traps.a'						; Traps definitions
+			INCLUDE		'GestaltEqu.a'
+			INCLUDE		'InternalOnlyEqu.a'				; lowmem globals
+			INCLUDE		'HardwarePrivateEqu.a'
+			INCLUDE		'UniversalEqu.a'				; lowmem global records
+			INCLUDE 	'ATalkMacros.a' 				; Nifty Macros
+			INCLUDE		'SysPrivateEqu.a'				; ExpandMem defs
+
+; Conditional compile equates
+BUFDEBUG		EQU			0
+DEBUG			EQU			0
+PROM			EQU			0
+Logging			EQU			1
+SUPPORTS_OLD_HW EQU			1
+USEDEFERREDTASK	EQU			1
+
+
+			PRINT		NOGEN,NOMDIR,ON
+			INCLUDE 	'PDMMaceEqu.a' 					; Mace definitions
+			INCLUDE 	'AMICEqu.a' 					; AMIC definitions
+			INCLUDE 	'ENETEqu.a' 					; Driver definitions
+			INCLUDE 	'SNMPLAP.a' 					; SNMP definitions
+			EJECT
+
+
+
+
+;_______________________________________ 
+;
+; Misc definitions
+;_______________________________________
+
+OneWdsSz	EQU 		8								; single fragment wds size
+INTLockOut	EQU 		$0700							; SR value to disable ALL interrupts
+DMALockOut	EQU 		$0400							; SR value to disable AMIC DMA interrupts
+NeedDefer	EQU			5								; bit indicates VM is running
+
+MACERevA2	EQU			$0941
+MACERevB0	EQU			$0940
+
+MAX_STAT_PEND	EQU		1
+
+
+MaceVars	RECORD		0								; our variables
+MACEmem			DS.l	1								; ptr to memory block with recv & xmit buffers
+MACEmemSz		DS.l	1								; need size if need to free it 
+XmitBuffMem		DS.l	1								; xmit buffer mem 
+DMAPacketPtr	DS.l	1								; ptr to active receive packet in DMA buffer
+MACEBase		DS.l	1								; MACE base address
+AMICDMABase		DS.l	1								; AMIC DMA base address
+DTQE	  		DS.b	dtQElSize						; Deferred task queue element
+MACEChipID  	DS.w	1								; MACE revision
+		ALIGN 4
+
+; ¥¥¥ parms saved from MaceInit call
+RcvRtn		DS.l		1								; users recv rtn
+RcvParm		DS.l		1								; users recv rtn parm
+XmtDnRtn	DS.l		1								; users xmit completion rtn
+XmtDnParm	DS.l		1								; users xmit completion rtn parm
+MCfg		DS.l		1								; ptr to MACE config record
+Dot3StatPtr	DS.l		1								; ptr to 802.3 statistics counters
+LAPMIBStatPtr DS.l		1								; ptr to LAP MIB statistics counters
+OurAddrPtr	DS.l		1								; ptr to ethernet address
+MemMove		DS.l		1								; ptr to fast memory move rtn
+; ¥¥¥ end parms
+
+DeferFlag	ds.b		1								; bit 0 = deferred task installed.
+XmitPend	ds.b		1								; <> 0 = # xmits pending
+XmitStat	ds.b		1								; <> 0 = # xmit status's pending from mace
+	
+	IF SUPPORTS_OLD_HW THEN
+BoardFlag	ds.b		1								; 00 = AMIC1-3
+														; 01 = AMIC4
+	ENDIF														
+
+		ALIGN 4
+DMABufStart	DS.l		1								; logical addr of start of DMA recv buffer
+TxBuffPtr0	DS.l		1								; logical addr of start of DMA xmit buffer0
+TxBuffPtr1	DS.l		1								; logical addr of start of DMA xmit buffer1
+
+XmitRegSet	ds.w		1								; 0 or 1
+ByteCount	ds.w		1								; bytes in current xmit packet 
+			
+COLLCnt		DS.l		1								; recv frames with collision error 
+
+	; Transmit Frame Status Register counters
+XmtStatINV	DS.l		1								; xmit ints with xmit status invalid
+XmtLCOL		DS.l		1								; late collision
+XmtRTRYCnt	DS.l		1								; total number of retries
+
+	; Interrupt Register counter
+RCVCOCnt	DS.l		1								; *256 to get # collisions on net
+MPCOCnt		DS.l		1								; *256 to get # of missed packets due to
+														; RcvOFLO, receiver disabled, or excessive
+														; receive frame count (RcvFC)
+
+LogAddrFltr DS.b		8								; Copy of MACE Logical Address Filter
+														;  bit order 63-56, 55-48, ... 7-0
+LAFHashTbl	DS.b		64 								; Tbl of counts of number multicasts addresses
+
+RcvBuffer	ds.b		6*256		 					; Receive buffer (transfered to from DMA buffer)
+
+	IF Logging THEN
+LogPtr		ds.l		1
+LogEndPtr	ds.l		1								; ptr to end of log
+LogStart	ds.l		512*4							; room for 512 log entries
+LogEnd		
+	ENDIF
+
+MaceVarSz	EQU 		*								; End of variables
+			ENDR
+
+
+;-----------------------------------------------------------------
+;		Receive Buffer template
+;		-ensure 1st one is quad-aligned and all the rest will be
+;-----------------------------------------------------------------
+RecvBuff 	Record		0
+MaceStat 	DS.b		4								; Recv'd pkt status from Mace
+			DS.b		4								;  Garbage bytes
+Packet		DS.b		Max_Pkt_Size					; packet data area
+			EndR
+			
+			
+			
+
+			EJECT
+
+			STRING		PASCAL
+			MACHINE 	MC68020
+
+MaceData	PROC
+			ENTRY		MaceVarPtr
+MaceVarPtr	DC.L		0								; Contains ptr to my variables
+			ENDP
+
+
+			
+
+;________________________________________________________________________
+;
+; ResetMACE - Reset AMIC & MACE FIFOs and disable recv & xmit paths and reset MACE
+;
+;	Call:	A2 - drvr vars
+;
+;	Return: none
+;
+;	Destroys:	A1,D0,D1
+;
+;________________________________________________________________________
+
+ResetMACE	PROC	EXPORT		
+			WITH	MACERegs,MaceVars
+
+; reset & disable MACE -> AMIC receive path
+			MoveA.l		MACEBase(A2), A0				; A0-> base address of MACE regs
+			MoveA.l		AMICDMABase(A2), A1				; A1-> base address of AMIC regs
+
+			Move.b		#0, MACE_MAC_CNFG(A0)			; Disable MACE recv, xmit, et. al.
+			nop
+			Move.b		MACE_FIFO_CNFG(A0), D0			; Get current FIFO config
+			OrI.b		#(1<<RCVFWR), D0				; Keep current FIFO's watermarks
+			Move.b		D0, MACE_FIFO_CNFG(A0)			; Reset MACE recv FIFO
+			nop
+	
+			Move.b		#(1<<DMARST), AMIC_DMA_RECV_CNTL(A1) 
+			nop												; Allow it to complete
+			Move.b		#(1<<DMAIF), AMIC_DMA_RECV_CNTL(A1) ; Clear interrupt flag
+			nop												; Allow it to complete
+			Move.b		#(1<<DMARST), AMIC_DMA_XMIT_CNTL(A1) ; Reset xmit chnl
+			nop												; Allow it to complete
+			Move.b		#(1<<DMAIF), AMIC_DMA_XMIT_CNTL(A1) ; Clear interrupt flag
+			nop												; Allow it to complete
+
+
+			Move.b		MACE_FIFO_CNFG(A0), D0			; Get current FIFO config
+			OrI.b		#(1<<XMTFWR), D0				; Keep current FIFO's watermarks
+			Move.b		D0, MACE_FIFO_CNFG(A0)			; Reset MACE xmit FIFO
+			nop
+; Reset MACE 
+			Move.b		#(1<<MACERESET), MACE_BIU_CNFG(A0) ; reset MACE
+			nop
+@wait		Move.b		MACE_BIU_CNFG(A0), D0
+			BTst		#MACERESET, D0
+			Bne.s		@wait							; loop until reset complete
+			
+			Move.b		#0, MACE_MAC_CNFG(A0)			; make sure MACE disabled
+			nop
+			Move.b		#MaceIntMask, MACE_INT_MSK(A0) 	; Disable all MACE ints.
+			nop
+			
+			Rts
+			
+			ENDP
+			EJECT
+
+;________________________________________________________________________
+;
+; FreeMACEMem - free all memory
+;
+;	Call:	A2 - our globals
+;
+;	Return: none
+;
+;	Destroys:	A0
+;
+;________________________________________________________________________
+
+FreeMACEMem	PROC		
+
+			IMPORT	FreeMemory
+			WITH	MaceVars
+
+			Tst.l 		MaceVarPtr						; Mace var pointer
+			Beq.s		@57 							; no mem allocated
+
+			Move.l		#0, -(SP)						; size not needed
+			Move.l		A2, -(SP)						; ptr to mem to free
+			Move		#0, -(SP) 						; no options
+			Lea			FreeMemory, A0
+			Jsr			(A0)							; free MACE var memory
+			Lea			10(SP), SP						; strip parms
+			Lea			MaceVarPtr, A0
+			Clr.l		(A0)							; Clear MaceVarPtr contents
+@57			
+			Rts
+			
+			ENDWITH
+			ENDP
+			EJECT
+
+
+;________________________________________________________________________
+;
+; MACEHalt - HALT the MACE, remove interrupt handlers, free all memory
+;
+;	Call:	none
+;
+;	Return: none
+;
+;	Destroys:	A1,D0,D1
+;
+;________________________________________________________________________
+
+MACEHalt	PROC	EXPORT		
+
+			WITH	MACERegs,MaceVars
+
+			Move.l		A2, -(SP)						; save regs
+			MoveA.l 	MaceVarPtr, A2					; Get ptr to my vars
+			
+			Move		SR,-(SP)            			; Save interrupt mask level
+			OrI			#DMALockOut, SR					; Disable DMA ints.
+
+			Bsr			ResetMACE
+
+			Move.l		AMICDMABase(A2), A1					; Base address of AMIC
+			Move.b		#(1<<DMAIF), AMIC_DMA_XMIT_CNTL(A1) ; Clear IF & disable xmit DMA
+			nop												; Allow it to complete
+			Move.b		#(1<<DMAIF), AMIC_DMA_RECV_CNTL(A1) ; Clear IF & disable xmit DMA
+			nop												; Allow it to complete
+			
+			MoveA.l		MACEBase(A2), A3
+			Move.b		#MaceIntMask, MACE_INT_MSK(A3)	; Disable all MACE interrupts
+			nop											; Allow it to complete
+
+			
+			OrI			#INTLockOut, SR					; Disable ALL ints.
+
+	IF USEDEFERREDTASK THEN
+			bclr.b		#0,DeferFlag(A2)				; is Deferred Task installed?
+			Beq.s		@nodq							; nope
+		IF DEBUG THEN
+			_Debugger
+		ENDIF
+			Lea			DTQE(A2), A0					; get ptr to queue entry
+			LEA			DTQueue, A1						; get ptr to queue
+			_Dequeue									; remove from deferred task queue
+
+@nodq
+	ENDIF
+		
+			Move		(SP)+, SR            			; Restore SR
+
+; Free MACE buffer and var memory
+; ¥¥¥¥
+; ¥¥¥¥ WARNING: upper layer handlers better be done with packets cause we're
+; ¥¥¥¥			freeing the mem the packets are in!
+; ¥¥¥¥
+			Bsr			FreeMACEMem						; Free, and unlock if needed, all mem blks
+			
+			Move.l		(SP)+, A2						; restore regs
+			Rts
+			
+			ENDP
+			EJECT
+
+
+;________________________________________________________________________
+;
+; NormAddr - convert IEEE address to normal format
+;
+;	Call:	D0 bit-inverted address byte from Address Prom
+;
+;	Return: D0 bit-inverted address byte
+;
+;	Destroys:	D1
+;
+;________________________________________________________________________
+
+NormAddr	PROC		EXPORT
+			MoveM.l 	D2,-(SP)
+			Clr.b		D1
+			MoveQ		#7,D2
+@loop
+			Lsl.b		#1,D1							; get ready for next bit
+			Lsr.b		#1,D0							; get a bit from source
+			Bcc.s		@lb 							; non there
+			AddQ.b		#1,D1
+@lb
+			DBra		D2,@loop
+			Move.b		D1,D0							; D0=converted value
+			MoveM.l 	(SP)+,D2
+			Rts
+			
+			ENDP
+			EJECT
+
+;________________________________________________________________________
+;
+; DoCRC - compute Ethernet CRC on address field
+;
+;   Call:
+;       	D1 = first two bytes of address
+;       	D3 = last four bytes of address
+;
+;   Return:
+;			D0 = 6 bit hash into Logical Address Filter
+;
+;	Uses:	D0,D1
+;
+; The CRC-32 of a sequence of bits views that sequence as the co-efficients of a (long!)
+; polynomial.  This polynomial is multiplied by x^32, then divided by the CRC polynomial
+; x^32 + x^26 + x^23 + x^22 + x^16 + x^12 + x^11 + x^10 + x^8 + x^7 + x^5 + x^4 + x^2 +x+1.
+; It is the remainder of this division (of degree <= x^31), considered as a 32 bit sequence,
+; that is the CRC.  In the calculation, the initial value of the "remainder" is all 1's.
+;
+;________________________________________________________________________
+
+CRCPoly 	EQU 		%00000100110000010001110110110111 
+														; Co-efficients after a shift left
+
+DoCRC   	PROC
+			Move.l		D2, -(SP)
+			MoveQ   	#-1,D2      					; D2 = current value of CRC
+			Bsr.s   	@10     						; Compute over D1, address bits 47-32
+			Move.l  	D3,D1   						; D1 = rest to do
+			Swap		D1      						; Get high word of D3 into D1
+			Bsr.s   	@10     						; Compute over D1, address bits 31-16
+			Swap		D1      						; Get low word of D3 into D1
+			Bsr.s   	@10     						; Compute over D1, address bits 15-0
+
+			And 		#%111111, D2     				; Get six hash bits in low byte
+			
+			Move		D2, D0   						
+			Bsr			NormAddr						; D0 = bit inverted hash
+			Lsr.b		#2, D0							; Move 6 msb's to 6 lsb's
+			Move.l		(SP)+, D2
+			Rts											; Exit DoCRC
+			
+;
+; Accumulate the CRC over the low 16 bits of D1 (starting with high byte bit 0!)
+;
+@10 		MoveQ   	#16,D0      					; D0 = no. of bits to do
+			Ror 		#8,D1   						; Do high byte first
+@15 		Lsl.L   	#1,D2   						; Shift CRC, clear low bit, old hi bit in C
+;
+; If (CRC-hi-bit XOR D1-current-bit) = 1, we complement bits specified by the CRC polynomial
+; (this is the equivalent of a subtract operation in the long division process, I think)
+;
+			Bcc.s   	@30     						; Branch if CRC hi bit clear
+			Ror 		#1,D1   						; Shift D1, low bit in C
+			Bcs.s   	@50     						; (1 XOR 1) = 0: don't compl; low bit = 0
+			Bra.s   	@40     						; Go complement
+
+@30 		Ror 		#1,D1   						; Shift D1, high bit in C
+			Bcc.s   	@50     						; (0 XOR 0) = 0: don't compl; low bit = 0
+@40 		Eor.l   	#CRCPoly,D2     				; Complement some bits; set low bit
+@50 		SubQ		#1,D0   						; Decrement count of bits to do
+			Bne.s   	@15     						; Do all 16 bits
+			Rts 										; That's it if done them all
+			
+			ENDP
+			EJECT
+
+;________________________________________________________________________
+;
+; WriteLAF - update MACE Logical Address Filter (LAF) from copy in drvr globals
+;
+;	Call:
+;			A2 -> my variables
+;
+;	Return:
+;			none	
+;
+;	Uses:
+;			A1, D0
+;
+;	The LAF can not be updated while MACE recv is enabled.   Disable MACE pkt
+;	reception.  If frames in MACE Recv FIFO, reset MACE Recv FIFO (possible pkt 
+;	loss), flush AMIC recv FIFO, and reprime affected DMA Reg. Set.  Finally,
+;	update the LAF.
+;________________________________________________________________________
+
+WriteLAF	PROC
+			WITH		MACERegs,MaceVars
+			MoveA.l		MACEBase(A2), A1
+
+			Move.b		MACE_MAC_CNFG(A1), -(SP)		; Save current config 
+
+			Move.b		#(1<<ADDRCHG), MACE_ADDR_CNFG(A1) ; Set address change bit
+			nop
+@wait1		Move.b		MACE_ADDR_CNFG(A1), D0			; wait for MACE to clear it
+			BTst		#ADDRCHG, D0
+			Bne.s		@wait1
+
+			Lea			LogAddrFltr(A2), A0				; A0-> copy of logical address filter
+			Move.b		#(1<<LOGADDR), MACE_ADDR_CNFG(A1) ; Select logical address
+			nop
+			MoveQ		#7, D0
+@laf		Move.b		(A0,D0.w), MACE_LOG_ADDR(A1) 	; Set appropriate bits in Log. Addr Filter
+			nop
+			DBra		D0, @laf
+
+			Move.b		(SP)+, MACE_MAC_CNFG(A1) 		; restore MACE mac config
+			nop
+			RTS
+			
+			ENDP
+			EJECT
+
+;___________________________________________________________________________
+;
+; MaceAddMulti - add a multicast address to the list
+;
+;	Call:
+;			D1 = first two bytes of address
+;			D3 = last four bytes of address
+;
+;	Return:
+;			none
+;
+; 	Computes the hash for this multicast address and increments hash count in 
+;	the Logical Address Filter (LAF) Table.  If hash count now = 1, sets
+;	appropriate bit in the MACE LAF.
+;___________________________________________________________________________
+
+MaceAddMulti	PROC	EXPORT
+			WITH		MACERegs,MaceVars
+			
+			Move.l		A2, -(SP)						; Save used C regs
+			MoveA.l 	MaceVarPtr, A2					; Get ptr to my vars
+
+			Bsr		   	DoCRC   						; D0-> 6 bit hash into LAF
+			AddQ.b		#1, (LAFHashTbl,A2,D0)			; Inc. # of multi's with this hash
+			CmpI.b		#1, (LAFHashTbl,A2,D0)			; Multiaddr hash bit already in LAF?
+			Bhi 		@bye							; yes, do nothing
+
+			Lea			LogAddrFltr(A2), A0				; A0-> copy of log. addr. filter
+			Cmp.b		#31, D0							; Hash > 31?
+			Bhi.s		@b63to32						; yes
+			Move.l		4(A0), D1						; no, get LAF bits 31-0
+			BSet.l		D0, D1							; Is this hash bit already set?
+			Bne			@bye							; yes, nothing to do
+			Move.l		D1, 4(A0)						; Save modified LAF bits 31-0
+			Bra.s		@doit
+		
+@b63to32	Sub.b		#32, D0							; Convert hash for use on LAF bits 63-32
+			Move.l		(A0), D1						; Get LAF bits 63-32
+			BSet.l		D0, D1							; Is this hash bit already set?
+			Bne			@bye							; yes, nothing to do
+			Move.l		D1, (A0)						; Save modified LAF bits 63-32
+
+@doit		Bsr			WriteLAF						; Write the new LAF
+
+@bye		Move.l		(SP)+, A2						; Restore used C regs
+			Rts
+			ENDP
+			EJECT
+			
+;___________________________________________________________________________
+;
+; MaceDelMulti - Delete a multicast address HASH from the LAF
+;
+;	Call:
+;			D1 = first two bytes of address
+;			D3 = last four bytes of address
+;
+;	Return:
+;			none
+;
+; 	Computes the hash for this multicast address and decrements the LAF
+;	Table hash count for the given Multicast address.  If new hash count = 0,
+;	clears appropriate bit in MACE LAF.
+;	Depends on caller to ensure not called for a multicast's hash that hasn't
+;	already been inc'd in LAFHashTbl.
+;___________________________________________________________________________
+
+MaceDelMulti	PROC	EXPORT
+			WITH		MACERegs,MaceVars
+
+			Move.l		A2, -(SP)						; Save used C regs
+			MoveA.l 	MaceVarPtr, A2					; Get ptr to my vars
+
+			Bsr		   	DoCRC   						; D0-> 6 bit hash into LAF
+			SubQ.b		#1, (LAFHashTbl,A2,D0)			; Dec. # of multi's with this hash
+			Bne			@bye							; Do nothing if hash table cnt non-zero
+											
+														; Clear this bit in LAF since no other
+														; multiaddr's hash to this bit
+			Lea			LogAddrFltr(A2), A0				; A0-> copy of log. addr. filter
+			Cmp.b		#31, D0							; Hash > 31?
+			Bhi.s		@b63to32						; yes
+			Move.l		4(A0), D1						; no, get LAF bits 31-0
+			BClr.l		D0, D1							; Clear this hash bit
+		IF DEBUG	THEN
+			Beq			@huh							; if LAFHashTbl correct, D1 should
+		ELSE											;   have D0 bit set!
+			Beq			@bye							; do nothing hash bit already clear!
+		ENDIF
+			Move.l		D1, 4(A0)						; Save modified LAF bits 31-0
+			Bra.s		@doit
+		
+@b63to32	Sub.b		#32, D0							; Convert hash for use on LAF bits 63-32
+			Move.l		(A0), D1						; Get LAF bits 63-32
+			BClr.l		D0, D1							; Clear this hash bit
+		IF DEBUG	THEN
+			Beq			@huh							; if LAFHashTbl correct, D1 should
+		ELSE											;   have D0 bit set!
+			Beq			@bye							; do nothing hash bit already clear!
+		ENDIF
+			Move.l		D1, (A0)						; Save modified LAF bits 63-32
+
+@doit		Bsr			WriteLAF						; Write the new LAF
+
+@bye		Move.l		(SP)+, A2						; Restore used C regs
+			Rts			
+
+		IF DEBUG	THEN
+@huh		_Debugger									; nothing to do 'cause hash bit
+			Bra.s		@bye							; was already clear
+		ENDIF
+
+			ENDP
+			EJECT
+			
+;___________________________________________________________________________
+;
+;	PrimeXmitRS - Prime Reg Set with transmit packet info.  
+;		
+;	Call: 
+;			4(SP) 	- xmit buffer ptr
+;			A2 		- our vars
+;	 
+;	Return: 
+;			If xmit register sets are full, return CC==NE; else, CC==EQ.
+;	Notes:
+;			Called both on normal writes AND write completion (interrupt level 4)
+;___________________________________________________________________________
+
+PrimeXmitRS	PROC
+			IMPORT		AddToLog
+
+XmitPrm		RECORD		4
+XmitPtr		DS.l		1								; Transmit buffer ptr
+ParmSz		EQU			*
+			ENDR
+
+			WITH		MACERegs,MaceVars,LAPMIBStats
+
+			addq.b		#1,XmitStat(a2)					; count this packet as waiting to go out			<SM20>
+			
+			move.l		AMICDMABase(A2),A3				; Get AMIC DMA base addr
+
+			Move.b		AMIC_DMA_XMIT_CNTL(A3), D1		; get xmit status
+			BTst		#DMARUN, D1						; DMA enabled already?
+			Beq			@noten							; No, don't reset it
+
+			move.b		#XMTMSK, AMIC_DMA_XMIT_CNTL(A3) ; Clear IF & DMARUN
+			nop
+
+
+@noten		moveq		#0, D0
+			Move.w		ByteCount(A2), D0				; Get DMA byte count (word)
+			move.w		XmitRegSet(a2),d1				; get register set
+			lsl			#4,d1							; * 16 for proper reg offset
+
+	IF Logging THEN
+			move.l		#'DMA ',-(sp)
+			move.l		#'SEND',-(sp)
+			move.l		d0,-(sp)
+			move.w		XmitPend(a2),(sp)
+			bsr			AddToLog
+			add.w		#12,sp
+	ENDIF
+
+			Move.b		D0, (AMIC_DMA_XMIT_CNT0L,A3,d1.w)	; Set DMA byte count (LOW)
+			nop												; Allow it to complete
+			ror.w		#8,D0								; Get HIGH count into lower byte
+			Move.b		D0, (AMIC_DMA_XMIT_CNT0H,A3,d1.w)	; Set DMA byte count (HIGH)
+			nop												; Allow it to complete
+
+
+@aroundone	rol.w		#8,D0							; Get HIGH count back into upper byte
+
+			Move.l		XmitPrm.XmitPtr(SP),a1			; a1 - xmit buffer ptr
+			BTst		#0,(A1)							; xmiting a multi/bcast?
+			MoveA.l		LAPMIBStatPtr(A2), A1
+			Bne.s		@30
+			AddQ.l		#1, ifOutUcastPkts(A1) 			; inc. non-multi/bcast cntr
+			Bra.s		@31
+@30			AddQ.l		#1, ifOutNUcastPkts(A1) 		; inc. multi/bcast cntr
+@31			Add.l		D0, ifOutOctets(A1)				; inc. sent octet cntr
+
+	
+			Move.b		#XMTDMA, AMIC_DMA_XMIT_CNTL(A3)	; Clear IF & enable xmit DMA
+			nop											; Allow it to complete
+	
+			MoveQ		#0, D0							; Set CC's
+			Rts											; Return
+
+			ENDP
+			EJECT
+
+
+
+;___________________________________________________________________________
+;
+;	MaceXmit - Calls PrimeXmitRS to prime Reg Set with transmit packet info.  
+;				If xmit register sets are full, put xmit buffer ptr on tail 
+;				of xmit InUse queue.
+;		
+;	Call: 
+;			4(SP) - WDS ptr
+;	 
+;	Return: 
+;			D0 = error code; nobuff - temporarily out of xmit buffers
+;							 eLenErr - sum of data in WDS > max. pkt size
+;							 noErr - primed reg set with xmit pkt or put pkt
+;										on xmit InUse queue
+;	Notes:
+;			Called both on normal writes AND write completion (interrupt level 4).  Due to
+;			a hardware problem in Curio (it seems), you cannot DMA another packet into
+;			MACE before a pending Xmit status is read, or the transmitter locks up.  Hence
+;			the code below will return a 'nobuff' error if there is an outstanding status.
+;			If the part is fixed, then by modifying a constant, the code will allow 2 or more
+;			packets to go out before returning the error.
+;___________________________________________________________________________
+
+MaceXmit	PROC		EXPORT	
+
+WDSPrm		RECORD		4								; Return address
+WDSPtr		DS.l		1								; Write Data Structure ptr
+ParmSz		EQU			*
+			ENDR
+
+			IMPORT		AddToLog
+			WITH		MACERegs,MaceVars
+
+			Move.l		WDSPrm.WDSPtr(SP), D2			; Get WDS ptr
+			movem.l		A0-A4/D1-D4,-(SP)				; save non-scratch regs
+
+			MoveA.l 	MaceVarPtr, A2					; Get ptr to my vars
+
+			Move		SR,-(SP)            			; ¥¥`Save interrupt mask level
+			OrI			#DMALockOut, SR					; Disable DMA ints.
+
+			move.l		AMICDMABase(A2),a0				; Get AMIC DMA base addr
+			Move.b		AMIC_DMA_XMIT_CNTL(A0),d0		; Which reg set is available?
+			andi.b		#(1<<SET0)+(1<<SET1),d0			; We're only interested in these 2
+			Bne.s		@haveBuff
+
+		_debugger										; something's really screwed...
+			move		(sp)+,sr						; ¥¥Restore int. mask level
+			movem.l		(sp)+,a0-a4/d1-d4				; Restore C regs
+			moveq		#nobuff,d0						; Set no xmit buff available error
+			rts 										; return to caller
+
+@haveBuff	
+;------------------------------------------
+; first make sure we don't have any status's pending before sending the packet.
+;------------------------------------------
+
+			move.b		XmitStat(a2),d0					; see how many packets outstanding
+			cmpi.b		#MAX_STAT_PEND,d0				; MACE can only buffer 1 status (bug)
+			blo.s		@gotit							; 0 outstanding, send another
+			
+			addq.b		#1,XmitPend(a2)					; else, count pending packet
+			move		(sp)+,sr						; ¥¥Restore int. mask level
+			movem.l		(sp)+,a0-a4/d1-d4				; Restore C regs
+			moveq		#nobuff,d0						; Set no xmit buff available error
+			rts 										; return to caller
+
+			
+@gotit		
+;------------------------------------------
+; Total the length and make sure it's valid
+;------------------------------------------
+			move.w		#0,XmitRegSet(a2)				;
+			move.l		TxBuffPtr0(a2),a1				; assume DMA set 0 for now
+
+;			addq.w		#1,XmitRegSet(a2)				; ¥¥ no need for the 2nd DMA channel due to MACE bug
+;			move.l		TxBuffPtr1(a2),a1				; use set 1
+
+			move.l		a1,-(sp)						; ¥¥save buffer pointer for later
+			
+			Clr.w		ByteCount(A2)					; init len
+			Move.l		D2, A4							; A4-> WDS
+@1
+			MoveQ		#0,D0
+			Move.w		(A4), D0						; get this wds entry length
+			Beq.s		@2 								; all done
+			AddQ.w		#6, A4							; inc to next wds entry length
+			Add.w		D0,ByteCount(A2)	 			; sum the length
+			Bra.s		@1								; look for more
+@2
+			Move.w		ByteCount(A2),D1 				; get single fragment length
+			Sub.w		#EHdrSize,D1					; Subtract out header bytes
+			Cmp.w		#EMaxDataSz,D1					; Check the data's length
+			Bls.s		@cont	 						; Branch if ok
+
+;------------------------------------------
+; Length error, relink buffer onto free list and return error
+;------------------------------------------
+			MoveA.l		(SP)+,A1						; ¥¥Pop buff ptr
+
+			Move		(SP)+,sr						; ¥¥Restore int. mask level
+			Movem.l		(SP)+,A0-A4/D1-D4				; Restore C regs
+			MoveQ		#eLenErr,D0 					; Set length error
+			Rts											; Return it
+
+
+;------------------------------------------
+; Copy WDS data to our Xmit buffer			
+;------------------------------------------
+@cont		MoveA.l		(SP),A1							;
+			MoveA.l		D2,A4							; A4-> WDS
+@3
+			Move.w		(A4)+,D0						; last WDS entry?
+			Beq.s		@4 								; yes, all done
+			MoveA.l		(A4)+,A0						; get pointer to the data
+														; A0->source, A1->dest, D0=len
+			MoveM.l		A1/D0,-(SP)						; save buff ptr and len
+			Jsr			([MemMove,A2])					; move the data
+			MoveM.l		(SP)+,A1/D0
+			AddA.l		D0, A1							; update buff ptr
+			Bra.s		@3								; look for more
+@4														; (SP) -> Xmit buffer ptr pushed earlier
+			Jsr			PrimeXmitRS
+
+			AddQ		#4,sp							; ¥¥Pop buff ptr
+			Move		(SP)+,SR						; ¥¥Restore int. mask level
+			Movem.l		(SP)+,A0-A4/D1-D4				; Restore C regs
+			MoveQ		#0, D0							; Set return code & CC's
+			Rts											; Return
+
+			ENDP
+			EJECT
+
+
+
+
+
+
+
+;___________________________________________________________________________
+;
+; MaceRecv - Deferred Task Packet receive routine 
+;
+;	Call:	a1 		- 	our variables
+;
+;	Return:
+;
+;	Destroys: a0-a1,d0-d1
+;
+;	Calls:
+;		Calls user's handler to receive packet.
+;
+;   Notes: 
+;		Installed via DMAInterrupt, called via Deferred Task Mgr.
+;___________________________________________________________________________
+
+MaceRecv	PROC
+			IMPORT		AddToLog,CopyRcvBuffer,InitStatBuf
+			WITH		MACERegs,MaceVars,RecvBuff
+			WITH		Dot3StatsEntry,LAPMIBStats
+
+
+			movem.l		A2-A6/D2-D4,-(SP)				; save non-scratch regs
+			move.l		a1,a2							; get ptr to our globals
+
+@ChkRecv	movea.l		AMICDMABase(a2),a3				; get ptr to AMIC
+
+			move.w		sr,-(sp)						; ¥¥ save sr
+			ori.w		#DMALockOut,sr					; ¥ mask out DMA ints
+			
+;--------------------------------------
+; Here we check for a valid packet in the circular buffer...
+;--------------------------------------
+@rcvPcktLoop			
+			moveq		#0,d0
+			move.b		AMIC_DMA_RECV_TAIL(A3),D0		; Are there packets to process? (should be)
+			cmp.b		AMIC_DMA_RECV_HEAD(A3),D0		; Get the Head Ptr
+			bne			@gotData
+			
+			btst.b		#6,AMIC_DMA_RECV_CNTL(a3)		; overrun?
+			beq			@exit
+		IF Logging THEN
+			move.b		AMIC_DMA_RECV_HEAD(A3),d0
+			move.l		#'McRv',-(sp)					; push string
+			move.l		#'OVER',-(sp)					; push string
+			move.l		#'RUN ',-(sp)					; push string
+			bsr			AddToLog
+			add.w		#12,sp
+		ENDIF
+@gotData			
+			tst.l		DMAPacketPtr(a2)				; did we re-enter??
+			bne			@exit							; yes, exit for now
+
+
+	IF Logging THEN
+			move.l		d0,-(sp)
+			swap		d0
+			move.b		AMIC_DMA_RECV_HEAD(A3),d0
+			move.l		#'DMAr',-(sp)					; push string
+			move.l		d0,-(sp)						; push tail/head
+
+			move.l		DMABufStart(A2),a0				; Recv buffer ptr
+			clr.w		d0
+			swap		d0
+			lsl.w		#8,d0
+			adda.l		d0,a0							; point to start of packet
+			move.l		(a0),-(sp)						; push status/length
+
+			bsr			AddToLog
+			add.w		#12,sp
+			move.l		(sp)+,d0
+	ENDIF
+
+			move.l		DMABufStart(A2),a0				; Recv buffer ptr
+			lsl.w		#8,d0							; convert to offset
+			add.l		d0,a0							; a0=addr of packet
+	IF SUPPORTS_OLD_HW THEN
+			tst.b		BoardFlag(a2)					; AMIC4?
+			bgt.s		@skipStat						; yes, don't bother with the hack
+			tst.l		(a0)							; ¥ has status been updated?
+			beq			@exit							; ¥ no, not full packet, exit
+@skipStat
+	ENDIF
+			move.l		a0,DMAPacketPtr(a2)				; save ptr, flag we're in use			
+			
+			move.w		(sp)+,sr						; ¥¥ restore interrupts
+
+;--------------------------------------
+; we seem to have a complete packet, get it's status,
+; copy DMA buffer to our receive buffer (if status valid),
+; and call user with data
+;--------------------------------------
+
+			moveq		#0,d1
+			move.w		(a0),d1							; Get Status(15-12) & Byte Cnt(11-8,7-0) 
+			move.w		d1,d2							; want Status later
+			lsr.w		#8,d2							; d2.w=00ss
+			andi.b		#$f0,d2							; d2.w=00s0
+			swap 		d2								; d2.l=s000
+			move.w		2(a0),d2						; d2.l=s0cr  (Get the Collision & Runt cnts)
+			swap 		d2								; d2.l=crs0  (Coll,Runt,Stat,Null)
+			andi.w		#$0fff,d1						; remove status bits from byte cnt
+
+			bsr			CopyRcvBuffer					; copy the DMA buffer into our receive buffer
+		
+			btst.b		#6,AMIC_DMA_RECV_CNTL(a3)		; are we in an overrun condition?
+			beq.s		@notOverrun								
+		IF Logging THEN
+			move.b		AMIC_DMA_RECV_HEAD(A3),d0
+			move.l		#'McR2',-(sp)					; push string
+			move.l		#'OVER',-(sp)					; push string
+			move.l		#'RUN ',-(sp)					; push string
+			bsr			AddToLog
+			add.w		#12,sp
+		ENDIF
+			move.b		#$4a,AMIC_DMA_RECV_CNTL(a3)		; yes, clear the overrun and turn on DMA
+@notOverrun			
+
+			MoveA.l		LAPMIBStatPtr(A2),A5			; pt to LAP stats
+			MoveA.l		Dot3StatPtr(A2),A6				; pt to DOT3 stats
+
+;-----------------------------------------------------------------
+; Retrieve status bytes from beginning of buffer.  Each status byte is present in
+; the high and low bytes of a word.  There are 4 status bytes, so there are 8 bytes 
+; of status.  
+;-----------------------------------------------------------------
+			Add.l		d1,ifInOctets(a5)
+
+			Btst		#RcvOFLO,d2							; Overflow Error?
+			Beq.s		@s1
+			AddQ.l		#1,dot3StatsInternalMacReceiveErrors(a6)
+			Bra.s		@s4									;
+
+@s1			AndI.b		#(1<<RcvCLSN)+(1<<RcvFRAM)+\
+							(1<<RcvFCS),d2 					; Receive Status Error?
+			Beq.s		@s4									; Note: only lower status/len byte trashed
+
+			AddQ.l		#1,ifInErrors(a5)
+			Btst		#RcvFCS,d2							; FCS Error?
+			Beq.s		@s2
+			AddQ.l		#1, dot3StatsFCSErrors(A6)
+@s2			Btst		#RcvFRAM, d2						; Framing Error?
+			Beq.s		@s3
+			AddQ.l		#1, dot3StatsAlignmentErrors(A6)
+@s3			Btst		#RcvCLSN, d2						; Collsion Error?
+			Beq.s		@s4
+			AddQ.l		#1, COLLCnt(A2)						; Yes
+			AddQ.l		#1, dot3StatsLateCollisions(A6) 	; xmit & recv cntr
+@s4			
+
+;-----------------------------------------------------------------
+; Call user's receive routine
+;-----------------------------------------------------------------
+			move.w		sr,-(sp)							; ¥¥ save sr
+			movem.l		a2-a3/d1-d2,-(sp)					; ¥¥ save non-scratch regs
+			lea			RcvBuffer(a2),a0					; get ptr to our receive buffer
+			Pea			Packet(a0)							; Pass recv packet ptr
+			Move.l		d2,-(sp)							; pass recv packet status word
+			move.l		d1,-(sp)							; pass recv packet length
+			Move.l		RcvParm(a2),-(sp)					; Pass user's rcv rtn parm
+			MoveA.l		RcvRtn(a2),a0						; User's rcv rtn
+			Jsr 		(a0)								; Call user's rcv rtn
+			Add			#RcvParms.ParmsSz,sp				; strip parms
+			movem.l		(sp)+,a2-a3/d1-d2					; ¥¥ restore non-scratch regs
+
+			ori.w		#DMALockOut,sr						; ¥ mask interrupts
+			clr.l		DMAPacketPtr(a2)					; local buffer not in use now
+			
+;--------------------------------------
+; Now see if length valid by checking error status (bits 4-7)
+; If invalid, we must reset the receiver and receive DMA channels,
+; since the length might be incorrect.  If the HeadPtr (hardware bug) 
+; didn't move during a packet, we wouldn't have to to this.
+;--------------------------------------
+			tst.b		d2									; status bits zero?
+			beq.s		@rcvPcktLoop						; length correct, check for another packet
+			
+			move.l		MACEBase(a2),a1						; Base address of Mace
+			move.b		#(1<<ENXMT)+(0<<ENRCV),\
+								MACE_MAC_CNFG(a1) 			; disable receiver
+			nop
+			move.b		#(1<<DMARST),AMIC_DMA_RECV_CNTL(a3)	; turn off receive DMA
+			nop
+			move.b		#TFW16+RFW64+(1<<RCVFWR),\			; reset MACE's receive fifo
+							MACE_FIFO_CNFG(a1)				
+			nop
+
+	IF SUPPORTS_OLD_HW THEN
+			tst.b		BoardFlag(a2)						; AMIC4?
+			bgt.s		@skipStatInit						; yes, don't bother with the hack
+			bsr			InitStatBuf							; init status/length words in DMA buff
+@skipStatInit
+	ENDIF
+			move.b		#RCVMSK, AMIC_DMA_RECV_CNTL(A3) 	; Clear IF & enable recv DMA
+			move.b		#(1<<ENXMT)+(1<<ENRCV),\
+								MACE_MAC_CNFG(a1) 			; re-enable receiver
+			nop
+
+@exit		bclr		#0,DeferFlag(a2)					; deferred task complete
+			move.w		(sp)+,sr							; ¥¥ restore interrupts
+			movem.l		(sp)+,d2-d4/a2-a6					; ¥¥ restore registers
+			rts
+			
+
+			ENDP
+
+
+
+			EJECT
+;___________________________________________________________________________
+;
+; MaceInterrupt - Process interrupts from MACE
+;
+;	Calls:	none
+;
+;	Notes:	Mace interrupts at Level 3 
+;
+;	Primary function is to read the MACE transmit status upon receipt of the 
+;	Transmit Completion interrupt.  Also, reads and processes interrupts for 
+;	error conditions.
+;___________________________________________________________________________
+
+MaceInterrupt PROC
+			IMPORT		AddToLog
+			WITH		MACERegs,MaceVars,Dot3StatsEntry,LAPMIBStats
+
+			MoveA.l 	MaceVarPtr,A1					; Get ptr to my vars
+
+@more		Move.l		MACEBase(A1), A0				; Base address of Mace
+			Move.b		MACE_INT(A0), D0				; Get Mace Interrupt Status
+			AndI.b		#~OurIntsMask, D0				; Process only the ones we want
+			Bne			@goOn							; no ints we care about, leave
+			rts											; Return from MaceInterrupt
+
+@goOn		MoveA.l		LAPMIBStatPtr(A1), A2
+			MoveA.l		Dot3StatPtr(A1), A3
+
+;--------------------------------------
+; Process Transmit Completion Interrupt
+;--------------------------------------
+			BTst		#XMTINT, D0						; Xmit done int?
+			Beq			@rcvco							; no, check for err int.
+
+;--------------------------------------
+; Read Mace Transmit Status
+;--------------------------------------
+			MoveQ		#0, D1
+			Move.b		MACE_TX_RETRY_CNT(A0), D1		; Read Xmit Retry Count
+			Add.l		D1, XmtRTRYCnt(A1)
+			Move.b		MACE_TX_FRM_STAT(A0), D1		; Read Xmit Frame Status
+
+			tst.b		XmitStat(a1)					; make sure there's an outstanding frame	<SM24>
+			beq.s		@skipCnt						; no, don't count it						<SM24>
+			subq.b		#1,XmitStat(a1)					; else, count this frame status as read
+@skipCnt
+	IF Logging THEN
+			move.l		#'MACE',-(sp)
+			move.l		d0,-(sp)						; log interrupt reg
+			move.b		d1,1(sp)						; and frame status
+			move.l		XmitPend(a1),-(sp)
+			move.b		MACE_FIFO_FRM_CNT(A0),2(sp)		; and frame counts
+			bsr			AddToLog
+			add.w		#12,sp
+	ENDIF
+			BTst		#XMTSV, D1						; Is status valid?
+			Bne.s		@10								; yes, continue
+			AddQ.l		#1, XmtStatINV(A1)
+			Bra			@xmit
+
+@10			Move.b		D1, -(SP)						; save D1
+			AndI.b		#(1<<UFLO)+(1<<LCOL)+(1<<RTRY), D1
+			Beq.s		@1
+			AddQ.l		#1, ifOutErrors(A2)
+@1			Move.b		(SP)+, D1						; restore D1
+			beq.s		@xmit							; There's no other status
+
+			BTst		#UFLO, D1						; Underflow?
+			Beq.s		@2								; no
+			AddQ.l		#1, dot3StatsInternalMacTransmitErrors(A3)
+
+@2			BTst		#LCOL, D1						; Late Collision?			
+			Beq.s		@3								; no
+			AddQ.l		#1, XmtLCOL(A1)
+			AddQ.l		#1, dot3StatsLateCollisions(A3)
+
+@3			BTst		#LCAR, D1						; Loss of Carrier?			
+			Beq.s		@4								; no
+			AddQ.l		#1, dot3StatsCarrierSenseErrors(A3)
+
+@4			BTst		#DEFER, D1						; deferred?			
+			Beq.s		@5								; no
+			AddQ.l		#1, dot3StatsDeferredTransmissions(A3)
+
+@5			BTst		#RTRY, D1						; 15 retries?			
+			Beq.s		@6								; no
+			AddQ.l		#1, dot3StatsExcessiveCollisions(A3)
+			Bra.s		@xmit							; Chk err since remaining  
+														;  bits can't be set
+@6			BTst		#MORE, D1						; More than 1 retry?			
+			Beq.s		@7								; no
+			AddQ.l		#1, dot3StatsMultipleCollisionFrames(A3)
+			Bra.s		@xmit							; Chk err since remaining 
+														;  bits can't be set
+@7			BTst		#ONE, D1						; Exactly 1 retry?			
+			Beq.s		@xmit							; no
+			AddQ.l		#1, dot3StatsSingleCollisionFrames(A3)
+
+
+@xmit		movem.l		d0-d1/a1-a3,-(sp)
+			move.w		sr,-(sp)						; ¥¥
+			Move.l		XmtDnRtn(a1),d0			
+			Beq.s		@8								; no xmit completion rtn
+			Move.l		XmtDnParm(a1),-(sp)				; Push user parm
+			MoveA.l		d0,a0			
+			move.b		XmitPend(a1),d0					; pass our 'xmit waiting' flag
+			beq.s		@7a
+			subq.b		#1,XmitPend(a1)
+@7a			Jsr			(a0)							; Call user xmit completion rtn
+			addq		#4,sp							; Strip parms
+@8			move.w		(sp)+,sr						; ¥¥
+			movem.l		(sp)+,d0-d1/a1-a3
+
+
+;--------------------------------------
+; Process Error Interrupts
+;--------------------------------------
+@rcvco		
+			BTst		#RCVCO, D0						; Recv Collision Overflow count interrupt?
+														; Indicates RCV coll cntr rolled over from 255->0
+			Beq.s		@mpci							; no
+			AddQ.l		#1, RCVCOCnt(A1)
+
+@mpci		BTst		#MPCO, D0						; Missed packet count interrupt? This int.
+														; indicates MPC reg. rolled over from 255->0
+			Beq.s		@cerr							; no
+			AddQ.l		#1, MPCOCnt(A1)
+			Add.l		#256, ifInErrors(A2)
+
+
+@cerr		BTst		#CERR, D0						; Collision error interrupt?
+			Beq.s		@babl							; no
+			AddQ.l		#1, dot3StatsSQETestErrors(A3)
+			AddQ.l		#1, ifOutErrors(A2)
+			
+@babl		BTst		#BABL, D0						; Babble error interrupt?
+			Beq.s		@chkAgain						; no
+			AddQ.l		#1, dot3StatsFrameTooLongs(A3)
+			AddQ.l		#1, ifOutErrors(A2)
+
+@chkAgain	bra			@more
+
+			ENDP
+
+
+
+
+;___________________________________________________________________________
+;
+; 	Routine:	CopyRcvBuffer
+;
+;	Inputs:		d1	-	packet length
+;				d2	-	packet status
+;				a0	-	ptr to start of packet in DMA buffer
+;				a2	-	globals
+;				a2	-	AMIC base
+;	Outputs:	RcvBuffer	-	contains the received packet
+;	Destroys:	a1,d3
+;
+;	Calls:
+;
+;	Function:	Copyies the packet in DMA buffer to our receive buffer, bumping
+;				the tail pointer as we go.
+;___________________________________________________________________________
+CopyRcvBuffer	PROC		EXPORT
+			WITH		MACERegs,MaceVars
+
+			move.l		d1,-(sp)						; save length
+			tst.b		d2								; check status, is length valid?
+			bne.s		@copyExit
+			
+			add.w		#$00ff+8,d1						; compute the rounded up length in pages
+			andi.w		#$ff00,d1
+			lsr.w		#8,d1							; # of pages (256 bytes)
+			subq.w		#1,d1							; adjust for dbra
+			blt.s		@copyExit
+
+			moveq		#0,d3
+			move.b		AMIC_DMA_RECV_TAIL(a3),d3		; get tail ptr
+			move.l		DMAPacketPtr(a2),a0				; get buf ptr		
+			lea			RcvBuffer(a2),a1				; get ptr to our receive buffer
+			
+@clrLoop	move.l		#$0100,d0
+			_BlockMove									; copy next page to user buffer
+			add.w		#$0100,a1						; point to next page
+			clr.l		(a0)							; clear out it's length/status ¥¥hardware fix
+			add.w		#$0100,a0						; point to next status
+			addq.b		#1,d3							; bump tail ptr
+			cmpi.b		#$c0,d3							; at end of buffer?
+			blo.s		@update							; no, continue
+			moveq		#0,d3							; yes, reset to starting page
+			move.l		DMABufStart(a2),a0				; wrap length/status ptr to start
+@update		move.b		d3,AMIC_DMA_RECV_TAIL(a3)		; update tail ptr
+			nop
+			cmp.b		AMIC_DMA_RECV_HEAD(a3),d3		; have we caught up with head (bad length)?	
+			dbeq		d1,@clrLoop						; and repeat for next page
+
+@copyExit	move.l		(sp)+,d1
+			rts
+			
+			ENDP
+
+
+
+			EJECT
+;___________________________________________________________________________
+;
+; DMAIntHandler - Process DMA Interrupt from AMIC
+;
+;	Call:	A1 - our variables (reference constant from dispatcher)
+;
+;	Regs:	A2 - our variables
+;			A3 - Receive or Transmit DMA Channel base address
+;			D4.B - Register Set offset, 0 or $10
+;
+;	Calls:	PrimeRecv - reprime a Recv DMA reg set
+;		MaceXmitDone - read Xmit status and reprime Xmit DMA regs if needed
+;
+;	RePrime Receive and Transmit Register Sets. Install Deferred Task to 
+;	process Received Packets and Transmit Completions.
+;___________________________________________________________________________
+
+DMAIntHandler PROC
+			IMPORT		AddToLog,InitStatBuf,CopyRcvBuffer
+			WITH		MACERegs,MaceVars
+
+			Move.l		D4, -(SP)						; Save non-interrupt regs used
+			Move.l		A1,A2							; A2 -> our variables
+
+;--------------------------------------
+; Check for packet in Receive DMA Channel
+;--------------------------------------
+ChkRecv		MoveA.l		AMICDMABase(a2),a3
+			Move.b		AMIC_DMA_RECV_CNTL(a3),d0		; Get receive status, int pending?
+			bpl			@ChkXmitDone					; no, check xmit channel
+			
+			btst		#6,d0							; is this an overrun?
+			beq.s		@notOVRN						; no, continue
+		IF Logging THEN
+			move.b		AMIC_DMA_RECV_HEAD(A3),d0
+			move.l		#'RECV',-(sp)					; push string
+			move.l		#'OVER',-(sp)					; push string
+			move.l		#'RUN ',-(sp)					; push string
+			bsr			AddToLog
+			add.w		#12,sp
+		ENDIF
+
+		IF DEBUG	THEN
+			_debugger
+		ENDIF
+			Move.b		#$80, AMIC_DMA_RECV_CNTL(A3)	; Clear the interrupt
+			bra.s		@2
+@notOVRN	Move.b		#RCVMSK, AMIC_DMA_RECV_CNTL(A3)	; Clear the interrupt and turn on DMA
+@2
+			nop
+
+		IF Logging THEN
+			move.b		AMIC_DMA_RECV_HEAD(A3),d0
+			move.l		#'DMAr',-(sp)					; push string
+			move.l		#'Int ',-(sp)					; push string
+			move.l		DeferFlag(a2),-(sp)
+			bsr			AddToLog
+			add.w		#12,sp
+		ENDIF
+
+			bset		#0,DeferFlag(a2)				; we're installing deferred task
+			bne.s		@ChkXmitDone					; skip if already installed
+			
+		IF USEDEFERREDTASK THEN
+		  	lea			DTQE(a2),a0					  	; A0->deferred task queue element
+		  	movea.l		JDTInstall,a1
+		  	jsr			(a1)						  	; install deferred task
+		ELSE
+			move.l		a2,a1							; a1 = globals for deferred tasks
+			bsr			MaceRecv
+		ENDIF
+	
+;---------------------------------------------------------------								
+; Check for Transmit Completion Interrupt
+;---------------------------------------------------------------								
+@ChkXmitDone
+			move.b		AMIC_DMA_XMIT_CNTL(a3),d0		; AMIC xmit control/status
+			bpl			@doneAMICInt					; exit if no xmit DMA int
+			
+		IF Logging THEN
+			move.l		#'DMA ',-(sp)
+			move.l		#'DONE',-(sp)
+			move.l		d0,-(sp)
+			bsr			AddToLog
+			add.w		#12,sp
+		ENDIF
+
+			Move.b		#XMTMSK, AMIC_DMA_XMIT_CNTL(A3) ; clear the interrupt
+			nop
+				
+@doneAMICInt	
+			Move.l		(SP)+, D4
+			
+			rts											; Return from DMAInterrupt
+
+			ENDP
+
+
+
+
+
+			EJECT
+;___________________________________________________________________________
+;
+; MaceInit - Get var and DMA memory, then initialize DMA Register Sets and 
+;				MACE chip
+;
+;	Call: following record on stack:
+;
+;			MACEInitParms	RECORD		0
+;			RecvRtn			DS.l		1	; address of Ethernet receive routine
+;			RecvPrms		DS.l		1	; parms to pass @ receive
+;			XmitRtn			DS.l		1	; address of Ethernet xmit complete routine
+;			XmitPrms		DS.l		1	; parms to pass @ xmit complete
+;			MACECfgPtr		DS.l		1	; ptr to MACE config record
+;			Dot3NetStats	DS.l		1	; ptr to 802.3 statistics array
+;			LAPMIBNetStats	DS.l		1	; ptr to LAP MIB statistics array
+;			EnetAddr		DS.l		1	; ptr to ethernet address
+;			FastMoveRtn		DS.l		1	; ->proc to move memory FAST
+;			IPSize			EQU			*
+;
+;	Return:
+;			D0 = openErr (-23) or mFulErr (-41)
+;___________________________________________________________________________
+
+MaceInit	PROC		EXPORT
+
+parms			RECORD		{A6Link}
+LocalSize		EQU			*
+A6Link			DS.l		2							; link and return address
+initp			DS			MACEInitParms				; parameters passed to us
+				ENDR
+
+			IMPORT		TranslateAddress, GetMemory, FreeMemory, AddToLog, InitStatBuf
+			WITH		parms,initp,MACERegs,MaceVars
+			
+			Link		A6,#LocalSize					; Save A6
+			MoveM.l		A2-A4/D3-D5,-(SP)				; Save regs
+
+			Move.l		#MaceVarSz, -(SP)				; requested memory size
+			Move		#0, -(SP) 						; do NOT want memory locked,
+														; contiguous, and non-cacheable
+			Lea			GetMemory, A0
+			Jsr			(A0)							; get memory in D0
+			AddQ		#6, SP							; pop parms
+			Blt			@InitError						; bra if CC indicate error
+
+			Lea			MaceVarPtr, A3
+			Move.l		A0, (A3)						; Save ptr to my vars
+			MoveA.l		A0, A2
+	
+			
+	IF SUPPORTS_OLD_HW THEN
+			clr.b		BoardFlag(a2)					; init to AMIC1-3 
+			move.w		sr,-(sp)						;¥¥
+			ori.w		#$0700,sr						; mask ints during this
+			lea			$50f14010,a0
+			move.b		(a0),d1
+			move.b		d1,-(sp)						;¥¥ read AMIC, save old value
+			btst.l		#3,d1							; check bit 3
+			bne.s		@amic4							; if set, must be amic4
+			ori.b		#(1<<3),d1						; clear, get set mask
+			move.b		d1,(a0)							; try setting bit 3
+			nop
+			btst.b		#3,(a0)							; did it set?
+			beq.s		@hwChkDone						; no, must be AMIC1-3
+@amic4		addq.b		#1,BoardFlag(a2)				; yes, 01=AMIC4
+@hwChkDone	move.b		(sp)+,(a0)						; ¥¥ restore AMIC
+			move.w		(sp)+,sr						; ¥¥ restore SR
+	ENDIF
+
+	IF Logging THEN
+			lea			LogStart(a2),a0
+			move.l		a0,LogPtr(a2)
+			lea			LogEnd(a2),a0
+			move.l		a0,LogEndPtr(a2)
+			
+			move.l		#'STRT',-(sp)
+			move.l		#'ENET',-(sp)
+			clr.l		-(sp)
+			bsr			AddToLog
+			add.w		#12,sp
+	ENDIF
+	
+			Move.l		UnivInfoPtr, A0					; get ptr to ProductInfo
+			Add.l		ProductInfo.DecoderInfoPtr(A0), A0	; point to the base address table
+			Move.l		DecoderInfo.MACEAddr(A0), MACEBase(A2) ; Save the MACE base address
+			Move.l		DecoderInfo.AMICAddr(A0), AMICDMABase(A2) ; Save the AMIC base address
+
+			Move.l		RecvRtn(A6), RcvRtn(A2)			; save addr of recv rtn
+			Move.l		RecvPrms(A6), RcvParm(A2)		; save parm for recv rtn
+				
+			Move.l		XmitRtn(A6), XmtDnRtn(A2)		; save addr of xmit compl rtn
+			Move.l		XmitPrms(A6), XmtDnParm(A2)		; save parm for xmit compl rtn
+								
+			Move.l		Dot3NetStats(A6), Dot3StatPtr(A2)
+			Move.l		LAPMIBNetStats(A6), LAPMIBStatPtr(A2)
+			
+			Move.l		EnetAddr(A6), OurAddrPtr(A2)	; save ptr to our Ethernet address
+			Move.l		FastMoveRtn(A6), MemMove(A2)	; save addr of fast mem move rtn
+
+
+;-------------------------------------------------------------------------------------
+; Get the buffer addresses from the AMIC base address register + offsets
+;-------------------------------------------------------------------------------------
+			lea			$61000000,a1					; Get the buffer base address
+			Move.l		a1,DMABufStart(A2)				; Set Recv buffer pointer
+
+			adda.l		#XMIT_BUFF0,a1					; D0 = Recv ptr + xmit buff offset
+			Move.l		a1,TxBuffPtr0(A2)				; Set 1st Xmit buffer pointer			
+			adda.w		#2048,a1
+			Move.l		a1,TxBuffPtr1(A2)				; Set 2nd Xmit buffer pointer			
+
+	IF SUPPORTS_OLD_HW THEN
+			tst.b		BoardFlag(a2)					; AMIC4?
+			bgt.s		@skipStat						; yes, don't bother with the hack
+			bsr			InitStatBuf						; ¥¥ hack to init status words at each page boundary
+@skipStat
+	ENDIF
+;-------------------------------------------------------------------------------------
+; Install MACE Recv DMA channel Deferred Task, called by MACE_RECVhndlr
+;-------------------------------------------------------------------------------------
+		  	Move.w		#dtQType, DTQE+qType(A2)	  	; Set Deferred Task queue type
+		  	Lea			MaceRecv,A1
+		  	Move.l		A1, DTQE+dtAddr(A2)		 	 	; Set address of DT, called by slot int. hndlr.
+		  	Move.l		A2, DTQE+dtParm(A2)		  		; Set variable pointer to MACE vars
+
+;-------------------------------------------------------------------------------------
+; MACE Chip initialization
+;-------------------------------------------------------------------------------------
+			MoveA.l		MACEBase(A2), A0						; A0-> base address of Mace regs
+
+			Bsr			ResetMACE								; Reset MACE chip and AMIC DMA chnls
+
+			Move.b		#(1<<RTRD), MACE_USER_TEST_REG(A0) 		; Disable access to Reserved Test Regs
+			Move.b		#MaceIntMask, MACE_INT_MSK(A0) 			; Disable all ints.
+			nop
+			Move.b		#XMTS64, MACE_BIU_CNFG(A0)				; Xmit start after 64 bytes, Intel Bus Mode
+			Move.b		#(1<<APADXMT), MACE_TX_FRM_CNTRL(A0) 	; ¥¥¥Xmit Control ->
+																;  Enable Retry, FCS, Auto Padding
+			Move.b		#$00, MACE_RX_FRM_CNTRL(A0)  			; ¥¥¥Recv Control ->
+																;  Disable Auto Pad Stripping
+																; Set up FIFOs' configuration
+			Move.b		#TFW16+(1<<XMTFWR)+RFW64+(1<<RCVFWR),\	; ¥¥¥
+							MACE_FIFO_CNFG(A0)				
+			Move.b		#0, MACE_PLS_CNFG(A0) 					; Set up for normal transmit
+			nop
+
+			Move.b		MACE_CHIP_ID_HIGH(A0), D0
+			Lsl			#8, D0
+			Move.b		MACE_CHIP_ID_LOW(A0), D0
+			Move		D0, MACEChipID(A2)
+
+
+			CmpI		#MACERevA2, MACEChipID(A2)			;???? temp code to check MACE chip id
+			Beq.s		@skip1								; MACE in Rev B0 Curio has new bit in IAC!
+
+			Move.b		#(1<<ADDRCHG), MACE_ADDR_CNFG(A0) 	; Set address change bit
+			nop												; Allow it to complete
+@wait1		Move.b		MACE_ADDR_CNFG(A0), D0				; wait for MACE to clear it
+			Bne.s		@wait1
+@skip1
+
+
+			Move.b		#(1<<PHYADDR), MACE_ADDR_CNFG(A0) 	; Select physical address
+			nop												; Allow it to complete
+			Lea			MACE_PHY_ADDR(A0), A0				; A0-> Mace Phy Address Reg
+			MoveA.l		OurAddrPtr(A2), A1					; A1-> Our node address
+			Move.b		(A1)+, (A0) 						; Move addr byte0 to Mace reg
+			nop												; Allow it to complete
+			Move.b		(A1)+, (A0) 						; Move addr byte1 to Mace reg
+			nop												; Allow it to complete
+			Move.b		(A1)+, (A0) 						; Move addr byte2 to Mace reg
+			nop												; Allow it to complete
+			Move.b		(A1)+, (A0) 						; Move addr byte3 to Mace reg
+			nop												; Allow it to complete
+			Move.b		(A1)+, (A0) 						; Move addr byte4 to Mace reg
+			nop												; Allow it to complete
+			Move.b		(A1), (A0) 							; Move addr byte5 to Mace reg	
+			nop												; Allow it to complete
+			MoveA.l		MACEBase(A2), A0					; Get back base address of Mace regs
+
+			CmpI		#MACERevA2, MACEChipID(A2)			;???? temp code to check MACE chip id
+			Beq.s		@skip2								; MACE in Rev B0 Curio has new bit in IAC!
+			Move.b		#(1<<ADDRCHG), MACE_ADDR_CNFG(A0) 	; Set address change bit
+			nop												; Allow it to complete
+@wait2		Move.b		MACE_ADDR_CNFG(A0), D0				; wait for MACE to clear it
+			Bne.s		@wait2
+@skip2
+
+			Move.b		#(1<<LOGADDR), MACE_ADDR_CNFG(A0) 	; Select logical address
+			nop												; Allow it to complete
+			Lea			MACE_LOG_ADDR(A0), A1				; A1-> Mace Phy Address Reg
+			MoveQ		#7, D0
+@laf		Move.b		#0, (A1) 							; CLEAR all bits in Log Addr Filter
+			nop												; Allow it to complete
+			DBra		D0, @laf
+			
+
+			MoveA.l		AMICDMABase(A2), A3 				; Get the AMIC base address
+			Move.b		#(1<<DMAIF), AMIC_DMA_RECV_CNTL(A3) ; Clear recv DMA IF, disable DMA
+			nop												; Allow it to complete
+
+			
+; Install MACE Recv DMA channel Deferred Task, called by MACE_RECVhndlr
+		  	Move.w		#dtQType, DTQE+qType(A2)	  	; Set Deferred Task queue type
+		  	Lea			MaceRecv, A1
+		  	Move.l		A1, DTQE+dtAddr(A2)		 	 	; Set address of DT, called by slot int. hndlr.
+		  	Move.l		A2, DTQE+dtParm(A2)		  		; Set variable pointer to MACE vars
+
+								
+; Initialize Recv & Xmit DMA Channel Control Registers
+			MoveA.l		AMICDMABase(A2), A3 			; <!>Get the AMIC base address
+			Move.b		#XMTMSK, AMIC_DMA_XMIT_CNTL(A3)	; Clear IF to be safe
+			nop											; Allow it to complete
+			Move.b		#RCVMSK, AMIC_DMA_RECV_CNTL(A3) ; Clear IF & enable recv DMA
+			nop											; Allow it to complete
+
+; Be sure the Tail Pointer starts out a 0
+			Move.b		#0, AMIC_DMA_RECV_TAIL(A3)		; Start at the beginning
+			nop											; Allow it to complete
+
+;------------------------------------------------------------
+; Install Enet interrupt handlers
+;------------------------------------------------------------
+
+			with		ExpandMemRec, DMADispGlobals
+
+			movea.l		([ExpandMem],emDMADispatchGlobals), A0
+
+	; Install MACE (level 3) interrupt handler
+
+			lea			MaceInterrupt, A1
+			move.l		A1, maceVector(A0)				; register the handler in its designated entry
+
+	; Install AMIC DMA (level 4) interrupt handlers
+
+			lea			DMAIntHandler, A1
+			moveq		#hwAmicETX, D0
+			move.l		A1, ddVector0(A0,D0.l*8)		; register transmit DMA handler
+			move.l		A2, ddRefCon0(A0,D0.l*8)		; register globals pointer as reference constant
+
+			moveq		#hwAmicERX, D0
+			move.l		A1, ddVector0(A0,D0.l*8)		; register receive DMA handler
+			move.l		A2, ddRefCon0(A0,D0.l*8)		; register globals pointer as reference constant
+
+			endwith
+
+;------------------------------------------------------------
+; Enable MACE
+;------------------------------------------------------------
+			Move.l		MACEBase(A2), A0				; Base address of Mace
+			Move.b		#(1<<ENXMT)+(1<<ENRCV),\
+							MACE_MAC_CNFG(A0) 			; Enable xmit and recv
+			nop
+			Move.b		#OurIntsMask, MACE_INT_MSK(A0) 	; Enable ints. we care about
+			nop
+
+			MoveQ		#0, D0
+			Bra.s		@60
+			
+;------------------------------------------------------------
+; Init error - clear out variable pointer for next try
+;------------------------------------------------------------
+@InitError
+			Move		D0,D3							; Save error code
+			Bsr			FreeMACEMem						; Free, and unlock if needed, all mem blks
+
+			Move		D3,D0
+			CmpI		#-1,D0							; Translate generic error
+			Bne.s		@60
+			MoveQ		#openErr,D0
+@60
+			Tst			D0
+			MoveM.l		(SP)+, A2-A4/D3-D5				; Restore regs
+			Unlk		A6
+			Rts 										; Return with error
+
+			ENDP
+
+
+
+;___________________________________________________________________________
+;
+; 	Fuctions:	InitStatBuf
+;	Inputs:		a2	-	ptr to globals
+;	Destroys:	d0,a0
+;	Return:
+;___________________________________________________________________________
+
+InitStatBuf	PROC	EXPORT
+	IF SUPPORTS_OLD_HW THEN
+			WITH		MaceVars
+
+			Move.l		DMABufStart(a2),a0				; Set Recv buffer pointer
+			move.w		#$c0-1,d0
+@clrLp		clr.l		(a0)							; clear length/status ¥¥hardware fix
+			add.w		#$0100,a0						; point to next possible status field
+			dbra		d0,@clrLp
+			rts
+	ENDIF			
+			ENDP
+		
+		
+
+
+			EJECT
+	IF Logging THEN
+;___________________________________________________________________________
+;
+; 	Fuctions:	AddToLog
+;	Inputs:		a2		-	ptr to globals
+;			4-16(sp) 	-	params to log
+;	Return:
+;___________________________________________________________________________
+
+AddToLog	PROC	EXPORT
+
+			WITH		MaceVars
+			
+			movem.l	a0-a1,-(sp)						; save regs
+			move.w	sr,-(sp)
+			ori.w	#$0700,sr
+			Lea		MaceVarPtr, a1
+			move.l	(a1),a1
+			move.l	LogPtr(a1),a0					; get current ptr into log buffer
+			move.l	22(sp),(a0)+					; log user data
+			move.l	18(sp),(a0)+
+			move.l	14(sp),(a0)+
+			move.l	Ticks,-(sp)						; and time stamp
+			move.w	4(sp),(sp)						; and saved SR
+			move.l	(sp)+,(a0)+						; stuff them
+			cmpa.l	LogEndPtr(a1),a0				; are we at end?
+			blo.s	@ok
+			lea		LogStart(a1),a0
+@ok			move.l	a0,LogPtr(a1)					; update log ptr
+			move.w	(sp)+,sr
+			movem.l	(sp)+,a0-a1
+			rts
+			
+			ENDP
+	ENDIF			
+			END

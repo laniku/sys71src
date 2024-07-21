@@ -1,0 +1,848 @@
+;
+;	File:		ApolloDriver.a
+;
+;	Contains:	This file contains the video driver for use by the Macintosh
+;				OS on the Apollo hardware
+;
+;	Written by: Mike Puckett.
+;
+;	Copyright:	© 1991-1992 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 11/5/92	SWC		Changed VideoEqu.a->Video.a and ShutdownEqu.a->Shutdown.a.
+;	   <SM2>	 11/2/92	kc		Don't include SonicEqu.a
+;		 <1>	 10/6/92	GDW		New location for ROMLink tool.
+;		 <1>	 3/30/92	JSM		first checked in
+;		 <6>	 5/22/91	jmp		Code Review changes:  For consistency, did a StripAddress on
+;									VidOpen’s copy of the privates; eliminated the redundant clears
+;									and checks for the the driver copy of the fixed-entry clut; and
+;									replaced #0’s with #noErr’s where appropriate.
+;		 <5>	 5/15/91	jmp		SetInterrupt wasn’t checking the input value correctly -- it was
+;									doing a csMode(A3) instead of csMode(A2).  So, it would either
+;									enable (0) or disable (1), depending on whether csMode(A3) was
+;									non-zero or not.  Also, GetInterrupt returned -1.w (instead of
+;									1.b) for disabled, so some test tools were confused; so, I now
+;									just return 1.b when interrupts are disabled.
+;		 <4>	 5/10/91	jmp		Fixed a bug in GetInterrupt where I wasn’t returning the
+;									interrupt status, but instead was writing into my private
+;									storage!  Fixed the error-handling code in VidOpen.  Fixed a bug
+;									in GetEntries where A0 was not loaded properly.  Made GetEntries
+;									32-bit clean.  GetEntries was trashing A1, so async calls were
+;									failing (i.e., jumping thru IODone requires A1 to be pointing to
+;									the AuxDCE).  Indexed GetEntries didn’t work at all because I
+;									was checking for indexed via A3 instead of A2!  Made the Control
+;									& Status dispatchers 32-bit clean.  SaveMode was never being
+;									setup!  Code review changes:  Eliminated SetEntries &
+;									SetDefaultMode, and fixed GetDefaultMode.
+;		 <3>	 4/17/91	jmp		Updated comments and cleaned up the fixed-device support.
+;		 <2>	 2/15/91	jmp		Added everything!  The only things left to are:  1)  Need to
+;									change VISA names to Eagle names once Gus/Jim/Celia update the
+;									equate files and 2) Need to get the fixed device stuff working
+;									properly.
+;		 <1>	 2/10/91	jmp		First checked into TERROR ROM.
+;
+;	To Do:
+;		
+;		1)  Need to change VISA names in interrupt handling code to Eagle names.
+;				This entails touching SetInterrupt, WaitVSync, and BeginIH.
+;
+
+				STRING 	C
+
+				PRINT	OFF
+				LOAD	'StandardEqu.d'
+
+				INCLUDE 'DockingEqu.a'
+				INCLUDE	'EgretEqu.a'
+				INCLUDE	'GestaltEqu.a'
+				INCLUDE	'GestaltPrivateEqu.a'
+				INCLUDE 'HardwarePrivateEqu.a'
+				INCLUDE	'IOPrimitiveEqu.a'
+				INCLUDE	'PowerPrivEqu.a'
+				INCLUDE 'ROMEqu.a'
+				INCLUDE	'Video.a'
+				INCLUDE	'SlotMgrEqu.a'
+				INCLUDE	'ShutDown.a'
+			;	INCLUDE	'SonicEqu.a'
+				INCLUDE	'UniversalEqu.a'
+				
+				INCLUDE	'DepVideoEqu.a'
+				PRINT	ON
+
+				SEG		'_sApolloDriver'
+
+				BLANKS		ON
+				STRING		ASIS
+				MACHINE		MC68020
+
+; This is device storage which is stored in the dCtlStorage field of the AuxDCE.
+
+ApolloVidPrivates	RECORD		0
+saveBaseAddr 		DS.L		1					; the screen base address
+saveSQElPtr			DS.L		1					; the SQ element pointer (for _SIntRemove)
+saveFixedCLUT		DS.L		1					; pointer to fixed-entry CLUT
+saveNumFixedEntries	DS.W		1					; number of entries in fixed CLUT (zero based)
+saveMode			DS.W		1					; the current mode setting
+GFlags				DS.W		1					; flags word
+ApolloVidPrivSize	EQU			*
+					ENDR
+					
+LApolloDriver		MAIN	EXPORT
+
+					WITH spBlock,SlotIntQElement
+;-------------------------------------------------------------------
+;	Video Driver Header
+;-------------------------------------------------------------------
+;
+ApolloDrvr		DC.W	$4C00						; ctl,status,needsLock
+				DC.W	0,0,0						; not an ornament
+
+; Entry point offset table
+
+				DC.W	ApolloVidOpen-ApolloDrvr 	; open routine
+				DC.W	ApolloDrvr-ApolloDrvr		; no prime
+				DC.W	ApolloVidCtl-ApolloDrvr		; control
+				DC.W	ApolloVidStatus-ApolloDrvr 	; status
+				DC.W	ApolloVidClose-ApolloDrvr	; close
+			
+				STRING	Pascal
+ApolloVidTitle
+				DC.B	'.Display_Video_Apple_Apollo'		
+				STRING	ASIS
+				ALIGN	2							; make sure we're word aligned
+				DC.W	CurApolloDrvrVersion		; version
+
+
+**********************************************************************
+*
+* ApolloVidOpen allocates private storage for the device in the AuxDCE and locks
+*	it down for perpetuity. Also, install the simulated interrupt handler and 
+*	start it going.
+*
+* Entry:	A0 = param block pointer
+*			A1 = AuxDCE pointer
+*
+* Locals:	A3 = pointer to private storage
+*
+**********************************************************************
+
+				WITH	VDPageInfo,ApolloVidPrivates
+
+ApolloVidOpen	
+		
+;
+; Allocate private storage (since block is CLEAR, GFlags are zeroed) and get
+;	a pointer to it in A3.
+;
+	
+				MOVEQ	#ApolloVidPrivSize,D0		; get size of parameters
+				_ResrvMem  ,SYS 					; make room as low as possible
+				MOVEQ	#ApolloVidPrivSize,D0		; get size of parameters
+				_NewHandle ,SYS,CLEAR				; get some memory for private storage
+				BNE  	@OpError1					; => return an error in open
+				MOVE.L	A0,dCtlStorage(A1)			; save returned handle in AuxDCE
+				_HLock								; and lock it down forever
+				
+				MOVE.L	(A0),D0						; Get a 32-bit clean pointer
+				_StripAddress						;	to our privates into A3.
+				Move.l	D0,A3
+				
+				MOVE.L	dCtlDevBase(A1),saveBaseAddr(A3) ; save the screen base address
+
+; Get and install the interrupt handler.  Call the EnableVGuts utility code to do 
+;	this.  This utility also starts the interrupts going.  If there is an error
+;	condition, EnableVGuts returns with Z-bit cleared.
+;
+				
+				MOVEQ	#sqHDSize,D0				; allocate a slot queue element
+				_NewPtr	,SYS,CLEAR					; get it from system heap cleared
+				BNE.S   @OpError2					; if not allocated, return bad
+				MOVE.L	A0,saveSQElPtr(A3)			; save the SQ element pointer.
+	
+				BSR		ApolloEnableVGuts			; do it
+				BNE.S 	@OpError2					; 
+
+; For doing GetEntries, we need to get our fixed-entry CLUT from the Slot Manager.
+;
+				With	spBlock
+	
+				Suba	#spBlockSize,Sp				; Make an SpBlock on the stack and
+				Move.l	Sp,A0						;	get a pointer to it in A0.
+				
+				Move.b	dCtlSlot(A1),spSlot(A0)		; Get the slotnumber.
+				Move.b	dCtlSlotID(A1),spID(A0)		; Get the spID of video sRsrc.
+				Clr.b	spExtDev(A0)				;
+				_sRsrcInfo							; Try to get the spsPointer.
+				Bne.s	@OpError3					; We’re dead if this fails.
+				
+				Move.b	#firstVidMode,spID(A0)		; Look for our mode entry.
+				_sFindStruct						; If we don’t find it, then
+				Bne.s	@OpError3					;	we’re dead.
+				
+				Move.b	#mTable,spID(A0)			; Get our fixed-entry CLUT.
+				 _sGetBlock							; If we don’t get it, then
+				Bne.s	@OpError3					;	we’re dead.
+				
+				Move.l	spResult(A0),A0				; Get ptr to fixed-entry CLUT
+				Move.w	ctSize(A0),saveNumFixedEntries(A3)	; Save the number of entries.
+				Lea		ctTable(A0),A0						; Get ptr to table, and
+				Move.l	A0,saveFixedCLUT(A3)				;	save it.
+				
+				Adda	#spBlockSize,Sp				; restore stack
+				
+				EndWith
+			
+; There’s only one vidMode, so save it now because SetMode doesn’t need to.
+;
+				Move.w	#firstVidMode,saveMode(A3)	
+
+; All done!
+;
+@AllDone		MOVEQ	#noErr,D0					; no error
+@EndOpen		RTS 								; return
+	
+@OpError3		ADD.W	#spBlockSize,SP				; release the spBlock
+@OpError2		MOVE.L	dCtlStorage(A1),A0			; get the private storage back
+				_DisposHandle						; release the driver private storage
+@OpError1		MOVE.L	#OpenErr,D0					; say can't open driver
+				BRA.S	@EndOpen
+	
+				ENDWITH
+
+**********************************************************************
+*
+* Video Driver Control Call Handler.  There are ten calls:
+*
+*	(0)  Reset (VAR mode, page: INTEGER; VAR BaseAddr: Ptr);
+*	(1)  KillIO
+*	(2)	 SetMode(mode, page: INTEGER; VAR BaseAddr: Ptr);
+*	(3)	 SetEntries ( Table: Ptr; Start,Count : integer );
+*	(4)	 SetGamma ( Table : Ptr );
+*   (5)  GrayPage (page);
+*   (6)  SetGray (csMode = 0 for color, 1 for gray)
+*	(7)	 SetInterrupt ( csMode = 0 for enable, 1 for disable)
+*	(8)	 DirectSetEntries (not implemented)
+*	(9)	 SetDefaultMode 
+*
+*   Entry: 	A0 		= param block pointer
+*			A1 		= AuxDCE pointer
+*	Uses:	A2		= ptr to cs parameters (ie. A2 <- csParam(A0))
+*			A3 		= scratch (doesn't need to be preserved)
+*			A4		= scratch (must be preserved)
+*			D0-D3 	= scratch (don't need to be preserved)
+*
+*	Exit:	D0	  	= error code
+*
+**********************************************************************
+
+;
+; Decode the call
+;
+
+ApolloVidCtl
+				MOVEM.L	A0/A1,-(SP)						; Preserve exit registers.
+	
+				MOVE.L	csParam(A0),A2					; A2 <- Ptr to control parameters
+					
+				MOVE.L	dCtlStorage(A1),A3				; A3 <- Ptr to private storage
+				MOVE.L	(A3),D0							;
+				_StripAddress							;
+				MOVE.L	D0,A3							;
+	
+				MOVE.W	csCode(A0),D0					; get the opCode
+				
+				CMP.W	#9,D0							; IF csCode NOT IN [0..9] THEN
+				BHI.S	ApolloCtlBad					;   Error, csCode out of bounds
+				MOVE.W	ApolloCtlJumpTbl(PC,D0.W*2),D0	; Get the relative offset to the routine
+				JMP		ApolloCtlJumpTbl(PC,D0.W)		; GOTO the proper routine
+				
+ApolloCtlJumpTbl	
+				DC.W	ApolloVidReset-ApolloCtlJumpTbl		; $00 => VidReset
+				DC.W	ApolloCtlGood-ApolloCtlJumpTbl		; $01 => KillIO
+				DC.W	ApolloSetVidMode-ApolloCtlJumpTbl	; $02 => SetVidMode
+				DC.W	ApolloCtlBad-ApolloCtlJumpTbl		; $03 => SetEntries			(not needed)
+				DC.W	ApolloCtlBad-ApolloCtlJumpTbl		; $04 => SetGamma			(not needed)
+				DC.W	ApolloGrayPage-ApolloCtlJumpTbl		; $05 => GrayPage
+				DC.W	ApolloCtlBad-ApolloCtlJumpTbl		; $06 => SetGray			(not needed)
+				DC.W	ApolloSetInterrupt-ApolloCtlJumpTbl	; $07 => SetInterrupt
+				DC.W	ApolloCtlBad-ApolloCtlJumpTbl		; $08 => DirectSetEntries	(not needed)
+				DC.W	ApolloCtlBad-ApolloCtlJumpTbl 		; $09 => SetDefaultMode		(not needed)
+
+ApolloCtlBad	MOVEQ	#controlErr,D0					; else say we don't do this one
+				BRA.S	ApolloCtlDone					; and return
+			
+ApolloCtlGood	MOVEQ	#noErr,D0						; return no error
+	
+ApolloCtlDone	MOVEM.L	(SP)+,A0/A1						; Restore exit registers.
+				BRA		ApolloExitDrvr
+
+ApolloVidReset
+;---------------------------------------------------------------------
+;
+;	Reset the card to its default
+;
+;---------------------------------------------------------------------
+
+				WITH	VDPageInfo,ApolloVidPrivates
+			
+				MOVE	#FirstVidMode,csMode(A2)		; return default mode
+				MOVE	#FirstVidMode,saveMode(A3)		; remember FirstVidMode as the requested mode
+				CLR.W	csPage(A2)						; return page zero
+				MOVE.L	saveBaseAddr(A3),csBaseAddr(A2) ; return the base address
+				BSR		ApolloGrayScreen				; paint the screen gray
+				BRA.S	ApolloCtlGood					; => no error
+	
+				ENDWITH
+		
+ApolloSetVidMode
+;---------------------------------------------------------------------
+;
+;	Set the card to the specified mode and page.  If it's not 1-bit 
+;	mode, page zero, then return an error
+;
+;   If the card is already set to the specified mode, then do nothing.
+;
+;---------------------------------------------------------------------
+
+				WITH	VDPageInfo,ApolloVidPrivates
+			
+				CMP.W	#FirstVidMode,csMode(A2)		; is it one-bit (the first and only)
+				BNE.S	ApolloCtlBad					; => not a valid mode
+	
+				TST.W	csPage(A2)						; it is page zero?
+				BNE.S	ApolloCtlBad					; => not a valid page
+	
+				MOVE.L	saveBaseAddr(A3),csBaseAddr(A2)	; return the base address
+				BRA 	ApolloCtlGood					; => return no error
+			
+				ENDWITH
+
+ApolloSetEntries
+;---------------------------------------------------------------------
+;
+;	Since Apollo has no color table, there’s nothing do here.  Return a ctl
+;	bad result (but do it up above in the control dispatcher, since it
+;	saves a few bytes.
+;
+;---------------------------------------------------------------------
+		
+ApolloSetGamma
+;---------------------------------------------------------------------
+;
+;	Since Apollo has no color table, there's no opportunity to set the
+;	gamma correction in this hardware.  Return a ctl bad result (but
+;	do it up above in the control dispatcher, since it saves a few bytes.
+;
+;---------------------------------------------------------------------
+			
+ApolloGrayPage											
+;---------------------------------------------------------------------
+;
+;	Clear the specified page in the current mode to gray
+;
+;		A0 = Ptr to private storage
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;
+;---------------------------------------------------------------------
+			
+				WITH 	VDPageInfo,ApolloVidPrivates
+			
+				TST.W	csPage(A2)						; Is it requesting page zero?
+				BNE		ApolloCtlBad
+	
+				BSR		ApolloGrayScreen				; paint the screen gray
+				BRA		ApolloCtlGood					; => return no error
+	
+				ENDWITH
+		
+ApolloSetGray
+;---------------------------------------------------------------------
+;
+;	Since Apollo has no color table, there's no opportunity to set
+;	luminence mapping in this hardware.  Return a ctl bad result (but
+;	do it up above in the control dispatcher, since it saves a few bytes.
+;
+;---------------------------------------------------------------------
+			
+ApolloSetInterrupt
+;---------------------------------------------------------------------
+;
+;	Enable (csMode = 0) or disable (csMode = non-zero) VBL interrupts
+;
+;   As a future performance enhancement, interrupts on the card can be
+;	disabled or enabled from software. For instance, if the cursor is
+;	not on a screen, and there is nothing in the Slot Interrupt Queue
+;	for that device, interrupts may be disabled reducing interrupt 
+;	overhead for the system.
+;
+;	The slot interrupt queue element is always allocated by the Open call.
+;	This routine just inserts and removes it from the slot interrupt task queue.
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+
+				WITH	VDPageInfo,ApolloVidPrivates
+			
+				Tst.b	csMode(A2)						; If csMode = 0, then we are 
+				Beq.s	@EnableThem						;	enabling VBL interrupts.
+
+; This is the code that disables VBL interrupts, then removes the interrupt handler.
+;
+				Bsr.s	ApolloDisableVGuts				; Do disabling activities, and
+				Bra		ApolloCtlGood					;	return noErr.
+
+; This is the code that installs and enables the interrupt handler.
+;
+@EnableThem
+				Bsr.s	ApolloEnableVGuts				; Do enabling activites, and
+				Bne		ApolloCtlBad					;	flag problem on errors;
+				Bra		ApolloCtlGood					;   otherwise, return noError.
+
+; The following two routines are used by SetInterrupt as well as by Open/Close.  So,
+;	their names don’t have @’s in front of them, and they return via Rts instructions.
+;
+ApolloDisableVGuts
+		
+				Bset	#IntDisFlag,GFlags(A3)			; Set disabled flag to true.
+				
+				Move.w	Sr,-(Sp)						; Preserve the status register.
+				Moveq	#7,D0							; Get mask into D0.
+				And.b	(Sp),D0							; Get the current interrupt level.
+				Subq.b	#2,D0							; If interrupt level ≥ 2,
+				Bge.s	@Ok								; 	then don’t change.
+				Ori.w	#$0200,Sr						; Otherwise, raise it above level 2,
+				Andi.w	#$FAFF,Sr						;	and make it level 2.
+@Ok
+				Bsr		ApolloWaitVSync					; To be safe, wait for NEXT VBL to occur.
+				
+				MOVE.L	VISA,A0							; Point to the VISA base.
+				MOVE.B	#$40,RvSEnb(A0)					; Set slot 0 interrupt disabled (slot 0 bit+set/clear to 0).
+	
+				Move.w	(Sp)+,Sr						; Restore status register/interrupt level.
+				
+				Clr.w	D0								; Setup for removing slot $0 interrupt handler.
+				Move.l	saveSQElPtr(A3),A0				; Get the SQ element ptr.
+				_SIntRemove								; Remove the interrupt handler.
+				
+				Rts										; Return home.
+
+ApolloEnableVGuts
+			
+				Bclr	#IntDisFlag,GFlags(A3)			; Set disabled flag to false.
+				
+				Move.l	saveSQElPtr(A3),A0				; Get the queue element.
+				Lea		ApolloBeginIH,A2				; Save pointer to interrupt handler.
+				Move.w	#siQType,sqType(A0)				; Setup queue ID.
+				Move.l	A2,sqAddr(A0)					; Setup routine address.
+				Move.l	A3,SQParm(A0)					; Cache ApolloVidPrivates.
+				Clr.w	D0								; Do it for slot $0.
+				_SIntInstall
+				Bne.s	@IntBad
+				
+				MOVE.L	VISA,A0							; Point to the VISA base.
+				MOVE.B	#$C0,VsSEnb(A0)					; Set slot 0 interrupt enabled (slot 0 bit+set/clear to 1).
+	
+				Cmp		D0,D0							; Clear z-bit for good result.
+@IntBad			Rts										; Return home.
+				
+				ENDWITH
+	
+ApolloSetDefaultMode
+;---------------------------------------------------------------------
+;
+;	Since Apollo only has one video sRsrc and it’s already set, just return
+;	a ctl bad result (but do it up above in the control dispatcher, since
+;	it saves a few bytes.
+;
+;---------------------------------------------------------------------
+				
+**********************************************************************
+*
+* VideoClose releases the device's private storage and removes the 
+*		interrupt handler.
+*
+*
+* Entry:	A0 = param block pointer
+*			A1 = AuxDCE pointer
+*
+* Other:	A2 = temporary AuxDCE pointer copy
+*
+**********************************************************************
+								
+				WITH	 ApolloVidPrivates
+
+ApolloVidClose		
+				MOVE.L	dCtlStorage(A1),A3			; A3 <- Ptr to private storage
+				MOVE.L	(A3),D0						;
+				_StripAddress						;
+				MOVE.L	D0,A3						;
+	
+				Bsr		ApolloDisableVGuts			; Call utility to deactivate interrupts.
+				Move.l	saveSQElPtr(A3),A0			; Dispose of the slot interrupt queue element ptr
+				_DisposPtr
+	
+				Move.l	saveFixedCLUT(A3),A0		; Dispose of our fixed-entry CLUT.
+				_DisposPtr
+							
+				MOVE.L	dCtlStorage(A1),A0			; Dispose of the private storage
+				_DisposHandle						;
+	
+				MOVEQ	#noErr,D0					; no error
+				RTS									; and return
+				
+				ENDWITH
+
+**********************************************************************
+*
+* Video Driver Status Call Handler.  Right now there are ten calls:
+*
+*	(0)  Error
+*	(1)  Error
+*	(2)	 GetMode
+*	(3)  GetEntries
+*	(4)	 GetPage
+*	(5)	 GetPageBase
+*	(6)  GetGray
+*	(7)	 GetInterrupt
+*	(8)	 GetGamma
+*	(9)  GetDefaultMode
+*
+*   Entry: 	A0 		= param block
+*			A1 		= AuxDCE pointer
+*	Uses:	A2		= cs parameters
+*			A3 		= pointer to private storage
+*			D0-D3 	= scratch (don't need to be preserved)
+*
+*	Exit:	D0	  	= error code
+*
+**********************************************************************
+
+ApolloVidStatus	
+				MOVEM.L	A0/A1,-(SP)							; Preserve exit registers.
+				
+				MOVE.L	csParam(A0),A2						; A2 <- Ptr to control parameters
+			
+				MOVE.L	dCtlStorage(A1),A3					; A3 <- Ptr to private storage
+				MOVE.L	(A3),D0								;
+				_StripAddress								;
+				MOVE.L	D0,A3								;
+
+				MOVE.W	csCode(A0),D0						; get routine selector
+			
+				CMP.W	#9,D0								;IF csCode NOT IN [0..9] THEN
+				BHI.S	ApolloStatBad						;  Error, csCode out of bounds.
+				MOVE.W	ApolloStatJumpTbl(PC,D0.W*2),D0		;Get the relative offset to the routine.
+				JMP		ApolloStatJumpTbl(PC,D0.W)			;GOTO the proper routine.
+				
+ApolloStatJumpTbl
+				DC.W	ApolloStatBad-ApolloStatJumpTbl			;$00 => Error
+				DC.W	ApolloStatBad-ApolloStatJumpTbl			;$01 => Error
+				DC.W	ApolloGetMode-ApolloStatJumpTbl			;$02 => GetMode
+				DC.W	ApolloGetEntries-ApolloStatJumpTbl		;$03 => GetEntries
+				DC.W	ApolloGetPage-ApolloStatJumpTbl			;$04 => GetPage
+				DC.W	ApolloGetPageBase-ApolloStatJumpTbl		;$05 => GetPageBase
+				DC.W	ApolloStatBad-ApolloStatJumpTbl			;$06 => GetGray		(not needed)
+				DC.W	ApolloGetInterrupt-ApolloStatJumpTbl 	;$07 => GetInterrupt
+				DC.W	ApolloStatBad-ApolloStatJumpTbl			;$08 => GetGamma	(not needed)
+				DC.W	ApolloGetDefaultMode-ApolloStatJumpTbl	;$09 => GetDefaultMode
+
+ApolloStatBad	MOVEQ	#statusErr,D0					; else say we don't do this one
+				BRA.S	ApolloStatDone					; and return
+			
+ApolloStatGood	MOVEQ	#noErr,D0						; return no error
+
+ApolloStatDone	MOVEM.L	(SP)+,A0/A1						; Restore exit registers.
+				BRA		ApolloExitDrvr
+
+ApolloGetMode
+;---------------------------------------------------------------------
+;
+;	Return the current mode
+;
+;		Inputs : A2 = pointer to csParams
+;				 A3 = pointer to private storage
+;
+;---------------------------------------------------------------------
+
+				WITH	ApolloVidPrivates,VDPageInfo
+			
+				MOVE.W	saveMode(A3),csMode(A2)			; return the mode
+				CLR.W	csPage(A2)						; return the page number
+				MOVE.L	saveBaseAddr(A3),csBaseAddr(A2)	; and the base address
+				
+				BRA.S	ApolloStatGood					; => return no error
+		
+				ENDWITH
+
+ApolloGetEntries
+;---------------------------------------------------------------------
+;
+;	Fake the current contents of the CLUT.  There isn't really a clut around,
+;	but that's no reason not to return a reasonable looking response
+;
+;		Inputs : A2 = pointer to csParams
+;				 A3 = pointer to privates
+;
+;	For Apollo the color table is fixed.  So, we’ll always return good values
+;	as long as there is a reasonable looking color table around.
+;
+;	Idea:	If we’re in indexed mode, we’ll cycle thru the input
+;			table.  While doing this, we’ll ignore all entries
+;			whose value fields are out of range.  For entries
+;			whose value field are in range, we’ll return the
+;			appropriate rgb fields.
+;
+;			If we’re in sequential mode, we just need to write out
+;			the number of entries we know about.
+;
+;---------------------------------------------------------------------
+
+				With	ApolloVidPrivates
+			
+				Move.l	csTable(A2),D0					; If we were handed a nil pointer,
+				Beq		ApolloStatBad					;	then hike.
+				_StripAddress							; Otherwise, make it 32-bit clean.
+				
+				Move.l	D4,-(Sp)						; Save work register.
+
+; Calculate the index range…
+;
+				Move.w	saveNumFixedEntries(A3),D3		; Get number of entries to check against.
+				
+				Move.w	csCount(A2),D4					; Get the number of entries to set,
+				Bmi.s	@GEErr							; 	and hike if it’s out of range.
+				Cmp.w	D3,D4							; If D4-D3 > 0 (count > # of entries),
+				Bhi.s	@GEErr							;	then hike.
+				Move.w	D4,D2							; Otherwise, copy the count.
+				
+				Move.l	D0,A0							; Get pointer to input table.
+				Cmp.w	#indexEntries,csStart(A2)		; If table accesses are to be indexed,
+				Beq.s	@GECom							;	then go on.
+				
+				Move.w	D4,D1							; Otherwise, sequence thru table from
+				Add.w	csStart(A2),D2					;	csStart thru csCount entries.
+
+; The following code is BAD, BAD, BAD!  We should build our own table here so
+;	as to NOT mess up the user’s data.  But all the previous Apple video drivers
+;	have done the same thing, so we’ll continue the trend for now.
+
+@TableLoop		Move.w	D2,value(A0,D1*colorSpecSize)	; Write the index into the table.
+				Subq	#1,D2							; Decrement index.
+				Dbra	D1,@TableLoop
+	
+@GECom		
+@Repeat			Move.w	value(A0),D1					; Get the NEXT table position into D1.
+				Cmp.w	D3,D1							; If this position is out of range,
+				Bhi.s	@Until							;	then go on.
+				
+				Move.l	saveFixedCLUT(A3),A1			; Point to start of fixed CLUT.	
+				Lea		(A1,D1*colorSpecSize),A1		; Index into right entry.
+	
+				Move.w	rgb+red(A1),rgb+red(A0)			; Copy	red,
+				Move.w	rgb+green(A1),rgb+green(A0)		; 		green,
+				Move.w	rgb+blue(A1),rgb+blue(A0)		;		blue.
+	
+@Until			Addq	#colorSpecSize,A0				; Point to next entry in input ColorTable.
+				Dbra	D4,@Repeat
+	
+				Move.l	(Sp)+,D4						; Restore work register.
+				Bra		ApolloStatGood					; Return noError.
+				
+@GEErr			Move.l	(Sp)+,D4						; Restore work register.
+				Bra		ApolloStatBad					; Return statError.
+				
+				EndWith
+
+ApolloGetPage
+;---------------------------------------------------------------------
+;
+;	Return the number of pages in the specified mode.  
+;
+;---------------------------------------------------------------------
+				
+				WITH	ApolloVidPrivates,VDPageInfo
+			
+				CMP.W	#FirstVidMode,csMode(A2)		; this mode, or else
+				BNE		ApolloStatBad					; oh,oh
+				
+				MOVE.W	#OBMPagesApollo,csPage(A2)		; return page count
+				BRA		ApolloStatGood					; => return no error
+				
+				ENDWITH
+		
+ApolloGetPageBase
+;---------------------------------------------------------------------
+;
+;	Return the base address for the specified page in the current mode
+;
+;---------------------------------------------------------------------
+			
+				WITH	ApolloVidPrivates,VDPageInfo
+			
+				MOVE.W	csPage(A2),D0					; get the requested page
+				BNE		ApolloStatBad					; => no, just return
+							
+				MOVE.L	saveBaseAddr(A3),csBaseAddr(A2)	; return the base address
+				BRA 	ApolloStatGood					; => return no error
+				
+				ENDWITH
+			
+ApolloGetGray
+;---------------------------------------------------------------------
+;
+;	No CLUT, so this routine returns an status error.  It's implemented
+;	in the Status dispatch table above.
+;
+;---------------------------------------------------------------------
+
+ApolloGetInterrupt
+;---------------------------------------------------------------------
+;
+;	Return a boolean in csMode, set true if VBL interrupts are disabled
+;
+;---------------------------------------------------------------------
+
+				WITH	ApolloVidPrivates,VDPageInfo
+			
+				Btst	#IntDisFlag,GFlags(A3)			; If interrupts are enabled (zero)			
+				Beq.s	@IsOn							;	then return enabled state.
+				Move.b 	#1,csMode(A2)					; Otherwise, return disabled.
+				Bra		ApolloStatGood
+@IsOn
+				Clr.b	csMode(A2)						; Return enabled state.
+				Bra		ApolloStatGood					; return noErr
+			
+				ENDWITH
+		
+ApolloGetGamma
+;---------------------------------------------------------------------
+;
+;	No CLUT, so this routine returns an status error.  It's implemented
+;	in the Status dispatch table above.
+;
+;---------------------------------------------------------------------
+
+ApolloGetDefaultMode
+;---------------------------------------------------------------------
+;
+;	Read the card default mode from slot pRAM.
+;
+;		A1 = Ptr to AuxDCE
+;		A2 = Ptr to cs parameter record
+;		A3 = Ptr to private storage
+;
+;---------------------------------------------------------------------
+
+; For most video drivers, we look in pRAM to see what the last
+;	configuration set was.  However, for Apollo, there only one
+;	mode possible, so we just return that value here.
+
+				WITH		VDPageInfo					; GDW1
+				MOVE.B		dCtlSlotID(A1),csMode(A2)	; return the result
+				BRA			ApolloStatGood				;
+				ENDWITH									; GDW1
+
+;---------------------------------------------------------------------
+;
+;	Exit from Control or Status.
+;
+;	 	A0 = Ptr to param block.
+;		A1 = Ptr to AuxDCE.
+;		D0 = error code.
+;
+;---------------------------------------------------------------------
+
+ApolloExitDrvr	BTST	#NoQueueBit,ioTrap(A0)			; no queue bit set?
+				BEQ.S	ApolloGoIODone					; => no, not immediate
+				RTS 									; otherwise, it was an immediate call
+
+ApolloGoIODone	MOVE.L	JIODone,-(Sp)					; Get the IODone address,
+				Rts										; 	and go there.
+
+;=====================================================================
+;
+;	Utilities
+;
+;=====================================================================
+
+;---------------------------------------------------------------------
+;
+;	Wait for vertical blanking.  Interrupts are raised to level-2 around
+;	this routine.  
+;
+;   A1 = AuxDCE POINTER
+;	A3 = pointer to private storage
+;---------------------------------------------------------------------
+
+ApolloWaitVSync
+			
+				Movem.l	A0/D0,-(Sp)						; Save work registers.
+	
+				MOVE.L	VISA,A0							; Point to VISA.
+				MOVE.B	#$40,VsSInt(A0) 				; Clear the interrupt, just in case,
+														;   since the intHndlr can't get 
+														;	called here.
+	
+				ADDA	#VsSInt,A0						; Point to interrupt register.
+@0				MOVE.B	(A0),D0							; Read the Vert-Sync state.
+				BTST	#6,D0							; 
+				BNE.S	@0								; Repeat until it goes hi.
+			
+				Movem.l	(Sp)+,A0/D0						; Restore registers.
+				Rts
+
+
+ApolloGrayScreen
+;---------------------------------------------------------------------
+;
+;	Fill the screen with a 50% dithered gray pattern.
+;			A3 = driver private storage
+;
+;	All registers are preserved
+;
+
+				WITH 		ApolloVidPrivates
+
+				MOVEM.L		D0/D2/D3/A0/A1,-(SP)		; save all registers
+
+				MOVE.L		#OneBitGray,D3				; get the one-bit gray pattern
+
+				MOVE.L		saveBaseAddr(A3),A0			; get the frame buffer base address
+				MOVE.W		#defmBounds_BApollo-1,D0	; get the # of rows
+
+@NxtRow			MOVE.W		#(OBMApolloRB/4)-1,D2		; get the # of longs/row 
+@NxtLong		MOVE.L		D3,(A0)+					; write gray
+				DBRA		D2,@NxtLong					; for each scanline
+				NOT.L		D3							; invert pattern on next row
+				DBRA		D0,@NxtRow					; for each row
+
+				MOVEM.L		(SP)+,D0/D2/D3/A0/A1		; restore registers
+				RTS
+
+				ENDWITH			
+
+;-------------------------------------------------------------
+;	The Interrupt handler Apollo Built-In Video
+;-------------------------------------------------------------
+; On entry A1 contains the pointer to the driver's private storage
+; D0-D3/A0-A3 have been preserved.
+		
+ApolloBeginIH		
+
+				MOVE.L		VISA,A0						; Point to VISA.
+				MOVE.B		#$40,VsSInt(A0) 			; Clear the interrupt.
+
+				Clr.w		D0							; Setup for slot $0 VBLTask.
+				Move.l		JVBLTask,A0	
+				Jsr			(A0)
+
+				Moveq		#1,D0						; Tell the caller that interrupt was handled,
+				Rts										; 	and return.
+
+				ENDWITH
+	END

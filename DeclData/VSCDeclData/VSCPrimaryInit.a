@@ -1,0 +1,681 @@
+;---------------------------------------------------------------------
+;
+;	File:		VSCPrimaryInit.a
+;
+;	Written by:	Gary Rensberger, based on Mike Puckets Sonora PrimaryInit.   Jan 4, 1992
+;
+;	Copyright:	© 1988-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	12/13/93	PN		Roll in KAOs and Horror changes to support Malcom and AJ
+;									machines
+;		 <1>	12-04-92	jmp		first checked in
+; ———————————————————————————————————————————————————————————————————————————————————————
+;	  Pre-SuperMario comments begin here.
+; ———————————————————————————————————————————————————————————————————————————————————————
+;		<H7>	 7/14/92	HJR		Enable CSync back on VGA monitors.
+;		<H6>	 7/13/92	HJR		Disable CSync on VGA monitors. Reverse polarity of PmgrExtVidOn
+;									and call PmgrHook if Video is enabled.
+;		<H5>	 6/30/92	HJR		General Cleanup.
+;		<H4>	  6/1/92	HJR		Check if charger is installed. If not, kill power to external
+;									video and notify user that something is wrong. Also if video is
+;									disable, return error so that slot manager can mark slot as
+;									being bad.
+;		<H3>	  5/7/92	HJR		Changed VideoBase to VSCVideoBase.
+;		<H2>	 4/27/92	HJR		Turn off clocks to the VSC if no monitor is detected.
+;		 <1>	 4/24/92	HJR		first checked in
+;		<12>	  3/5/92	RLE		turn off change <10> for Deskbars
+;		<11>	  3/5/92	GMR		Fixed a0 register trash bug from change <9>
+;		<10>	  3/4/92	RLE		set up nuchip33 to pass Nubus accesses in superslot 6, slot E,
+;									and superslot E to DB Lite system without translation
+;		 <9>	  3/4/92	GMR		Now properly setting clock after alternate family mode detected.
+;		 <8>	 2/27/92	RLE		turn off eject and ethernet interrupt enables
+;		 <7>	 2/13/92	RLE		move power plane stuff into secondary init where the scc init
+;									will take place
+;		 <6>	  2/6/92	RLE		renamed board ID so it works with either Gemini or Deskbar
+;		 <5>	 1/31/92	GMR		Made the slot interrupt handler more robust.
+;		 <4>	 1/31/92	RLE		fix stoopid power plane bset bug
+;		 <3>	 1/30/92	RLE		turn on all power planes, setup new SCC base addresses (until
+;									docking stuff in place)
+;		 <2>	 1/30/92	GMR		Now installs a slot E handler for NuBus slots C and D.
+;		 <1>	 1/28/92	GMR		first checked in
+;---------------------------------------------------------------------
+
+;---------------------------------------------------------------------
+;	Header
+;---------------------------------------------------------------------
+				
+				dc.b	sExec2								; Header
+				dc.b	sCPU68020
+				dc.w	0
+				dc.l	BeginVSCInit-*
+
+;---------------------------------------------------------------------
+;	Local variables, definitions, etc....
+;---------------------------------------------------------------------
+
+			WITH	SEBlock,SPBlock
+
+VSCFrame	RECORD	{A6Link},Decrement
+Return			ds.l	1									; Return address.
+A6Link			ds.l	1									; Saved A6.
+memMode			ds.l	1									; 24/32 bit (from swapMMUMode)
+spBlk			ds		SPBlock								; SpBlock for generic use.
+sPRAMBlk		ds.b	SizeSPRAMRec						; sPRAMRec for generic use.
+vidParamsPtr	ds.l	1									; Pointer to video parameters.
+configParamsPtr	ds.l	1									; Pointer to config parameters.
+startingConfig	Ds.b	1									; Used to determine if we need to reload configs.
+				Ds.b	1									; <pad>
+SFSize			EQU		*
+			ENDR
+
+			ENDWITH
+			
+VRAMConfigRec RECORD	0									; 
+sRsrcID			ds.b	1									; Default sRsrc ID for this vRam configuration.
+alt1			ds.b	1									; …family mode alternative 1,
+alt2			ds.b	1									; …family mode alternative 2,
+alt3			ds.b	1									; …family mode alternative 3.
+modeID			ds.b	1									; Favored modeID (depth).
+				ds.b	1									; <pad>
+VRAMConfigSize	EQU		*
+			  ENDR
+
+MiniGamma	RECORD	0										; Entries for mini gamma table used in VSCInit.
+blackRed		ds.b	1									; Red
+whiteRed		ds.b	1									;
+blackGreen		ds.b	1									; Green
+whiteGreen		ds.b	1									;
+blackBlue		ds.b	1									; Blue
+whiteBlue		ds.b	1									;
+				ds.b	2									; <pad>
+GT_Size			EQU		*
+			ENDR
+
+			WITH	MiniGamma,VRAMConfigRec
+
+VSCConfigRec	Record	0
+gammaTbl		ds.b	GT_Size								; Mini-gamma table
+SConfigHdrSize	EQU		*
+s512KVRAM		ds.b	VRAMConfigSize						; 512K vRAM preferences.
+SConfigRecSize	EQU		*
+			ENDR
+
+			ENDWITH
+
+;=====================================================================
+;	Utils
+;=====================================================================
+
+;---------------------------------------------------------------------
+;
+;	Routine:	PruneList
+;
+;	Inputs:		d0.b	-	sRsrcID of the “keeper”
+;				d3.l	-	sRsrcID of 4 family-mode alternates
+;				a0		-	pointer to appropriately filled-out SpBlock
+;				a1		-	pointer to list of sRsrcIDs
+;
+;	Outputs:	none
+;
+;	Destroys: 	d0-d2/a1
+;
+;	Function:	Loops thru a table of sRsrcIDs comparing the “keeper” with each
+;				of the entries in the table.  Those IDs that don’t match
+;				the keeper or alternate ID's are pruned.  Those that don't match 
+;				the keeper, but match one of the alternate ID's will be disabled.
+;---------------------------------------------------------------------
+			WITH	SpBlock
+
+PruneList		move.b	d0,-(sp)					; Remember the ID of the “keeper.”							
+				move.w	(a1)+,d1					; Get the zero-based counter into D1.
+
+				Move.l	D3,D2						; Get the list of family modes.
+				Andi.l	#$00FFFFFF,D2				; Remember if there are any alternatives.
+
+@repeat			move.b	(a1)+,d0					; Get an sRsrc ID.
+				cmp.b	(sp),d0						; If it’s the keeper,
+				beq.s	@until						;	then don’t prune it.
+				move.b	d0,spID(a0)					; else, set ID so we can prune/disable it
+
+				Tst.l	D2							; If there are no family-mode alternatives,
+				Beq.s	@delete						; 	then just do the delete.
+				
+				rol.l	#8,d3
+				cmp.b	d0,d3						; else, see if it's an alternate family member
+				beq.s	@disable					; yes, then disable it
+				rol.l	#8,d3
+				cmp.b	d0,d3						; see if it's the other alternate family member
+				beq.s	@disable					; yes, then disable it
+				rol.l	#8,d3
+				cmp.b	d0,d3						; else, see if it's an alternate family member
+				beq.s	@disable					; yes, then disable it
+				rol.l	#8,d3
+				cmp.b	d0,d3						; see if it's the other alternate family member
+				beq.s	@disable					; yes, then disable it
+
+@delete			_sDeleteSRTRec
+@until			dbra	d1,@Repeat					; Loop until done.
+				bra.s	@exit
+				
+@disable		move.l	#1,spParamData(a0)			; Setup to disable this mode.
+				clr.l	spsPointer(a0)				; Not a RAM sRsrc.
+				_SetsRsrcState						; Set it.
+				bra.s	@until
+
+@exit			tst.b	(sp)+						; Clean up the stack.
+				rts									; Return to caller.
+				
+			ENDWITH
+				
+;---------------------------------------------------------------------
+;
+;	Routine:	Delay8ms
+;
+;	Inputs:		a0		-	Ptr to VIA1 base
+;
+;	Outputs:	none				
+;
+;	Destroys:	d0
+;
+;	Function:	Delays around 8 us, for ensuring PLL is programmed correctly.
+;---------------------------------------------------------------------
+
+Delay8ms		move.w	TimeVIADB,d0
+				lsl.w	#3,d0						; 8 ms delay
+@wait			tst.b	(a0)
+				dbra	d0,@wait
+				rts
+				
+;---------------------------------------------------------------------
+;
+;	Routine:	SendPLLData
+;
+;	Inputs:		a3		-	Ptr to AIV3 base
+;				d0.l	-	Data to shift out
+;				d1.w	-	Number of bits to shift out minus 1 (n-1)
+;	
+;	Outputs:	none
+;
+;	Destroys:	d0-d2
+;
+;	Function:	Sends the specified data to the PLL through the VIA (AIV3).
+;---------------------------------------------------------------------
+
+SendPLLData		Move.l		D3,-(Sp)				; Save D3 (as it’s a global).
+				rol.l		#6,d0					; First, move starting bit into bit 6.
+
+@nextBit		move.l		d0,d3					; Get the data.
+				andi.b		#(1<<SData),d3			; Only keep bit 6 (the data bit).
+				move.b		AIV3cfg(a3),d2			; Get the current reg value.
+				andi.b		#((1<<SpeedCtl)++\		; Keep the wait state bit.
+							  (1<<BufCtl)),d2		; Keep buffer control bit.
+				or.b		d3,d2					; Add in data bit.
+				move.b		d2,AIV3cfg(a3)			; Write the data bit.
+				ori.b		#(1<<SClock),d2			; Set up to…
+				move.b		d2,AIV3cfg(a3)			; …reset the clock line.
+				ror.l		#1,d0					; Prep next bit.
+				dbra.w		d1,@nextBit
+				
+				Bclr		#SClock,AIV3Cfg(A3)		; Clear the clock and…
+				Bclr		#SData,AIV3Cfg(A3)		; …data lines for good measure.
+				Move.l		(Sp)+,D3				; Restore D3.
+				rts									; And leave.
+
+;---------------------------------------------------------------------
+;
+;	Routine:	SetDotClock
+;
+;	Inputs:		a3		-	Ptr to AIV3 base
+;				a1		-	ptr to config word.l/bit count.w
+;	
+;	Outputs:	a1		-	bumped past clock info, points to VSC parameters
+;
+;	Destroys:	d0-d2
+;
+;	Function:	Loads the PLL with a value pointed to by a1.  a1+4 = # bits to load
+;---------------------------------------------------------------------
+
+				With	VSCFrame,VSCVidParams
+
+SetDotClock		move.l	a0,-(sp)							; save regs
+				move.l	VIA,a0								; VIA base in a0 for delays
+
+				Moveq	#0,D0								; Clear out high-order word of D0.
+				
+				move.w	#firstCtrl,d0						; first control word
+				moveq	#CtrlCount,d1						; count
+				bsr.s	SendPLLData							; send it serially
+
+				move.l	(a1)+,d0							; serial config word
+				move.w	(a1)+,d1							; count
+				bne.s	@sendData
+				
+				move.w	#postCtrl,d0						; if count 0, special case (use default)
+				moveq	#CtrlCount,d1						; count
+				bsr.s	SendPLLData							; send it serially
+
+				bsr		Delay8ms							; delay at least 5 ms before sending final word
+
+				move.w	#postCtrl,d0						; final control word
+				moveq	#CtrlCount,d1						; count
+				bsr.s	SendPLLData							; send it serially
+				bra.s	@exit								; and exit
+				
+@sendData		bsr.s	SendPLLData							; send it serially
+
+				move.w	#postCtrl,d0						; post control word
+				moveq	#CtrlCount,d1						; count
+				bsr.s	SendPLLData							; send it serially
+
+				bsr		Delay8ms							; delay at least 8 ms before sending final word
+
+				move.w	#finalCtrl,d0						; final control word
+				moveq	#CtrlCount,d1						; count
+				bsr.s	SendPLLData							; send it serially
+
+@exit			move.l	(sp)+,a0							; restore a0								<11>
+				rts
+
+				Endwith
+
+;==================================================================================================
+;	Routine:	PrimaryInit
+;
+;	Inputs:
+;
+;	Ouputs:
+;
+;	May destroy:	d0-d7,a0-a6
+;
+;	Uses	A3	-	ptr to AIV3 base
+;			A4	-	ptr to VSC's video register base
+;==================================================================================================
+
+			WITH	SEBlock,SPBlock,VSCFrame
+
+BeginVSCInit
+
+; Set up initial “vendor” status.
+				
+				link	a6,#SFSize							; Allocate stack space for locals.
+				move.w	#seSuccess,seStatus(a0)				; Just say that we’re okay.
+				
+;
+; Perform some generic initializations.
+;
+				move.b	seSlot(A0),spBlk.spSlot(a6)			; Get our slot number from the Slot Manager.
+				clr.b	spBlk.spExtDev(a6)					; Why ask why? Just clear this guy.
+								
+;
+; Initialize the BoardID part of the Slot $E pRAM if necessary, and prune the board sResources.
+;
+			With	SP_Params
+				
+				lea		spBlk(a6),a0						; Point A0 at our local SpBlock.
+				lea		sPRAMBlk(a6),a2						; Get a pointer to our local SPRAMBlock.
+				move.l	a2,spResult(a0)						; Put our pointer in the SpBlock.
+				_sReadPRAMRec								; Read Slot $E’s pRAM.
+				
+				tst.w	SP_BoardID(a2)						; If the board ID is non-zero,
+				bne.s	@VSCVideoInit						;	then just go on.
+				
+				move.b	#sRsrc_Board,spID(a0)				; Otherwise, look for the appropriate board sRsrc.
+				_sRsrcInfo									; Get the spsPointer.
+				
+				move.b	#BoardID,spID(a0)					; Set up to get the correct board ID.
+				_sReadWord									; Get it.
+				
+				move.w	spResult+2(a0),SP_BoardID(a2)		; Save the board ID into pRAM.
+				move.l	A2,spsPointer(a0)					;
+				_InitSlotPRAM								;
+				
+; In a “classic” PrimaryInit, this is the point in the code where would actually go out to
+;	detect the kind of display that is connected.  However, since that has already been
+;	done for us by the Docking Manager, we just read the indexed MonID from PRAM here.
+
+@VSCVideoInit
+
+				Moveq	#0,D6								; Clear out the indexed display ID reg.
+				Move.b	SP_MonID(A2),D6						; Load the indexed display ID.
+			
+			ENDWITH
+
+; Get some useful values up front.
+;
+				lea		VSCVideoBase,a4						; Get the video base address into a4.
+				lea		AIV3Base,a3							; Point to AIV3 base.
+				
+;-------------------------------------------------------
+; We’ll size VRAM later if necessary.  For now, just assume
+;	512K.  See the VRAM sizing notes below.
+;-------------------------------------------------------
+
+				Moveq	#0,D4								; Assume there’s 512K of VRAM for now.
+
+;-------------------------------------------------------
+; Get the video parameters for this monitor (1bbp) and use to setup the dot-clock
+; so we can then size VRAM.
+;-------------------------------------------------------
+
+			WITH	VRAMConfigRec,VSCConfigRec
+
+				lea		VSCConfigTable,a1					; Point to the VSC configuration table.
+				move.w	#SConfigRecSize,d0					; Get the size of each entry into D0.
+				mulu	d6,d0								; Multiply it by the right entry.
+				adda.l	d0,a1								; Skip to the entry we want.
+				move.l	a1,configParamsPtr(a6)				; Save it for later.
+				adda.l	#SConfigHdrSize,a1					; Skip past the header.
+				move.w	#VRAMConfigSize,d0					; Get the size of the VRAM entries.
+				mulu	d4,d0								; Multiply by the right entry.
+				adda.l	d0,a1								; Skip to the right VRAM entry.
+
+				Move.b	sRsrcID(A1),D5						; Get an “okay” sRsrcID into D5.
+				move.b	modeID(a1),d7						; Get the default mode (depth).
+				move.l	sRsrcID(a1),d3						; get both family ID's (if any) in d3 (for disabling)
+				
+				Clr.l	vidParamsPtr(A6)					; Remember that we haven’t loaded in vidParams yet.
+				Cmpi.b	#sRsrc_VSC_NeverMatch,D5			; If it’s the null one, then
+				Beq		@SetConfig							;	just get ready to leave.
+				
+				lea		spBlk(a6),a0						; Point A0 at our local SpBlock.
+				move.b	#sRsrc_Board,spID(a0)				; Get the board sRsrc ID that we need.
+				_sRsrcInfo
+				
+				move.b	#sVidParmDir,spID(a0)				; Look for the video parameters directory.
+				_sFindStruct
+				
+				move.b	D5,spID(a0)							; Look in the directory for this config’s params.
+				_sGetBlock
+				
+				move.l	spResult(a0),a1						; Get a pointer to the vidParams for this config.
+				move.l	a1,vidParamsPtr(a6)					; Save for later disposal.
+				
+				Move.b	D5,startingConfig(A6)				; Remember which config we started with.
+			
+			ENDWITH
+
+;-------------------------------------------------------
+; Set up the dot-clock chip based on our monitor type. 
+;-------------------------------------------------------
+
+				bsr		SetDotClock							; setup the dot clock to default config
+
+;-------------------------------------------------------
+; Size the amount of VRAM.  When done, d4 is set to one of {0,1}, where 0=512K,1=1024K.
+; Note:  On the Darts and BlackBird, only 512K of VRAM is installed, so we just
+; Skip this check.
+;-------------------------------------------------------
+
+				move.b	#((1<<VSCenB0)+(0<<VSCenB1)+\		; enable both banks of VRAM before we size	
+						  (1<<VSCEnDotClk)),VSC_VidCtrl(a4) ; enable the dot clock
+
+;-------------------------------------------------------
+; Initialize built-in video’s PRAM.
+;-------------------------------------------------------
+			
+			WITH	SP_Params
+
+				Move.b	SP_Flags(A2),D0						; Copy the flags byte.
+				Bfins	D4,D0{spVRamBits:numSPVRamBits}		; Load the amount of vRAM.
+ 				Move.b	D0,SP_Flags(A2)						; Remember how much vRAM we setup for.
+
+				cmp.b	SP_DfltConfig(a2),d5				; If this is the same configuration we had last time,
+				beq.s	@WritePRAM							;	then just go on.
+				
+@Reconfig		move.b	d5,SP_DfltConfig(a2)				; Set the identification configuration (as THIS one).
+				move.b	d5,SP_LastConfig(a2)				; Make this the current config also.
+				move.b	d7,SP_Depth(a2)						; Set the default depth for this configuration.
+
+@WritePRAM		move.l	a2,spsPointer(a0)					; Set up the PRAM parameter block.
+				_sPutPRAMRec								; Write out Slot $E’s pRAM.
+
+				move.b	SP_LastConfig(a2),d5				; Get requested ID into D5.
+
+@SetConfig		lea		VSCModeList,a1						; Point to the table of supported video sResources.
+				move.b	d5,d0								; Get the sRsrc ID of the keeper into D0.
+				lea		spBlk(a6),a0						; Point A0 at our local SpBlock.
+				bsr.s	PruneList							; Call our pruning utility.
+				
+			Endwith
+				
+;-------------------------------------------------------
+; Now that everything is set up, we need to determine whether a known configuration is out there.
+;	If so, we continue with the normal PrimaryInit process.  Otherwise, we shut things down and
+;	leave.
+;-------------------------------------------------------
+				
+				Cmpi.b	#sRsrc_VSC_NeverMatch,D5			; If we’ve got a known configuration,
+				Bne.s	@EndConfig							; 	then just go on.
+				
+				Bclr	#VidPwrEn,AIV3PwrEn(a3)				; Only turn off video power.
+				Bra		VSCExit								; And leave.
+				
+@EndConfig
+
+;-------------------------------------------------------
+; Initialize the video hardware (VSC and Ariel)
+;-------------------------------------------------------
+			
+			WITH	VSCVidParams,MiniGamma
+					
+				Movea.l	vidParamsPtr(a6),A0					; Get the vidParams pointer.
+								
+				Cmp.b	startingConfig(A6),D5				; If this isn’t the config we started with,
+				Bne.s	@NewConfig							;	then go reload.
+				
+				Movea.l	A0,A1								; Get the vidParams pointer into A1.
+				Adda.w	#VVPClkSize,A1						; Skip past the dot-clock fields.
+				Bra.s	@VidTiming							; Go set up the timing.
+
+@NewConfig		_DisposPtr									; Dispose of the earlier vidParams.
+				
+				lea		spBlk(a6),a0						; Point A0 at our local SpBlock.
+				move.b	#sRsrc_Board,spID(a0)				; Get the board sRsrc ID that we need.
+				_sRsrcInfo
+				
+				move.b	#sVidParmDir,spID(a0)				; Look for the video parameters directory.
+				_sFindStruct
+				
+				move.b	d5,spID(a0)							; Look in the directory for this config’s params.
+				_sGetBlock
+				
+				move.l	spResult(a0),a1						; Get a pointer to the correct vidParams.
+				move.l	a1,vidParamsPtr(a6)					; Save for later disposal.
+				
+				Bclr	#VSCEnDotClk,VSC_VidCtrl(A4)		; Disable external access to the dot clock.
+				Bsr		SetDotClock							; Reprogram the dot-clock for this config.
+				Bset	#VSCEnDotClk,VSC_VidCtrl(A4)		; Re-enable access to the dot-clock.
+
+@VidTiming		move.b	(a1)+,VSC_HFP(a4)					; set horizontal front porch
+				move.b	(a1)+,VSC_HS(a4)					; set horizontal sync
+				move.b	(a1)+,VSC_HBP(a4)					; set horizontal back porch
+				move.b	(a1)+,VSC_HA(a4)					; set horizontal active dots
+				move.b	(a1)+,VSC_SyncA(a4)					; set SyncA dots
+				move.w	(a1)+,VSC_VFP(a4)					; set vertical front porch
+				move.w	(a1)+,VSC_VS(a4)					; set vertical sync lines
+				move.w	(a1)+,VSC_VBP(a4)					; set vertical back porch
+				move.w	(a1)+,VSC_VA(a4)					; set vertical active lines			
+				move.b	#$07,VSC_BusInt(a4)					; set vram to BlackBird Specs *HJR* (7 for new Pratt, 5 for old)
+@done
+				Movea.l	vidParamsPtr(A6),A1					; Re-point to start of vidParams.
+				clr.b	VSC_Depth(a4)						; Set the frame buffer controller 1bpp.
+				
+				lea		VDACBase,a2							; Get the base address of the VDAC.
+				move.b	#$08,ArielConfigReg(a2)				; Set the CLUT/DAC to 1bpp, master mode, no overlay.
+				adda.w	#ArielDataReg,a2					; Point to the CLUT/DAC data register.
+				move.l	configParamsPtr(a6),a5				; Point to the config parameters.
+
+				move.b	#$7F,ArielAddrReg-ArielDataReg(a2)	; Setup to write 1bpp white.
+				_CLUTDelay									;
+				move.b	whiteRed(a5),(a2)
+				move.b	whiteGreen(a5),(a2)
+				move.b	whiteBlue(a5),(a2)
+				_CLUTDelay									;
+				
+				move.b	#$FF,ArielAddrReg-ArielDataReg(a2)	; Setup to write 1bpp black.
+				_CLUTDelay									;
+				move.b	blackRed(a5),(a2)
+				move.b	blackGreen(a5),(a2)
+				move.b	blackBlue(a5),(a2)
+
+;-------------------------------------------------------
+; Gray the screen.
+;-------------------------------------------------------
+
+				moveq	#true32b,d0							; Set up to flip into 32-bit addressing mode.
+				_SwapMMUMode								; Do the flip.
+				move.l	d0,memMode(a6)						; save old mode
+				
+				lea		VRAMBase,a2							; Point to the base of VRAM.
+				
+				move.w	vvpNumRows(a1),d3					; Get the number of rows.
+				move.l	#OneBitGray,d2						; Set the 1bpp gray pattern.
+
+@nextRow		moveq	#0,d1
+				move.w	vvp1bppRowBytes(a1),d1				; Get the number of bytes/row.
+				move.w	d1,d0
+				andi.w	#$03,d0								; d0 = Rem(bytes/row DIV 4)
+				lsr.w	#2,d1								; d1 = Int(longs/row)
+				bra.s	@cntLong
+				
+@nextLong		move.l	d2,(a2)+							; Write out gray to the frame buffer…
+@cntLong		dbra	d1,@nextLong						; …for each scanline.
+				bra.s	@cntByte
+				
+@nextByte		move.b	d2,(a2)+							; finish remainder (if any) with bytes
+@cntByte		dbra	d0,@nextbyte
+
+				not.l	d2									; Invert the pattern for the next row.
+				dbra	d3,@nextRow							; Repeat for each row.						
+
+				move.l	memMode(a6),d0						; restore old mode
+				_SwapMMUMode								; Do the flip.
+
+			ENDWITH
+
+;-------------------------------------------------------
+; Turn on video now
+;-------------------------------------------------------
+				
+; First, turn on the syncs…
+;
+				move.b	VSC_VidCtrl(a4),d0
+				ori.b	#((1<<VSCEnCSync)+\					; enable composite sync…
+						  (1<<VSCEnVSync)+(1<<VSCEnHSync)+\	; enable h/v sync…
+						  (1<<VSCExtMuxDelay)),d0			; enable ???
+				move.b	d0,VSC_VidCtrl(a4)					; Do it.
+			
+; Next, wait a few frames to let the monitor catch up with us…
+;
+				Moveq	#5-1,D1								; We’re going to wait 5 VBLs. 
+@WaitBlank		Clr.b	VSC_IntClear(A4)					; Clear the current VBL.
+@SyncLoop		Btst	#slotVBL,AIV3SlotInt(A3)			; If it’s not pending (0=pending),
+				Bne.s	@SyncLoop							;	then keep looping.
+				Dbra	D1,@WaitBlank						; Keep loop ’til done.
+
+; Finally, let’s show that video.
+;
+				Ori.b	#(1<<VSCblankBit),VSC_VidCtrl(A4)	; Enable blanking.
+
+;-------------------------------------------------------
+; Clean up and go home.
+;-------------------------------------------------------
+				
+VSCExit
+				Move.l	vidParamsPtr(A6),D0					; If the vidParamsPtr is nil,
+				Beq.s	@LastChance							;	then just go on.
+
+				Movea.l	D0,A0								; Dispose of the vidParams pointer.
+				_DisposPtr
+
+@LastChance
+				move.b	#((0<<setEnable)|\
+						  (1<<ejectEn)|\
+						  (1<<enetEn)),vscBase+vscIER
+				
+				unlk	a6									; De-allocate local stack frame.
+				rts											; Return to caller.
+				
+			ENDWITH
+
+			ALIGN	4
+
+;---------------------------------------------------------------------
+; Lists all video functional sRsrc's used for pruning/disabling.
+;---------------------------------------------------------------------
+
+VSCModeList		dc.w	EndVSCML-BeginVSCML-1
+BeginVSCML
+				dc.b	sRsrc_Vid_VSC_FPa,		sRsrc_Vid_VSC_FPb				
+				dc.b	sRsrc_Vid_VSC_GS
+				dc.b	sRsrc_Vid_VSC_RGBFPa,	sRsrc_Vid_VSC_RGBFPb
+				dc.b	sRsrc_Vid_VSC_HR
+				dc.b	sRsrc_Vid_VSC_VGA
+				dc.b	sRsrc_Vid_VSC_GF
+				dc.b	sRsrc_Vid_VSC_SVGA
+				dc.b	sRsrc_Vid_VSC_MSB1,		sRsrc_Vid_VSC_MSB2
+				dc.b	sRsrc_Vid_VSC_1K
+EndVSCML
+
+			ALIGN	4
+
+; The VSCConfigTable is an array of configuration parameters indexed
+;	by monitor type.  Within each set of monitor parameters is a set
+;	of parameters that are indexed by the amount of vRAM available.  These
+;	paramters are used in setting up the intial values of the CLUT and
+;	selecting the right functional sRsrc per monitor per vRAM configuration.
+;
+
+			WITH	VSCConfigRec
+
+VSCConfigTable
+				dcb.b	SConfigRecSize,sRsrc_VSC_NeverMatch							; [0] Vesuvio 		(Not Supported)
+				
+				dc.b	$00,$00,$00,$00,$00,$FF,0,0									; [1] Mono Full-Page
+				dc.b	sRsrc_Vid_VSC_FPa,sRsrc_Vid_VSC_FPb,0,0						; 512K params
+				Dc.b	ThirdVidMode,0												;
+
+				dc.b	$05,$FF,$05,$FF,$05,$FF,0,0									; [2] Rubik
+				dc.b	sRsrc_Vid_VSC_GS,0,0,0										; 512K params
+				Dc.b	FourthVidMode,0												;
+				
+				dcb.b	SConfigRecSize,sRsrc_VSC_NeverMatch							; [3] Mono Two-Page	(Not Supported)
+				dcb.b	SConfigRecSize,sRsrc_VSC_NeverMatch							; [4] NTSC			(Not Supported)
+				
+				dc.b	$00,$FF,$00,$FF,$00,$FF,0,0									; [5] RGB Full-Page
+				dc.b	sRsrc_Vid_VSC_RGBFPa,sRsrc_Vid_VSC_RGBFPb,0,0				; 512K params
+				Dc.b	ThirdVidMode,0												;
+	
+				dc.b	00,$FF,$00,$FF,$00,$FF,0,0									; [6] High-Res RGB/Mono
+				dc.b	sRsrc_Vid_VSC_HR,0,0,0										; 512K params
+				Dc.b	FourthVidMode,0												;
+				
+				dcb.b	SConfigRecSize,sRsrc_VSC_NeverMatch							; [7] 				(Skip, no-connect)
+				
+				dc.b	$00,$FF,$00,$FF,$00,$FF,0,0									; [8] VGA
+				dc.b	sRsrc_Vid_VSC_VGA,sRsrc_Vid_VSC_SVGA,sRsrc_Vid_VSC_1K,0		; 512K params
+				Dc.b	FourthVidMode,0												;
+				
+				dcb.b	SConfigRecSize,sRsrc_VSC_NeverMatch							; [9] PAL			(Not Supported)
+				
+				dc.b	$00,$FF,$00,$FF,$00,$FF,0,0									; [10] GoldFish
+				dc.b	sRsrc_Vid_VSC_GF,0,0,0										; 512K params
+				Dc.b	FourthVidMode,0												;
+				
+				dcb.b	SConfigRecSize,sRsrc_VSC_NeverMatch							; [11] 19" 			(Not Supported)
+			
+				dc.b	$00,$FF,$00,$FF,$00,$FF,0,0									; [12] MSB1
+				dc.b	sRsrc_Vid_VSC_MSB1,sRsrc_Vid_VSC_GS,sRsrc_Vid_VSC_GF,0		; 512K params
+				Dc.b	FourthVidMode,0												;
+			
+				dc.b	$00,$FF,$00,$FF,$00,$FF,0,0									; [13] MSB2
+				dc.b	sRsrc_Vid_VSC_MSB2,sRsrc_Vid_VSC_HR,sRsrc_Vid_VSC_1K,0		; 512K params
+				Dc.b	FourthVidMode,0												;
+			
+				dc.b	$00,$FF,$00,$FF,$00,$FF,0,0									; [14] MSB3
+				dc.b	sRsrc_Vid_VSC_MSB2,sRsrc_Vid_VSC_HR,sRsrc_Vid_VSC_1K,0		; 512K params
+				Dc.b	FourthVidMode,0												;
+
+			ENDWITH

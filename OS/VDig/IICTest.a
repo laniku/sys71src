@@ -1,0 +1,606 @@
+;
+;	File:		IICTest.a
+;
+;	Contains:	
+;
+;	Written by:	
+;
+;	Copyright:	© 1992-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	  <SM11>	 6/14/93	kc		Roll in Ludwig.
+;	   <LW6>	 4/30/93	DH		For b6 build update;-Added compression bounds fix
+;									(gAsync_Source_Start)
+;	   <LW5>	 3/25/93	DH		For b4 update;  Changed _BlockMove to _BlockMoveData;  Took out
+;									nop.
+;	   <LW4>	 1/13/93	DH		Added nop for move16 syncronization.
+;	   <LW3>	  1/7/93	DH		Added speed up code to move video data using MOVE16s when
+;									possible.
+;	   <LW2>	12/11/92	DH		Update to add Line Doubline copy for when linedoubling register
+;									is set;  Also set line doubling comment to indicate only one
+;									byte for gLineDoubling boolean.
+;	  <SM10>	11-18-92	jmp		Eliminated obsolete ENDWITH statement caused by previous
+;									checkin.
+;	   <SM9>	11/18/92	SWC		Changed ToolEqu.a->ToolUtils.a. Fixed the debug code in EgretGlu
+;									(some of it was still being included instead of commented out).
+;	   <SM8>	10/29/92	DH		Updated for A5 build; Updated to use definitions of common VDig
+;									globals.
+;	   <SM7>	 10/9/92	DH		Fix for A4+; Big_Small video length was incorrect for big video
+;									offsets.
+;	   <SM6>	  9/1/92	DH		Updated for Async. grabs.
+;	   <SM5>	 7/28/92	DH		Updated more for d9 build; -Fixed user interrupt field checking,
+;									to work correctly.
+;	   <SM4>	 7/26/92	DH		Updated for d9 build; -Added user interrupt video field
+;									determination code.
+;	   <SM3>	  7/1/92	fau		Commented out the _DebugStr if EgretDispatch fails.
+;	   <SM2>	 6/29/92	DH		Updated latest to SuperMario for first alpha build
+;		 <1>	  6/3/92	RLM		first checked in
+;				 5/20/91	gjs		Add 040 move16 for MUNI Block move...
+;
+			
+			
+				CASE	OBJ				; allow upper and lower case
+
+				INCLUDE	'SysEqu.a'
+				INCLUDE	'SysErr.a'
+				INCLUDE	'ToolUtils.a'
+				INCLUDE	'Traps.a'
+
+	
+;___________________________________________________________________________
+;
+;	EXPORTS
+;___________________________________________________________________________
+;
+;
+;		Exports for the IICTest.a code
+;
+				MACHINE		MC68040
+
+EgretGlu		proc		export
+
+forDebug		EQU			0
+
+			IF forDebug THEN
+				pea			EnterMove16
+				_DebugStr
+			ENDIF
+				move.l		4(sp), a0
+				_EgretDispatch
+			IF forDebug THEN
+				beq.s		@MoveDone
+				pea			NotAligned
+				_DebugStr
+@MoveDone
+			ENDIF
+				rts
+
+			IF forDebug THEN
+				STRING	PASCAL
+EnterMove16		dc.b	'***  Begin Egret Glue...'
+NotAligned		dc.b	'***  Buffer not quad long aligned...'
+				ALIGN	2
+				STRING	ASIS
+			ENDIF
+		ENDP
+
+;********************************************************************
+;
+;	Int_Service
+;
+;		This is the VDC interrupt service routine.
+;
+;********************************************************************
+;===============================================;
+; VDig Globals Record
+;===============================================;
+GVdig						RECORD		0
+gVDC_Int_Flag				DS.W		1		; 0-1 VDC interrupt counter 0,1 
+gVDC_User_Proc				DS.L		1		; 2-5 Specified user interrupt routine 
+gVDC_User_Flags				DS.L		1		; 6-9 Specified user interrupt flags 
+gVDC_User_Refcon			DS.L		1		; 10-13 Specified user interrupt refcon 
+gVDC_User_Field				DS.L		1		; 14-17 Passed user interrupt field 
+gVDC_User_FCount			DS.L		1		; 18-21 User Field counter 
+;/*Pseudo Async Move variables */
+gAsync_Flag					DS.W		1		; 22-23 Async flag (not zero means move after interrupt
+gAsync_Base					DS.L		1		; 24-27 Async base of where to move it to 
+gAsync_Bytes				DS.L		1		; 28-31 Aysnc no. of bytes to move 
+gAsync_Row_Bytes			DS.L		1		; 32-35 Async line offset 
+gAsync_V_Lines				DS.W		1		; 36-37 Async no. of vertical lines to move 
+gAsync_DonePtr				DS.L		1		; 38-41 Async done flag pointer 
+playThruState				DS.W		1		; 42-43 Playthru state indicator 
+gLineDoubling				DS.W		1		; 44-45 Boolean indicatin if line doubling
+gAsync_Source_Start			DS.L		1		; Souce VRAM start location (normally $50200800) B6_FIX Compression (Bug 1077255)
+							ENDR
+
+;===============================================;
+; CIVIC chip Equates
+;===============================================;
+CIVIC						EQU			$50036000			;Memory address for CIVIC chip
+vdc_clock_enable			EQU			$18					;enable/disable VDC register
+big_small_video				EQU			$14					;big/small VRAM config. register
+vdc_int_enable				EQU			$10					;enable VDC interrupts register
+clr_vdc_int					EQU			$0c					;clear VDC interrupts register
+vdc_int						EQU			$08					;VDC interrupt indicator register
+			
+INT_SERVICE proc	export
+			import INT_Mv_User
+			WITH GVdig
+			Move.l	A0,-(SP)								; Save work registers (according to IM V).
+			Move.l	D1,-(SP)								;	(Two Moves are faster than a Movem.)
+
+;			Moveq	#true32b,D0								; Set up to swap into 32-bit mode.
+;			_SwapMMUMode									; Do fast swap.
+;			Move.b	D0,-(SP)								; Save previous mode.
+
+			Move.l	#CIVIC,A0								; Point to the base of Civic.
+;			Move.l	#0,vdc_int_enable(A0)					; Disable VDC interrupt
+
+			Move.l	vdc_int(A0),D0							; Is this a VDC Interrupt
+			Btst	#0,D0
+			Beq.s	@ItsAVDC								; Active low interrupt
+
+
+;			Move.l	#1,vdc_int_enable(A0)					; ReEnable VDC interrupts
+;			Move.b	(SP)+,D0								; Swap back to previous mode.
+;			_SwapMMUMode									; Do fast swap.
+			Moveq	#0,D0									; Signal that the interrupt was not serviced			
+			bra.s	@FinishThis
+@ItsAVDC			
+			Move.l	#0,clr_vdc_int(A0)						; Clears interrupt with a "low"
+			Move.l	#1,clr_vdc_int(A0)						; UnClears interrupt
+
+;
+;Now check to see if we need to do a move.  If we do, then we need to turn off VDC writes to 
+;ensure that the data in VRAM isnt overwitten with a new field in the event that we take too long.
+;
+;Note that A1 is our global data pointer
+
+			Movea.l	A1,A0									; move global pointer in A0
+			Movea.l	(A0),A0									; dereference handle 
+			Tst.W	GVdig.gAsync_Flag(A0)					; test flag to see if we need to do move
+			Beq.s	@NoMove									; branch if not move time
+;We need to do a pseudo async move, so we must now set things up
+			Move.l	#1,CIVIC+vdc_clock_enable				; turn off VDC access to VRAM
+@NoMove
+;
+;Now schedule the move and user function as a deferUserFn for VM (if in middle of page fault)
+;
+			Lea		INT_Mv_User,A0							; Pass the routines address
+			Move.l	A1,D0									; Pass the global parameter
+			_DeferUserFn									; Defer the move and user function until safe for VM
+			
+
+@NoUserRtn
+;			Move.b	(SP)+,D0								; Swap back to previous mode.
+;			_SwapMMUMode									; Do fast swap.
+			Moveq	#1,D0									; Signal that the interrupt was serviced			
+
+@FinishThis
+			Move.l	(SP)+,D1								; Restore our work registers.
+			Move.l	(SP)+,A0								;	(Two Moves are faster than a Movem.)
+			RTS
+
+
+		ENDP
+;********************************************************************
+;
+;	Int_Mv_User
+;
+;		This is setup by the VDC interrupt routine to do the async.
+;		data move and call the user function.
+;
+;		This routine is called as a DeferUserFn for VM. This is to ensure
+;		that a double pagefault doesn't happen during the move or
+;		by the user function.
+;
+;********************************************************************
+INT_Mv_User proc	export
+
+			Move.l	A0,A1									; remember the defered parameter is passed in A1
+;Note that A1 is our global data pointer
+			Movea.l	(A1),A1
+			AddQ.w	#1,(A1)									; inc. interrupt flag counter
+			AddQ.l	#1,GVdig.gVDC_User_FCount(A1)			; inc. field count incase needed
+;**************************************************************
+;This does the Async Move if requested
+;**************************************************************
+			Tst.W	GVdig.gAsync_Flag(A1)					; test flag to see if we need to do move
+			Beq	@UserRoutine							; branch if not move time
+; _Debugger
+;We need to do a pseudo async move, so we must now set things up
+			Move.l	#1,CIVIC+vdc_clock_enable				; turn off VDC access to VRAM
+			Move.l	A3,-(SP)								; Save A3 so we can use it, and to be restored
+			Move.l	A4,-(SP)								; Save A4 so we can use it, and to be restored
+			
+			Move.l	A1,A3									; Now use A3 for our global pointer
+			
+			Move.l	CIVIC+big_small_video,D1				; Get big_small_video bit from civic
+			Andi.l	#$00000001,D1							; Look only at bit, also clear msword of A4
+			Move.l	D1,A4
+			beq.s	@SmallVideo								; Branch if small video (line is 0x400 bytes long)
+			Move.w	#$0200,A4								; Was big video (line is 0x600 bytes long)
+@SmallVideo
+			Add.w	#$0400,A4								; A4 now has the correct line bytes for our video buffer
+			
+			Moveq	#0,D1									; this makes sure highbyte is zero
+			Move.w	GVdig.gAsync_V_Lines(A3),D1				; get line counter
+			Move.l	GVdig.gAsync_Source_Start(A3),A0		; init. to start of video vram buffer area B6_Fix compression (Bug 1077255)
+			Move.l	GVdig.gAsync_Base(A3),A1				; init. destination
+
+			Tst.b	GVdig.gLineDoubling(A3)					; test to see if line doubling
+			Beq.s	@The1Loop								; branch if not doubling
+			Bra.s	@The2Loop
+;**************************************************************
+; This does the Move when line doubling (we copy each line twice)
+;**************************************************************
+@Move2Loop			
+;This moves the first line
+			Move.l	A0,-(SP)								; Save source pointer
+			Move.l	A1,-(SP)								; Save destination pointer
+			Move.l	GVdig.gAsync_Bytes(A3),D0				; Get no. of bytes
+
+			Jsr		FastMove								; Do a series of move16s if possible
+;			_BlockMove										; move the line
+
+			Move.l	(SP)+,A1								; Restore destination.
+			Move.l	(SP)+,A0								; Restore source
+			
+			DBF		D1,@Move2nd								; dec. line counter, branch if not -1
+			Bra.s	@MoveDone
+@Move2nd
+			Add.l	GVdig.gAsync_Row_Bytes(A3),A1			; inc. destination by one line offset
+
+;This moves the second line
+			Move.l	A0,-(SP)								; Save source pointer
+			Move.l	A1,-(SP)								; Save destination pointer
+			Move.l	GVdig.gAsync_Bytes(A3),D0				; Get no. of bytes
+
+			Jsr		FastMove								; Do a series of move16s if possible
+;			_BlockMove										; move the line
+
+			Move.l	(SP)+,A1								; Restore destination.
+			Move.l	(SP)+,A0								; Restore source
+			
+			Add.l	A4,A0									; inc. source by one line
+			Add.l	GVdig.gAsync_Row_Bytes(A3),A1			; inc. destination by one line offset
+@The2Loop
+			DBF		D1,@Move2Loop							; dec. line counter, branch if not 0		
+			Bra.s	@MoveDone
+;**************************************************************
+; This does the Move when not line doubling
+;**************************************************************
+@Move1Loop			
+			Move.l	A0,-(SP)								; Save source pointer
+			Move.l	A1,-(SP)								; Save destination pointer
+			Move.l	GVdig.gAsync_Bytes(A3),D0				; Get no. of bytes
+
+			Jsr		FastMove								; Do a series of move16s if possible
+;			_BlockMove										; move the line
+
+			Move.l	(SP)+,A1								; Restore destination.
+			Move.l	(SP)+,A0								; Restore source
+			
+			Add.l	A4,A0									; inc. source by one line
+			Add.l	GVdig.gAsync_Row_Bytes(A3),A1			; inc. destination by one line offset
+@The1Loop
+			DBF		D1,@Move1Loop							; dec. line counter, branch if not 0		
+
+@MoveDone
+			Tst.l	GVdig.gAsync_DonePtr(A3)				; see if done flag ptr is null or not
+			Beq.s	@NoDoneFlag								; branch if nil, no done flag wanted
+			Move.l	GVdig.gAsync_DonePtr(A3),A0				; else get done flag ptr in A0
+			Move.w	#$ffff,(A0)								; set the flag that we are done moving
+@NoDoneFlag
+			Clr.w	GVdig.playThruState(A3)					; set playThruState= OFF
+;Now finish up by clearing the move flag (so we wont end up moving it until the flag is set again by the VDig)
+			Clr.w	GVdig.gAsync_Flag(A3)					; clear the move test flag
+			
+			Move.l	A3,A1									; restore global pointer
+			Move.l	(SP)+,A4								; Restore saved A4
+			Move.l	(SP)+,A3								; Restore saved A3
+
+;**************************************************************
+;Now see if we have a user routine defined and if we need to call it.
+;**************************************************************
+@UserRoutine
+			Tst.l	GVdig.gVDC_User_Proc(A1)				; see if an interrupt routine was specified
+			Beq.s 	@NoUserRtn								; branch if no user routine defined
+			Tst.l	GVdig.gVDC_User_Flags(A1)				; test flags to see if its a field to be called
+			Beq.s	@NoUserRtn								; branch if no fields were specified
+			
+;First see if user wants even field interrupt
+			Btst	#0,GVdig.gVDC_User_Flags+3(A1)			; look at lsbyte of user specified flags
+			Beq.s	@TryOdd									; if user doesnt want even, try odd
+			
+			Cmp.l	#1,GVdig.gVDC_User_Field(A1)			; see if VDC set to only even fields
+			Beq.s	@ItsEven								; branch if it was set to only even
+
+			Tst.l	GVdig.gVDC_User_Field(A1)				; look at what VDC was set to
+			Bne.s	@TryOdd									; if not VDC both fields, try odd
+			Btst	#0,GVdig.gVDC_User_FCount+3(a1)			; then VDC is set to both, look at counter
+			Bne.s	@TryOdd									; if not even, try odd else its even time						
+@ItsEven
+			MOVEM.L	A1-A6/D1-D7,-(SP)						; Protect the user from messing up register values
+			Move.l	#1,-(A7)								; pass flag (even field)
+			Bra.s	@CallUser
+			
+
+@TryOdd
+;Now see if user wants odd field interrupt
+			Btst	#1,GVdig.gVDC_User_Flags+3(A1)
+			Beq.s	@NoUserRtn								; if user doesnt want odd, dont call
+			
+			Cmp.l	#2,GVdig.gVDC_User_Field(A1)			; see if VDC set to only odd fields
+			Beq.s	@ItsOdd									; branch if it was set to only odd
+
+			Tst.l	GVdig.gVDC_User_Field(A1)				; look at what VDC was set to
+			Bne.s	@NoUserRtn								; if not VDC both fields, dont call
+			Btst	#0,GVdig.gVDC_User_FCount+3(A1)			; then VDC is set to both, look at counter
+			Beq.s	@NoUserRtn								; if not odd, dont call, else its odd time						
+@ItsOdd
+			MOVEM.L	A1-A6/D1-D7,-(SP)						; Protect the user from messing up register values
+			Move.l	#2,-(A7)								; pass flag (odd field			
+			
+@CallUser
+			Move.l	GVdig.gVDC_User_Refcon(A1),-(A7)		; pass user interrupt refcon
+			Move.l	GVdig.gVDC_User_Proc(A1),A1				; get interrupt routine addr.
+			jsr		(A1)									; call user interrupt routine
+;****User interrupt routine will return here
+			MOVEM.L	(SP)+,A1-A6/D1-D7						; Restore register values
+
+@NoUserRtn
+			rts												; now just return
+
+;**************************************************************
+;Fast Move Routine using Move16s
+;**************************************************************
+FastMove
+			Move.l	D1,-(SP)								; Save D1
+			Move.l	D2,-(SP)								; Save D2
+			Move.l	A0,D1
+			Move.l	A1,D2
+			Or.l	D1,D2									; Or the source and destination
+			Andi.B	#$0f,D2									;is the low 4 bits zero	
+			Beq.s	CanMove		
+;We arrive here if we are not 16 byte alligned, must use block move
+			Move.l	(SP)+,D2								; Restore D2
+			Move.l	(SP)+,D1								; Restore D1
+			_BlockMoveData
+			rts
+
+;We arrive here if the source and destination are both 16 byte aligned
+CanMove
+			Move.l	A2,-(SP)								; Save A2
+			Andi.B	#$f0,D0									; And out mod 16 bits
+			Asr.L	#2,D0									; Now have displacement from bottom of Move16s
+			Neg.L	D0
+			Lea		(TheMove16s),A2
+			Jmp		(A2,D0.L)
+
+;We need 768*2 = 1536 bytes max to move, 1536/16=96 move16s (we'll setup with 100, just incase we somehow need them.)
+			Move16	(A0)+,(A1)+								; 10 Move16s
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+
+			Move16	(A0)+,(A1)+								; 10 Move16s
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+
+			Move16	(A0)+,(A1)+								; 10 Move16s
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+
+			Move16	(A0)+,(A1)+								; 10 Move16s
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+
+			Move16	(A0)+,(A1)+								; 10 Move16s
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+
+			Move16	(A0)+,(A1)+								; 10 Move16s
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+
+			Move16	(A0)+,(A1)+								; 10 Move16s
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+
+			Move16	(A0)+,(A1)+								; 10 Move16s
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+
+			Move16	(A0)+,(A1)+								; 10 Move16s
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+
+			Move16	(A0)+,(A1)+								; 10 Move16s
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+			Move16	(A0)+,(A1)+
+TheMove16s													; Warning, dont move this from the bottom of the move16s table
+;
+;Now we finish up with whatever bytes that are left.
+;
+; _Debugger
+
+			Move.l	GVdig.gAsync_Bytes(A3),D0				; Get total no. of bytes on the line
+			Andi.W	#$000f,D0								; look only at whats left after move 16s
+			Move.w	QMoveLT16(PC,D0.W*2),D0					; Get jump address from table
+			Jmp		QMoveLT16(PC,D0.W)						; Jump relative to QMoveLT16+PC+D0
+;
+; Jump table for small quick moves (left overs from move16s)
+;
+QMoveLT16
+			dc.w	DoneQ-QMoveLT16
+			dc.w	Quick1-QMoveLT16
+			dc.w	Quick2-QMoveLT16
+			dc.w	Quick3-QMoveLT16
+			dc.w	Quick4-QMoveLT16
+			dc.w	Quick5-QMoveLT16
+			dc.w	Quick6-QMoveLT16
+			dc.w	Quick7-QMoveLT16
+			dc.w	Quick8-QMoveLT16
+			dc.w	Quick9-QMoveLT16
+			dc.w	Quick10-QMoveLT16
+			dc.w	Quick11-QMoveLT16
+			dc.w	Quick12-QMoveLT16
+			dc.w	Quick13-QMoveLT16
+			dc.w	Quick14-QMoveLT16
+			dc.w	Quick15-QMoveLT16
+
+			
+
+Quick1		Move.b	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick2		Move.w	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick3		Move.w	(A0)+,(A1)+
+			Move.b	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick4		Move.l	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick5		Move.l	(A0)+,(A1)+
+			Move.b	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick6		Move.l	(A0)+,(A1)+
+			Move.w	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick7		Move.l	(A0)+,(A1)+
+			Move.w	(A0)+,(A1)+
+			Move.b	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick8		Move.l	(A0)+,(A1)+
+			Move.l	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick9		Move.l	(A0)+,(A1)+
+			Move.l	(A0)+,(A1)+
+			Move.b	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick10		Move.l	(A0)+,(A1)+
+			Move.l	(A0)+,(A1)+
+			Move.w	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick11		Move.l	(A0)+,(A1)+
+			Move.l	(A0)+,(A1)+
+			Move.w	(A0)+,(A1)+
+			Move.b	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick12		Move.l	(A0)+,(A1)+
+			Move.l	(A0)+,(A1)+
+			Move.l	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick13		Move.l	(A0)+,(A1)+
+			Move.l	(A0)+,(A1)+
+			Move.l	(A0)+,(A1)+
+			Move.b	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick14		Move.l	(A0)+,(A1)+
+			Move.l	(A0)+,(A1)+
+			Move.l	(A0)+,(A1)+
+			Move.w	(A0)+,(A1)+
+			Bra.s	DoneQ
+
+Quick15		Move.l	(A0)+,(A1)+
+			Move.l	(A0)+,(A1)+
+			Move.l	(A0)+,(A1)+
+			Move.w	(A0)+,(A1)+
+			Move.b	(A0)+,(A1)+
+			
+DoneQ
+			Move.l	(SP)+,A2								; Restore A2
+
+			Move.l	(SP)+,D2								; Restore D2
+			Move.l	(SP)+,D1								; Restore D1
+
+			rts
+
+
+
+		ENDP
+
+		END

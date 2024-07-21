@@ -1,0 +1,141 @@
+;
+;	File:		InactiveAppleTalkOpenPatch.a
+;
+;	Contains:	A patch on _Open that prevents existing AppleTalk drivers –
+;				.MPP, .ATP, .DSP, .XPP, & .AFPTranslator – from being opened
+;				if AppleTalk is inactive, and a patch on _Gestalt to return that the 'atkv' selector is undefined.  These patches are only applied if
+;				AppleTalk is inactive on startup.
+;
+;	Written by: Dean Yu
+;
+;	Copyright:	© 1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <1>	 1/19/92	DTY		first checked in
+
+			load		'StandardEqu.d'
+			include		'GestaltEqu.a'
+			include		'PackMacs.a'
+			include		'GestaltPrivateEqu.a'
+			include		'LinkedPatchMacros.a'
+
+kOpenTrap		equ		$A000
+kGestaltTrap	equ		$A0AD
+
+; ApplyOpenPatchIfAppleTalkIsInactive checks to see if Port B is configured
+; for AppleTalk use.  If it is, it patches _Open, otherwise, it does nothing.
+			
+ApplyOpenPatchIfAppleTalkIsInactive	InstallProc	(Plus,SE,Portable,II,IIci)
+			Import	DontLetAppleTalkDriversOpen
+			Import	UndefineGestaltAppleTalkSelector
+			
+			move.l	ExpandMem,a0					;
+			tst.w	ExpandMemRec.emAppleTalkInactiveOnBoot(a0)	; If AppleTalk is active, don’t patch _Open
+			bz.s	@exit							; AppleTalk is active.  Bail out.
+
+; AppleTalk is inactive.  Apply the patch to _Open that prevents AppleTalk drivers
+; from being opened and the patch to _Gestalt to return gestaltUndefSelectorErr for
+; requests for the 'atkv' selector.
+
+			move.w	#kOpenTrap,d0
+			_GetTrapAddress					; Get address of original _Open
+			leaResident	DontLetAppleTalkDriversOpen,a1	; Get patch routine
+			move.l	a0,2(a1)				; Save the old _Open
+			move.w	#kOpenTrap,d0
+			move.l	a1,a0
+			_SetTrapAddress					; Patch _Open
+			
+			move.w	#kGestaltTrap,d0
+			_GetTrapAddress ,NewOS			; Get address of original _Gestalt
+			leaResident	UndefineGestaltAppleTalkSelector,a1	; Get patch routine
+			move.l	a0,2(a1)				; Remember real _Gestalt
+			move.w	#kGestaltTrap,d0
+			move.l	a1,a0
+			_SetTrapAddress ,NewOS
+@exit
+			rts
+			EndProc
+
+; This is the _Open patch.  It checks the ioNamePtr field of the parameter block in A0
+; to see if the name is of an AppleTalk driver that should not be opened.  If it is,
+; _Open is not called, and notOpenErr is returned.  If _Open is being called for something
+; else, the call is left alone.
+
+DontLetAppleTalkDriversOpen	Proc	Export			
+			bra.s	PatchStart
+OldOpenAddress
+			ds.l	1						; Fixed up with address of old _Open
+
+PatchStart
+			movem.l	a0/a3-a4/d6-d7,-(sp)	; Save some registers?
+			move.l	ioNamePtr(a0),d0		; Is there a name?
+			bz.s	@callOldOpen			; No, let this call through
+			
+			move.l	d0,a3
+			moveq	#0,d6
+			move.b	(a3)+,d6				; Save length of driver name
+			cmp.b	#'.',(a3)				; Driver names always being with a period.
+			bne.s	@callOldOpen			; If it’s not a driver that’s being opened, let it through.
+			
+			lea		DriversOfInterest,a4	; Get table of drivers not to open.
+			moveq	#0,d7					; Used for length of driver name in table
+@checkDriverNameLoop
+			move.b	(a4)+,d7				; Check length byte
+			bz.s	@callOldOpen			; If 0, end of table was reached without a match.  Let the driver open.
+
+			move.l	a3,a0					; Pointer to first string
+			move.l	a4,a1					; Pointer to second string
+			move.w	d6,d0					; Length of first string
+			swap	d0
+			move.w	d7,d0					; Length of second string
+			_CmpString						; Are they equal?
+			tst.l	d0
+			beq.s	@dontLetThisDriverOpen	; If equal, don’t let it open.
+			add.l	d7,a4					; Point to next driver name in table.
+			bra.s	@checkDriverNameLoop	; And check it out.
+			
+@dontLetThisDriverOpen
+			move.w	#notOpenErr,d0			; Report an error
+			movem.l	(sp)+,a0/a3-a4/d6-d7
+			move.w	d0,ioResult(a0)			; Return the error
+			tst.w	d0						; Set up the condition code
+			rts								; And return to the caller
+			
+@callOldOpen
+			movem.l	(sp)+,a0/a3-a4/d6-d7
+			move.l	OldOpenAddress,-(sp)
+			rts								; Call the orginal _Open
+			
+DriversOfInterest
+			String	Pascal
+			dc.b	'.MPP'
+			dc.b	'.ATP'
+			dc.b	'.XPP'
+			dc.b	'.DSP'
+			dc.b	'.AFPTranslator'
+			dc.b	0
+			ALIGN
+			EndProc
+			
+UndefineGestaltAppleTalkSelector	Proc	Export
+			bra.s	PatchStart
+OldGestaltAddress
+			ds.l	1						; Placeholder for real _Gestalt routine
+			
+PatchStart
+			cmp.w	#kGestaltTrap,d1		; Gestalt?  (As opposed to _NewGestalt or _ReplaceGestalt)
+			bne.s	@toRealGestalt			; No.
+			
+			cmpi.l	#gestaltATalkVersion,d0	; gestaltATalkVersion?
+			bne.s	@toRealGestalt			; No.
+			
+			move.w	#gestaltUndefSelectorErr,d0	; Pretend this selector is undefined.
+			moveq	#0,a0
+			rts
+			
+@toRealGestalt
+			move.l	OldGestaltAddress,-(sp)
+			rts								; Jump to real _Gestalt routine
+			EndProc
+			End

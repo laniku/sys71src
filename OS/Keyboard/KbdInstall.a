@@ -1,0 +1,559 @@
+;_________________________________________________________________________________________
+;
+;	File:		KbdInstall.a
+;
+;	Contains:	Code to ADB keyboard driver and code for installing keyboard driver as 
+;				well as for installing resources KMAP & KCHR.
+;				This file is the code that is put in the System file's ADBS 
+;				resource ID = 2. The driver in this file overrides the driver in the ROM
+;				and overrides any patches to the ROM driver.  However, this  driver 
+;				depends on the ADBProc in the ROM/Patch for the deallocation of the 
+;				keyboard data buffer at the beginning of ADBReinit.
+;
+;	Written by:	Joe Fontana, Ed Tecot and Gary G. Davidian
+;
+;	Copyright:	© 1986-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		<4>	 	10/22/92	JMF		Added changes so that the modifiers of the last KEYBOARD
+;									pressed are the modifiers that the Norsi KEYPAD uses,
+;									since the KEYPAD has no modifier keys of its own.
+;		<3>		10/22/92	JMF		Incorporated ROM keyboard Driver into ADBS Resource ID=2.
+;		<2>		12/28/89	dba		Used MAIN instead of PROC to get dead code stripping.
+;	  <1.1>	 	 8/28/89	SES		Removed references to nFiles.
+;	  <1.0>		11/16/88	CCH		Added to EASE.
+;				  3/2/87	EMT		Fixed bug introduced above.
+;				  2/9/87	EMT		Permit KCHR to be overridden Check files of type 'KCAP' for
+;									KMAPs Use default KMAP (0) as last resort Flush keyboard on 
+;									exit. Dispose of myself on exit.
+;				10/14/86	EMT		Fix bug related to 6 Oct change above.
+;			 	 10/6/86	EMT		Data area can be set up by ROM.
+;			 	 7/15/86	EMT		Updated to use KCHR resource.
+;			 	 6/25/86	EMT		Created.
+;
+;_________________________________________________________________________________________
+
+
+			LOAD	'StandardEqu.d'
+
+
+  ; Keyboard driver data
+KBufCount	EQU		2
+KBufLen		EQU		10				; 8 bytes + length + inuse
+
+KMAPPtr		EQU		$00
+KeyBits		EQU		KMAPPtr+4
+KCHRPtr		EQU		KeyBits+(128/8)
+DeadKey		EQU		KCHRPtr+4
+KNoADBOp	EQU		DeadKey+4
+KNumBufs	EQU		KNoADBOp+1
+KFirstBuf	EQU		KNumBufs+1
+KbdDSize	EQU		KFirstBuf+(KBufCount*KBufLen)
+
+str			EQU		-$100			
+iopb		EQU		str-ioFQElSize	
+KISize		EQU		iopb
+
+  ; KMAP offsets
+KMid		EQU		$00
+KMtype		EQU		$01
+KMvers		EQU		KMid+2
+KMstart		EQU		KMvers+2
+KMnumEx		EQU		KMstart+128
+KMstEx		EQU		KMnumEx+2
+
+talkCmd   	EQU 	$0C   				; Command for Talk R0
+
+keypadNorsi	EQU		$0E					; Handler ID for Norsi ergonomic keypad
+
+
+
+;_________________________________________________________________________________________
+;
+; Routine:		KbdInst
+; Arguments:	D0.B	ADB Address
+;				D1.B	Device Type
+; Output:		None
+; Function:		Loads and locks the KMAP and KCHR resources used by the keyboard driver,
+;				updates the ADB table and installs a new keyboard driver
+;
+; Side Effects:	Trashes A0, A1, D0, D2
+;_________________________________________________________________________________________
+
+KbdInst		MAIN	EXPORT
+
+			BRA.S	@Start				; Branch around version number
+			
+			DC.W	$0001				; Version number
+			
+@Start		MOVEM.L	D3-D7/A2-A4, -(SP)	; Save the registers
+			LINK	A6, #KISize			; Save space on stack
+
+			MOVE.W	D0, D2				; Save the ADB Address
+			SUB.L		#10, SP			; Allocate space on stack
+			MOVE.L	SP, A0				; Pointer to data area
+			_GetADBInfo
+
+			ADDQ.L	#2, SP				; Discard OrigAddr and DeviceType
+			MOVE.L	4(SP), A0			; Put the data address in A0
+			MOVE.L	A0, D0				; See if it is a real address
+			BEQ.S	@AllocBuf			; Skip DisposPtr, if no buffer allocated yet
+			_DisposPtr					; Dispose of data allocated by the ROM
+
+@AllocBuf	MOVE.L	#KbdDSize, D0		; Amount of space needed for new keyboard drvr data
+			_NewPtr	,SYS,CLEAR			; Get a pointer
+			MOVE.L	A0, A1				; Save it in A1
+
+			MOVE.B	#KBufCount, KNumBufs(A1)
+
+KCHRLoad	SUBQ.L	#4, SP					; Make room for result
+			MOVE.L	#'KCHR', -(SP)		; ResType = KCHR
+			CLR.W	-(SP)				; theID = 0 (for now)
+			MOVE.W	#MapTrue, ROMMapInsert	; Use ROM resource if available	
+			_GetResource
+			MOVE.L	(SP), -(SP)			; Save the handle
+			BEQ		NoKCHR				; Skip if NIL
+			_DetachResource				; Detach it
+			MOVE.L	(SP)+, A0
+			_HLock						; Lock it down
+			MOVE.L	(A0), KCHRPtr(A1)	; Dereference and put away
+
+	; We didn't find the KMAP in the system file or ROM, try the blessed folder
+			MOVE.L	#'KCAP', D3				; File type							
+			CLR.W	iopb+ioVRefNum(A6)		; The blessed folder				
+			CLR.W	iopb+ioFDirIndex(A6)	; Initialize the index				
+			LEA		str(A6), A0				; Get the address of local string	
+			MOVE.L	A0, iopb+ioFileName(A6)	; Put in iopb					
+			MOVEQ	#0, D4					; No resource file on first pass
+
+			MOVE.W	#MapTrue, ROMMapInsert	; Use ROM resource first time
+FindKMAP									;									
+			SUBQ.L	#4, SP				; Make room for result
+			MOVE.L	#'KMAP', -(SP)		; ResType = KMAP
+			CLR.W	-(SP)				; Clear it out since Device Type is byte
+			MOVE.B	D1, 1(SP)			; theID = DeviceType
+			_GetResource
+			MOVE.L	(SP), -(SP)			; Save the handle
+			BNE.S	GotKMAP					; Skip if not NIL	
+
+			ADDQ.L	#8, SP					; Clean off the stack
+
+			TST.W	D4						; File open?	
+			BEQ.S	NextFile				; Nope, go on
+			MOVE.W	D4, -(SP)				; refNum		
+			_CloseResFile					;
+
+NextFile								
+			LEA		iopb(A6), A0				; Point to the block
+			ADD.W	#1, ioFDirIndex(A0)			; Increment the file index
+			_GetFileInfo						;
+			BMI.S	NoMoreFiles					; That's all of them
+			CMP.L	ioFlUsrWds+fdType(A0), D3	; Correct type?
+			BNE.S	NextFile					; Nope, try again
+
+			SUBQ.L	#2, SP					; Make room for result		
+			PEA		str(A6)					; fileName					
+			_OpenResFile					;							
+			MOVE.W	(SP)+, D4				; Store the refNum			
+			BRA.S	FindKMAP				;							
+
+NoMoreFiles
+	; All is not lost.  We can try to find the default KMAP (0)			
+			SUBQ.L	#4, SP					; Make room for result		
+			MOVE.L	#'KMAP', -(SP)			; ResType = KMAP			
+			CLR.W	-(SP)					; theID = 0					
+			MOVE.W	#MapTrue, ROMMapInsert	; Use ROM resource if available
+			_GetResource					;							
+			MOVE.L	(SP), -(SP)				; Save the handle			
+			BEQ.S	NoKMAP					; Skip if NIL				
+
+GotKMAP														
+	; Assumes two copies of the resource handle are on the stack.
+			_DetachResource				; Detach it
+			MOVE.L	(SP)+, A0
+			_HLock						; Lock it down
+			MOVE.L	(A0), A0			; Dereference it
+			MOVE.L	A0, KMAPPtr(A1)		; Put it away
+			MOVE.B	D1, KbdType			; Update KbdType to show this keyboard
+			MOVE.B	D2, KbdLast			; Same with KbdLast
+
+			MOVE.W	D2, D0				; ADB Address
+			MOVE.L	A1, 4(SP)			; Replace the data address
+			LEA		KbdDrvr, A0			
+			MOVE.L	A0, (SP)
+			MOVE.L	SP, A0				; Pointer to two addresses
+			_SetADBInfo
+
+			TST.W	D4					; File open?				
+			BEQ.S	Done				; Nope, go on				
+			MOVE.W	D4, -(SP)			; refNum					
+			_CloseResFile				;							
+			BRA.S	Done				;							
+
+NoKMAP
+NoKCHR
+			ADDQ.L	#8, SP				; Discard unused parameters
+Done
+			MOVE.W	D2, D0				; ADB Address				
+			LSL.W	#4, D0				; Put address in high nibble
+			ADDQ.W	#1, D0				; Flush command				
+			CLR.L	-(SP)				; No data address				
+			CLR.L	-(SP)				; No completion routine		
+			CLR.L	-(SP)				; No buffer							
+			MOVE.L	SP, A0				; Point to the block				
+			_ADBOp						; Flush the keyboard		
+			LEA		12(SP), SP			; Remove parameters from stack		
+
+			UNLK	A6					;							
+			MOVEM.L	(SP)+, D3-D7/A2-A4	; Restore the registers		
+
+			RTS							; End KbdInst
+
+
+
+;_________________________________________________________________________________________
+;
+; Routine:		KbdDrvr 
+; Arguments:	D0.B	ADB Command
+;				A0.L	ADB Buffer address
+;				A1.L	ADB Completion Routine Address (= KbdServ)
+;				A2.L	Pointer to private data area
+; Output:		None
+; Function:		Reads buffer and posts keyboard events as appropriate.
+; Side Effects:	Trashes A0, A1, D0, D1, D2, D3
+;
+;_________________________________________________________________________________________
+
+KbdDrvr		MOVE.L	A2, D3				; See if A2 actually contains a pointer
+			BEQ		KbdDone				; If not, can't go on.
+
+			MOVE.L	A0, A1				; Save A0 in A1
+			LSR.W	#4, D0				; Shift ADB Address down to low nibble
+			MOVEQ	#$F, D1				; Mask for ADB Address
+			AND.L	D1, D0				; D0 now contains ADB Address
+			MOVE.L	D0, D3				; Save it in D3
+			LEA		-10(SP), SP			; Build parameter block on stack
+			MOVE.L	SP, A0				; Point to it
+			_GetADBInfo
+
+			ROR.L	#8, D3				; Rotate ADB Address to high byte
+			MOVE.W	(SP)+, D3			; Put Device Type, Orig Addr in low word
+			ADDQ.L	#8, SP				; Clear off the rest of the stack
+			SWAP	D3					; D3 is now Device Type;Orig Addr;ADB Addr;Unused
+
+			MOVE.B	1(A1), D0			; Get first stroke
+			MOVE.B	2(A1), -(SP)		; Save second one on stack
+			BSR.S	KeyIn
+			MOVE.B	(SP)+, D0			; Get second stroke
+
+
+
+;_________________________________________________________________________________________
+;
+; Routine:		KeyIn
+; Arguments:	D0.B	Raw Keycode
+;				D3.L	Device Type, Orig Addr, ADB Addr, Unused
+;				A2.L	Pointer to private data area
+; Output:		None
+; Function		Translates keycode and posts event as appropriate.
+; Side Effects:	Trashes A0, A1, D0, D1, D2, D3
+; Called From:	KbdDrvr twice, (1 BSR, 1 fall-through)
+;
+;_________________________________________________________________________________________
+
+KeyIn		CMP.B	#$FF, D0			; Is it not a key?
+			BEQ 	KbdDone				; Skip if so
+
+			CLR.W	KeyLast				; Stop repeating
+			CLR.W	HiKeyLast			; Stop repeating
+
+			MOVEQ	#$7F, D1			; Mask = 01111111 binary
+			AND.B	D0, D1				; Clear all but low 7 bits
+
+			MOVE.L	KMAPPtr(A2), A1		; Get KMAP table address
+			MOVE.B	KMstart(A1, D1), D3	; Get device independent keycode
+			BPL.S	NoExcept			; Handle normally if high bit clear
+
+	; An exception has been indicated.  Find the correct entry in the exception
+	; table and handle as appropriate.
+			BCLR	#7, D3				; Clear the high bit
+			LEA		KMnumEx(A1), A0		; Get to the beginning of the exceptions
+			MOVE.W	(A0)+, D2			; Number of entries in table
+			BEQ.S	NoExcept			; Skip if none
+			SUBQ.W	#1, D2				; Turn it into a zero-based count
+
+ExLoop
+			CMP.B	(A0)+, D0			; See if this is the one
+			BEQ		FoundEx				; Skip if so
+			MOVE.B	1(A0), D1			; Get the string length
+			LEA		2(A0, D1), A0		; Point to the next entry
+			DBRA	D2, ExLoop			; Go around again
+
+NoExcept
+			MOVEQ	#0, D2				; Clear out D2
+			MOVE.B	D3, D2				; Copy virtual keycode to D2
+			LSR.W	#3, D2				; Divide by 8 for byte offset
+
+			TST.B	D0					; Up or down key?
+			BMI.S	KeyUp				; Skip around if key up
+			BSET	D3, KeyBits(A2, D2)	; Set it for key down
+			BRA.S	Hammer
+KeyUp
+			BCLR	D3, KeyBits(A2, D2)	; Clear it for key up
+			BSET	#7, D3				; Remember key up for raw key.
+
+ ;* Begin Norsi Keypad changes (keypad uses modifiers from last keyboard pressed) 04/21/92* 
+Hammer		MOVE.L	D3, D0				; Get Device Type, Orig Addr, ADB Addr, keycode
+			ROL.L	#8, D0				; Rotate Device Type into low byte
+			CMP.B	#keypadNorsi, D0	; Is this a Norsi ergonomic KEYPAD?
+			BNE.S	HammerKeyMap		; If not, go update the keymap
+			MOVE.W	KeyMap+6, D0		; Modifier bits of last pressed keyboard  
+			AND.W	#$807F,D0			; Mask off non-modifier bits
+			MOVE.W	KeyBits+6(A2), D1	; Get Norsi KEYPAD's pseudo modifier bits
+			AND.W	#$7F80,D1			; Mask off KEYPAD's old modifier bits
+			OR.W	D0, D1				; Replace KEYPAD's modifier bits with the modifier
+			MOVE.W	D1, KeyBits+6(A2)	;  bits from the last pressed keyboard
+ ;* End Norsi Keypad changes (keypad uses modifiers from last keyboard pressed) 04/21/92* 
+			
+HammerKeyMap			
+			MOVEM.L	KeyBits(A2), D0-D2/A0	; Get current devices map of key pressed or not
+			MOVEM.L	D0-D2/A0, KeyMap		; Hammer this devices map into global keymap
+			MOVE.L	D3, D0					; Bits 15-8 contain ADB address
+			LSR.L	#8, D0					; Put it in the low byte
+			MOVE.B	D0, KbdLast				; Stuff it down
+			SWAP	D0						; Now get DeviceType
+			MOVE.B	D0, KbdType				; Update KbdType to show last one used
+	
+	; The next two instructions build the byte of modifier flags from the
+	; global key state information.  This works because the modifier flags
+	; exist in bits $37 to $3E, which appear in the following manner:
+	; Byte	|			6			|			7			|
+	; Bit	|37 36 35 34 33 32 31 30|3F 3E 3D 3C 3B 3A 39 38|
+	;		|^^						|	^^ ^^ ^^ ^^ ^^ ^^ ^^|
+			MOVE.W	KeyBits+6(A2), D0	; Get modifier word
+			ROL.W	#1, D0				; Rotate in command key
+
+			SUBQ.L	#4, SP				; Make room for result
+			MOVE.L	KCHRPtr(A2), -(SP)	; Push address of KCHR resource
+			MOVE.W	D3, -(SP)			; Push keycode (w/o modifiers)
+			MOVE.B	D0, (SP)			; Put modifiers where they belong
+			PEA		DeadKey(A2)			; Push address of dead key state
+			_KeyTrans
+
+			MOVE.W	(SP)+, D0			; Get the high word first
+			BEQ.S	NextWord			; Skip if null
+			BSR.S	PostIt				; Otherwise post the event
+NextWord
+			MOVE.W	(SP)+, D0			; Get the other word
+			BEQ.S	KbdDone				; If null, we're done
+
+
+
+;_________________________________________________________________________________________
+;
+; Routine:		PostIt
+; Arguments:	D0.W	ASCII Code
+;				D3.W	ADB Address in high byte and raw keycode in low byte
+;				A2.L	Pointer to private data area
+; Output:		None
+; Function		Posts the keyboard event as appropriate.
+; Side Effects:	Trashes A0, D0, D1
+; Called From:	KeyIn twice, (1 BSR, 1 fall-through)
+;
+;_________________________________________________________________________________________
+
+PostIt		ROR.W	#8, D0				; Swap ASCII high and low byte (xxLH)
+			SWAP	D0					; Move to high word (LHxx)
+			MOVE.W	D3, D0				; Move in ADB address and raw keycode (LHFR)
+			ROL.L	#8, D0				; Rotate around (HFRL)
+
+			TST.B	D3					; Key up or down?
+			BMI.S	PostKeyUp			; Skip if key up
+			MOVE.L	Ticks, D1
+			MOVE.L	D1, KeyTime			; Mark the time for auto repeat
+			MOVE.L	D1, KeyRepTime
+			MOVE.W	D0, KeyLast			; Save event message
+			SWAP	D0
+			MOVE.W	D0, HiKeyLast		; Save high word too
+			SWAP	D0
+			MOVE	#KeyDwnEvt, A0		; Get event number
+			_PostEvent					; Post it
+KbdDone
+			RTS							; And leave
+PostKeyUp
+			MOVE	#KeyUpEvt, A0		; Get event number
+			BCLR	#15, D0				; Clear the up/down bit in the raw keycode
+			_PostEvent					; Post it
+			RTS							; End KbdDrvr
+
+
+
+;_________________________________________________________________________________________
+;
+; Routine:		FoundEx
+; Arguments:	A0.L	Pointer to exception data
+;				A2.L	Pointer to private data area
+;				D3.W	Virtual keycode
+; Output:		None
+; Function		An exception exists for this particular keystroke.  Process it 
+;				appropriately.
+; Side Effects:	Trashes A0, D0, D1, D2
+; Called From:	KeyIn twice, (1 BSR, 1 fall-through)
+;
+;_________________________________________________________________________________________
+FoundEx
+			MOVE.B	(A0)+, D1			; Get the operand
+			BPL.S	@notXORKey			; Skip if not
+
+			MOVEQ	#0, D2				; Clear out D2
+			MOVE.B	D3, D2				; Copy virtual keycode to D2
+			LSR.W	#3, D2				; Divide by 8 for byte offset
+			BTST	D3, KeyBits(A2, D2)	; Get current key state
+			SEQ		D0					; Invert and put in D0
+
+@notXORKey
+			MOVEQ	#$F, D2				; Prepare mask for ADB op
+			AND.B	D1, D2				; D2 is ADB op w/o net address
+			BEQ.S	KbdDone				; If ADB op = 0 (Bus Reset), ignore key
+
+			TST.B	KNoADBOp(A2)		; See if we should even do this
+			BNE		NoExcept			; Skip if not
+			MOVEM.L	D0/A1, -(SP)		; Save D0 & A1
+			MOVE.L	A0, -(SP)			; Data address = mask
+			CMP.B	#TalkCmd, D2		; Is it a talk command?
+			BGE.S	@kbdTalk			; Skip if so
+			PEA		KbdBufFree			; Completion routine = KbdBufFree
+			BRA.S	@kbdBufAlloc
+@kbdTalk
+			PEA		KbdListen			; Completion Routine = KbdListen
+
+@kbdBufAlloc
+			LEA		KNumBufs(A2), A1	; Point to the number of available buffers
+			MOVE.B	(A1)+, D1			; Get the number of buffers
+			BEQ.S	@kNoBufAvail		; Skip if none available
+			SUBQ.W	#1, D1				; Turn it into a zero based count
+@kBufLoop
+			TST.B	(A1)+				; Is the buffer busy?
+			BEQ.S	@kGotABuf			; No, Go use it
+			LEA		KBufLen-1(A1), A1	; Point to the next one
+			DBRA	D1, @kBufLoop		; Go around again
+			BRA.S	@kNoBufAvail		; It's a loss
+
+@kGotABuf
+			MOVE.B	D0, -1(A1)			; Store the up/down state in the busy info
+			BSET	#1, -1(A1)			; Make sure it shows up as busy
+			MOVE.L	A1, -(SP)			; Buffer Address
+
+			MOVE.B	(A0), D1			; Get length of source string
+			CMP.B	#8, D1				; Greater than 8?
+			BLS.S	@kStrCopyLoop		; If not, no problem
+			MOVEQ	#8, D1				; Copy only the first 8 to avoid trashing mem
+@kStrCopyLoop
+			MOVE.B	(A0)+, (A1)+		; Start copying the string
+			DBRA	D1, @kStrCopyLoop	; Repeat D1+1 times
+
+			MOVE.W	D3, D0				; Get the FDB Address
+			CLR.B	D0					; Clear out the low byte
+			LSR.W	#4, D0				; Shift it down to form high nibble of ADB Command
+			OR.B	D2, D0				; Include low op nibble
+			MOVE.L	SP, A0				; Point to parameter block
+			_ADBOp						; Pray that everything is OK
+			BNE.S	@kOpFailed			; Branch if not
+			ADDQ.L	#4, SP				; Pop Buffer Address
+@kNoBufAvail
+			ADDQ.L	#8, SP				; Pop Completion and Data Address
+			MOVEM.L	(SP)+, D0/A1		; Restore D0 & A1
+			BRA		NoExcept			; Finish dealing with the keystroke
+
+@kOpFailed
+			MOVE.L	(SP)+, A1			; Get the buffer address
+			CLR.B	-1(A1)				; Mark it as not busy
+			BRA.S	@kNoBufAvail		; End FoundEx
+
+
+
+;_________________________________________________________________________________________
+;
+; Routine:		KbdListen
+; Arguments:	D0.B	ADB Command
+;				D1.L	DeviceType, OrigAddr, ADBAddr, Unused (byte order)
+;				A0.L	ADB Buffer Address
+;				A1.L	ADB Completion Routine Address (= KbdListen)
+;				A2.L	Pointer to private data area
+; Output:		None
+; Function:		Sets or clears bits in mask pointed to by A2 in buffer pointed
+;				to by A0.  Used to alter values of registers in ADB devices.
+; Side Effects:	Trashes A0, A1, A2, D0, D1, D2
+;
+;_________________________________________________________________________________________
+
+KbdListen	MOVE.L	A0, A1				; Copy A0 into A1
+			MOVEQ	#0, D1				; Clear out D1
+			MOVE.B	(A1)+, D1			; Get length of buffer
+			MOVE.B	(A2)+, D2			; Get length of mask
+			CMP.B	D2, D1				; Is mask length smaller?
+			BLS.S	@notSmall			; Skip if not
+			MOVE.B	D2, D1				; Use the mask length instead
+@notSmall
+; (A2) is a mask for (A0), 0 meaning don't change, 1 meaning clear or set
+; depending upon the value of -1(A0).
+			TST.B	-1(A0)				; PL = clear, MI = set
+			BPL.S	@endClrLoop
+			BRA.S	@endSetLoop
+
+@setLoop
+			MOVE.B	(A2)+, D2			; Get the mask byte
+			OR.B	D2, (A1)+			; Set the correct bits
+@endSetLoop
+			DBRA	D1, @setLoop		; Go around again
+			BRA.S	@kLoopDone
+
+@clrLoop
+			MOVE.B	(A2)+, D2			; Get the mask byte
+			NOT.B	D2					; Invert it
+			AND.B	D2, (A1)+			; Clear the correct bits
+@endClrLoop
+			DBRA	D1, @clrLoop		; Go around again
+
+@kLoopDone
+			CLR.L	-(SP)				; No data address needed
+			PEA		KbdBufFree			; Completion routine = KbdBufFree
+			MOVE.L	A0, -(SP)			; Use the buffer one more time
+			MOVE.L	SP, A0				; Point to parameter block
+			BCLR	#2, D0				; Turn the talk into a listen command
+			_ADBOp
+			BNE.S	@kLSuccess			; Branch on success
+
+			MOVE.L	(SP), A0			; Get the buffer address
+			CLR.B	-1(A0)				; Mark it as not busy
+@kLSuccess
+			LEA		12(SP), SP			; Pop the parameter block
+			RTS							; End KbdListen
+
+
+
+;_________________________________________________________________________________________
+;
+; Routine:		KbdBufFree
+; Arguments:	D0.B	ADB Command
+;				D1.L	DeviceType, OrigAddr, ADBAddr, Unused (byte order)
+;				A0.L	ADB Buffer Address
+;				A1.L	ADB Completion Routine Address (= KbdListen)
+;				A2.L	Pointer to private data area
+; Output:		None
+; Function:		Marks the buffer pointed to by A0 as free.
+; Side Effects:	None
+;
+;_________________________________________________________________________________________
+
+KbdBufFree	CLR.B	-1(A0)		; Mark buffer free
+			RTS					; End KbdBufFree
+
+
+
+;_________________________________________________________________________________________
+;_________________________________________________________________________________________
+;_________________________________________________________________________________________
+
+			END					;End file

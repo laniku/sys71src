@@ -1,0 +1,191 @@
+;
+;	File:		PatchProtector.a
+;
+;	Contains:	a patch to SetTrapAddress and GetTrapAddress that “protects” come-from patches
+;
+;	Written by:	Darin Adler
+;
+;	Copyright:	© 1990-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		<11>	 8/28/91	JSM		Cleanup header.
+;		<10>	  4/5/91	gbm		dba: Exit via jCacheFlush when setting the trap address. This
+;									makes it possible to use copy-back mode on '040's
+;		 <9>	  4/3/91	dba		kill the fun
+;		 <8>	 3/25/91	dba		VL: get rid of that stupid StripAddress
+;		 <7>	  3/4/91	dba		gbm: do a StripAddress for all the 24-bit slobs out there
+;		 <6>	12/18/90	gbm		(dba) Use the noPatchProtector conditional to prevent two patch
+;									protectors from getting upset at each other.
+;		 <5>	 12/5/90	dba		<gbm> disallow come-from patch headers except from people who
+;									use the $CXXX form of SetTrapAddress; also check the address
+;									passed to SetTrapAddress for validity, by reading the first long
+;									word and looking for the come-from header
+;		 <4>	  8/2/90	dba		get rid of the MemTop and odd checks
+;		 <3>	 5/30/90	dba		add validation for the old address in GetTrapAddress
+;		 <2>	  5/1/90	dba		do nothing to this file, just touch it so that people will get
+;									the LinkedPatchLib rebuilt
+;		 <1>	 3/21/90	dba		fixed some more bugs and checked in for general use
+;				  2/1/90	dba		fixed the bug that Ed found
+;				 1/30/90	dba		revamped, added [GS]etTrapWordAddress
+;				 1/25/90	dba		added a header
+;
+;	To Do:
+;		take into account the number of toolbox traps on each machine in [GS]etTrapWordAddress
+;
+;	This is a patch to Get/SetTrapAddress that respects come-from patches with a special format.
+;
+;		bra.s	*+6
+;		jmp		OldTrapAddress
+;
+;	Get and SetTrapAddress will notice patches that begin with this sequence and treat them as
+;	“come-from” patches. Instead of changing the address of the trap in the trap table, instead
+;	they will change the “old” address in the last come-from patch in the chain.
+;
+;	This patch needs to be installed before any come-from patches are installed. This can be done
+;	by linking it first in the first 'lpch' to be loaded.
+;
+;	This patch also implements a new variant of [GS]etTrapAddress called [GS]etTrapWordAddress.
+;	It takes a whole trap word, and does the right thing, removing the need for N[GS]etTrapAddress.
+;
+
+		print push,off
+		load 'StandardEqu.d'
+		include 'LinkedPatchMacros.a'
+		print pop
+
+; opcodes
+
+kBranchOverJMPLOpcode	equ		$6006
+kJMPLOpcode				equ		$4EF9
+
+kComeFromHeader			equ		(kBranchOverJMPLOpcode << 16) + kJMPLOpcode
+
+; bits in trap numbers and Set/GetTrapAddress opcodes
+
+TrapNumber				record	0
+toolboxBit				equ		11
+						endr
+
+TrapAddressOpcode		record	0
+newBit					equ		9
+toolboxBit				equ		10
+						endr
+
+; The following patch has to use $A046 as the trap number instead of _GetTrapAddress.
+; This is because it is installed before these patches modify the behavior of [GS]etTrapAddress
+; to work properly for full trap words. The trap number is thus used as an “old-style” trap number.
+; $A046 is GetTrapAddress, but $A146 (the value of _GetTrapAddress) is interpreted as $A946.
+
+ProtectGetTrap	patchproc $A046,(Plus,SE,II,Portable,IIci,noPatchProtector)
+				import TrapAddressBits
+				export OldGetTrapAddress
+
+		jsr		TrapAddressBits				; set bits in the trap word
+		move	sr,-(sp)					; would do a MOVE CCR, but it is not available on 68000
+		bsr.s	OldGetTrapAddress			; call the old GetTrapAddress
+		move	(sp)+,ccr					; get condition codes back
+		bcs.s	@done						; come-from patches bypass our trickery
+@next
+		cmp.l	#kComeFromHeader,(a0)		; does this have the come-from header?
+		bne.s	@done						; no we are done
+		move.l	4(a0),a0					; go on to the next
+		bra.s	@next
+@done
+		moveq	#0,d0						; must zero the result code again
+		rts
+
+OldGetTrapAddress
+		jmpOld
+
+				endproc
+
+; Since SetTrapAddress looks at the first long word of the previous value of the trap’s address,
+; it can be dangerous to call SetTrapAddress on some random value. Later, a correct SetTrapAddress
+; might encounter a bus error or address error or some other problem. To avoid this, SetTrapAddress
+; looks at the first long word of the new trap address *before* setting the address in the trap table
+; or come-from chain. This ensures that the bus error will happen right away.
+
+ProtectSetTrap	patchproc _SetTrapAddress,(Plus,SE,II,Portable,IIci,noPatchProtector)
+				import TrapAddressBits
+				import OldGetTrapAddress
+
+		move.l	(a0),d2						; get header of trap, and check for bus errors		<5>
+
+		jsr		TrapAddressBits				; set bits in the trap word
+		bcs.s	OldSetTrapAddress			; come-from patches bypass our trickery
+
+		cmp.l	#kComeFromHeader,d2			; headers can only be used on come-from patches		<5>
+		beq.s	@illegalHeader				; saw a header, so I must system error				<5>
+
+		movem.l	d0-d1/a0,-(sp)				; save trap address, number, and bits
+		jsr		OldGetTrapAddress			; call the old GetTrapAddress
+		move.l	#0,a1						; no come-froms found yet
+@next
+		cmp.l	#kComeFromHeader,(a0)+		; does this have the come-from header?
+		bne.s	@done						; no we are done
+		move.l	a0,a1						; remember this address
+		move.l	(a0),a0						; go on to the next
+		bra.s	@next
+@done
+		movem.l	(sp)+,d0-d1/a0				; restore trap address, number, and bits
+
+		cmp.l	#0,a1						; any come-froms found?
+		beq.s	OldSetTrapAddress			; no, go do the real SetTrapAddress
+		move.l	a0,(a1)						; set the trap address
+		move.l	jCacheFlush,-(sp)			; get the cache flush vector						<9>
+		rts									; call it, and then return to the trap dispatcher	<9>
+
+@illegalHeader
+		move.w	#dsBadPatchHeader,d0		; get error code									<5>
+		_SysError							; report it to the unsuspecting user				<5>
+
+OldSetTrapAddress
+		jsrOld								; call so we can flush the cache when we return		<9>
+		move.l	jCacheFlush,-(sp)			; get the cache flush vector						<9>
+		rts									; call it, and then return to the trap dispatcher	<9>
+
+				endproc
+
+TrapAddressBits	proc
+
+; TrapAddressBits
+;
+;	In:
+;		d0.w	trap number
+;		d1.w	[GS]etTrapAddress trap word
+;
+;	Out:
+;		d1.w	(modified) [GS]etTrapAddress trap word
+;		ccr		CC if it is not a come-from, CS if it is a come-from
+
+		btst	#TrapAddressOpcode.newBit,d1		; is this N[GS]etTrapAddress?
+		bnz.s	@notFullWord						; yes, don’t handle it
+		btst	#TrapAddressOpcode.toolboxBit,d1	; is this normal [GS]etTrapAddress?
+		bz.s	@notFullWord						; yes, don’t handle it
+
+@fullWord
+		; adjust the trap bits
+
+		bset	#TrapAddressOpcode.newBit,d1		; is this NGetTrapAddress?
+		btst	#TrapNumber.toolboxBit,d0			; is the trap a Toolbox trap?
+		bnz.s	@toolbox							; yes, leave the bit set
+		bclr	#TrapAddressOpcode.toolboxBit,d1	; clear bit for OS
+@toolbox
+
+		cmp.w	#$C000,d0					; is this a come-from trap word?
+		blo.s	@notComeFrom				; no, it is not
+		cmp.w	#$D000,d0					; is it a come-from trap word?
+		bhs.s	@notComeFrom				; no, it is not
+@comeFrom
+		; oooh... carry is set for us, we can return
+		rts
+
+@notFullWord
+@notComeFrom
+		and		#$FE,ccr					; clear the carry bit
+		rts
+
+				endproc
+
+				end

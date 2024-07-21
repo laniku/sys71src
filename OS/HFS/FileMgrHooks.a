@@ -1,0 +1,1419 @@
+;
+;	File:		FileMgrHooks.a
+;
+;	Contains:	This is a grab bag of code that needs to be merged into
+;				the rest of the file system.
+;
+;	Copyright:	© 1990-1994 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM7>	 1/29/94	DCB		Roll in changes from MissingLink to support Async SCSI.
+;	   <SM6>	 11/6/93	pdw		Added clearing of FSCallAsync after syncWait completes to fix
+;									QuickTime record bug.
+;	   <SM5>	 11/5/93	pdw		In FSDispatchRequest, changed sne to st.b FSCallAsync to always
+;									call drivers asynchronously no matter what the characteristic of
+;									the file system request.  Also rolled in the AppleShare
+;									4.0-found bug fix: calling CheckSCSICollision from deferred task
+;									to make sure that SCSI is still free.
+;	   <SM4>	 8/27/93	BH		Added flushing of critical volume info for manual-eject drives
+;									to ExtFSHook.  Some tweaks to _Eject handling for manual-eject
+;									drives: use A6 instead of A7 stack, bigger DSAlertRect, more
+;									intelligent VCB finding.
+;	   <SM3>	  8/3/93	BH		Added _Eject patch for manual-eject drives to ExtFSHook.
+;	   <SM2>	10/22/92	CSS		Change some branch short instructions to branches.
+;	   <SM1>	 4/1/92		kc		Copied the code from FileMgrPatches.a that needs 
+;									to be rolled in at a later date.
+;
+;	To Do:
+;				Merge/Roll this into the other sources
+;
+;——————————————————————————————————————————————————————————————————————————————————————————
+
+
+;________________________________________________________________________________
+;
+;	FSQueueHook patch										<9>
+;
+;	Grab control at the FSQueueHook to implement new call dispatching and some
+;	patches after the SyncWait loop.
+;
+;	We now defer dispatching a call if either the SCSI bus is busy or the interrupt
+;	mask is up.  To implement the SCSI deferral we wait until the SCSI manager calls
+;	us through the jSCSIFreeHook when the bus frees up.  If the interrupt mask is up,
+;	we install a deferred task.
+;
+;	After the SyncWait loop (i.e. only at the completion of synchronous calls) we
+;	tag FCBs with the serial number of the process that's opening them, and we
+;	attempt to allocate more FCBs or WDCBs if we run out.  We also do the disk recovery
+;	code (disk switch).
+;
+;	Inputs:
+;		d0.w	dispatch selector if $ax60 call
+;		d1.w	trap word
+;		a0.l	caller's pb
+;
+;	ASSERT: this patch must be the first one hooked in so that it is the
+;	last one called.  It must be the last one called because we are replacing
+;	the code in rom that follows the call to the fsQueueHook.
+;——————————————————————————————————————————————————————————————————————————————————————————
+
+fsQueueHookPatch:	proc	export
+			export	vAfterFSQHook, FSDispatchRequest, CheckInterruptMask
+			import	MungeTrapWord,UnMungeTrapWord, fsInterruptDeferProc
+			import	TagFileWithPSN, CheckFCBAllocation, MoreWDCBs
+
+VolatileRegs	reg		a0-a1/d1-d2
+pascalRegs		reg		a2-a6/d3-d7
+
+			addq.l	#4,sp					; we never want to return to ROM
+vAfterFSQHook:
+			move.w	#1,IOResult(a0) 		; set IOResult to "in process"
+			bsr		MungeTrapWord
+
+			move.l	(sp)+,IOCmdAddr(a0) 	; save address to go to when ready
+			move.w	#FSQType,IOType(a0)		; say its a file system queueing element
+
+			btst	#AsyncTrpBit,d1 		; async bit on?
+			beq.s	notAsync				; br if not
+
+			tst.b	FrcSync 				; force it synchronous?
+			beq		FSAsync 				; if not, do it async
+			bra.s	doItSync
+
+notAsync:
+			clr.l	IOCompletion(a0)		; no completion routines for sync calls
+doItSync:
+			move.l	IOCmdAddr(a0), -(sp)	; save address to go to when ready
+			lea		SyncReadyToRun, A1 
+			move.l	A1, IOCmdAddr(a0)		; replace IOCmdAddr with our intermediate call
+			
+			move.l	A0, -(sp)				; save parameter block ptr
+			bsr		FSAsync					; queue it up (and maybe call it)
+			move.l	(sp)+, A0
+
+syncStartWait:
+			tst.l	IOCmdAddr(A0)
+			bne.s	syncStartWait
+runSync:
+			move.l	(sp)+, A1					; get address to call
+			movem.l	A0/PascalRegs, -(sp)		; observe Pascal regsave conventions
+
+			move.l	A1, IOCmdAddr(a0)			; restore processing routine addr
+			movea.l PMSPPtr, A6					; Point to the Poor Man's Search Path table
+			clr.w	PMSPIndx(A6)				; No entries used yet
+
+			movea.l	HFSStkTop, A6				; Set up A6 for use as stack pointer
+			jsr		(a1)						; go do the call
+
+			movem.l	(sp)+, A0/PascalRegs		; restore registers
+
+; synchronous calls spin here until call is complete
+vSyncWait:
+SyncWait:	move.w	ioResult(a0),d0 		; get the result code into d0
+			bgt.s	SyncWait				; done when result is zero or negative
+
+; We're done with a synchronous call.  See what work there is to do.
+; 1) on successful file open, tag the file with the current process ID
+; 2) on failure of any call, see if recovery (fcb's, wdcb's, offline) is possible
+
+			tst.w	d0						; call successful?
+			bne.s	@ErrorRecovery			; if not, try recovering
+
+; see if this is an open.  Tag the FCB with the current process ID for _FSCleanup
+			bsr		UnMungeTrapWord			; get trap word in d1, selector in d0
+			andi.w	#$f0ff,d1				; clear the modifier bits
+			cmp.w	#$a060,d1				; is it our dispatcher?
+			bne.s	@CheckOpenTraps			; if not, look at straight traps
+			cmp.w	#selectOpenDF,d0		; is it _OpenDF?
+			beq.s	@TagIt					; branch if so
+			cmp.w	#selectOpenDeny,d0		; is it _OpenDeny?
+			beq.s	@TagIt					; branch if so
+			cmp.w	#selectOpenRFDeny,d0	; is it _OpenRFDeny?
+			beq.s	@TagIt					; branch if so
+@Return:
+			move.w	ioResult(a0), d0		; restore the result code to d0
+			ext.l	d0						; make it long for tradition's sake
+			rts 							; return to caller
+
+@CheckOpenTraps
+			cmp.w	#$a000,d1				; is this _Open?
+			beq.s	@TagIt					; branch if so
+			cmp.w	#$a00a,d1				; is this _OpenRF?
+			bne.s	@Return					; branch if not an open of any kind
+@TagIt
+			bsr		TagFileWithPSN			; put PSN in parallel array (a0 = iopb)
+			bra.s	@Return					; common exit
+
+; try to recover if a synchronous call failed because FCB or WD array was full
+@ErrorRecovery
+			cmp.w	#TMFOErr,d0				; Run out of FCBs?
+			bne.s	@CheckWDCBs
+
+			; Make sure we ran out of FCBs locally										<38>
+			movea.l	FSVarsPtr,a1			;											<38>
+			btst.b	#fsNeedFCBs,FSVars.fsFlags(a1)	; Too few FCBs locally?				<38>
+			beq.s	@CheckWDCBs				; no? check for WDCB space					<38>
+
+			bsr		CheckFCBAllocation		; see what we can do about the FCB trouble	<38>
+			beq.s	@RetryCall				; we can try again if we got more FCBs		<38>
+
+@CheckWDCBs:
+			cmp.w	#TMWDOErr,d0			; Run out of WDCB space?
+			bne		@Continue				; no? then I don' wanna talk to you
+			bsr		MoreWDCBs				; try to allocate more WDCBs
+			bne.s	@Continue				; Errors? Then, my dear, we've failed
+
+@RetryCall:									; <15>
+			bsr		UnMungeTrapWord			; trap word in d1, dispatch in d0
+			lea.l	TrapAgain,a1			; get ready to play assembler
+			move.w	d1,(a1)+				; write in the trap word
+			move.w	#$4E75,(a1)				; follow it with an RTS
+			move.l	jCacheFlush,a1			; get address of the CPU’s cache flusher	<45>
+			jsr		(a1)					; be cool on hoopy cached cpus				<45>
+			jmp		TrapAgain				; Go re-execute the original trap
+
+; call disk switch hook if synchronous call failed because volume went offline
+@Continue:
+			ext.l	d0						; extend result to long
+			cmp.w	#VolOffLinErr,d0		; volume off-line error? (detected by file
+			bne.s	@Return					;  system) br if not
+			move.l	DskSwtchHook,-(sp)		; OffLineVol points to VCB, a0 to request
+			bgt.s	@Return					; br if there is a hook proc
+			addq	#4,sp					; otherwise, just return
+
+	;•		This code was not in the system patch do we want it?? 
+	;•		IF		ForROM THEN
+	;•		btst	#7, DSAlertRect 		; already in our proc?
+	;•		bne 	DSHook					; br if not
+	;•		ENDIF
+			bra.s	@Return					; join exit code
+
+FSAsync:
+			move	sr, -(sp)				; save interrupt state
+			ori		#HiIntMask, sr			; turn interrupts off
+			lea.l	FSQHdr,a1         		; Point to the File System Queue
+			_Enqueue						; Enqueue the request
+			bset.b	#fsBusyBit, FSBusy		; make sure the file system is marked busy
+			beq.s	@1						; if free, go try to dispatch the call
+			move.w	(sp)+, sr				; restore interrupt state
+			moveq.l	#noErr, d0				; no errors (yet)
+			rts
+
+@1:			move.w	(sp)+, sr				; restore interrupt state
+
+
+;      Now we have to worry about whether interrupts are masked out.  We don't want to be 
+; running long file system calls with interrupts masked.  If interrupts are masked, we'll  
+; install a deferred task that will restart us when the mask is back down.
+;	   Compatibility note:  Macsbug likes to do logging to files with interrupts off.  While
+; we can't guarantee that this will work forever, it was the general consensus that it was
+; worth letting sync calls go through even if the interrupt mask was > 0 so as to let
+; macsbug do logging.  This also protects a few skanky programs which do sync calls from
+; vbl tasks and the like, although it doesn't change the fact that sync calls from interrupt
+; level are completely illegal.
+;      Note that we should probably put similar logic into the completion routines at
+; Basic I/O, since they are called as the result of interrupts.  This hasn't proven to be
+; a problem, though.
+
+CheckInterruptMask:
+			move.l	a0, -(sp)					; save a0											<34>
+			move.l	FSQHead,a0					; get first parameter block							<34>
+			btst.b	#AsyncTrpBit, ioTrap(a0)	; is this a sync call?								<34>
+			movea.l	(sp)+, a0					; restore a0 (keep ccr)								<34>
+			beq.s	SavePascalRegistersAndDispatch	; if sync, don't worry about interrupts				<34>
+			move.w	sr, d0						; get interrupt state
+			andi.w  #$0700,d0					; interrupt mask > level 0?
+			beq.s	SavePascalRegistersAndDispatch ; If not, there's nothing to worry about
+
+; The mask is up -  install a deferred task
+			movem.l VolatileRegs, -(sp)			; save across _DTInstall
+			move.l	FSVarsPtr, a1				; point to file system lomem
+			bset.b	#fsIntMaskDefer, FSBusy		; do we already have one in the oven?
+			bne.s	@AlreadyInstalled			; if yes, we can go now
+
+			lea.l	FSVars.fsDefer(a1), a0		; aim at our deferred task pb
+			lea		fsInterruptDeferProc, a1	; aim at our deferred task proc
+			move.l	a1, dtAddr(a0)				; tell the pb about it
+			move.w	#dtQType,qType(a0)			; Indicate proper queue type
+			clr.l	dtResrvd(a0)				; 'cause they told me to
+			clr.w	dtFlags(a0)					; 'cause it's reserved
+			_DTInstall							; call 976-wake
+
+@AlreadyInstalled:
+			movem.l	(sp)+, VolatileRegs			; restore registers
+			rts
+
+; <48>
+; SavePascalRegistersAndDispatch - the general call dispatcher.
+;   We make the following assumptions:
+;		We're not going to collide with a SCSI transaction
+;		We don't need to defer for anything (interrupts, etc.)
+;		The file system busy flag has been set
+;
+SavePascalRegistersAndDispatch:
+			movem.l	PascalRegs,-(sp)			; observe Pascal regsave conventions
+			bsr		FSDispatchRequest			; do the work
+			movem.l	(sp)+,PascalRegs			; restore registers
+			rts 								; and return (all commands finish by jumping to CmdDone)
+
+; FSDispatchRequest - the specific call dispatcher
+;	We assume that the appropriate registers have been saved and dispatch the call.
+FSDispatchRequest:
+			move.l	FSQHead,a0					; get first parameter block
+			move.l	IOCmdAddr(a0),a1			; get address to call
+			movea.l PMSPPtr,a6					; Point to the Poor Man's Search Path table
+			clr.w	PMSPIndx(a6)				; No entries used yet
+			btst.b	#AsyncTrpBit,ioTrap(a0) 	; set the flavor for this trap		<01Oct85>
+			sne.b 	FSCallAsync 				; if sync, we'll do our I/O synchronous <01Oct85>
+			movea.l	HFSStkTop,a6				; Set up A6 for use as stack pointer
+			jmp		(a1)						; go do the call								<48>
+
+;——————————————————————————————————————————————————————————————————————————————————————————
+;
+; This is our signal routine which is called when the sync IO is initially dispatched.
+;	It signals the syncStartWait loop by clearing the IOCmdAddr field.
+;
+SyncReadyToRun
+			clr.l	IOCmdAddr(A0)
+			rts
+			
+			endproc
+
+;_____________________________________________________________________________________
+; <38>
+;	CheckFCBAllocation
+;
+;	Function:
+;		Check to see if there's a pending request for more FCBs.  If
+;		there is a request, service it.
+;
+;		This routine is called from both the tail of the syncwait loop and
+;		from idle time.
+;
+;		Note that we only attempt to allocate more FCBs when the #fsNeedsFCBs
+;		bit is set.  This allows the syncwait loop to come here for all
+;		#tmfoErr cases, even when those cases were generated by remote
+;		volumes failing to get FCBs.
+;
+;		Note that this routine makes a file system call (_AllocateFCBs), so
+;		it can't be called from within the file system.
+;
+;	Input:
+;		none
+;
+;	Output:
+;		d0.w - #noErr if nobody has any outstanding FCB requests or
+;				the outstanding request was successfully fulfilled
+;
+;			 - #tmfoErr if FCBs were requested and none could be made
+;				available
+;
+;		ccr's - tst.w of d0
+;_____________________________________________________________________________________
+CheckFCBAllocation: proc
+@regs		reg		d1/a0/a1
+
+			movem.l	@regs,-(sp)
+			move.l	FSVarsPtr,a1
+			with	FSVars
+
+			btst.b	#fsNoFCBExpansion,fsFlags(a1)	; does anybody even care?
+			bne.s	@quickExit
+
+			bclr.b	#fsNeedFCBs,fsFlags(a1)			; does anybody need any FCBs?
+			beq.s	@quickExit						; if not, cruise
+
+			sub.w	#ioHQElSize,sp					; allocate an iopb
+			movea.l	sp,a0							; grab the iopb pointer
+			move.w	fsFCBBurst(a1),ioFCBBurst(a0)	; indicate desired FCB headroom
+			move.w	fsFCBGrow(a1),ioFCBGrow(a0)		; indicate target when we do grow
+			_AllocateFCBs							; go see what we can get
+			move.w	ioTotalFCBs(a0),d1				; grab the total now
+			add.w	#ioHQElSize,sp					; deallocate iopb
+
+			cmp.w	fsFCBMax(a1),d1					; are we at max FCBs?
+			blt.s	@exit							; if not, don't worry
+			bset.b	#fsNoFCBExpansion,fsFlags(a1)	; if so, don't bother keeping track anymore
+
+@exit:
+			movem.l	(sp)+,@regs
+			tst.w	d0
+			rts
+
+@quickExit:
+			moveq.l	#noErr,d0
+			bra.s	@exit
+
+			endwith
+			endproc
+;_____________________________________________________________________________________
+;
+;	FileManagerIdleProc
+;
+;	Function:
+;		This function is called from _IdleSynchTime to allow the file system
+;		to perform periodic activity.
+;
+;		Currently we check to make sure that enough FCBs are free.
+;
+;	Input:
+;	Output:
+;		none
+;_____________________________________________________________________________________
+FileManagerIdleProc:	proc export
+			jsr		CheckFCBAllocation
+			rts
+			endproc
+
+;——————————————————————————————————————————————————————————————————————————————————————————
+;________________________________________________________________________________
+;
+; Routine:	MoreFCBs
+; Function:	Create more FCBs.
+; Input:	d2.w - number of FCBs to extend array by				<38>
+;
+; Output:	d0 = OSErr.  #noErr on success.  #TMFOErr on failure.
+;			condition codes = (tst.w d0)
+;
+; This routine is called just after syncWait time (obviously it only works on synchronous
+; calls) where a #TMFOErr is seen.  Attempt to allocate a new, larger FCB array and copy the
+; contents of the old FCB array to the new area and release the old FCB array.
+; NOTE: We thought of just SetPtrSize'ing the old main array to create the new, larger parallel
+; array.  This has a couple problems: a) the parallel array elements may some day be
+; bigger than the main elements, and b) more obtusely, we deal better with
+; fragmentation by doing a NewPtr, since it may find a better spot than the current one.
+;
+; This routine is also called by our FS idle proc when it decides that there
+; aren't enough FCBs lying around.
+;________________________________________________________________________________
+
+FCBGrowRegs	reg		d1-d4/a0-a3
+MoreFCBs:	proc
+			movem.l	FCBGrowRegs,-(sp)		; Save some scratch regs
+
+; Remember # of FCBs that we're attempting to add
+			move.w	d2, d4
+
+; Calculate size of new, larger main FCB array and attempt to allocate it
+			move.l	FCBsPtr,a2				; Point to existing FCB array
+			moveq.l	#0,d0					; clear d0 to receive long size
+			move.w	(a2),d0					; get size of the array in bytes
+			move.w	FSFCBLen,d1				; start with the length of a single fcb
+			mulu.w	d4,d1					; multiply by the number we're adding		<38>
+			add.w	d1,d0					; add size to extend it by
+			bmi		@FailedMain				; if d0 > maxSignedWord we're stuck
+
+			move.l	d0,d3					; save new size (for switching sizes later)
+			_NewPtr	sys, clear				; ...and try to allocate a larger array
+			bne		@FailedMain				; Xfer if can't get the memory...
+
+; Copy contents of old FCB array to the newly allocated larger, main FCB array
+; Gentle Reader: BlockMove'ing the old to the new, of course, copies the size field as
+; well as the data.  We postpone setting the new size, tho, until we know we have a new
+; block for the enlarged parallel array.  This keeps asynch callers from tripping over
+; inconsistencies, without requiring us to turn ints off across the NewPtr.  Also
+; makes error recovery from second alloc a simple SetPtrSize of the first alloc.
+			move.l	a0,a1					; Dest address is new FCB array
+			movea.l	a2,a0					; Source is old FCB array
+			moveq.l	#0, d0					; clear the high bytes
+			move.w	(a2),d0					; Get size of the old array
+			move.w	sr,-(sp)				; save current status register
+			ori.w	#HiIntMask,sr			; turn interrupts off to protect from marauding async calls
+			_BlockMove						; copy the old array (including its old size word)
+			move.l	a1,FCBsPtr				; set new FCB array address (leave the old size for now)
+			move.w	(sp)+,sr				; restore status register
+
+; Deallocate the old FCB array (fill memory with bus error bait to catch stale users)
+			move.l	a2,a0					; pointer to old FCB array for disposal
+			moveq.l	#0, d0					; clear the high bytes
+			move.w	(a2),d0					; get size of the old array
+			lsr.l	#1,d0					; convert to words
+			subq.l	#1,d0					; adjust for dbra
+@CrudLoop:	move.w	#$fe1d,(a2)+			; fill a word and inc pointer
+			dbra	d0,@CrudLoop			; decrement count and loop if non-zero
+			_DisposPtr						; release the block
+
+; now replace the parallel FCB array with a larger one
+			move.l	FSVarsPtr,a3			; a3 = ptr(FSVars)
+			movea.l	FSVars.fcbPBuf(a3),a2	; a2 = current FCB parallel array
+			move.w	cbPBufULen(a2),d0		; size of each parallel array element
+			move.w	cbPBufCount(a2),d1		; count of existing array entries
+			mulu.w	d0,d1					; size of elements in existing array
+			addq.l	#fcbPBufData,d1			; d1 = size of current array and header info
+			mulu.w	d4,d0					; calc bytes of additional elements			<38>
+			add.l	d1,d0					; d0 = new array size
+			_NewPtr	sys, clear				; allocate (bound to work since we just freed old main array)
+			bne.s	@FailedParallel			; deal with failure, tho
+
+; We have all we need.  Copy old to new, update the count in the parallel array, and
+; the size in main array.  This is a critical section because a) we can't afford someone
+; modifying part of the old array after BlockMove has passed it, and b) the main size
+; and the parallel count need to agree.  We disable interrrupts.
+			movea.l	a0,a1					; a1= destination=new array
+			movea.l	a2,a0					; a0= source     =old array
+			move.l	d1,d0					; d0= count		 =old size
+			move.w	sr,-(sp)				; save current status register
+			ori.w	#HiIntMask,sr			; turn interrupts off to protect from marauding async calls
+			_BlockMove						; copy over
+			add.w	d4,cbPBufCount(a1)		; set new count								<38>
+			move.l	a1,FSVars.fcbPBuf(a3)	; save new array
+			movea.l	FCBsPtr,a0				; now that it is safe, update the main FCB array size
+			move.w	d3,(a0)					; use the d3 we made long ago
+			move.w	(sp)+,sr				; restore status register
+
+; free the old parallel array
+			movea.l	a2,a0					; Pointer to old parallel FCB array
+			_DisposPtr						; Release it
+			moveq	#noErr,d0				; say noErr since it worked!
+@ExitOutNow
+			movem.l	(sp)+,FCBGrowRegs		; restore the scratch regs
+			rts
+
+; We got the memory for the larger main FCB array but failed to get the memory for
+; the parallel FCB array.  However, anticipating this problem, we haven't
+; yet set the size word in the new FCB array.  Since we're failing to
+; grow, we'll just set the pointer size of the (new, bigger) FCB array
+; back to the size it used to be and report the #TMFOErr to the caller.
+@FailedParallel:
+			movea.l	FCBSPtr,a0				; point to the base of the FCB array
+			moveq.l	#0,d0					; clear since SetPtrSize takes a long
+			move.w	(a0),d0					; get size of old array
+			_SetPtrSize						; drop the size back down
+
+@FailedMain:
+			moveq.l	#TMFOErr,d0				; we have to live with it
+			bra.s	@ExitOutNow				; share exit
+
+			endproc
+
+;________________________________________________________________________________
+;
+; Routine:	MoreWDCBs
+; Function:	Create more WDCBs.
+; Input:	none.
+; Output:	d0 = OSErr.  #noErr on success.  #TMWDOErr on failure.
+;			condition codes = (tst.w d0)
+;
+; This routine is called just after syncWait time (obviously it only works on synchronous
+; calls) where a #TMWDOErr is seen.  Attempt to allocate a new, larger WDCB array and copy the
+; contents of the old WDCB array to the new area and release the old WDCB array.
+; NOTE: We have no choice but to use a hardwired constant (WDCBLen) for the WDCB element
+; size, since the value is not stored in memory.
+; NOTE: We thought of just SetPtrSize'ing the old main array to create the new, larger parallel
+; array.  This has a couple problems: a) the parallel array elements may some day be
+; bigger than the main elements, and b) more obtusely, we deal better with
+; fragmentation by doing a NewPtr, since it may find a better spot than the current one.
+;________________________________________________________________________________
+
+			entry	MoreWDCBs
+WDCBGrowRegs	reg		d1-d3/a0-a3
+MoreWDCBs	proc
+			movem.l	WDCBGrowRegs,-(sp)		; Save some scratch regs
+
+; calculate larger size, and try to allocate the memory
+			move.l	WDCBsPtr,a0				; point to existing WDCB array
+			moveq.l	#0, d0					; clear the high bytes
+			move.w	(a0),d0					; get size of that array (bytes)
+			addi.w	#fsWDCBExtendCount*WDCBLen,d0	; calc the new, larger size			<38>
+			bmi 	@FailedMain				; if d0 > maxSignedWord we're stuck <SM2> CSS 
+
+			move.l	d0,d3					; save new size (for switching sizes later)
+			_NewPtr	sys, clear				; ...and try to allocate a larger array
+			bne		@FailedMain				; jump if can't get the memory...
+			movea.l	a0,a1					; copy ptr to useful and durable register
+
+; copy contents of old WDCB array to the new location
+; Gentle Reader: BlockMove'ing the old to the new, of course, copies the size field as
+; well as the data.  We postpone setting the new size, tho, until we know we have a new
+; block for the enlarged parallel array.  This keeps asynch callers from tripping over
+; inconsistencies, without requiring us to turn ints off across the NewPtr.  Also
+; makes error recovery from second alloc a simple SetPtrSize of the first alloc.
+			movea.l	WDCBsPtr,a0				; source is existing WDCB array
+			moveq.l	#0, d0					; clear the high bytes
+			move.w	(a0),d0					; get size of old array (bytes)
+			movea.l	a0,a2					; save for later
+			move.w	sr,-(sp)				; save current status register
+			ori.w	#HiIntMask,sr			; turn interrupts off to protect from marauding async calls
+			_BlockMove						; a1 is preserved
+			move.l	a1,WDCBsPtr				; set new WDCB array address
+			move.w	(sp)+,sr				; restore status register
+
+; deallocate the old WDCB array
+			move.l	a2,a0					; Pointer to old WDCB array
+			_DisposPtr						; Release it
+
+; now replace the parallel WDCB array with a larger one
+			move.l	FSVarsPtr,a3			; a3 = ptr(FSVars)
+			movea.l	FSVars.wdcbPBuf(a3),a2	; a2=old WDCB parallel array
+			move.w	cbPBufULen(a2),d0		; d0=unit size
+			move.w	cbPBufCount(a2),d1		; old array count
+			mulu.w	d0,d1					; calc bytes of array elements
+			addq.l	#wdcbPBufData,d1		; d1=current buffer size, including header
+			mulu.w	#fsWDCBExtendCount,d0	; calc bytes of additional elements			<38>
+			add.l	d1,d0					; d0=new array size
+			_NewPtr	sys, clear				; ...and try to allocate a larger array
+			bne.s	@FailedParallel			; deal with error
+
+; We have all we need.  Copy old to new, update the count in the parallel array, and
+; the size in main array.  This is a critical section because a) we can't afford someone
+; modifying part of the old array after BlockMove has passed it, and b) the main size
+; and the parallel count need to agree.  We disable interrrupts.
+			movea.l	a0,a1					; a1=destination=new array
+			movea.l	a2,a0					; a0=source=old array
+			move.l	d1,d0					; old size
+			move.w	sr,-(sp)				; save current status register
+			ori.w	#HiIntMask,sr			; turn interrupts off to protect from marauding async calls
+			_BlockMove						; copy over
+			add.w	#fsWDCBExtendCount,cbPBufCount(a1)	; set new count					<38>
+			move.l	a1,FSVars.wdcbPBuf(a3)	; save new array
+			movea.l	WDCBsPtr,a0				; now that it is safe, update the main WDCB array size
+			move.w	d3,(a0)					; use the d3 we made long ago
+			move.w	(sp)+,sr				; restore status register
+
+; free the old parallel array
+			movea.l	a2,a0					; Pointer to old WDCB array
+			_DisposPtr						; Release it
+			moveq	#noErr,d0				; say noErr since it worked!
+@ExitOutNow
+			movem.l	(sp)+,WDCBGrowRegs		; restore the scratch regs
+			rts
+
+; We got the memory for the larger main WDCB array but failed to get the memory for
+; the parallel WDCB array.  However, anticipating this problem, we haven't
+; yet set the size word in the new WDCB array.  Since we're failing to
+; grow, we'll just set the pointer size of the (new, bigger) WDCB array
+; back to the size it used to be and report the #TMWDOErr to the caller.
+@FailedParallel:
+			movea.l	WDCBsPtr,a0				; point to the base of the WDCB array
+			moveq.l	#0,d0					; clear since SetPtrSize takes a long
+			move.w	(a0),d0					; get size of old array
+			_SetPtrSize						; drop the size back down
+
+@FailedMain:
+			moveq.l	#TMWDOErr,d0			; we have to live with it
+			bra.s	@ExitOutNow				; share exit
+
+			endproc
+;________________________________________________________________________________
+;
+;	fsInterruptDeferProc
+;
+;	This procedure is the completion routine of the file system's deferred
+;	task.  It clears the fsIntMaskDefer flag and jumps into dispatching the frontmost
+;	call.
+;
+;________________________________________________________________________________
+fsInterruptDeferProc:	proc	export
+			import	FSDispatchRequest, CallWithRegistersPreserved
+interruptRegs	reg		a4-a6/d4-d7
+
+			bclr.b	#fsIntMaskDefer, FSBusy				; indicate that there's no task pending
+			movem.l	InterruptRegs,-(sp)
+			jsr		FSDispatchRequest					; call dispatcher
+			movem.l	(sp)+,InterruptRegs
+			rts
+			
+			endproc
+;——————————————————————————————————————————————————————————————————————————————————————————
+;
+;	fsSCSIFreeHookProc
+;
+;	This procedure is called by the SCSI manager every time the SCSI bus is
+;	freed up.  If (the File System is busy) and (we're waiting for a wake up)
+;	then jump to where we deferred until SCSI was free.
+;
+;——————————————————————————————————————————————————————————————————————————————————————————
+fsSCSIFreeHookProc:	proc
+			import	SCSINotBusy
+			
+			bclr.b	#fsSCSIDefer, FSBusy	; if we're waiting, we'll have this flag set
+			beq.s	NoWakeUp
+
+			MOVEM.L D1-D7/A0-A6,-(SP)		; preserve registers (for caller of fsSCSIFreeHook)
+			PEA 	SCSIBusyReturn 			; return to here to restore regs
+
+			MOVEA.L HFSStkPtr,A6			; Recover HFS' private stack pointer
+			MOVEM.L (A6)+,D1-D7/A0-A5		; Retrieve registers off A6 stack
+			MOVE.L	A6,HFSStkPtr			; save stack ptr
+
+			JMP		SCSINotBusy				; continue with the dispatch
+
+SCSIBusyReturn
+			MOVEM.L (SP)+,D1-D7/A0-A6		; restore significant registers
+			
+NoWakeUp	RTS 							; 
+
+			endproc
+
+
+;________________________________________________________________________________
+;
+;	fsGeneralWakeUp
+;
+;	This procedure can be called by anyone at any time.  It checks to see if there
+;	is any File System work that needs to be done, and if so, dispatches it.
+;
+;________________________________________________________________________________
+fsGeneralWakeUp:	proc
+	import CheckInterruptMask
+			move	sr,-(sp)				; save interrupt state
+			ori 	#HiIntMask,sr			; only debug interrupts allowed
+			tst.l	FSQHead 				; is a command pending?
+			beq.s	@Done
+
+			bset.b	#fsBusyBit, FSBusy		; make sure the file system is marked busy
+			bne.s	@Done					; if it was already busy, we can return
+			move.w	(sp)+,sr				; restore interrupt state
+			bra		CheckInterruptMask		; go run the next call
+
+@Done:
+			move.w	(sp)+,sr				; restore interrupt state and return
+			rts
+
+;________________________________________________________________________________
+; Routine:	ProcessMgrExists
+; Function: check if Process Mgr is running
+; Input:	none
+; Output:	D0=0 if it is ready; all other registers are preserved.
+;			Condition codes = (tst.w  d0)
+; ________________________________________________________________________________
+ProcessMgrExists	proc	export
+			move.l	a0,-(sp)			; save a0
+			move.l	#GestaltOSAttr,d0	; set up Gestalt selector
+			_Gestalt					; ask Gestalt about Process Mgr
+			movea.l	(sp)+,a0			; d0 = OSErr, noErr if Process Mgr exists
+			rts							; leave with condition codes intact
+
+			endproc
+
+;________________________________________________________________________________
+;
+; Routine:      TagFileWithPSN
+;
+; Function:     Store current process ID in parallel array element for the file
+;				whose refnum is in the iopb passed in a0.
+;
+; Inputs:       A0 = Parameter block
+; Output:       A0 = Parameter block
+; Eats:			pascal regs, except a0
+;
+;________________________________________________________________________________
+			proc
+			entry	TagFileWithPSN
+
+TagFileWithPSN
+; Open traps can be (and are!) called before Process Mgr is init'd
+			bsr		ProcessMgrExists	; is Process Mgr ready?
+			bne.s	@CantRecord			; Process Mgr is not ready yet
+
+; find the current PSN
+			move.l	a0,-(sp)			; save pb pointer on stack
+			suba.w	#10, sp				; allocate storage for PSN (8 bytes) and result
+			pea		2(sp)				; push address of PSN storage
+			_GetSystemClientProcess		; get PSN with which to associate the file
+			tst.w	(sp)+				; ignore result (on error, PSN == kNoProcess)
+
+; PSN on top of stack.  Locate entry in parallel array, and store.
+			movea.l	8(sp),a0			; get iopb back in a register
+			move.w	ioRefNum(a0),d0		; get refNum to convert it
+			bsr		ParallelFCBFromRefnum	; a1 = ptr(parallel FCB entry)
+			move.l	(sp)+,xFCBPid1(a1)	; save high half of PSN
+			move.l	(sp)+,xFCBPid2(a1)	; save low half of PSN
+			tst.l	(sp)+				; pop a0 (since we've already restored it)
+@CantRecord
+			rts
+
+			endproc
+
+;________________________________________________________________________________
+;
+;	ExtFSCatchAll - catch external file system calls that nobody handled
+;
+;	To complete our ability to implement future file system calls in external
+;	file systems before we implement them locally, we pass unknown a060
+;	traps (i.e. those that we dispatch to UnknownCall) down the toExtFS hook
+;	to see if there are any external file systems that want to process them.
+;
+;	If an external file system does process the call it will change the error
+;	code to something negative or zero.  If nobody handles it, we'll arrive
+;	here with a positive dispatch number in d0.
+;		#paramErr is for calls that are known now but not implemented locally
+;		#extFSErr is for calls which we do implement, so if we're here then
+;				  nobody spoke up for the call.
+;
+;	Note that we don't have to worry about straight traps ending up here, since
+;	if they get dropped on the floor we'll exit the toExtFS hook with the
+;	original #ExtFSErr still sitting in d0.
+;
+;	Inputs:
+;		a0 - pointer to currently executing parameter block
+;		d0 - dispatch selector
+;
+;	Currently, we send the following dispatch values through UnknownCall
+;		$1c - $1f						we want to be flexible about the parameters to these
+;		selectVolumeMount ($41)			since there's no volume to aim at
+;		selectGetUGEntry ($44) - $4f	•• should get the hell off of $a060, that's what.
+;		everything above $70			we want to be flexible about the parameters to these
+;________________________________________________________________________________
+ExtFSCatchAll:	proc
+		tst.w	d0						; is this a selector?						<15Jan91 #28>
+		ble.s	@Exit					; no										<15Jan91 #28>
+		cmp.b	#$1c, d0				; check the bottom of the first range
+		blo.s	@ExtFSErrExit			; since we implement dispatches < $1c, return #ExtFSErr
+		cmp.b	#$1f, d0				; check the top of the first range
+		bls.s	@ParamErrExit			; we don't implement $1c<=dispatch<=$1f, so #paramErr it
+
+		cmp.b	#selectVolumeMount, d0	; check for volumeMount
+		beq.s	@ParamErrExit			; no local volumeMount, so #paramErr it
+
+		cmp.b	#selectGetUGEntry, d0	; check for bottom of third range
+		blo.s	@ExtFSErrExit
+		cmp.b	#$4f, d0				; check top of third range
+		bls.s	@ParamErrExit
+
+		cmp.b	#$70, d0				; check for the edge of the known world
+		blo.s	@ExtFSErrExit
+
+@ParamErrExit:
+		moveq.l	#paramErr, d0
+		bra.s	@Exit
+
+@ExtFSErrExit:
+		moveq.l	#extFSErr, d0		; restore correct error code
+@Exit:
+		rts
+
+		endproc
+
+
+;_____________________________________________________________________________________
+;
+;	MungeTrapWord   (d0 and d1) -> ioTrap(a0)
+;
+;	Function
+;		Store the trap word in d1 into ioTrap(a0).  If the trap is Ax60, combine
+;		d1 with the dispatch value on d0 before storing.
+;
+;	Input:
+;		a0   - pointer to caller's PB
+;		d0	 - dispatch value (for Ax60 traps)
+;		d1	 - trap word
+;
+;	Output:
+;		a0		- pointer to caller's PB
+;		ioTrap(a0) - munged trap word
+;
+;		All registers preserved
+;_____________________________________________________________________________________
+MungeTrapWord:	proc	export
+			move.w	d1,IOTrap(a0)		; save the trap number
+			cmp.b	#$60,d1 			; TFS trap dispatch?
+			bne.s	@noNeedToMunge		; If not, leave ioTrap alone
+
+			and.b	#$0F,ioTrap(a0) 	; Leave only modifier bits
+			move.b	d0,ioTrap+1(a0) 	; Store trap index in low byte
+
+@NoNeedToMunge:
+			rts
+			endproc
+
+;_____________________________________________________________________________________
+;
+;	UnMungeTrapWord		ioTrap(a0) -> d0 and d1
+;
+;	Function
+;		Expand the trap word in ioTrap(a0) into its original dispatch trap
+;		word (in d1) and leave the selector in d0.  ioTrap is not touched.
+;
+;		Note that we're not converting the dispatch selector into a signed byte.
+;		The negative value we return is a word, so it's cool to check the word
+;		in d0 for negativeness even when we get dispatch selectors > 128.
+;		ExtFSErr happens to be the right value when calling toExtFS, so it's the
+;		negative number of choice.
+;
+;	Input:
+;		a0   - pointer to caller's PB
+;
+;	Output:
+;		a0		- pointer to caller's PB
+;		d0.w	- dispatch value (for dispatch traps), or #ExtFSErr (for straight traps)
+;		d1.w	- trap word
+;		N		- set for straight traps, clear for $Ax60 traps
+;
+; Note:
+;	This routine is called by the desktop manager, too.
+;_____________________________________________________________________________________
+UnMungeTrapWord:	proc	export
+			moveq.l	#ExtFSErr,d0		; for straight traps
+			move.w	ioTrap(a0),d1		; get munged version of trap word
+			bmi.s	@Exit				; no need to un-munge if it was an Ax00 trap
+			moveq.l	#0,d0				; clear long since we only move a byte
+			move.b	d1,d0				; d0 = hfs dispatch code
+			clr.b	d1					; clear selector from low byte
+			ori.w	#$a060,d1			; merge HFSDispatch trap word with modifiers
+@Exit:
+			tst.w	d0					; sets N for straight traps
+			rts
+			endproc
+
+;________________________________________________________________________________
+;
+;	ExtFSHook patch										<9>
+;
+;	Grab control at the ExtFSHook to implement patches to CmdDone.  We are
+;	called after the file system has executed the local attempt at the call
+;	and after it has attempted the PMSP.
+;
+;	We are currently performing the following steps
+;
+;		1) Run external file systems if necessary  (replaces code in ROM)
+;		2) Do check to catch stray selectors
+;		3) Perform MakeFSSpec emulation if necessary
+;		4) Set up the info for the disk switch hook
+;		5) UnTag FCBs on all _Close calls
+;		6) Fix up FCBs on successful _OpenRF calls (details follow)
+;		7) Call completion routines (replaces code in ROM)
+;		8) Check for more calls to dispatch (replaces code in ROM)
+;
+;	Calling external file systems is tricky since the AppleShare external file
+;	system (and any other peer-to-peer client file systems) dequeue their calls
+;	and clear the local file system (to allow peers to send calls to this machine
+;	and not get stuck in a deadlock).
+;	The rules of calling the external file system chain allow for a single
+;	address on top of the stack that the external file system should return
+;	to when the call is really complete.  Below that the stack belongs to
+;	whomever we/the external file system plans to return to during async execution
+;	of the call (quite possibly a return address into the file system syncwait loop,
+;	but we can't be sure).
+;
+;	Figure 1:
+;
+;	Top of a7 stack
+;		The Command Done Address		External file system pop this and jump here when done
+;		The Async Context				External file systems rts when returning asynchronously
+;			(arbitrarily deep)
+;	Bottom of a7 stack
+;
+;	Since we can save at most one return addresses' worth of context (the one that the
+;	external file system will return to when it is done with the call) AND we
+;	(this patch) are jsr'ed to from the rom, we would have no way to calling external
+;	file systems with the right stack depth.  So, we throw away the return address to
+;	ROM and replace all of the code that the ROM normally does.
+;
+;	Nota Bene:
+;		Anyone who hooks onto the ExtFSHook and bsrOlds is guaranteed to break the
+;		system since we required the ability to call external file systems from
+;		this patch and calling external file systems requires the above-mentioned
+;		stack discipline.
+;
+;	All of this stack business is why the patches are all at the same subroutine level.
+;	Obviously, you can't write a patch that will call external file systems if you
+;	are down in a subroutine.
+;
+;	See tech note #xxxxx (the exciting tech note of the future about those wacky zany
+;	file system hooks)
+;
+;	The dirty details about _OpenRF and AdjEof
+;
+;	The logic at the end of FOpen (the common data and resource fork opener) has
+;	a bug in the code when it syncs up the FCBs of the fork it just opened (which
+;	has information from the catalog file record) with any other FCBs (which
+;	have information that's been modified by file system calls
+;	made since the last flush).  The code loops through all FCBs looking
+;	for forks on the same volume with the same file number of the same rsrc/data
+;	type that aren't the file that was just opened.  If it finds one, it calls the
+;	AdjEOF subroutine, which forces all FCBs of the same file/fork to have the
+;	the same file positioning information.  The bug is that the check for "same
+;	fork" is flawed.  It loads D3 with a WORD sized value when extracting the
+;	FCBMdRByt field from the new FCB, but uses it as a byte when comparing it to
+;	the FCBMdRByt field of other FCBs.  This means it is using the byte after
+;	FCBMdRByt, which is FCBTypByte.  FCBTypByte happens to always be zero in HFS
+;	(type is an MFS concept).  A zero in the fork flag () of FCBTypByte means
+;	"data fork", so data fork opens act correctly.  Of course, resource fork opens
+;	do not.  We make up for it in this patch to OpenRF.
+;
+;	•• What about the fact that a resource file will always look like a data
+;	fork to the ROM's confused FCB synchronizer?
+;
+;	Inputs:
+;		d0.w - result code from current file manager call	input to toExtFS hook
+;		d1.l - (on Open calls only) points to a free fcb	input to toExtFS hook
+;		a0.l - caller's pb									input to toExtFS hook
+;		a3.l - possible pointer to WDCB						input to toExtFS hook
+;
+;	Register usage:
+;		We can trash only interrupt regs (d0-d3/a0-a3).
+;
+;		According to the unpublished IM Vol. IV chap (21), external file systems
+;		can trash only d1/d2/a0/a1
+;
+;		But, old versions of XFS (CD-ROM, ISO-9660) trash D4, HFSStkPtr and any other
+;		side effects of calling the disk cache (though it points a6 at its own
+;		space).
+;
+;		As far as we know, none of the external file systems use the memory
+;		below HFSStkTop^ for their own use.
+;
+;		When you enter command done, registers d0-d3/a0-a3 are protected and
+;		are available for File System use. d0/d1/a0/a3 are input parameters to
+;		the external file system chain.
+;
+;		About the #NoMacDskErr bug: We assume that it is fixed in a patch that is
+;		called before this patch is.
+;
+;	Reentrancy:
+;		The AppleShare client file system causes this code to be reentered.  When
+;		AppleShare decides to derail a call (because it is heading to an external
+;		volume that might be on a peer of this machine) it remembers the return
+;		address (as it should) but removes the PB from the front of the FSQueue
+;		and clears the FSBusy word (which it really shouldn't).  Since the File
+;		System isn't busy, other calls will be processed (and come through here
+;		as they complete).  At some arbitrary time in the future AppleShare will
+;		finish the transaction with the external volume and will (after kindly
+;		making sure that the File System isn't busy) jump back to the return
+;		address that it remembered long ago.  This means that we can't save any
+;		state above the call to external file systems that we'll want after they
+;		return.
+;________________________________________________________________________________
+ExtFSHookPatch:	proc
+	import	QMEnqueue, ExternalMakeFSSpec, GetOffFSQueue
+	import	FSDispatchRequest, CallWithRegistersPreserved, Gt1stMatch, GtNxtMatch
+
+		addq.w	#4,sp					; throw away the return address
+
+; Run external file systems if we need to (ExtFSErr, or any error with _MountVol)
+
+		cmp.w	#ExtFSErr,d0			; Pass request on to external FS's?
+		bne.s	@1						; if not, check for NoMacDskErr					<25>
+		cmp.w	#$A00F,ioTrap(A0)		; _MountVol could return "ExtFSErr"				<25>
+		beq.s	@3						; yes, it is _MountVol							<25>
+		bra.s	@CallExternals			; No, never mind								<25>
+@1
+		cmp.w	#NoMacDskErr, d0		; Did we fail a MountVol?
+		bne.s	@DoneWithExternals		; if not, move on
+@3		clr.l	ReqstVol				; Force 'No VCB' for this call
+
+@CallExternals:
+		move.l	FSQHead, a0				; grab current pb
+		cmp.w	#FSQType, ioType(a0)	; better be one of ours
+		bne		toDSFSErr				; or end the ballgame
+
+		move.l	d1, d2					; save possible FCB pointer
+		bsr		UnMungeTrapWord			; get trap word (d1) and dispatch or #ExtFSErr (d0)
+		move.w	d1, ioTrap(a0)			; set trap word
+
+	;; If this an A060 call, then D0.W = selector. After we call ext FS, D0 is trashed,	<25>
+	;; So we need to save it somewhere for FSM foreign file systems.					<25>
+	;; This selector can only be used (by FSM) if old ext FS don't handle the call,		<25>
+	;; because cmdDone is now reentered.												<25>
+		movea.l	FSVarsPtr, A1			; A1 = ptr(FSVars block)						<25>
+		move.w	D0,FSVars.FSSelector(A1); Save trap word or HFS selector for FSM		<25>
+		bpl.s	@5						; D0 is HFS selector							<25>
+		move.w	D1,FSVars.FSSelector(A1); else, save trap word for FSM					<25>
+@5
+		move.l	d2, d1					; restore possible FCB pointer					<25>
+		move.l	toExtFS, d2				; Grab the current external file system chain
+		cmp.l	MinusOne, d2			; Is there anyone on it?
+		beq.s	@TryFSM					; No? Go check FSM								<25>
+		movea.l	d2, a1					; move vector to jsr'able register
+	;; The story about TOPS. It takes selector as a long word,							<25>
+	;; so we have to do the following to fix their bug.									<25>
+		ext.l	d0						; make it a long								<25>
+
+		jsr		(a1)					; call external file system(s) (which remunge the trap word)
+		tst.w	d0						; test the result from the external file systems
+		beq.s	@DoneWithExternals		; if error = 0, someone handled the call		<25>
+		bpl.s	@TryFSM					; if d0 > 0, then no one handled the call, so Try FSM.
+; < 0 could be #extFSErr which means nobody handled the call, or a "real" error
+; AccessPC returns memFullErr for other FS on a _MountVol call, what should we do?		<25>
+		cmp.w	#extFSErr,D0			; is it extFSErr?								<25>
+		bne.s	@DoneWithExternals		; if not, someone handled the call				<25>
+
+@TryFSM									; done with the old FnFS, give FSM a chance		<25>
+		movea.l	FSVarsPtr, A1			; A1 = ptr(FSVars block)						<25>
+		move.l	FSVars.FSMHook(A1),D2	; is FSM there?									<25>
+		beq.s	@noFSM					; no, all done									<25>
+		movea.l	D2,A1					; vector to call								<25>
+		move.l	FSQHead, a0				; old ext FS may trashed A0						<26>
+		jsr		(A1)					; call FSM external file system(s)				<25>
+		tst.w	D0						; any error?									<25>
+		beq.s	@DoneWithExternals		; if error = 0, someone handled the call		<25>
+		cmp.w	#extFSErr,D0			; is it extFSErr?								<40>
+		bne.s	@DoneWithExternals		; if not, someone handled the call				<40>
+@noFSM
+		bsr		UnMungeTrapWord			; get trap word (d1) and dispatch or #ExtFSErr (d0)
+		bsr		ExtFSCatchAll			; catch the UnknownCall dispatch that nobody took
+@DoneWithExternals:
+		move.l	FSQHead, a0				; grab current pb								<46>
+
+; Our first patch: MakeFSSpecEmulation
+;
+;	Function
+;		Check to see if a MakeFSSpec call came back from an external file
+;		system which didn't implement MakeFSSpec.  If so, emulate the call.
+;
+;	Input:
+;		a0   - pointer to caller's PB
+;		a1	 - pointer to context
+;		d0   - error code from current file manager call
+;
+;	Output:
+;		d0 	 - error code from external file systems (paramErr if they couldn't handle it)
+;		a0   - pointer to caller's PB
+;		d2	 - trash
+;
+fsCompatQType	equ		23
+		move.w	d0, d2					; save error code in a safe register
+		bsr		UnMungeTrapWord			; get trap word (d1) and dispatch or #ExtFSErr (d0)
+		bmi.s	@DoneWithEmulation		; MakeFSSpec isn't a straight trap
+		cmp.b	#selectMakeFSSpec, d0	; our selector?
+		bne.s	@DoneWithEmulation		; not MakeFSSpec, =>
+
+		cmp.w	#paramErr, d2			; did MakeFSSpec confuse them?
+		beq.s	@HandleIt				; yes, so let us help
+		cmp.w	#wrgVolTypErr, d2		; MakeFSSpec on MFS?								<29>
+		beq.s	@HandleIt				; another job for the compatibility layer			<29>
+		cmp.w	#extFSErr, d2			; we fear that some external FS's may reply with
+										; this error when they don't understand a dispatch
+		beq.s	@HandleIt				; so emulate on #extFSErrs, too						<14>
+		cmp.w	#wPrErr, d2				; HACK ALERT.  iso-9660 file systems are confused	<14>
+		bne.s	@DoneWithEmulation		; external FS liked it - we're done					<14>
+
+@HandleIt:
+		jsr		GetOffFSQueue			; Get a0 (now FSQHead) off FSQueue
+		moveq.l	#fsCompatQType, d2		; the compatibility layer queue type/refnum
+		bsr		QMEnqueue				; get queued up, dispatched to w/CmdDone addr on CL a6 stack
+		jsr		ExternalMakeFSSpec		; go do the call and return all the way out
+		move.l	(a6)+, -(sp)			; get completion address from a6 stack
+		rts								; jump out of CmdDone, leaving 1 return address on a7
+										; Note that the QMgr's completion code kick starts the FS
+@DoneWithEmulation:
+
+; --- Here's where to add more patches for routines which may have failed or succeeded.
+
+SetDSHookInfo:
+; <35>
+; Check for calls for which we're about to invoke the disk switch hook.
+; Save the VCB pointer and the name pointer for the volume we're trying
+; to recover.
+;
+; This solution has a big hole in it.  We only do disk recovery for
+; synchronous calls, but we can no longer check ioTrap to see if a
+; call is synchronous since File Sharing refires sync calls from their
+; scheduler.  This means that we have to assume that any call which
+; has failed with a #volOffLinErr should be the one that the disk switch
+; sees.  Unfortunately, in between the time we set these variables and the
+; time the disk switch code draws the name a truly async call could come
+; in for an offline volume and cause the wrong name to be drawn.
+		cmpi.w	#volOffLinErr, d2		; did we get a volume offline error?
+		bne.s	@DoneSettingDSHookInfo
+
+		move.l	ReqstVol, a1
+		pea.l	VCBVN(a1)				; grab the name pointer
+		movea.l	FSVarsPtr, a1
+		move.l	ReqstVol, fsVars.dsRecoverVCBPtr(a1)	; remember the volume
+		move.l	(sp)+, fsVars.dsRecoverNamePtr(a1)		; remember the name of the volume
+		bra		CallDone
+
+@DoneSettingDSHookInfo
+
+	IF hasManEject THEN					; <SM3> <BH 03Aug93>
+	
+; If the call caused critical volume identification information (name, creation date, and mod date)
+; to be changed and the volume is in a manual-eject drive, the information needs to be written to
+; disk.
+; <SM4> <BH 27Aug93>
+; Expected: A2 -> VCB of volume used in call, if any
+			MOVEM.L	D0/A0,-(A6)			; save regs
+			MOVE.L	A2,D0				; A2 nil?
+			BEQ.S	@DoneFlushCheck		; yes: skip this
+			MOVEA.L	VCBQHdr+qHead,A0	; scan VCB list to make sure A2 is valid
+@vcbchk		MOVE.L	A0,D0				; got one?
+			BEQ.S	@DoneFlushCheck		; no: goodbye
+			CMPA.L	A0,A2				; yes: is it the one we're looking for?
+			BEQ.S	@chkbit				; yes: check it out
+			MOVEA.L	qLink(A0),A0		; no: move on to the next one
+			BRA.S	@vcbchk
+@chkbit		MOVE.W	vcbFlags(A0),D0		; get flags
+			BTST	#vcbFlushCritBit,D0	; need to flush?
+			BEQ.S	@DoneFlushCheck		; no: bye
+			MOVEA.L	jFlushMDB,A0		; yes: go flush the volume info
+			JSR		(A0)
+			
+@DoneFlushCheck
+			MOVEM.L	(A6)+,D0/A0			; restore regs
+	
+; If _Eject was called for a manual-eject floppy drive, we need to tell the user to remove the disk.
+; Expected:	A0 -> paramblock
+;			D0 == dispatch code or ExtFSErr
+;			D1 == unmunged trap word
+;			D2 == error code
+; Trashes D3-D5.  All others preserved.
+			MOVEM.L	D0-D2/A0-A4,-(A6)	; save regs
+			CMPI.W	#$A017,D1			; _Eject?
+			BNE		@DoneManEject
+			TST.W	D2					; everything went OK?
+			BNE		@DoneManEject
+			
+			; get all the info about the volume we can...we must have the drive number, and hopefully
+			; we can find a VCB as well
+			MOVEA.L	jDtrmV3,A1			; can we find a VCB from the paramblock?	<SM4> <BH 27Aug93>
+			JSR		(A1)				;											<SM4> <BH 27Aug93>
+			BEQ.S	@gotvcb				; found it...								<SM4> <BH 27Aug93>
+			SUBA.L	A2,A2				; no VCB--clear the VCB pointer				<SM4> <BH 27Aug93>
+			MOVE.W	ioVRefNum(A0),D2	; and get drive number from paramblock		<SM4> <BH 27Aug93>
+			BRA.S	@getdrv				; find the drive queue element				<SM4> <BH 27Aug93>
+			
+@gotvcb		MOVE.W	vcbDRefNum(A2),D2	; after a successful _Eject, the drive number is here
+			
+@getdrv		MOVEA.L	DrvQHdr+qHead,A3	; first drive queue entry
+@chkdrv		MOVE.L	A3,D0				; end of the line?
+			BEQ		@DoneManEject		; yep, bail out
+			CMP.W	dqDrive(A3),D2		; is this the one?
+			BEQ.S	@gotdrv				; yep, we're set
+			MOVEA.L	qLink(A3),A3		; nope, try the next
+			BRA.S	@chkdrv
+			
+@gotdrv		MOVE.W	D2,D3				; drive num in D3
+			BTST	#dqManEjBit,dqInstall(A3)	; is this a manual-eject drive?
+			BEQ		@DoneManEject		; none of our business
+			TST.B	dqDIP(A3)			; is there a disk in the drive?
+			BGT.S	@rmvdisk			; yes: tell the user to remove it
+			BSR		@GetManEvt			; no: remove any pending maneject evt for this drive
+			BRA		@DoneManEject		; finished
+			
+@rmvdisk	MOVEQ	#1,D4				; set in case we're sharing syserr box with DSHook
+			BTST	#7,DSAlertRect		; has DSHook been invoked?
+			BEQ.S	@doerr				; yes: alternate alert rect is already set up
+			MOVEQ	#0,D4				; no: note the fact and set up the alternate
+			MOVE.L	#$004B006A,DSAlertRect		; alert rect (same as DSHook uses)
+			MOVE.L	#$00A50196,DSAlertRect+4	; now all NEW, all BIGGER DSAlertRect! <SM4> <BH 27Aug93>
+@doerr		
+			MOVEA.L	FSVarsPtr,A4
+			LEA		FSVars.dsRecoverNamePtr(A4),A4
+			MOVE.L	(A4),-(A6)			; save the old name
+			SUBA.L	#ioQElSize,A6		; get an ioparamblock on the stack
+			MOVEA.L	A6,A0				; A0 -> iopb
+			SUBA.L	#512,A6				; block buffer on top of stack
+			MOVE.L	A2,D0				; do we have a VCB?
+			BEQ.S	@novcb
+			TST.W	D4					; has DSHook been invoked?
+			BEQ.S	@usevcb				; no: go ahead and use it
+			CMP.L	ReqstVol,A2			; yes: oops, this is probably DSHook's VCB instead of ours
+			BEQ.S	@novcb				; yep, go get the name from the disk
+@usevcb		LEA		vcbVN(A2),A0		; volume name ptr
+			MOVE.L	A0,-(A6)			; save it on the stack
+			BRA.S	@syserr				; make the alert
+			
+@novcb									; no vcb, try to read name from disk
+			MOVE.W	D3,ioDrvNum(A0)		; fill in paramblock
+			MOVE.W	dqRefNum(A3),ioRefNum(A0)
+			MOVE.L	A6,ioBuffer(A0)			; get MDB on stack
+			MOVE.W	#fsFromStart,ioPosMode(A0)
+			MOVE.L	#1024, ioPosOffset(A0)	; MDB is block 2
+			MOVE.L	#512,ioByteCount(A0)	; one block
+			_Read							; read it
+			BNE.S	@noname					; failed, just use the drive number
+			CMPI.W	#tSigWord,drSigWord(A6)	; is it a TFS vol?
+			BNE.S	@noname					; no: just use the drive number
+			LEA		drVN(A6),A0				; volume name ptr
+			MOVE.L	A0,-(A6)				; save it on the stack
+			BRA.S	@syserr					; make the alert
+			
+@noname		CLR.L	-(A6)					; nil name ptr on stack
+			
+@syserr		MOVE.W	D3,-(A6)			; drive number on stack
+			MOVE.L	A6,(A4)				; dsRecoverNamePtr -> drive num + vol name ptr
+			MOVE.W	#dsRemoveDisk,D0	; syserr ID
+			_SysError
+			ADDA.L	#6+512+ioQElSize,A6	; dispose name info, block buffer, and iopb
+			MOVE.L	(A6)+,(A4)			; restore dsRecoverNamePtr
+			
+			BSR.S	@WaitManEvt			; wait for the disk to be manually ejected
+			
+			TST.W	D4					; are we inside of DSHook?
+			BNE.S	@DoneManEject		; yes: DSHook will clean up the sys alert stuff
+			BSR		CleanDSErr			; no: we have to do it, so clean up the alert
+			CLR.W	DSErrCode			; and clear the syserr code so we don't freak
+			BRA.S	@DoneManEject		; out the Process Mgr (this isn't a real error)
+			
+@GetManEvt								; see if there's a manual-eject event for the drive
+			MOVEQ	#1,D5				; number given in D3
+			BRA.S	@getevt
+@WaitManEvt								; await the appearance of a manual-eject event for the
+			MOVEQ	#0,D5				; drive number given in D3
+@getevt		SUBA.L	#EvtBlkSize,A6		; space for an event record
+			MOVEA.L	A6,A0				; event record
+@1			MOVE.W	#128,D0				; diskInsertEvt mask
+			_GetOSEvent					; wait for a disk-insert event
+			BNE.S	@chkexit			; didn't get one--keep waiting?
+			CMPI.W	#-2,evtMessage(A0)	; msg hi = -2 for manual eject
+			BNE.S	@repost				; put this one back and try again
+			MOVE.W	evtMessage+2(A0),D1	; msg lo = drive number
+			CMP.W	D1,D3				; is it our drive?
+			BEQ.S	@evtexit			; yes: exit
+										; no: put it back
+@repost		MOVE.L	evtMessage(A0),D0	; get the message
+			MOVEA.W	#DiskInsertEvt,A0	; and the type
+			_PostEvent					; put it back on the end of the queue
+
+@chkexit	TST.W	D5					; should we keep waiting for an event?
+			BEQ.S	@1					; yes, go check again
+@evtexit	ADDA.L	#EvtBlkSize,A6		; clean up
+			RTS							; goodbye
+			
+@DoneManEject
+			MOVEM.L	(A6)+,D0-D2/A0-A4	; restore regs
+	ENDIF
+
+	
+; All of the patches beneath this label are for calls that worked							<20>
+		tst.w	d2						; did the call work?								<20>
+		bne		CallDone				; if not, go try another call						<20>
+
+; patch:	UnTagFCBs
+; Registers now:
+;	a0 - caller's PB
+;	d0 - dispatch or #ExtFSErr
+;	d1 - unmunged trap word
+;	d2 - error code
+; On all _Close calls, clear the process serial number stored in the
+; parallel FCB array.
+
+		and.w	#$f0ff, d1				; clear modifier bits from trap word
+		cmp.w	#$a001, d1				; was this _Close?
+		bne.s	@CloseTagDone			; if not, we're done here
+
+@CloseAttempted:
+		move.w	ioRefNum(a0),d0			; get refNum
+		bsr		ParallelFCBFromRefnum	; a1 = address of parallel FCB element
+		clr.l	xFCBPid1(a1)			; clear high long of PSN
+		clr.l	xFCBPid2(a1)			; clear low long of PSN								<20>
+		bra		CallDone				; go do another call, if necessary
+@CloseTagDone:
+
+@UnTagWDCBs:							; do WDCBs the same way we do FCBs					<20>
+		cmpi.w	#selectCloseWD, d0		; is this a _CloseWD call?
+		bne.s	@UnTagWDCBsDone
+
+		move.w	ioVRefNum(a0), d0		; get WDRefNum
+		cmp.w	#WDRfnMax,d0			; Is it a VRefNum?									<23>
+		bhi.s	@UnTagWDCBsDone 		; vRefNum (i.e. WD's to the root) don't get tagged	<23>
+
+		bsr		ParallelWDCBFromRefnum	; a1 = address of parallel WDCB element
+		clr.l	xWDCBPid1(a1)
+		clr.l	xWDCBPid2(a1)
+		bra		CallDone
+@UnTagWDCBsDone:
+
+FixFCBSyncOnOpenRF:
+; Fix FCB synchronization on _OpenRF
+; Registers now:
+;	a0.l - pb
+;	d0 - dispatch or #ExtFSErr
+;	d1.w - trap word w/o modifiers
+;	d2.w - result code
+;
+; We only need to synchronize on successful local _OpenRF calls.
+; External file systems are responsible for keeping their own FCB marbles in order.
+; (for example, some may not use a unique file number for each fcb)
+; Note that we don't patch _OpenRFDeny because it's not a local FS call.
+
+		cmp.w	#$a00a, d1				; was this _OpenRF?
+		bne.s	@DoneCheckingOpenRF		; if not, we're out of here
+
+; Make sure this successful _OpenRF was local, and if so fix up FCBs of any other open paths.
+@FixOpenRFRegs	reg	d2/d4				; save regs (no i/o 'till we restore these)				<20>
+
+		movem.l	@FixOpenRFRegs, -(sp)	; save working registers
+		move.l	FCBsPtr,a1				; a1 = fcb array
+		move.w	ioRefNum(a0),d4			; d4 = refnum of newly opened RF
+		movea.l	fcbVptr(a1,d4.w),a2		; a2 = VCB
+		tst.w	vcbFSID(a2)				; are we local?											<20>
+		bne.s	@NoOtherPaths			; if not, it's not our problem
+
+		move.l	fcbFlNm(a1,d4),d2		; d2 = file num
+		jsr 	Gt1stMatch				; get an FCB which matches VCB & file num
+
+; Now A1 --> FCBs, d1 = refnum of the matching FCB
+@FixOpenRFLoop
+		cmp.w	d1,d4					; is it the one that we just got opened?
+		beq.s	@SawOurselves			; if so, ignore it
+		move.b	FCBMdRByt(a1,d1),d3		; mod byte
+		btst	#fcbRscBit,d3			; resource fork?
+		bne.s	@DoAdjust				; Adjust EOF if the forks match
+@SawOurselves:
+		jsr	 	GtNxtMatch				; look for another matching fcb
+		beq.s	@FixOpenRFLoop			; br if match
+		bra.s	@NoOtherPaths			; don't adjust if we're the only path
+
+@DoAdjust:
+		bsr		adjEOF					; Make our new FCB match old wise one
+		move.b	d3,FCBMdRByt(a1,d1)		; don't let AdjEOF change dirty bit
+
+@NoOtherPaths:
+		movem.l	(sp)+,@FixOpenRFRegs	; error code d0 and param a0 unchanged
+@DoneCheckingOpenRF:
+
+; --- Here's where to add more patches for routines which succeed
+
+	if 0 then							; you might want this if you add patches
+		bra.s	CallDone
+	endif
+
+; The current call is now done.
+CallDone:
+
+; Check to see if there’s another call to execute.
+		move	sr, -(sp)				; save interrupt state					<27Aug85>
+		ori		#HiIntMask, sr			; only debug interrupts allowed
+		clr.w	FSBusy					; we're not busy anymore
+
+; delete the current request from the queue and post any completion routines
+
+		move.l	FSQHead,a0				; a0 -> current request
+		cmp.w	#FSQType,IOType(a0)		; it better be an I/O queue element
+		bne		toDSFSErr				; or else die
+		move.l	qLink(a0),FSQHead		; get next request, if any
+		bne.s	@CallCompletion		 	; branch if queue not empty 			<27Aug85>
+		clr.l	FSQTail 				; clear tail ptr, too
+
+@CallCompletion: 						;										<27Aug85>
+		move	(sp)+,sr				; restore interrupt state
+		move.w	d2,IOResult(a0) 		; post error code
+		move.w	d2,d0					; put result code into d0				<21>
+
+		move.l	ioCompletion(a0),d1		; is there a completion routine?
+		beq.s	@DispatchNext 			; skip if there's not                   <27Aug85>
+
+		move.l	d1,a1					; get the completion routine address
+		jsr 	(a1)					; call completion routine
+
+@DispatchNext:
+		move	sr,-(sp)				; save interrupt state
+		ori 	#HiIntMask,sr			; only debug interrupts allowed
+		tst.l	FSQHead 				; is a command pending?
+		beq.s	@Done
+
+		bset.b	#fsBusyBit, FSBusy		; make sure the file system is marked busy
+		bne.s	@Done					; if it was already busy, we can return asynchronously
+		move.w	(sp)+,sr				; restore interrupt state
+
+		lea.l	FSDispatchRequest,a0		; our dispatcher’s entry point						<48>
+		jmp		CallWithRegistersPreserved	; call it 											<48>
+
+@Done:
+		move.w	(sp)+,sr				; restore interrupt state and return
+		rts
+
+toDSFSErr:
+		moveq.l	#DSFSErr,d0
+		_SysError
+
+; AdjEOF -- Call through the jAdjEOF vector
+AdjEOF:
+		move.l	jAdjEOF,-(sp)			; jumptable entry for vAdjEOF
+		rts 							; go there
+
+		endproc

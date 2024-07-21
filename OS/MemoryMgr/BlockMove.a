@@ -1,0 +1,695 @@
+;
+;	File:		BlockMove.a
+;
+;	Contains:	Here is the optimized Mac block move routine.  It handles overlapping
+;				blocks by moving left or right when appropriate.	It uses a MOVE.L
+;				loop when possible and uses a 12 register MOVEM.L loop for blocks
+;				longer than 124 bytes.
+;
+;	Written by:		Andy Hertzfeld
+;	Re-Written by:	Gary Davidian
+;
+;	Copyright:	© 1982-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM5>	 5/18/93	kc		Roll in Gary's clean up and large overlap bug fix.
+;	   <SM4>	 4/23/93	kc		Add "IF Supports24Bit" arround "and.l MaskBC,d1" in Block Move.
+;	   <SM3>	11/10/92	CSS		Update from Reality:
+;									<12> 10/23/92	pvh		Reset d1 from d2 for byte copies less than 12 bytes (veryShort
+;															needs it)
+;									<11> 10/15/92	DTY		Use D2 for the 12 byte or less check so we can preserve the trap
+;															word in D1, which is now checked to see if we’re doing
+;															BlockMove, or BlockMoveData. BlockMoveData, which doesn’t flush
+;															the cache, is signaled by having bit 9 (the immediate bit) set
+;															in the trap word.
+;	   <SM2>	10/16/92	RB		Removed the jCacheFlush call from the 68040 BlockMove, that code
+;									is never executed. (Horror has the same code, so don't bring it
+;									over!)
+;		<10>	 2/12/92	JSM		Moving to MemoryMgr directory, keeping all revisions.
+;		 <9>	  2/6/92	RB		Fixed bug in 68040 version of BlockMove. The bug was introduced
+;									(by me) while moving the code from Terror into Reality.
+;		 <8>	  1/3/92	RB		Rolled in 68040 version of BlockMove from Terror. It gets
+;									installed from StartInit.a when an 040 is present.
+;		 <7>	10/18/91	JSM		Remove 68000 versions.
+;		 <6>	 8/29/91	JSM		Cleanup header.
+;		 <5>	 9/18/90	BG		Removed <2>, <4>. 040s are behaving more reliably now.
+;		 <4>	  8/3/90	BG		Added some EclipseNOPs for flakey 040s. Currently 040s require
+;									ANY instruction to separate two adjacent MOVEMs.
+;		 <3>	 7/17/90	dba		change name of BlockMove routine so it does not conflict with
+;									the BlockMove glue
+;		 <2>	 6/18/90	CCH		Added NOPs for flaky 68040's.
+;	   <1.6>	 7/15/89	GGD		Added code alignment for better burst performance.
+;	   <1.5>	 2/22/89	GGD		Made the 68020 version work in 32 bit mode as well as 24 bit
+;									mode, and work with move counts greater than 2**24.
+;	   <1.4>	 2/20/89	rwh		re-spelled conditional in comment, won't show up in searches.
+;	   <1.3>	 12/6/88	GGD		Fixed a incorrect register bug which in the 68000 decrementing
+;									path.
+;	   <1.2>	11/17/88	GGD		Re-written, and optimized, although algorithms still basicly the
+;									same for 68000 machines. Now the decrementing copy loops are
+;									only used if there is overlap between the source and dest, since
+;									the incrementing address modes are faster on the 68000, also
+;									optimized the MOVEM loop. 68000 version also includes the 68020
+;									version, and the correct version is chosen at start time based
+;									upon CpuFlag. This way accelerated machines will get faster
+;									moves and correct cache flushing. For 68020 got rid of single
+;									byte at a time move loop because the 020 can read words from odd
+;									addresses. Also longword aligned the destination to reduce bus
+;									cycles. Special cased very short (up to 12 byte) copies to read
+;									the entire source, and then write it out so that overlap need
+;									not be checked, and misalignment doesn't cost too much. It now
+;									only flushes the instruction cache when the length of the move
+;									is greater than 12 bytes.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	  <•1.1>	 9/23/88	CCH		Got rid of inc.sum.d and empty nFiles
+;	   <1.0>	 2/10/88	BBM		Adding file for the first time into EASE…
+;	  <Cxxx>	10/16/87	rwh		Port to Modern Victorian (onMvMac)
+;	  <C690>	 1/24/87	JTC		Improvements for 020. With new longword alignment in 020
+;	  <C668>	 1/22/87	bbm		made the code which flushed the cache a external vector.
+;	  <C482>	 12/4/86	bbm		The code to flush the cache in blockmove needed to be set in
+;									conditionals for NuMac. <1.4>
+;	  <C456>	11/22/86	bbm		moved the code to flush the cache into blockmove, loadseg,
+;									unloadseg, and read. this might improve performance.
+;	  <C206>	 10/9/86	bbm		Made file use mpw aincludes.
+;				 2/19/86	BBM		Made some modifications to work under MPW
+;				 4/23/85	SC		Insure D0=0 upon exit(I told you there was an bug)
+;				 4/20/85	JTC		Added .DEF for routine name!
+;				 4/16/85	SC		Rewrote with no space consideration and new blockmove
+;									statistics. On the average, this is 30% faster than old one.
+;				 1/29/85	EHB		Check for negative lengths too!!
+;				 1/23/85	LAK		Adapted for new equate files.
+;				 8/18/83	JTC		Hacked for space by JTC
+;				  3/9/83	AJH		Fixed bug by making it add long for moving right
+;				10/31/82	AJH		Integrated for ROM
+;				 8/26/82	AJH		Modified it to support blocks > 64K
+;				 5/19/82	AJH		fixed bug Malloy found in cleaning up after MOVEM loop
+;				 5/12/82	AJH		re-organized things to make it cleaner
+;
+;
+
+;_______________________________________________________________________
+;
+; BlockMove(SrcPtr,DstPtr: Ptr; nBytes: INTEGER);
+;
+; Here is the optimized Mac block move routine.  It handles overlapping
+; blocks by moving left or right when appropriate.	It uses a MOVE.L
+; loop when possible and uses a 12 register MOVEM.L loop for blocks
+; longer than 124 bytes.
+;
+; It uses a register interface.  A0 = source, A1 = destination, D0 = count.
+; The addresses are firsted masked with $00FFFFFF.
+;
+; Register mask during computation:
+;		D0 = count
+;		D1 = destination pointer - source pointer
+;		A0 = source pointer
+;		A1 = destination pointer
+;
+;	 written by Andy Hertzfeld	May 10, 1982
+; re-written by Gary Davidian	Nov 13, 1988
+;
+; Copyright Apple Computer, Inc. 1982-1989
+; All Rights Reserved
+;
+;	Ancient Modification History: (for historical purposes only, does not correspond to this code)
+;
+;	   12-May-82   AJH	  re-organized things to make it cleaner
+;	   19-May-82   AJH	  fixed bug Malloy found in cleaning up after MOVEM loop
+;	   26-Aug-82   AJH	  Modified it to support blocks > 64K
+;	   31-Oct-82   AJH	  Integrated for ROM
+;	   09-Mar-83   AJH	  Fixed bug by making it add long for moving right
+;	   18-Aug-83   JTC	  Hacked for space by JTC
+;
+;_______________________________________________________________________
+; 23 Jan 85  LAK  Adapted for new equate files.
+; 29-Jan-85  EHB  Check for negative lengths too!!
+; 16-Apr-85  SC   Rewrote with no space consideration and new blockmove
+;				  statistics.  On the average, this is 30% faster than
+;				  old one.
+; 20 Apr 85  JTC  Added .DEF for routine name!
+; 23 Apr 85  SC   Insure D0=0 upon exit(I told you there was an bug)
+;_______________________________________________________________________
+;
+; Post Lonely Hearts
+;_______________________________________________________________________
+;
+; <19feb86>	BBM Made some modifications to work under MPW
+;<C206/09oct86> bbm Made file use mpw aincludes.
+;<C456/22nov86> bbm moved the code to flush the cache into blockmove, loadseg,
+;					unloadseg, and read.  this might improve performance.
+;<C482/04dec86> bbm The code to flush the cache in blockmove needed to be set
+;					in conditionals for NuMac. <1.4>
+;<C668/22jan87> bbm made the code which flushed the cache a external vector.
+;<C690/24jan87> JTC Improvements for 020.  With new longword alignment in 020
+;	memory managers, it’s worthwhile to take advantage of the fastest possible
+;	move, an unrolled dbra loop of MOVE.Ls.  We arbitrarily choose 16 moves,
+;	since the dbra overhead looks like 6 cycles based on work with Ron H.
+;	The 16 cases of interest are moves from (4N+K) to (4M+J) where M and
+;	N are nonnegative and 0 ≤ K,J ≤ 3.  As before, lump all even/odd cases
+;	into one big dbra thrash by bytes.
+;<Cxxx/16oct87> rwh	Port to Modern Victorian (onMvMac)
+;_______________________________________________________________________
+
+; Interesting numbers from psuedo-random sampling:
+
+; 80%+ calls are for 1-31 bytes
+; 95%+ calls are for less than 256 bytes
+; On a 512K Mac, 20% of the calls come from memory manager
+; On a 128K Mac, 40% of the calls come from memory manager
+; => this probably should be JSR'ed to from Memory Manager
+
+
+			print	off
+			LOAD	'StandardEqu.d'
+			print	on
+			print	nomdir
+			machine	mc68040
+
+BlockMoves	proc
+			export	__BlockMove			; Default version
+			export	BlockMove68020		; 68020 version (flushes cache too)
+			EXPORT	BlockMove68040		; 68040 version					<8> rb
+			eject
+			
+			align	alignment
+Loop16		move16	(a0)+,(a1)+			; move 32 bytes, 16 at a time
+			sub.l	d2,d0				; adjust for the 32 bytes just moved
+			move16	(a0)+,(a1)+
+			bge.s	Loop16				; loop until count is -32…-1
+			jmp		CopyTailInc(d0.w*2)	; copy the remaining bytes
+
+			Title	'BlockMove - Copy Tail Incrementing'
+
+;_______________________________________________________________________
+;
+;  Routine:		CopyTailInc
+;  Inputs:		A0 - source address
+;				A1 - destination address
+;  Outputs:		D0 - error code (noErr)
+;  Destroys:	A0, A1
+;
+;  Function:	Copy up to 31 bytes in incrementing address order using a direct
+;				sequence of moves.  This routine returns to the BlockMove caller
+;				with D0=noErr.
+;
+;  Calling Convention:
+;				D0 is setup with size-32, so that moving 0…31 bytes => d0 = -32…-1
+;				The trick is to double D0 and use it as an index into a table of
+;				branches to the appropriate code.  Thanks to Steve Capps for all this.
+;
+;				68000	add.w	d0,d0				68020	jmp	CopyTailInc(d0.w*2)
+;						jmp		CopyTailInc(d0.w)
+;
+;_______________________________________________________________________
+
+TailInc30	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 30 bytes Incrementing
+TailInc26	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 26 bytes Incrementing
+TailInc22	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 22 bytes Incrementing
+TailInc18	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 18 bytes Incrementing
+TailInc14	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 14 bytes Incrementing
+TailInc10	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 10 bytes Incrementing
+TailInc06	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final  6 bytes Incrementing
+TailInc02	move.w	(a0)+,(a1)+			; 12 1 1 1	copy final  2 bytes Incrementing
+			moveq.l	#noErr,d0			;  4 1 0 0	return success status
+			rts							; 16 2 2 0	_BlockMove complete
+
+			bra.s	TailInc00			; 10 2 0 0	copy final  0 bytes Incrementing
+			bra.s	TailInc01			; 10 2 0 0	copy final  1 byte  Incrementing
+			bra.s	TailInc02			; 10 2 0 0	copy final  2 bytes Incrementing
+			bra.s	TailInc03			; 10 2 0 0	copy final  3 bytes Incrementing
+			bra.s	TailInc04			; 10 2 0 0	copy final  4 bytes Incrementing
+			bra.s	TailInc05			; 10 2 0 0	copy final  5 bytes Incrementing
+			bra.s	TailInc06			; 10 2 0 0	copy final  6 bytes Incrementing
+			bra.s	TailInc07			; 10 2 0 0	copy final  7 bytes Incrementing
+			bra.s	TailInc08			; 10 2 0 0	copy final  8 bytes Incrementing
+			bra.s	TailInc09			; 10 2 0 0	copy final  9 bytes Incrementing
+			bra.s	TailInc10			; 10 2 0 0	copy final 10 bytes Incrementing
+			bra.s	TailInc11			; 10 2 0 0	copy final 11 bytes Incrementing
+			bra.s	TailInc12			; 10 2 0 0	copy final 12 bytes Incrementing
+			bra.s	TailInc13			; 10 2 0 0	copy final 13 bytes Incrementing
+			bra.s	TailInc14			; 10 2 0 0	copy final 14 bytes Incrementing
+			bra.s	TailInc15			; 10 2 0 0	copy final 15 bytes Incrementing
+			bra.s	TailInc16			; 10 2 0 0	copy final 16 bytes Incrementing
+			bra.s	TailInc17			; 10 2 0 0	copy final 17 bytes Incrementing
+			bra.s	TailInc18			; 10 2 0 0	copy final 18 bytes Incrementing
+			bra.s	TailInc19			; 10 2 0 0	copy final 19 bytes Incrementing
+			bra.s	TailInc20			; 10 2 0 0	copy final 20 bytes Incrementing
+			bra.s	TailInc21			; 10 2 0 0	copy final 21 bytes Incrementing
+			bra.s	TailInc22			; 10 2 0 0	copy final 22 bytes Incrementing
+			bra.s	TailInc23			; 10 2 0 0	copy final 23 bytes Incrementing
+			bra.s	TailInc24			; 10 2 0 0	copy final 24 bytes Incrementing
+			bra.s	TailInc25			; 10 2 0 0	copy final 25 bytes Incrementing
+			bra.s	TailInc26			; 10 2 0 0	copy final 26 bytes Incrementing
+			bra.s	TailInc27			; 10 2 0 0	copy final 27 bytes Incrementing
+			bra.s	TailInc28			; 10 2 0 0	copy final 28 bytes Incrementing
+			bra.s	TailInc29			; 10 2 0 0	copy final 29 bytes Incrementing
+			bra.s	TailInc30			; 10 2 0 0	copy final 30 bytes Incrementing
+TailInc31	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 31 bytes Incrementing
+CopyTailInc								;			copy final 0…31 bytes Incrementing
+TailInc27	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 27 bytes Incrementing
+TailInc23	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 23 bytes Incrementing
+TailInc19	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 19 bytes Incrementing
+TailInc15	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 15 bytes Incrementing
+TailInc11	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 11 bytes Incrementing
+TailInc07	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final  7 bytes Incrementing
+TailInc03	move.w	(a0)+,(a1)+			; 12 1 1 1	copy final  3 bytes Incrementing
+TailInc01	move.b	(a0)+,(a1)+			; 12 1 1 1	copy final  1 byte  Incrementing
+			moveq.l	#noErr,d0			;  4 1 0 0	return success status
+			rts							; 16 2 2 0	_BlockMove complete
+
+TailInc28	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 28 bytes Incrementing
+TailInc24	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 24 bytes Incrementing
+TailInc20	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 20 bytes Incrementing
+TailInc16	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 16 bytes Incrementing
+TailInc12	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 12 bytes Incrementing
+TailInc08	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final  8 bytes Incrementing
+TailInc04	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final  4 bytes Incrementing
+TailInc00	moveq.l	#noErr,d0			;  4 1 0 0	return success status
+			rts							; 16 2 2 0	_BlockMove complete
+
+TailInc29	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 29 bytes Incrementing
+TailInc25	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 25 bytes Incrementing
+TailInc21	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 21 bytes Incrementing
+TailInc17	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 17 bytes Incrementing
+TailInc13	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final 13 bytes Incrementing
+TailInc09	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final  9 bytes Incrementing
+TailInc05	move.l	(a0)+,(a1)+			; 20 1 2 2	copy final  5 bytes Incrementing
+			move.b	(a0)+,(a1)+			; 12 1 1 1	copy final  1 byte  Incrementing
+			moveq.l	#noErr,d0			;  4 1 0 0	return success status
+			rts							; 16 2 2 0	_BlockMove complete
+
+			Title	'BlockMove - Copy Incrementing 68020 / 68030'
+
+			align	alignment			;										<1.6>
+CopyInc68020
+
+;	Check to see if the source and destination overlap such that a copy using
+;	incrementing addresses would cause modification of the source, in which case
+;	we must copy starting at the end of the fields, using decrementing addresses.
+
+			move.l	jCacheFlush,-(sp)	; flush the instruction cache when we exit
+			move.l	a1,d1				; get the destination address
+			moveq.l	#-4,d2				; setup mask for longword alignment
+			or.l	d1,d2				; d2= -1…-4, number of bytes to align
+			sub.l	a0,d1				; d1 := dest - src
+
+	IF Supports24Bit THEN
+;	Mask the address difference to 24 bits before comparing to length, this is needed for
+;	24 bit mode where the upper byte of the addresses may have flags.  This even works in
+;	32 bit mode as long as the byte count doesn't exceed 24 bits, although in a 32 bit only
+;	system, this masking can be eliminated.
+
+			andi.l	#$00FFFFFF,d1		; strip off the high byte for 24 bit mode
+			cmp.l	d0,d1				; see if dest is before end of src
+			blo.s	overlap				; if so, fields overlap, must copy decrementing addrs
+	ELSE
+			cmp.l	d0,d1				; see if dest is before end of src
+			blo.w	CopyDec68020		; if so, fields overlap, must copy decrementing addrs
+	ENDIF
+
+;	Align the destination to a longword boundary to reduce bus cycles.  On a 68030
+;	with the data cache, the unaligned reads will cache, so that the same long word
+;	will not need to be read from RAM more than once.  At this point we also know that
+;	we are moving more than 12 bytes, so that the 0…3 bytes of alignment will not
+;	exceed the length.
+
+moveLongs								; <8> rb
+			jmp		align(d2.w*2)		; jump to the alignment routine <8> rb
+
+			bra.s	aligned				; -4, already longword aligned <8> rb
+			move.b	(a0)+,(a1)+			; -3, move 3 bytes to align
+			move.b	(a0)+,(a1)+			; -2, move 2 bytes to align
+			move.b	(a0)+,(a1)+			; -1, move 1 byte to align
+align		add.l	d2,d0				; adjust the byte count after alignment 		<8> rb
+
+aligned		moveq.l	#32,d2				; byte count adjustment, 32 bytes at a time 	<8> rb
+			sub.l	d2,d0				; setup for CopyTailInc
+			bge.s	longsLoop			; if 32 or more bytes left, use longword loop 	<8> rb
+			jmp		CopyTailInc(d0.w*2)	; copy the remaining bytes
+
+longsLoop	move.l	(a0)+,(a1)+			; move 32 bytes, 4 at a time					<8> rb
+			move.l	(a0)+,(a1)+			; (using a DBRA in this loop would save
+			move.l	(a0)+,(a1)+			;  2 clocks per loop, but would incur
+			move.l	(a0)+,(a1)+			;  overhead outside of the loop that would
+			move.l	(a0)+,(a1)+			;  slow down the shorter and more frequent
+			move.l	(a0)+,(a1)+			;  cases)
+			move.l	(a0)+,(a1)+			;
+			move.l	(a0)+,(a1)+			;
+			sub.l	d2,d0				; adjust for the 32 bytes just moved
+			bge.s	longsLoop			; loop until count is -32…-1					<8> rb
+			jmp		CopyTailInc(d0.w*2)	; copy the remaining bytes
+
+
+	IF Supports24Bit THEN
+overlap		cmpi.l	#$007FFFFF,d0		; see if length > 23 bits
+			bls.w	CopyDec68020		; if small len, don't care about address mode
+
+;	If length > 2**23 bits, we may be in 32 bit mode, and it is possible that	<1.5>
+;	the	source and destination differ by more than 2**23.  In which case the	<1.5>
+;	masked address difference above would not be accurate for detecting overlap.<1.5>
+
+			move.l	a1,-(sp)			; push dst address
+			move.l	a0,-(sp)			; push src address
+			btst.b	#Systemis24bit,SystemInfo	; are we in 24 bit mode?
+			beq.s	@32bit				;  nope
+			clr.b	4(sp)				; strip dst address
+			clr.b	(sp)				; strip src address
+@32bit		cmpm.l	(sp)+,(sp)+			; see if source <= dest (dec move needed)
+			bhs.w	CopyDec68020		; if so, start copy decrementing addrs	<1.5>
+			jmp		align(d2.w*2)		; go to the incr. alignment routine		<1.5> 	<8> rb
+	ENDIF
+
+			Title	'BlockMove - 68020 / 68030 Block Move'
+
+;_______________________________________________________________________
+;
+;  Routine:		BlockMove68020
+;  Inputs:		A0 - source address
+;				A1 - destination address
+;				D0 - byte count
+;  Outputs:		D0 - error code (noErr)
+;  Destroys:	A0, A1, D1, D2
+;
+;  Function:	68020/68030 block move routine, checks source, destination, and
+;				length to determine if the fields overlap in such a way that
+;				the direction of the copy should be changed to start at the
+;				end of the field use decrementing addresses.  The default
+;				and preferred order is to copy from the beginning of the
+;				fields and use incrementing addresses.  There is also a special
+;				case for moves of up to 12 bytes, in which case we read the entire
+;				source field into registers before writing it to the destination
+;				so that we don't need to check for overlap.
+;
+;_______________________________________________________________________
+
+
+			align	alignment			;										<1.6>
+__BlockMove								; ENTER HERE
+
+BlockMove68020							; ENTER HERE
+			moveq.l	#-12,d2				; special case length is 1…12
+			add.l	d0,d2				; see if length <= 12
+			bgt.s	CopyInc68020		; if not, normal case, try incrementing first
+
+veryShort	tst.l	d0					; check byte count							<8> rb
+			ble.s	@done				; if count was negative or zero, we're done
+
+;	if count was 1…12, we can read the entire source into registers and then write it
+;	out to the destination without having to worry about overlap, since all reads are
+;	completed before any writes start.  Since the count is so small, it's unlikely that
+;	we are moving code, so to improve performance, don't flush the instruction cache.
+
+			lsl.w	#3,d0				; convert byte count to bit count
+			addq.l	#4,d2				; see if 1…8 / 9…12
+			ble.s	@short1to8			; if count <= 8, check for 1…4 / 5…8
+
+@short9to12	addq.l	#8,a0				; point to final 1…4 bytes from source
+			bfextu	(a0){0:d0},d1		; read final 1…4 bytes from source
+			move.l	-(a0),d2			; read middle 4 bytes from source
+			move.l	-(a0),(a1)+			; copy first 4 bytes from source to dest
+@done5to8	move.l	d2,(a1)+			; write middle (or first) 4 bytes to destination
+@done1to4	bfins	d1,(a1){0:d0}		; write final 1…4 bytes to destination
+@done		moveq.l	#noErr,d0			; return success status
+			rts							; _BlockMove complete (don't flush cache)
+
+@short1to8	addq.l	#4,d2				; see if 1…4 / 5…8
+			ble.s	@short1to4			; if count <= 4, go move it
+
+@short5to8	move.l	(a0)+,d2			; read first 4 bytes from source
+			bfextu	(a0){0:d0},d1		; read final 1…4 bytes from source
+			bra.s	@done5to8			; write to destination and exit
+
+@short1to4	bfextu	(a0){0:d0},d1		; read 1…4 bytes from source
+			bra.s	@done1to4			; write to destination and exit
+
+			Title	'BlockMove - 68040 MOVE16 optimizations'
+
+; <8> rb
+;========================== 68040 BlockMove =========================
+; Terror History of 68040 BlockMove:
+;
+;
+;		 <7>	 5/10/91	RP		Rolled in GGDs MOVE16 BlockMove patch.
+;		 <6>	 4/25/91	CCH		Removed NOPs, since the bug was the unsetup DFC, not the 68040.
+;		 <5>	 4/25/91	CCH		Set DFC register before doing a PTEST.
+;		 <4>	 4/24/91	CCH		Added a NOP in front of the CPUSHL instructions since they
+;									currently don't always work in the D43B mask set of 68040's.
+;		 <3>	 4/21/91	CCH		Fixed BlockMove patch to convert addresses from logical to
+;									physical when using CPUSHL to flush.
+;		 <2>	  4/2/91	CCH		Don't optimize if VM is on.
+;		 <1>	  4/2/91	CCH		first checked in
+
+
+
+;_______________________________________________________________________
+;
+;  Routine:		BlockMove68040
+;  Inputs:		A0 - source address
+;				A1 - destination address
+;				D0 - byte count
+;				D1 - trap word: Don’t flush the cache if immediate bit is set.
+;  Outputs:		D0 - error code (noErr)
+;  Destroys:	A0, A1, D1, D2
+;
+;  Function:	68040 block move routine.  If length > 12 bytes, sets up
+;				cache flushing tail routine.  Otherwise, tries to use MOVE16
+;				if possible.  If MOVE16 not possible, uses standard 68030
+;				MOVE.L loops.
+;
+;_______________________________________________________________________
+
+
+			align	alignment
+			IMPORT	FlushCRangeForBM
+
+BlockMove68040							; ENTER HERE
+			moveq.l	#-12,d2				; special case length is 1…12 <11> Use D2 to preserve trap word in D1
+			add.l	d0,d2				; see if length <= 12 <11> Use D2 to preserve trap word in D1
+			ble.s	veryShort			; use fast path if length <= 12
+
+CopyInc68040
+			btst	#noQueueBit,d1		; <11> Check to see if the immediate bit is set.
+			bnz.s	@checkAlignment		; <11> If it’s set, don’t flush the cache on exit
+
+			move.l	d0,-(sp)			; Count parameter for FlushCRange
+			move.l	a1,-(sp)			; Address parameter for FlushCRange
+			bsr.s	@checkAlignment		; move the data
+			bra.l	FlushCRangeForBM	; flush the caches
+
+@checkAlignment
+
+;	Check to see if the source and destination overlap such that a copy using
+;	incrementing addresses would cause modification of the source, in which case
+;	we must copy starting at the end of the fields, using decrementing addresses.
+
+			move.l	a1,d1				; get the destination address
+			moveq.l	#-4,d2				; setup mask for longword alignment
+			or.l	d1,d2				; d2= -1…-4, number of bytes to align
+			sub.l	a0,d1				; d1 := dest - src
+
+	IF Supports24Bit THEN
+;	Mask the address difference to 24 bits before comparing to length, this is needed for
+;	24 bit mode where the upper byte of the addresses may have flags.  This even works in
+;	32 bit mode as long as the byte count doesn't exceed 24 bits, although in a 32 bit only
+;	system, this masking can be eliminated.
+
+			andi.l	#$00FFFFFF,d1		; strip off the high byte for 24 bit mode
+			cmp.l	d0,d1				; see if dest is before end of src
+			blo.w	overlap				; if so, fields overlap, must copy decrementing addrs
+	ELSE
+			cmp.l	d0,d1				; see if dest is before end of src
+			blo.w	CopyDec68020		; if so, fields overlap, must copy decrementing addrs
+	ENDIF
+
+;	Align the destination to a longword boundary to reduce bus cycles.  On a 68030
+;	with the data cache, the unaligned reads will cache, so that the same long word
+;	will not need to be read from RAM more than once.  At this point we also know that
+;	we are moving more than 12 bytes, so that the 0…3 bytes of alignment will not
+;	exceed the length.
+
+			cmpi.l	#47,d0				; see if long enough
+			blo.w	moveLongs			; if not, don't even think of Move16s
+			andi.b	#$0F,d1				; see if 16 byte relative alignment
+			bne.w	moveLongs			; if not, can't use Move16
+
+;	Align the source / destination to a 16 byte boundary to use MOVE16.  At this
+;	point we also know that we are moving at least 47 bytes, so that the 0…15 bytes
+;	of alignment will not exceed the length.
+
+@UseMove16	move.l	a1,d1				; get the destination address
+			neg.l	d1					; convert to byte count
+			moveq.l	#15,d2				; setup mask for longword alignment
+			and.l	d1,d2				; d2= 0…15, number of bytes to align
+			beq.s	@Aligned16			; exit if no alignment needed
+			sub.l	d2,d0				; update byte count
+			lsr.l	#1,d2				; test bit 0 of alignment count
+			bcc.s	@Aligned2			; skip if already byte aligned
+			move.b	(a0)+,(a1)+			; move 1 byte to force word alignment
+@Aligned2	lsr.l	#1,d2				; test bit 1 of alignment count
+			bcc.s	@Aligned4			; skip if already long aligned
+			move.w	(a0)+,(a1)+			; move 1 word to force long alignment
+@Aligned4	lsr.l	#1,d2				; test bit 2 of alignment count
+			bcc.s	@Aligned8			; skip if already long aligned
+			move.l	(a0)+,(a1)+			; move 1 long to force double alignment
+			tst.l	d2					; test bit 3 of alignment count
+@Aligned8	beq.s	@Aligned16			; skip if already long aligned
+			move.l	(a0)+,(a1)+			; move 1 double to force quad alignment
+			move.l	(a0)+,(a1)+
+@Aligned16	moveq.l	#32,d2				; byte count adjustment, 32 bytes at a time
+			sub.l	d2,d0				; setup for CopyTailInc
+			bclr.l	#4,d0				; see if tail >= 16 bytes
+			nop							; sync the pipeline for defective 68040s
+			beq.w	Loop16				; if not, start copy
+			move16	(a0)+,(a1)+			; extra move16 to reduce tail size
+			bra.w	Loop16				; align the loop on a cache line
+
+
+			Title	'BlockMove - Copy Tail Decrementing'
+
+;_______________________________________________________________________
+;
+;  Routine:		CopyTailDec
+;  Inputs:		A0 - source address+1
+;				A1 - destination address+1
+;  Outputs:		D0 - error code (noErr)
+;  Destroys:	A0, A1
+;
+;  Function:	Copy up to 31 bytes in decrementing address order using a direct
+;				sequence of moves.  This routine returns to the BlockMove caller
+;				with D0=noErr.
+;
+;  Calling Convention:
+;				D0 is setup with size-32, so that moving 0…31 bytes => d0 = -32…-1
+;				The trick is to double D0 and use it as an index into a table of
+;				branches to the appropriate code.  Thanks to Steve Capps for all this.
+;
+;				68000	add.w	d0,d0				68020	jmp	CopyTailDec(d0.w*2)
+;						jmp		CopyTailDec(d0.w)
+;
+;_______________________________________________________________________
+
+			align	alignment			;										<1.6>
+TailDec30	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 30 bytes Decrementing
+TailDec26	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 26 bytes Decrementing
+TailDec22	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 22 bytes Decrementing
+TailDec18	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 18 bytes Decrementing
+TailDec14	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 14 bytes Decrementing
+TailDec10	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 10 bytes Decrementing
+TailDec06	move.l	-(a0),-(a1)			; 22 1 2 2	copy final  6 bytes Decrementing
+TailDec02	move.w	-(a0),-(a1)			; 14 1 1 1	copy final  2 bytes Decrementing
+			moveq.l	#noErr,d0			;  4 1 0 0	return success status
+			rts							; 16 2 2 0	_BlockMove complete
+
+			bra.s	TailDec00			; 10 2 0 0	copy final  0 bytes Decrementing
+			bra.s	TailDec01			; 10 2 0 0	copy final  1 byte  Decrementing
+			bra.s	TailDec02			; 10 2 0 0	copy final  2 bytes Decrementing
+			bra.s	TailDec03			; 10 2 0 0	copy final  3 bytes Decrementing
+			bra.s	TailDec04			; 10 2 0 0	copy final  4 bytes Decrementing
+			bra.s	TailDec05			; 10 2 0 0	copy final  5 bytes Decrementing
+			bra.s	TailDec06			; 10 2 0 0	copy final  6 bytes Decrementing
+			bra.s	TailDec07			; 10 2 0 0	copy final  7 bytes Decrementing
+			bra.s	TailDec08			; 10 2 0 0	copy final  8 bytes Decrementing
+			bra.s	TailDec09			; 10 2 0 0	copy final  9 bytes Decrementing
+			bra.s	TailDec10			; 10 2 0 0	copy final 10 bytes Decrementing
+			bra.s	TailDec11			; 10 2 0 0	copy final 11 bytes Decrementing
+			bra.s	TailDec12			; 10 2 0 0	copy final 12 bytes Decrementing
+			bra.s	TailDec13			; 10 2 0 0	copy final 13 bytes Decrementing
+			bra.s	TailDec14			; 10 2 0 0	copy final 14 bytes Decrementing
+			bra.s	TailDec15			; 10 2 0 0	copy final 15 bytes Decrementing
+			bra.s	TailDec16			; 10 2 0 0	copy final 16 bytes Decrementing
+			bra.s	TailDec17			; 10 2 0 0	copy final 17 bytes Decrementing
+			bra.s	TailDec18			; 10 2 0 0	copy final 18 bytes Decrementing
+			bra.s	TailDec19			; 10 2 0 0	copy final 19 bytes Decrementing
+			bra.s	TailDec20			; 10 2 0 0	copy final 20 bytes Decrementing
+			bra.s	TailDec21			; 10 2 0 0	copy final 21 bytes Decrementing
+			bra.s	TailDec22			; 10 2 0 0	copy final 22 bytes Decrementing
+			bra.s	TailDec23			; 10 2 0 0	copy final 23 bytes Decrementing
+			bra.s	TailDec24			; 10 2 0 0	copy final 24 bytes Decrementing
+			bra.s	TailDec25			; 10 2 0 0	copy final 25 bytes Decrementing
+			bra.s	TailDec26			; 10 2 0 0	copy final 26 bytes Decrementing
+			bra.s	TailDec27			; 10 2 0 0	copy final 27 bytes Decrementing
+			bra.s	TailDec28			; 10 2 0 0	copy final 28 bytes Decrementing
+			bra.s	TailDec29			; 10 2 0 0	copy final 29 bytes Decrementing
+			bra.s	TailDec30			; 10 2 0 0	copy final 30 bytes Decrementing
+TailDec31	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 31 bytes Decrementing
+CopyTailDec								;			copy final 0…31 bytes Decrementing
+TailDec27	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 27 bytes Decrementing
+TailDec23	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 23 bytes Decrementing
+TailDec19	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 19 bytes Decrementing
+TailDec15	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 15 bytes Decrementing
+TailDec11	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 11 bytes Decrementing
+TailDec07	move.l	-(a0),-(a1)			; 22 1 2 2	copy final  7 bytes Decrementing
+TailDec03	move.w	-(a0),-(a1)			; 14 1 1 1	copy final  3 bytes Decrementing
+TailDec01	move.b	-(a0),-(a1)			; 14 1 1 1	copy final  1 byte  Decrementing
+			moveq.l	#noErr,d0			;  4 1 0 0	return success status
+			rts							; 16 2 2 0	_BlockMove complete
+
+TailDec28	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 28 bytes Decrementing
+TailDec24	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 24 bytes Decrementing
+TailDec20	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 20 bytes Decrementing
+TailDec16	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 16 bytes Decrementing
+TailDec12	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 12 bytes Decrementing
+TailDec08	move.l	-(a0),-(a1)			; 22 1 2 2	copy final  8 bytes Decrementing
+TailDec04	move.l	-(a0),-(a1)			; 22 1 2 2	copy final  4 bytes Decrementing
+TailDec00	moveq.l	#noErr,d0			;  4 1 0 0	return success status
+			rts							; 16 2 2 0	_BlockMove complete
+
+TailDec29	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 29 bytes Decrementing
+TailDec25	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 25 bytes Decrementing
+TailDec21	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 21 bytes Decrementing
+TailDec17	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 17 bytes Decrementing
+TailDec13	move.l	-(a0),-(a1)			; 22 1 2 2	copy final 13 bytes Decrementing
+TailDec09	move.l	-(a0),-(a1)			; 22 1 2 2	copy final  9 bytes Decrementing
+TailDec05	move.l	-(a0),-(a1)			; 22 1 2 2	copy final  5 bytes Decrementing
+			move.b	-(a0),-(a1)			; 14 1 1 1	copy final  1 byte  Decrementing
+			moveq.l	#noErr,d0			;  4 1 0 0	return success status
+			rts							; 16 2 2 0	_BlockMove complete
+
+			Title	'BlockMove - Copy Decrementing 68020 / 68030'
+
+;	Align the destination to a longword boundary to reduce bus cycles.  On a 68030
+;	with the data cache, the unaligned reads will cache, so that the same long word
+;	will not need to be read from RAM more than once.  At this point we also know that
+;	we are moving more than 12 bytes, so that the 0…3 bytes of alignment will not
+;	exceed the length.
+
+			align	alignment			;										<1.6>
+CopyDec68020
+			cmpa.l	a0,a1				; see if source=dest (no move needed)
+			beq.s	TailDec00			; if exactly the same, don't do the copy
+			adda.l	d0,a0				; point past end of source
+			adda.l	d0,a1				; point past end of destination
+			move.l	a1,d1				; get the destination address
+			moveq.l	#3,d2				; setup mask for longword alignment
+			and.l	d1,d2				; d2= 0…3, number of bytes to align
+			beq.s	@aligned			; if already aligned, skip alignment
+			neg.l	d2					; negate to index backwards
+			jmp		@align(d2.w*2)		; jump to the alignment routine
+
+			move.b	-(a0),-(a1)			; -3, move 3 bytes to align
+			move.b	-(a0),-(a1)			; -2, move 2 bytes to align
+			move.b	-(a0),-(a1)			; -1, move 1 byte to align
+@align		add.l	d2,d0				; adjust the byte count after alignment
+
+@aligned	moveq.l	#32,d2				; byte count adjustment, 32 bytes at a time
+			sub.l	d2,d0				; setup for CopyTailDec
+			bge.s	@longsLoop			; if 32 or more bytes left, use longword loop
+			jmp		CopyTailDec(d0.w*2)	; copy the remaining bytes
+
+@longsLoop	move.l	-(a0),-(a1)			; move 32 bytes, 4 at a time
+			move.l	-(a0),-(a1)			; (using a DBRA in this loop would save
+			move.l	-(a0),-(a1)			;  2 clocks per loop, but would incur
+			move.l	-(a0),-(a1)			;  overhead outside of the loop that would
+			move.l	-(a0),-(a1)			;  slow down the shorter and more frequent
+			move.l	-(a0),-(a1)			;  cases)
+			move.l	-(a0),-(a1)			;
+			move.l	-(a0),-(a1)			;
+			sub.l	d2,d0				; adjust for the 32 bytes just moved
+			bge.s	@longsLoop			; loop until count is -32…-1
+			jmp		CopyTailDec(d0.w*2)	; copy the remaining bytes
+
+
+			ENDP
+
+			END

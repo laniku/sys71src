@@ -1,0 +1,494 @@
+;
+;	File:		GenExcept.a
+;
+;	Contains:	Routines to detect reportable exceptions
+;
+;	Originally Written by:	Motorola Inc.
+;	Adapted to Apple/MPW:	Jon Okada
+;
+;	Copyright:	© 1990-1993 by Apple Computer, Inc., all rights reserved.
+;
+;   This file is used in these builds:   Mac32
+;
+;	Change History (most recent first):
+;
+;		<SM2>	  2/3/93	CSS		Update from Horror:
+;							<H2> 12/21/91 jmp (BG,Z4) (for JOkada) Installed workaround for erratum 0d43b #43
+;									  (FP corruption with denorm) under label "do_restore:".
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;	Pre-Horror ROM comments begin here.
+; ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+;		 <3>	 6/24/91	BG		Folded in Motorola version 2.0 bug fix for FPR dirty
+;							bits mistakenly written over.  Cleared NMCEXC and NMNEXC bits in D50D busy stack frame
+;			  				construction.  Corrected the construction of CMDREG3B
+;			  				structure from CMDREG1B structure.  Added call to 'getcmdreg3b' for E3 exceptions below
+;							label 'loop2'.
+;		 <2>	 3/30/91	BG		Rolling in Jon Okada's latest changes.
+;		 <1>	12/14/90	BG		First checked into TERROR/BBS.
+
+;
+
+;  genexcept.a
+
+;  Based upon Motorola file 'gen_except.sa'.
+
+;  CHANGE LOG
+;  04 Jan 91	JPO	Changed jump table 'exc_tbl' to contain 16-bit addresses
+;			  relative to table top.  Changed 'bra fpsp_done' to 'rte'.
+;			  Modified branching to trace exception handler.
+;  07 Jun 91	JPO	Folded in Motorola version 2.0 bug fix for FPR dirty
+;			  bits mistakenly written over.
+;  13 Jun 91	JPO	Cleared NMCEXC and NMNEXC bits in D50D busy stack frame
+;			  construction.  Corrected the construction of CMDREG3B
+;			  structure from CMDREG1B structure.
+;  18 Jun 91	JPO	Added call to 'getcmdreg3b' for E3 exceptions below
+;			  label 'loop2'.
+;  11 Dec 91	JPO	Installed workaround for erratum 0d43b #43 (FP corruption
+;			  with denorm) under label "do_restore:".
+;
+
+*
+*	gen_except.sa 3.4 4/26/91
+*
+*	gen_except --- FPSP routine to detect reportable exceptions
+*	
+*	This routine compares the exception enable byte of the
+*	user_fpcr on the stack with the exception status byte
+*	of the user_fpsr. 
+*
+*	Any routine which may report an exceptions must load
+*	the stack frame in memory with the exceptional operand(s).
+*
+*	Priority for exceptions is:
+*
+*	Highest:	bsun
+*			snan
+*			operr
+*			ovfl
+*			unfl
+*			dz
+*			inex2
+*	Lowest:		inex1
+*
+*	Note: The IEEE standard specifies that inex2 is to be
+*	reported if ovfl occurs and the ovfl enable bit is not
+*	set but the inex2 enable bit is.  
+*
+*
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* GEN_EXCEPT    IDNT    2,1 Motorola 040 Floating Point Software Package
+
+exc_tbl:				; modified <1/4/91, JPO>
+	dc.w	bsun_exc-exc_tbl
+	dc.w	commonE1-exc_tbl
+	dc.w	commonE1-exc_tbl
+	dc.w	ovfl_unfl-exc_tbl
+	dc.w	ovfl_unfl-exc_tbl
+	dc.w	commonE1-exc_tbl
+	dc.w	commonE3-exc_tbl
+	dc.w	commonE3-exc_tbl
+	dc.w	no_match-exc_tbl
+
+gen_except:
+	cmpi.b	#IDLE_SIZE-4,1(a7)	;test for idle frame
+	beq.w	do_check		;go handle idle frame
+	cmpi.b	#UNIMP_40_SIZE-4,1(a7)	;test for orig unimp frame
+	beq.b	unimp_x			;go handle unimp frame
+	cmpi.b	#UNIMP_41_SIZE-4,1(a7)	;test for rev unimp frame
+	beq.b	unimp_x			;go handle unimp frame
+	cmpi.b	#BUSY_SIZE-4,1(a7)	;if size <> $60, fmt error
+	bne	fpsp_fmt_error
+	lea.l	BUSY_SIZE+LOCAL_SIZE(a7),a1 ;init a1 so fpsp.h
+*					;equates will work
+* Fix up the new busy frame with entries from the unimp frame
+*
+	move.l	ETEMP_EX(a6),ETEMP_EX(a1) ;copy etemp from unimp
+	move.l	ETEMP_HI(a6),ETEMP_HI(a1) ;frame to busy frame
+	move.l	ETEMP_LO(a6),ETEMP_LO(a1) 
+	move.l	CMDREG1B(a6),CMDREG1B(a1) ;set inst in frame to unimp
+;	move.l	CMDREG1B(a6),d0		;fix cmd1b to make it - DELETED <6/13/91, JPO>		<T3>
+;	and.l	#$03800000,d0		;work for cmd3b - DELETED <6/13/91, JPO>		<T3>
+	bsr.b	getcmdreg3b		; map cmd1b format into cmd3b <6/13/91, JPO>		<T3>
+	move.l	d0,CMDREG3B(a1)		;in the busy frame
+*
+* Or in the FPSR from the emulation with the USER_FPSR on the stack.
+*
+	fmove.l	FPSR,d0		
+	or.l	d0,USER_FPSR(a6)
+	move.l	USER_FPSR(a6),FPSR_SHADOW(a1) ;set exc bits
+	or.l	#sx_mask,E_BYTE(a1)
+	bra	do_clean
+
+;
+; Subroutine getcmdreg3b converts longword at CMDREG1B(a6) into CMDREG3B			<T3> thru next <T3>
+; format and returns it in d0.  Uses:  d1
+;
+getcmdreg3b:
+	move.l	CMDREG1B(a6),d0		; d0 <- CMDREG1B
+	and.l	#$03ff0000,d0		; isolate interesting 10 bits
+	bfextu	d0{10:4},d1		; extract bit field to rotate
+	lsr.b	#1,d1			; rotate it
+	bcc.b	@1
+
+	bset.l	#3,d1
+@1:
+	bfins	d1,d0{10:4}		; insert rotated field back into d0
+
+	rts				; return with d0.hi in cmd3b format			<T3>
+
+*
+* Frame is an unimp frame possible resulting from an fmove <ea>,fp0
+* that caused an exception
+*
+* a1 is modified to point into the new frame allowing fpsp equates
+* to be valid.
+*
+unimp_x:
+	cmpi.b	#UNIMP_40_SIZE-4,1(a7)	;test for orig unimp frame
+	bne.b	test_rev
+	lea.l	UNIMP_40_SIZE+LOCAL_SIZE(a7),a1
+	bra.b	unimp_con
+test_rev:
+	cmpi.b	#UNIMP_41_SIZE-4,1(a7)	;test for rev unimp frame
+	bne	fpsp_fmt_error		;if not $28 or $30
+	lea.l	UNIMP_41_SIZE+LOCAL_SIZE(a7),a1
+	
+unimp_con:
+*
+* Fix up the new unimp frame with entries from the old unimp frame
+*
+	move.l	CMDREG1B(a6),CMDREG1B(a1) ;set inst in frame to unimp
+*
+* Or in the FPSR from the emulation with the USER_FPSR on the stack.
+*
+	fmove.l	FPSR,d0		
+	or.l	d0,USER_FPSR(a6)
+	bra	do_clean
+
+*
+* Frame is idle, so check for exceptions reported through
+* USER_FPSR and set the unimp frame accordingly.  
+* A7 must be incremented to the point before the
+* idle fsave vector to the unimp vector.
+*
+	
+do_check:
+	add.l	#4,A7			;point A7 back to unimp frame
+*
+* Or in the FPSR from the emulation with the USER_FPSR on the stack.
+*
+	fmove.l	FPSR,d0		
+	or.l	d0,USER_FPSR(a6)
+*
+* On a busy frame, we must clear the nmnexc bits.
+*
+	cmpi.b	#BUSY_SIZE-4,1(a7)	;check frame type
+	bne.b	check_fr		;if busy, clr nmnexc
+	clr.w	NMNEXC(a6)		;clr nmnexc & nmcexc
+	btst.b	#5,CMDREG1B(a6)		;test for fmove out
+	bne.b	check_fr
+	move.l	USER_FPSR(a6),FPSR_SHADOW(a6) ;set exc bits
+	or.l	#sx_mask,E_BYTE(a6)
+
+check_fr:
+	move.b	FPCR_ENABLE(a6),d0	;get fpcr enable byte
+	and.b	FPSR_EXCEPT(a6),d0	;and in the fpsr exc byte
+	bfffo	d0{24:8},d1		;test for first set bit
+	lea.l	exc_tbl,a0		;load jmp table address
+	subi.b	#24,d1			;normalize bit offset to 0-8
+;	move.l	(a0,d1.w*4),a0		;load routine address based
+*					;on first enabled exc - deleted <1/4/91, JPO>
+	adda.w	(a0,d1.w*2),a0		; calculate routine addr <1/4/91, JPO>
+	jmp	(a0)			;jump to routine
+*
+* Bsun is not possible in unimp or unsupp
+*
+bsun_exc:
+	bra	do_clean
+*
+* The typical work to be done to the unimp frame to report an 
+* exception is to set the E1/E3 byte and clr the U flag.
+* commonE1 does this for E1 exceptions, which are snan, 
+* operr, and dz.  commonE3 does this for E3 exceptions, which 
+* are inex2 and inex1, and also clears the E1 exception bit
+* left over from the unimp exception.
+*
+commonE1:
+	bset.b	#E1,E_BYTE(a6)		;set E1 flag
+	bra.b	commonE			;go clean and exit
+
+commonE3:
+	tst.b	UFLG_TMP(a6)		;test flag for unsup/unimp state
+	bne.b	unsE3
+uniE3:
+	bset.b	#E3,E_BYTE(a6)		;set E3 flag
+	bclr.b	#E1,E_BYTE(a6)		;clr E1 from unimp
+	bra.b	commonE
+
+unsE3:
+	tst.b	RES_FLG(a6)
+	bne.b	unsE3_0	
+unsE3_1:
+	bset.b	#E3,E_BYTE(a6)		;set E3 flag
+unsE3_0:
+	bclr.b	#E1,E_BYTE(a6)		;clr E1 flag
+;	move.l	CMDREG1B(a6),d0		;fix cmd1b to make it - DELETED <6/13/91, JPO>		<T3>
+;	and.l	#$03800000,d0		;work for cmd3b - DELETED <6/13/91, JPO>		<T3>
+	bsr	getcmdreg3b		; map cmd1b format into cmd3b <6/13/91, JPO>		<T3>
+	move.l	d0,CMDREG3B(a6)		;in the busy frame
+
+commonE:
+	bclr.b	#UFLAG,T_BYTE(a6)	;clr U flag from unimp
+	bra.w	do_clean		;go clean and exit
+*
+* No bits in the enable byte match existing exceptions.  Check for
+* the case of the ovfl exc without the ovfl enabled, but with
+* inex2 enabled.
+*
+no_match:
+	btst.b	#inex2_bit,FPCR_ENABLE(a6) ;check for ovfl/inex2 case
+	beq.b	no_exc			;if clear, exit
+	btst.b	#ovfl_bit,FPSR_EXCEPT(a6) ;now check ovfl
+	beq.b	no_exc			;if clear, exit
+	bra.b	ovfl_unfl		;go to unfl_ovfl to determine if
+*					;it is an unsupp or unimp exception
+	
+* No exceptions are to be reported.  If the instruction was 
+* unimplemented, no FPU restore is necessary.  If it was
+* unsupported, we must perform the restore.
+no_exc:
+	tst.b	UFLG_TMP(a6)	;test flag for unsupp/unimp state
+	beq.b	uni_no_exc
+uns_no_exc:
+	tst.b	RES_FLG(a6)	;check if frestore is needed
+	bne.w	do_clean 	;if clear, no frestore needed
+uni_no_exc:
+	movem.l	USER_DA(a6),d0-d1/a0-a1
+	fmovem.x USER_FP0(a6),fp0-fp3
+	fmovem.l USER_FPCR(a6),fpcr/fpsr/fpiar
+	unlk	a6
+	bra	finish_up
+*
+* Unsupported Data Type Handler:
+* Ovfl:
+*   An fmoveout that results in an overflow is reported this way.
+* Unfl:
+*   An fmoveout that results in an underflow is reported this way.
+*
+* Unimplemented Instruction Handler:
+* Ovfl:
+*   Only scosh, setox, ssinh, stwotox, and scale can set overflow in 
+*   this manner.
+* Unfl:
+*   Stwotox, setox, and scale can set underflow in this manner.
+*   Any of the other Library Routines such that f(x)=x in which
+*   x is an extended denorm can report an underflow exception. 
+*   It is the responsibility of the exception-causing exception 
+*   to make sure that WBTEMP is correct.
+*
+*   The exceptional operand is in FP_SCR1.
+*
+ovfl_unfl:
+	tst.b	UFLG_TMP(a6)	;test flag for unsupp/unimp state
+	beq.b	ofuf_con
+*
+* The caller was from an unsupported data type trap.  Test if the
+* caller set CU_ONLY.  If so, the exceptional operand is expected in
+* FPTEMP, rather than WBTEMP.
+*
+	tst.b	CU_ONLY(a6)		;test if inst is cu-only
+	beq.b	unsE3
+*	move.w	#$fe,CU_SAVEPC(a6)	; DELETED <6/7/91, JPO>					<T3>
+	clr.b	CU_SAVEPC(a6)		; ADDED <6/7/91, JPO>					<T3>
+	bset.b	#E1,E_BYTE(a6)		;set E1 exception flag
+	move.w	ETEMP_EX(a6),FPTEMP_EX(a6)
+	move.l	ETEMP_HI(a6),FPTEMP_HI(a6)
+	move.l	ETEMP_LO(a6),FPTEMP_LO(a6)
+	bset.b	#fptemp15_bit,DTAG(a6)	;set fpte15
+	bclr.b	#UFLAG,T_BYTE(a6)	;clr U flag from unimp
+	bra.b	do_clean		;go clean and exit
+
+ofuf_con:
+	move.b	(a7),VER_TMP(a6)	;save version number
+	cmpi.b	#BUSY_SIZE-4,1(a7)	;check for busy frame
+	beq.b	busy_fr			;if unimp, grow to busy
+	cmpi.b	#VER_40,(a7)		;test for orig unimp frame
+	bne.b	try_41			;if not, test for rev frame
+	moveq.l	#13,d0			;need to zero 14 lwords
+	bra.b	ofuf_fin
+try_41:
+	cmpi.b	#VER_41,(a7)		;test for rev unimp frame
+	bne	fpsp_fmt_error		;if neither, exit with error
+	moveq.l	#11,d0			;need to zero 12 lwords
+	clr.w	NMNEXC(a6)		; clr nmnexc and nmcexc bits <6/13/91, JPO>		<T3>
+ofuf_fin:
+	clr.l	(a7)
+loop1:
+	clr.l	-(a7)			;clear and dec a7
+	dbra.w	d0,loop1
+	move.b	VER_TMP(a6),(a7)
+	move.b	#BUSY_SIZE-4,1(a7)		;write busy fmt word.
+busy_fr:
+	move.l	FP_SCR1(a6),WBTEMP_EX(a6)	;write
+	move.l	FP_SCR1+4(a6),WBTEMP_HI(a6)	;execptional op to
+	move.l	FP_SCR1+8(a6),WBTEMP_LO(a6)	;wbtemp
+	bset.b	#E3,E_BYTE(a6)			;set E3 flag
+	bclr.b	#E1,E_BYTE(a6)			;make sure E1 is clear
+	bclr.b	#UFLAG,T_BYTE(a6)		;clr U flag
+	move.l	USER_FPSR(a6),FPSR_SHADOW(a6)
+	or.l	#sx_mask,E_BYTE(a6)
+;	move.l	CMDREG1B(a6),d0		;fix cmd1b to make it - DELETED <6/13/91, JPO>		<T3>
+;	and.l	#$03800000,d0		;work for cmd3b - <6/13/91, JPO>			<T3>
+	bsr	getcmdreg3b		; map cmd1b format into cmd3b <6/13/91, JPO>		<T3>
+	move.l	d0,CMDREG3B(a6)		;in the busy frame
+
+*
+* Check if the frame to be restored is busy or unimp.
+*** NOTE *** Bug fix for errata (0d43b #3)
+* If the frame is unimp, we must create a busy frame to 
+* fix the bug with the nmnexc bits in cases in which they
+* are set by a previous instruction and not cleared by
+* the save. The frame will be unimp only if the final 
+* instruction in an emulation routine caused the exception
+* by doing an fmove <ea>,fp0.  The exception operand, in
+* internal format, is in fptemp.
+*
+do_clean:
+	cmpi.b	#UNIMP_40_SIZE-4,1(a7)
+	bne.b	do_con
+	moveq.l	#13,d0			;in orig, need to zero 14 lwords
+	bra.b	do_build
+do_con:
+	cmpi.b	#UNIMP_41_SIZE-4,1(a7)
+	bne.b	do_restore		;frame must be busy
+	moveq.l	#11,d0			;in rev, need to zero 12 lwords
+	clr.w	NMNEXC(a6)		; clr nmnexc and nmcexc bits <6/13/91, JPO>		<T3>
+
+do_build:
+	move.b	(a7),VER_TMP(a6)
+	clr.l	(a7)
+loop2:
+	clr.l	-(a7)			;clear and dec a7
+	dbra.w	d0,loop2
+*
+* Use a1 as pointer into new frame.  a6 is not correct if an unimp or
+* busy frame was created as the result of an exception on the final
+* instruction of an emulation routine.
+*
+* We need to set the nmcexc bits if the exception is E1. Otherwise,
+* the exc taken will be inex2.
+*
+	lea.l	BUSY_SIZE+LOCAL_SIZE(a7),a1	;init a1 for new frame
+	move.b	VER_TMP(a6),(a7)	;write busy fmt word
+	move.b	#BUSY_SIZE-4,1(a7)
+	move.l	FP_SCR1(a6),WBTEMP_EX(a1) 	;write
+	move.l	FP_SCR1+4(a6),WBTEMP_HI(a1)	;exceptional op to
+	move.l	FP_SCR1+8(a6),WBTEMP_LO(a1)	;wbtemp
+	btst.b	#E1,E_BYTE(a1)
+;	beq.b	do_restore			; DELETED <6/18/91>				<T3>
+	bne.b	@1				; E1 exception <6/18/91>			<T3>
+
+	bsr	getcmdreg3b			; E3 exception requires CMDREG3B <6/18/91>	<T3>
+	move.l	d0,CMDREG3B(a1)			; <6/18/91>					<T3>
+	bra.b	do_restore			; <6/18/91>					<T3>
+
+@1:						; E1 exception - label ADDED <6/18/91>		<T3>
+	bfextu	USER_FPSR(a6){17:4},d0		;get snan/operr/ovfl/unfl bits
+	bfins	d0,NMCEXC(a1){4:4}		;and insert them in nmcexc
+	move.l	USER_FPSR(a6),FPSR_SHADOW(a1) 	;set exc bits
+	or.l	#sx_mask,E_BYTE(a1)
+	
+do_restore:
+	movem.l	USER_DA(a6),d0-d1/a0-a1
+	fmovem.x USER_FP0(a6),fp0-fp3
+	fmovem.l USER_FPCR(a6),fpcr/fpsr/fpiar
+	frestore (a7)+
+
+;<SM2> CSS
+; Workaround fix for D50D erratum F31 (0d43b #43) which occurs if the restored state is for
+; a restart of an operation with an extended denormal source operand (unsupported data
+; type) followed by a FMOVE/FABS/FNEG reg,reg.  This sequence may lead to an incorrect
+; tag for the destination of the FMOVE/FABS/FNEG.  The workaround involves inserting an
+; FSAVE immediately after the FRESTORE.  If the FSAVE is not idle, bit ETE15 in byte
+; STAG in the FSAVE frame is cleared; if the FSAVE is idle, an unimplemented frame of
+; all zeros is built.  The frame is then restored via FRESTORE.  This fix is for 68040
+; mask versions D50D and later, which have an unimplemented FSAVE frame of length $30.
+; <12/11/91, JPO>
+														; begin workaround <12/11/91, JPO>
+	fsave	-(a7)						; save state which was just restored
+	tst.b	1(a7)						; busy or unimp frame?
+	bne.b	@clrete15					; yes
+
+	tst.b	(a7)						; null frame?
+	beq.b	@restor2					; yes. done
+
+	clr.l	(a7)						; idle frame:  construct blank unimp frame
+	moveq	#10,d0						; use D0 as counter
+@unimplp:
+	clr.l	-(a7)						; loop pushes 11 longwords of zero
+	dbra.w	d0,@unimplp
+
+	move.l	#$41300000,-(a7)			; push D50D idle frame header longword
+	move.l	USER_DA(a6),d0				; restore user's D0 value
+	bra.b	@restor2					; done
+
+@clrete15:												; busy or unimp frame
+	bclr.b	#etemp15_bit,STAG(a6)		; clear ETE15 bit in frame
+
+@restor2:
+	frestore (a7)+						; 2nd FRESTORE ends workaround <12/11/91, JPO>
+
+	unlk	a6
+*
+* If trace mode enabled, then go to trace handler.  This handler 
+* cannot have any fp instructions.  If there are fp inst's and an 
+* exception has been restored into the machine then the exception 
+* will occur upon execution of the fp inst.  This is not desirable 
+* in the kernel (supervisor mode).  See MC68040 manual Section 9.3.8.
+*
+finish_up:
+	btst.b	#7,(a7)		;test T1 in SR
+	bne.b	g_trace
+	btst.b	#6,(a7)		;test T0 in SR
+	bne.b	g_trace
+;	bra	fpsp_done	; deleted <1/4/91, JPO>
+	rte			; <1/4/91, JPO>
+*
+* Change integer stack to look like trace stack
+* The address of the instruction that caused the
+* exception is already in the integer stack (is
+* the same as the saved friar)
+*
+* If the current frame is already a 6-word stack then all
+* that needs to be done is to change the vector# to TRACE.
+* If the frame is only a 4-word stack (meaning we got here
+* on an Unsupported data type exception), then we need to grow
+* the stack an extra 2 words and get the FPIAR from the FPU.
+*
+g_trace:
+	bftst	EXC_VEC-4(sp){0:4}
+	bne.b	g_easy
+
+	sub.w	#4,sp		;make room
+	move.l	4(sp),(sp)
+	move.l	8(sp),4(sp)
+	sub.w	#BUSY_SIZE,sp
+	fsave	(sp)
+	fmove	fpiar,BUSY_SIZE+EXC_EA-4(sp)
+	frestore (sp)
+	add.w	#BUSY_SIZE,sp
+
+g_easy:
+	move.w	#TRACE_VEC,EXC_VEC-4(a7)
+;	bra	real_trace	; deleted <1/4/91, JPO>
+	move.l	($0024).W,-(sp)	; push trace exception handler vector <1/4/91, JPO>
+	rts			; branch to trace exception handler <1/4/91, JPO>
+*
+
+

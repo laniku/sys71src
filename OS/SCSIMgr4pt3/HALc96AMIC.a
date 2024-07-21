@@ -1,0 +1,191 @@
+;____________________________________________________________________________________
+;
+;	File:		HALc96AMIC.a
+;
+;	Contains:	Stuff for 53c96/AMIC machines (PDM)
+;
+;	Written by:	Paul Wolf
+;
+;	Copyright:	© 1990-1993 by Apple Computer, Inc., all rights reserved.
+;
+;
+;	Change History (most recent first):
+;
+;	  <SM10>	10/14/93	pdw		<MC> roll-in.
+;	   <MC2>	10/12/93	pdw		Added support for Synchronous data transfers, rewrote State
+;									Machine, message handling etc.
+;	   <SM9>	  9/9/93	pdw		Lots of little changes.  Name changes, temporary cache_bug
+;									stuff.
+;	   <SM8>	 8/13/93	pdw		Added InitAMIC routine.
+;	   <SM7>	  8/1/93	pdw		Changed moves into bclrs/bsets in order to avoid trashing the
+;									undocumented(!) SCSI speed bits.
+;	   <SM6>	 7/17/93	pdw		Added this minDMAsize thing.
+;	   <SM5>	 6/29/93	pdw		Massive checkins: Change asynchronicity mechanism to CallMachine
+;									stack switching mechanism.  Adding support for Cold Fusion.
+;									Rearranging HW/SW Init code. Some code optimizations.
+;	   <SM4>	  5/5/93	PW		Converted names to meanies-friendly names.  Updated with latest
+;									from Ludwig stuff.
+;	   <SM3>	 3/29/93	PW		
+;		<1+>	 3/20/93	PW		Putting DMA out code back in.
+;		 <1>	 3/20/93	PW		first checked in
+;
+;____________________________________________________________________________________
+
+
+			MACHINE		MC68020			; '020-level
+			BLANKS		ON				; assembler accepts spaces & tabs in operand field
+			PRINT		OFF				; do not send subsequent lines to the listing file
+										;	don't print includes
+
+BFR_SIZE		EQU		512
+
+	
+;			LOAD		'StandardEqu.d'
+;			INCLUDE		'HardwarePrivateEqu.a'
+;			INCLUDE		'HardwareEqu.a'											;						
+;			INCLUDE		'UniversalEqu.a'		; for TestFor											
+			INCLUDE		'Debug.a'				; for NAME macro		
+
+			INCLUDE		'SCSI.a'
+			INCLUDE		'SCSIEqu53c96.a'
+			INCLUDE		'ACAM.a'
+			INCLUDE 	'SIMCoreEqu.a'
+			
+			INCLUDE 	'HALc96equ.a'
+			INCLUDE 	'AMICequ.a'
+
+			PRINT		ON				; do send subsequent lines to the listing files
+			CASE		OBJECT
+						
+			
+			IMPORT		RecordEvent
+			IMPORT		OneByteRead,	OneByteWrite
+
+
+;;AMIC_SCSIBaseAddr		EQU		$50F32000
+;;AMIC_SCSIDMAControl	EQU		$50F32008
+
+
+A1_ChanlControl	EQU		A1		; used and returned by StartAMIC and used by Stop…
+
+
+;--------------------------------------------------------------------------
+
+InitAMIC		PROC	EXPORT
+
+			bclr	#kbAMICRun, ([HALc96GlobalRecord.dmaCntrlAddr,A5])
+			rts
+			
+		NAME 'InitAMIC'
+				
+			ENDP
+		
+			
+;————————————————————————————————————————————			
+StackFrame			RECORD	{pushedA2},DECR
+
+;---- parameters ----
+direction			ds.w	1		; direction of transfer (kIn or kOut)
+byteCount			ds.l	1		; number of bytes to transfer
+bufferAddr			ds.l	1		; source/dest buffer for DMA transfer
+
+;---- mechanics
+returnAddr			ds.l	1		; return address
+pushedA2			ds.l	1
+
+					ENDR
+;————————————————————————————————————————————			
+
+
+StartAMIC		PROC	EXPORT
+
+		WITH	StackFrame
+			move.l	A2, -(sp)
+
+			move.l	HALc96GlobalRecord.dmaCntrlAddr(A5), A1_ChanlControl		
+
+			move.l	HALc96GlobalRecord.dmaBaseAddr(A5), A2
+			addq.l	#3, A2									; point to last byte
+			move.l	bufferAddr(sp), D0
+			
+			move.b	D0, (A2)
+			lsr.l	#8, D0									; Shift the base addr right one byte
+			move.b	D0, -(A2)
+			lsr.l	#8, D0
+			move.b	D0, -(A2)
+			lsr.l	#8, D0
+			move.b	D0, -(A2)
+			nop
+						
+			tst.w	direction(sp)
+			bne.s	@reading
+@writing
+			bset	#kbAMICDirection, (A1_ChanlControl)
+			bset	#kbAMICRun, (A1_ChanlControl)
+			move.l	(sp)+, A2
+			nop
+			rts
+@reading			
+			bclr	#kbAMICDirection, (A1_ChanlControl)
+			bset	#kbAMICRun, (A1_ChanlControl)
+			
+			move.l	(sp)+, A2
+			nop
+			rts
+
+		NAME 'StartAMIC'
+				
+		ENDWITH
+			ENDPROC
+			
+
+;--------------------------------------------------------------------------
+
+Wt4AMICComplete	PROC	EXPORT
+
+;			_debugger			; there is no such ability on AMIC
+			rts
+						
+		NAME 'Wt4AMICComplete'
+			
+			ENDPROC
+			
+			
+;--------------------------------------------------------------------------
+
+StopAMICRead			PROC	EXPORT
+;
+; ———————— On Entry:———————————————————————————————————————————————
+;
+
+			move.l	HALc96GlobalRecord.dmaCntrlAddr(A5), A1_ChanlControl
+
+			bclr	#kbAMICRun, (A1_ChanlControl)
+
+			bset	#kbAMICFlush, (A1_ChanlControl)
+@1			btst	#kbAMICFlush, (A1_ChanlControl)
+			bne.s	@1
+			rts
+						
+		NAME 'StopAMICRead'
+			
+			ENDPROC
+			
+			
+;--------------------------------------------------------------------------
+
+StopAMICWrite			PROC	EXPORT
+;
+; ———————— On Entry:———————————————————————————————————————————————
+;
+
+			move.l	HALc96GlobalRecord.dmaCntrlAddr(A5), A1_ChanlControl
+
+			bclr	#kbAMICRun, (A1_ChanlControl)
+			rts
+						
+		NAME 'StopAMICWrite'
+			
+			ENDPROC
+			
+			END

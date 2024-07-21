@@ -1,0 +1,298 @@
+;
+;	File:		GreggyBitsDefProc.a
+;
+;	Contains:	Decompress defProc for GreggyBits decompression "'dcmp'(2)"
+;
+;	Written by:	Greg Marriott
+;
+;	Copyright:	© 1990-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <6>	12/18/91	pvh		Remove '040 cache flushing from here and move to
+;									DeCompressorPatch.a where it will do more good for mankind.
+;		 <5>	12/10/91	pvh		Added cache flushing for '040s at end of decompression.  This
+;									appears to clear up boot problems on the Quadras.
+;		 <4>	 1/30/91	gbm		sab, #38: Change the name of one of the decompressor header
+;									files (because Sheila said it was okay)
+;		 <3>	12/14/90	dba		& sab: make a small optimization to the decompressor
+;		 <2>	  9/4/90	gbm		add new calling interface for new defProcs (like this one)
+;		 <1>	  9/3/90	gbm		first checked in
+;				  9/3/90	gbm		Newly checked in today
+;
+;	To Do:
+;
+
+	LOAD	'StandardEqu.d'
+	include	'DecompressorPatchEqu.a'
+
+	IF &TYPE('forCompressor')='UNDEFINED' THEN
+		forCompressor: SET	0
+	ENDIF
+
+
+;
+;	First, we have the offset table for the three entry points used by the decompress patch
+;
+
+EntryPointTable	proc
+				import	PrepareForDecompression, WordForByte, CleanUpAfterDecompression
+				dc.w	PrepareForDecompression-EntryPointTable
+				dc.w	WordForByte-EntryPointTable
+				dc.w	CleanUpAfterDecompression-EntryPointTable
+				endproc
+
+;---------------------------------------------------------------------------------
+;
+;	RECORD PrepareForDecompressionFrame
+;
+;	Stack frame template for PrepareForDecompression routine
+;
+;---------------------------------------------------------------------------------
+PrepareForDecompressionFrame	RECORD	{A6Link},DECR
+StartParams			EQU		*
+header				DS.L	1						; extended header for this resource
+ParamSize			EQU		StartParams-*
+Return				DS.L	1
+A6Link				DS.L	1
+; locals go here
+					ENDRSize
+
+;---------------------------------------------------------------------------------
+;
+;	PROCEDURE PrepareForDecompression( header : Ptr ); {ptr to an extended resource header}
+;
+;	This is the routine called by the decompress patch to tell us to get ready
+;	for decompression.  This is where we allocate extra storage, etc...
+;	But, this defproc doesn't NEED any extra storage, so we don't do anything.
+;
+;---------------------------------------------------------------------------------
+PrepareForDecompression		Proc	Export
+
+				With PrepareForDecompressionFrame
+			
+				; I guess we can just leave...
+				movem.l	D4/A6, BootTmp8				; this is very important
+				
+				move.l	(sp)+, a0					; get return address
+				add.l	#ParamSize, sp				; pop parameters
+				jmp		(a0)						; return to caller
+				
+				EndWith
+				EndProc
+
+;---------------------------------------------------------------------------------
+;
+;	RECORD CleanUpAfterDecompressionFrame
+;
+;	Stack frame template for CleanUpAfterDecompression routine
+;
+;---------------------------------------------------------------------------------
+CleanUpAfterDecompressionFrame	RECORD	{A6Link},DECR
+StartParams			EQU		*
+header				DS.L	1						; extended header for this resource
+ParamSize			EQU		StartParams-*
+Return				DS.L	1
+A6Link				DS.L	1
+; locals go here
+					ENDRSize
+
+;---------------------------------------------------------------------------------
+;
+;	PROCEDURE CleanUpAfterDecompression( header : Ptr ); {ptr to an extended resource header}
+;
+;	This is the routine called by the decompress patch to tell us to clean up
+;	after decompression.  This is where we deallocate extra storage, etc...
+;	But, this defproc doesn't NEED any extra storage, so we don't do anything.
+;
+;---------------------------------------------------------------------------------
+CleanUpAfterDecompression		Proc	Export
+
+				With CleanUpAfterDecompressionFrame
+			
+				; I guess we can just leave...
+				move.l	BootTmp8, A0				; this is just as important
+				add.l	BootTmp8+4, A0
+				
+				move.l	(sp)+, a0					; get return address
+				add.l	#ParamSize, sp				; pop parameters
+				jmp		(a0)						; return to caller
+				
+				EndWith
+				EndProc
+
+;---------------------------------------------------------------------------------
+;
+;	RECORD WordForByteFrame
+;
+;	Stack frame template for WordForByte routine
+;
+;---------------------------------------------------------------------------------
+WordForByteFrame	RECORD	{A6Link},DECR
+StartParams			EQU		*
+source				DS.L	1						; get compressed data here,
+destination			DS.L	1						; and put it here
+header				DS.L	1						; extended header for this resource
+ParamSize			EQU		StartParams-*
+Return				DS.L	1
+A6Link				DS.L	1
+; locals go here
+					ENDRSize
+
+;
+;	Register equates I COULD have used in decompression
+;
+;
+;scratch			EQU		d0
+;numberOfWords		EQU		d1
+;numberOfRuns		EQU		d1
+;wordsInLastRun		EQU		d2
+;runBitMap			EQU		d3
+;runCount			EQU		d4
+;extraByteFlag		EQU		d5
+
+;source				EQU		a0
+;byteTable			EQU		a1
+;destination		EQU		a2
+;extendedHeader		EQU		a3
+;endOfSource		EQU		a4
+;---------------------------------------------------------------------------------
+;
+;	PROCEDURE WordForByte( source, destination, extHeader : Ptr ); (not MemoryMgr blocks, just addresses)
+;
+;	This function takes data and decompresses it.  The data is moved from source to 
+;	destination, decompressing bytes into words.  If a dynamic byte table is included
+;	in the data, it is copied into the table buffer (contained herein) before decompression.
+;	A pointer to the extended header is also provided, so that various flags and whatnot will
+;	be available to the decompress routine.
+;	
+;---------------------------------------------------------------------------------
+WordForByte		Proc	Export
+
+				With WordForByteFrame, ExtendedResource
+			
+				link	a6, #WordForByteFrame.SIZE
+				movem.l	a0-a4/d0-d5, -(SP)
+				
+				move.l	header(a6), a3				; flags and shit be here...
+				move.l	source(a6), a0
+				move.l	destination(a6), a2
+				
+@testForTable
+				btst	#byteTableSaved, compressFlags(a3)
+				beq.s	@noByteTableSaved
+				moveq	#0, d0
+				move.b	byteTableSize(a3), d0		; get the size, in words, of the byte table
+				addq.w	#1, d0						; adjust it to "real" numbers (not zero based)
+				add.w	d0, d0						; make it bytes
+				lea		DynamicTable, a1			; point to the start of our storage
+				move.w	d0, d1						; save size a sec...
+				_BlockMove							; copy the table
+				adda.w	d1, a0						; move source pointer past table data
+				bra.s	@testForOddLength
+@noByteTableSaved
+				lea		StaticTable, a1				; point to the start of the static table
+@testForOddLength
+				move.l	actualSize(a3), d1			; get the real size, and figure out the special cases
+				lsr.l	#1, d1						; but first, turn data length into number of words of uncompressed data
+				scs		d5							; indicate no extra byte is there
+@testForBitMap
+				btst	#bitmappedData, compressFlags(a3)
+				bne.s	DoBitMappedData
+
+DoNonBitMappedData
+				move.l	a0, a4
+				add.l	d1, a4						; point a4 past last byte of source data
+@again
+				moveq	#0, d0
+				move.b	(a0)+, d0					; get byte
+				add.w	d0, d0						; turn it into an index
+				move.w	(a1, d0.w), (a2)+			; move word to destination
+				cmp.l	a0, a4
+				bhi.s	@again						; not at end, do it again
+
+DoDanglingByte
+				tst.b	d5							; is there one more byte to move?
+				beq.s	AllDone						;   no, leave
+				move.b	(a0), (a2)					;   yes, move it and leave
+				bra.s	AllDone
+				
+DoBitMappedData
+				move.l	d1, d2						; get number of uncompressed words we should do
+				andi.l	#$7, d2						; MOD 8 - d2 now has the number of words in the last run
+				lsr.l	#3, d1						; DIV 8 - d1 now has the number of 8 word runs to decompress
+				bra.s	@endOfRun
+@do8												; if we're making this routine for the compressor
+				IF forCompressor THEN				; to do its reality check, then make sure
+				cmp.l	a0, a2						; the source and dest pointers never cross...
+				bls.s	@pointersOK					; if they do, just leave, because the comparison
+				bra		AllDone						; routine will show that this decompressed
+@pointersOK											; resource doesn't match the original...
+				ENDIF
+				moveq	#8-1, d4					; otherwise, load up for another run
+				move.b	(a0)+, d3					; get bitmap
+				beq.s	@fast8						; if the bitmap's empty, all 16 words are uncompressed
+@doNextDatum
+				add.b	d3, d3						; shift map over one
+				bcs.s	@doCompressed				; bit was set, so do it the hard way
+				move.b	(a0)+, (a2)+				; bit wasn't set, so do it the easy way
+				move.b	(a0)+, (a2)+				; bit wasn't set, so do it the easy way, part II
+				dbra	d4, @doNextDatum			; loop around
+@endOfRun
+				subq.l	#1, d1						; subtract one from run count (we may go past -1 because of last run)
+				bpl.s	@do8						; and go do another batch of 16
+				bra.s	@doLastRun					; when we fall below zero, bail out
+
+@fast8
+				move.b	(a0)+, (a2)+
+				move.b	(a0)+, (a2)+
+				dbra	d4, @fast8
+				bra.s	@endOfRun
+
+@doCompressed
+				moveq	#0, d0
+				move.b	(a0)+, d0					; get compressed datum
+				add.w	d0, d0						; make it an index into byte table
+				move.w	(a1, d0.w), (a2)+			; move word from table to destination
+@lastEntry
+				dbra	d4, @doNextDatum			; loop around
+				bra.s	@endOfRun					; branch to end, prepare another run
+
+@doLastRun
+				move.w	d2, d4						; load up number of words to move
+				beq.s	DoDanglingByte				; there aren’t any more words, just think about a last byte
+				moveq	#0, d2						; and make sure we don’t do this again...
+				move.b	(a0)+, d3					; get mask for this run
+				bra.s	@lastEntry					; enter through bottom of dbra, 'cause the count is 1 based
+
+AllDone
+				; I guess we can just leave...
+				movem.l	(sp)+, a0-a4/d0-d5
+				unlk	a6
+				move.l	(sp)+, a0					; get return address
+				add.l	#ParamSize, sp				; pop parameters
+				jmp		(a0)						; return to caller
+				
+StaticTable
+				DC.W	$0000, $0008, $4EBA, $206E, $4E75, $000C, $0004, $7000, $0010, $0002, $486E, $FFFC, $6000, $0001, $48E7, $2F2E
+				DC.W	$4E56, $0006, $4E5E, $2F00, $6100, $FFF8, $2F0B, $FFFF, $0014, $000A, $0018, $205F, $000E, $2050, $3F3C, $FFF4
+				DC.W	$4CEE, $302E, $6700, $4CDF, $266E, $0012, $001C, $4267, $FFF0, $303C, $2F0C, $0003, $4ED0, $0020, $7001, $0016
+				DC.W	$2D40, $48C0, $2078, $7200, $588F, $6600, $4FEF, $42A7, $6706, $FFFA, $558F, $286E, $3F00, $FFFE, $2F3C, $6704
+				DC.W	$598F, $206B, $0024, $201F, $41FA, $81E1, $6604, $6708, $001A, $4EB9, $508F, $202E, $0007, $4EB0, $FFF2, $3D40
+				DC.W	$001E, $2068, $6606, $FFF6, $4EF9, $0800, $0C40, $3D7C, $FFEC, $0005, $203C, $FFE8, $DEFC, $4A2E, $0030, $0028
+				DC.W	$2F08, $200B, $6002, $426E, $2D48, $2053, $2040, $1800, $6004, $41EE, $2F28, $2F01, $670A, $4840, $2007, $6608
+				DC.W	$0118, $2F07, $3028, $3F2E, $302B, $226E, $2F2B, $002C, $670C, $225F, $6006, $00FF, $3007, $FFEE, $5340, $0040
+				DC.W	$FFE4, $4A40, $660A, $000F, $4EAD, $70FF, $22D8, $486B, $0022, $204B, $670E, $4AAE, $4E90, $FFE0, $FFC0, $002A
+				DC.W	$2740, $6702, $51C8, $02B6, $487A, $2278, $B06E, $FFE6, $0009, $322E, $3E00, $4841, $FFEA, $43EE, $4E71, $7400
+				DC.W	$2F2C, $206C, $003C, $0026, $0050, $1880, $301F, $2200, $660C, $FFDA, $0038, $6602, $302C, $200C, $2D6E, $4240
+				DC.W	$FFE2, $A9F0, $FF00, $377C, $E580, $FFDC, $4868, $594F, $0034, $3E1F, $6008, $2F06, $FFDE, $600A, $7002, $0032
+				DC.W	$FFCC, $0080, $2251, $101F, $317C, $A029, $FFD8, $5240, $0100, $6710, $A023, $FFCE, $FFD4, $2006, $4878, $002E
+				DC.W	$504F, $43FA, $6712, $7600, $41E8, $4A6E, $20D9, $005A, $7FFF, $51CA, $005C, $2E00, $0240, $48C7, $6714, $0C80
+				DC.W	$2E9F, $FFD6, $8000, $1000, $4842, $4A6B, $FFD2, $0048, $4A47, $4ED1, $206F, $0041, $600C, $2A78, $422E, $3200
+				DC.W	$6574, $6716, $0044, $486D, $2008, $486C, $0B7C, $2640, $0400, $0068, $206D, $000D, $2A40, $000B, $003E, $0220
+
+DynamicTable
+				DCB.W	256, 0
+
+				EndProc
+				End

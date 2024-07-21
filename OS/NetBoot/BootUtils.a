@@ -1,0 +1,631 @@
+;__________________________________________________________________________________________________
+;
+;	File:		BootUtils.a
+;
+;	Contains:	Network booting utilities
+;
+;	Written by:	Patrick Dyson
+;
+;	Copyright © 1989-1993 by Apple Computer, Inc.  All rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 6/14/93	kc		Roll in Ludwig.
+;	   <LW2>	  4/8/93	fau		Fixed a bug with the opening of the .ATBoot driver.  It was
+;									using an _Open which uses the res-id for the refnum.  This came
+;									out to -50, which was a driver that was already there.  I moved
+;									some code from Startinit.a that installs a driver at the lowest
+;									refnum available after 47 and changed the .ATBoot open to use it.
+;	   <SM2>	 11/5/92	SWC		Changed INCLUDEs to a LOAD of StandardEqu.d.
+;		 <7>	 3/20/90	PWD		Fix to DoATBootOpen to push #'DRVR' instead of 'DRVR'.
+;		 <6>	  3/9/90	PWD		Merge from xo splitoff - changes to drive queue element size,
+;									system heap growth routine.
+;		 <5>	 2/20/90	PWD		Fixed coincident zones grow zone proc by reiniting the app heap
+;									if I grow the system heap. Also added icons for startup sequence
+;									and a pc-relative open for the netboot driver.
+;		 <4>	  2/1/90	PWD		Fixed coincident zones grow zone proc by reiniting the app heap
+;									if I grow the system heap.
+;		 <4>	01/30/90	PWD		Changed grow zone proc to not clobber ApplZone and HeapEnd.
+;		 <3>	12/28/89	SWC		Fixed header and set tabs to 4.
+;		 <2>	12/19/89	PWD		Adding to bbs.
+;	   <1.1>	12/12/89	PWD		Added support for self-authenticating images
+;	   <1.0>	10/30/89	PWD		Adding to EASE
+;__________________________________________________________________________________________________
+
+			PRINT	OFF
+			LOAD	'StandardEqu.d'
+			INCLUDE	'Slots.a'					; Slot equates
+			INCLUDE	'ROMequ.a'					; Slot ROM declarations
+			INCLUDE	'NetBootEQU.a'				; netBoot defs
+			PRINT	ON
+
+
+;__________________________________________________________________
+;
+; TestPRam - C procedure to call our pram routines
+;
+;	On Entry:	8(SP) is 0 for write, 1 for read
+;				4(SP) points to a buffer to use
+;
+;	On Exit:	read pram in buffer
+;
+;__________________________________________________________________
+TestPRam	PROC	EXPORT
+			MOVE.L	4(SP),	A0					; buffer to read/write
+			MOVE.L	8(SP),	D0					; get selector
+			BEQ.S	@write
+			BSR.S	ReadPRAM
+			BRA.S	@Exit
+
+@write		BSR.S	WritePRAM
+
+@Exit		RTS
+;__________________________________________________________________
+;
+; ReadPRAM - read from our PRAM
+;
+;	On Entry:	A0 points to a read buffer
+;	On Exit:	the z bit is set if there was an error
+;				A0 points to the buffer read:
+;					password
+;					user name
+;					server name
+;
+;	Trashes D0,D1,A0,A1
+;__________________________________________________________________
+pRamEntries	EQU	5								; size of table
+pRamTable
+			DC.L	$00040004					; first four password bytes
+			DC.L	$000300AB					; next three byte
+			DC.L	$000100BC					; last password byte
+			DC.L	$00200020					; User name (32 bytes)
+			DC.L	$0020008B					; Server name (31 bytes)
+
+ReadPRAM	CLR.L	D0							; assume error
+			BTST	#14,HWCfgFlags				; New clock chip?
+			BEQ.S	@10							; Assume bridge if not
+			LEA		pRamTable, A1				; start of table
+			MOVEQ.L	#pRamEntries-1, D1			; entries (-1)
+@1			MOVE.L	(A1)+,D0					; first count
+			MOVE.L	D0,D2
+												; A0 has buffer area
+			_ReadXPRam							; trashes D0
+			SWAP	D2							; get count in low byte
+			ADDA	D2,A0						; bump buffer
+			DBRA	D1,@1						; go get more
+
+@10			RTS
+
+;__________________________________________________________________
+;
+; WritePRAM - write to our PRAM
+;
+;	On Entry:	A0 points to the buffer to write:
+;		password
+;		user name
+;		server name
+;	On Exit:	the z bit is set if there was an error
+;__________________________________________________________________
+
+WritePRAM	CLR.L	D0							; assume error
+			BTST	#14,HWCfgFlags				; New clock chip?
+			BEQ.S	@10							; Assume bridge if not
+			LEA	pRamTable, A1					; start of table
+			MOVEQ.L	#pRamEntries-1, D1			; entries (-1)
+@1			MOVE.L	(A1)+,D0					; first count
+			MOVE.L	D0,D2
+												; A0 has buffer area
+			_WriteXPRam
+			SWAP	D2							; get count in low byte
+			ADDA	D2,A0						; bump buffer
+			DBRA	D1,@1						; go get more
+
+@10			RTS
+			ENDP
+AddMyDrive	PROC	EXPORT
+;---------------------------------------------------------------------------
+;FUNCTION AddMyDrive(drvSize: LONGINT; drvrRef: INTEGER; drvStorage: Ptr): INTEGER;
+;---------------------------------------------------------------------------
+;Add a drive to the drive queue. Returns the new drive number, or a negative
+;error code (from trying to allocate the memory for the queue element).
+;---------------------------------------------------------------------------
+DQESize		EQU		18+8				;size of a drive queue element + private storage
+;We use a constant here because the number in SysEqu.a doesn't take into
+;account the flags LONGINT before the element, or the size word at the end.
+;---------------------------------------------------------------------------
+StackFrame	RECORD	{link},DECR
+result		DS.W	1							;function result
+params		EQU		*
+drvSize		DS.L	1							;drive size parameter
+drvrRef		DS.W	1							;drive refNum parameter
+drvNStorage	DS.L	1							; private storage on the end of the drive Q element
+paramSize	EQU		params-*
+return		DS.L	1							;return address
+link		DS.L	1							;saved value of A6 from LINK
+block		DS.B	ioQElSize					;parameter block for call to MountVol
+linkSize	EQU		*
+			ENDR
+;---------------------------------------------------------------------------
+			WITH	StackFrame					;use the offsets declared above
+
+			LINK	A6,#linkSize				;create stack frame
+
+			;search existing drive queue for an unused number
+
+			LEA		DrvQHdr,A0					;get the drive queue header
+			MOVEQ	#4,D0						;start with drive number 4
+CheckDrvNum
+			MOVE.L	qHead(A0),A1				;start with first drive
+CheckDrv
+			CMP.W	dqDrive(A1),D0				;does this drive already have our number?
+			BEQ.S	NextDrvNum					;yep, bump the number and try again.
+			CMP.L	qTail(A0),A1				;no, are we at the end of the queue?
+			BEQ.S	GotDrvNum					;if yes, our number's unique! Go use it.
+			MOVE.L	qLink(A1),A1				;point to next queue element
+			BRA.S	CheckDrv					;go check it.
+
+NextDrvNum
+			;this drive number is taken, pick another
+
+			ADDQ.W	#1,D0						;bump to next possible drive number
+			BRA.S	CheckDrvNum					;try the new number
+
+GotDrvNum
+			;we got a good number (in D0.W), set it aside
+
+			MOVE.W	D0,result(A6)				;return it to the user
+
+			;get room for the new DQE
+
+			MOVEQ	#DQESize,D0					;size of drive queue element, adjusted
+			_NewPtr	,SYS						;get memory for it
+			BEQ.S	GotDQE						;no error...continue
+			MOVE.W	D0,result(A6)				;couldn't get the memory! return error
+			BRA.S	FinishUp					;and exit
+
+GotDQE
+			;fill out the DQE
+
+			MOVE.L	#$80000,(A0)+				;flags: non-ejectable; bump past flags
+
+			MOVE.W	#1,qType(A0)				;qType of 1 means we do use dQDrvSz2
+			MOVE.W	#dFSID,dQFSID(A0)			;"external file system"
+			MOVE.W	drvSize(A6),dQDrvSz2(A0)	;high word of number of blocks
+			MOVE.W	drvSize+2(A6),dQDrvSz(A0)	;low word of number of blocks
+			MOVE.L	drvNStorage(A6), drvStorage(A0); private storage
+
+			;call AddDrive
+
+			MOVE.W	result(A6),D0				;get the drive number back
+			SWAP	D0							;put it in the high word
+			MOVE.W	drvrRef(A6),D0				;move the driver refNum in the low word
+			_AddDrive							;add this drive to the drive queue
+
+FinishUp
+			UNLK	A6							;get rid of stack frame
+			MOVE.L	(SP)+,A0					;get return address
+			ADD	#paramSize,SP					;get rid of parameters
+			JMP	(A0)							;back to caller
+;---------------------------------------------------------------------------
+			ENDPROC
+
+;
+; RmvDriver - glue for this undocumented trap
+;
+
+KillDriver	PROC	EXPORT
+			MOVE.L	4(SP),	D0					; pop parameter
+			_DrvrRemove
+												; function result in D0
+			RTS									; C functs clean up after themselves
+			ENDP
+
+;---------------------------------------------------------------------------
+;
+; pdbzero - our own copy of the famous "zero this many bytes routine"
+;
+;
+;
+;---------------------------------------------------------------------------
+			CASE	OBJ							; make this be case as specified
+pdbzero		PROC	EXPORT
+			move.l	4(sp),a0					; pointer to block to zero
+			move.l	8(sp),d0					; count of bytes to zero
+			ble.s	@theend						; punt if done already
+			sub.l	#1,d0						; for dbra
+			move.l	#0,d1						; something to clear with
+@11
+			move.b	d1,(a0)+					; clear that byte...
+			dbra	d0,@11						; until done.
+@theend
+			rts
+			ENDP
+
+;__________________________________________________________________
+;
+; myExtFSFilter
+;
+; This routine handles the _MountVol call to BootDrive after the boot
+; blocks have been read (handled by .netBoot). It is installed just before
+; the netboot read completes and de-installs itself when done.
+;
+; We install our grow zone proc before making the control call in case
+; it wants memory.
+;
+; Entry:	A0 -> 	the mountvol param block
+;
+; Exit:	D0	any error
+;
+; We trash D0, all other registers preserved.
+;
+			CASE	OBJ							; save case for C linker
+WDCBsPtr	EQU    $372 	; Working Directory queue header
+myExtFSFilter PROC	EXPORT						; imported by netBoot.c
+			IMPORT	myGrowZone
+			MOVEM.L	A0-A4/D1-D2, -(SP)			; savem
+			CMP.B	#$0F,ioTrap+1(A0)			; is this a MountVol call?
+			BNE		@NotOurs
+
+			MOVE.W	IODrvNum(A0), D0			; pick up drive
+			CMP.W	#4, D0						; is this for us?
+			BNE		@NotOurs
+;
+; go find the drive queue entry
+;
+			LEA	DrvQHdr,A2						; get the drive queue header
+			MOVE.L	qHead(A2),A1				; start with first drive
+@CheckDrv
+			CMP.W	dqDrive(A1),D0				; our drive?
+			BEQ.S	@GotDrvNum					; yep, cruise
+			CMP.L	qTail(A2),A1				; no, are we at the end of the queue?
+			BEQ	@Error							; yes, we're hosed
+			MOVE.L	qLink(A1),A1				; point to next queue element
+			BRA.S	@CheckDrv					; go check it.
+
+@GotDrvNum										; in A1
+			CMP.W	#dFSID, dQFSID(A1)			; ours?
+			BNE		@Error
+
+			MOVE.L	drvStorage(A1), D0			; pick up driver globals (on end of entry)
+			MOVE.L	A1, A4						; save drive entry pointer
+			BEQ		@Error
+
+			MOVE.L	D0, A2						; get globals pointer
+
+			MOVE.L	SysZone, A0					; pick up system heap pointer
+			move.l	a0,TheZone					; make sure that we keep our default zone...
+			MOVE.L	gzProc(A0), -(SP)			; save old grow zone
+			LEA		myGrowZone, A1				; pick up my grow zone proc
+			MOVE.L	A1, gzProc(A0)				; tell the memory manager
+			SUB		#ioQElSize,SP				; make a queue element
+			MOVE.L	SP,A0						; A0 -> queue element
+			MOVE	#mountSysVol,csCode(A0)		; set control code
+			MOVE	dProtoRefNum(A2),ioRefNum(A0) ; set driver refNum
+			_Control
+			BEQ.S	@Good						; branch if no error
+			ADD	#ioQElSize, SP					; restore stack
+			MOVE.L	SysZone, A0					; pick up system heap pointer
+			MOVE.L	(SP)+,gzProc(A0)			; restore old grow zone
+			BRA		@ControlError				; punt if error
+
+@Good		MOVE.L	returnVCB(A0), A1			; pick up VCB pointer
+			MOVE.L	A1, DefVCBPtr				; set as default volume
+			MOVE.L	WDCBsPtr, A3
+			MOVE.L	A1, WDVCBPtr+2(A3)			;
+			MOVEQ	#2, D0						; FSRtDirID
+			MOVE.L	D0, WDDirID+2(A3)			;
+			CLR.L	WDCatHint+2(A3)
+			CLR.L	WDProcID+2(A3)
+
+			MOVE.L	returnDrvQ(A0), A1			; pick up drive queue pointer
+
+			MOVE	dQFSID(A1), dQFSID(A4)		; set drive queue entry fsid
+			MOVE	dQRefNum(A1), dQRefNum(A4)	; set driver refnum to handle calls
+			MOVE.B	-3(A1), -3(A4)				; set flags
+
+			SUBQ	#4, A1						; point to buffer start
+			MOVE.L	A1, A0						; set up for _Dispos
+			_DisposPtr							; nuke it
+
+			CLR.L	drvStorage(A4)				; wipe out reference to our storage
+
+			MOVE.L	doldToExtFS(A2), ToExtFS	; restore ToExtFS (unhook ourselves)
+
+			ADD		#ioQElSize, SP				; restore stack
+			MOVE.L	SysZone, A0					; pick up system heap pointer
+			MOVE.L	(SP)+,gzProc(A0)			; restore old grow zone
+			MOVEQ	#0, D0						; set no error
+			BRA.S	@Leave						; outta' here
+@Error
+			MOVEQ	#-1, D0
+
+@ControlError
+@Leave
+@NotOurs
+			MOVEM.L	(SP)+, A0-A4/D1-D2			; restorem
+			RTS
+			ENDP
+
+;__________________________________________________________________
+;
+; myGrowZone
+;
+; This proc is installed before making calls to the boot protocol driver
+; or the downloaded code. The memory world is simple: The app and system
+; heap are coincident; The app heap about 16k after the end of the system.
+;
+; The app heap is assumed to be clobberable - our algorithm is to extend the
+; system heap by the requested amount + pad (currently 16k). We limit the size
+; of the system growth to 1/2 machine memory and by the bottom of the stack.
+;
+; This is a pascal procedure & thus cleans up its own stack.
+;
+; Entry:	4(SP).L		Requested memory size
+;			8(SP).L		Space for function return value
+;
+; Exit:		(SP).L		Size of block we freed
+SysHeapEndBuf EQU	8*1024						; amount of space between SysHeap end & SP	<A286>
+myGrowZone	PROC	EXPORT
+			MOVE.L	4(SP), D0					; pick up block size
+			MOVE.L	A2, -(SP)					; save a register
+			MOVE.L	SysZone,A1					; Point to System Heap.						<C102>
+			MOVE.L	bkLim(A1),A0				; Point to end of System Heap.
+			MOVE.L	A0, A2						; save the old end of the heap
+			ADD.L	#16*1024, D0				; add slop
+			LEA		0(A0,D0.L), A0				; point to "new" end
+			MOVE.L	D0, D1						; save off how much we are going for
+
+			MOVE.L	BufPtr,A1					; Upper bound is BufPtr						<C587>
+			SUB.L	#SysHeapEndBuf,A1			; Éminus a tad.								<A286>
+			CMP.L	A1,A0						; Is proposed end <= limit?					<A286>
+			BLS.S	@WithinLimit				; Branch if so.
+			MOVE.L	A1, D1						; pick up new end
+			SUB.L	A2, D1						; subtract off the bottom; size = (top-bottom)
+			MOVE.L	A1,A0						; If not, use upper limit instead.			<A286>
+@WithinLimit			;																	<A286>
+
+			_SetAppBase							; Set up the start of the application heap.	<C102>
+;			_InitApplZone						; and do all the fun initialization			<C793>
+
+			MOVE.L	SysZone, A1					; get the system zone
+			MOVE.L	A1,TheZone					; We still want the System Heap to be the default.	<C102>
+			MOVE.L	A1,ApplZone					; pd< Put back in for XO >revert to coincident zones				<C587>
+			MOVE.L	bkLim(A1),HeapEnd			; pd< Put Back in for XO >end of dynamic sys/appl zone				<C587>
+
+			MOVE.L	(SP)+, A2					; restore a register
+			MOVE.L	(SP)+, A0					; pop return address
+
+			MOVE.L	(SP)+, D0					; pop the passed size
+			MOVE.L	D1, (SP)					; return how much we are giving
+			JMP	(A0)							; and go back from whence we came
+			ENDP
+
+
+
+myGetA5		PROC	EXPORT
+			MOVE.L	A5, D0
+			RTS
+			ENDP
+
+mySetA5		PROC	EXPORT
+			MOVE.L	4(SP), A5
+			RTS
+			ENDP
+			
+			CASE	OBJ							; c case for the linker
+DoATBootOpen	PROC	EXPORT
+			move.l		4(SP), a0				; pick up passed param block
+			clr.l		-(sp)					; function result room
+			move.l		#'DRVR', -(sp)			; push the type
+			move.l		HParamBlockRec.ioNamePtr(a0), -(sp)	; push the name of the driver
+			_GetNamedResource					; go for it
+			clr			d0						; assume error (0 is error)
+			tst.l		(sp)+					; pop result
+			beq.s		@openErr
+			move.l		4(sp), a0				; get pb back
+			move.l		HParamBlockRec.ioNamePtr(a0), A1
+			MOVE.W		#60,D2					;  and resource ID										<SM84>
+			BSR			InstallDriver			; go install the driver	
+			swap		d0						; get refnum in lower word.
+			Andi.l		#$FFFF,D0				; clear the top word and return the refnum
+
+@openErr	rts
+
+;________________________________________________________________________________________
+;
+; Routine:	InstallDriver
+;
+; Inputs:	A1	-	pointer to driver name string (pascal)
+;			D2	-	driver's resource ID
+;
+; Outputs:	none
+;
+; Trashes:	D0-D2, A0-A2
+;
+; Function:	gets a driver from the ROM, and installs and opens it in the first available
+;			slot after entry 48
+;________________________________________________________________________________________
+
+InstallDriver
+			move.l	a1,a2							; move name ptr to a2 for safe keeping
+			bsr.s	GetDetachDRVR					; get and detach resource (d1,d1/a1)
+			beq.s	@exit							; exit if no handle
+
+			bsr.s	FirstEntryFree					; get ref num of first free entry (/d0,d1)
+			_DrvrInstall							; create dce (d0/d0)
+			tst.l	d0								; test for error
+			bne.s	@releaseDrvr					; ... exit if error
+			
+			move.l	UTableBase,a0					; point to utable array
+			move.l	(a0,d1),a0						; get handle to dce in a3
+			move.l	(a0),a0							; get pointer to dce
+			move.l	a1,dCtlDriver(a0)				; load driver
+
+			move.l	(a1),a1							; get pointer to driver
+			move.w	drvrFlags(a1),dCtlFlags(a0)		; copy data to dce
+			move.w	drvrDelay(a1),dCtlDelay(a0)
+			move.w	drvrEMask(a1),dCtlEMask(a0)
+			move.w	drvrMenu(a1),dCtlMenu(a0)
+
+			bset.b	#dNeedLock,dCtlFlags+1(a0)		; set the handle bit
+
+@openDrvr	move.l	a2,a1							; load pointer to driver name
+			bra.s	OpenDRVR						; open the driver (a1/)
+@releaseDrvr	
+			move.l	a1,a0							; move handle to a0
+			_DisposHandle							; release the memory
+@exit		rts
+
+
+;________________________________________________________________________________________
+;
+; Routine:	GetDetachDrvr, GetDetachRes
+;
+; Inputs:	D1	-	resource type (GetDetachRes)
+;			D2	-	driver's resource ID
+;
+; Outputs:	A1	-	handle to resource
+;			CCR	-	BEQ if successful, BNE if failure
+;
+; Trashes:	D0-D2, A0-A2
+;
+; Function:	gets a driver from the ROM and detaches it
+;________________________________________________________________________________________
+
+GetDetachDRVR
+			MOVE.L	#'DRVR',D1
+GetDetachRes
+			MOVE.W	#MapTrue,ROMMapInsert			; make sure we can get it from ROM
+			SUBQ.L	#4, SP							; For return address
+			MOVE.L	D1, -(SP)						; Resource type
+			MOVE.W	D2, -(SP)						; Resource ID
+			_GetResource
+			MOVE.L	(SP), A1						; Get resource handle to return
+			BNE.S @NoDetach							; If not found, don't try to detach it
+			_DetachResource
+			MOVE.L	A1,D0							; Set result code
+			RTS
+@NoDetach
+			ADDA.L	#4,SP							; recover stack
+			MOVEQ	#0,D0							; set error
+			RTS										; return
+
+
+;________________________________________________________________________________________
+;
+; Routine:	FirstEntryFree
+;
+; Inputs:	none
+;
+; Outputs:	D0	-	driver refNum
+;
+; Trashes:	none
+;
+; Function:	finds the first free entry in the unit table
+;________________________________________________________________________________________
+
+StartEntry	equ		(48-1)							; this avoids AppleTalk area
+		
+FirstEntryFree
+			move.l	a0,-(SP)						; save a0
+
+@findEntry	move.l	UTableBase,a0					; point to utable array
+			move.l	#(StartEntry*4),d0				; start at entry (48-1)
+				
+@testEntry	addq.l	#4,d0							; increment to next entry
+			tst.l	0(a0,d0)						; test entry
+			bne.s	@testEntry						; if != 0, next entry
+				
+@calcRefnum	move.l	d0,d1
+			lsr.l	#2,d0							; divide by 4 to get entry number
+			addq.l	#1,d0							; add 1 (refnum is -(entry number + 1)
+			neg.l	d0								; negate to get reference number				
+				
+			move.l	(SP)+,a0						; restore a0
+			rts
+
+
+;________________________________________________________________________________________
+;
+; Routine:	OpenDRVR
+;
+; Inputs:	A1	-	pointer to driver name string (pascal)
+;
+; Outputs:	D0	-	driver refNum in high word, Open result in low word
+;			CCR	-	BEQ if successful, BNE if failure
+;
+; Trashes:	A0
+;
+; Function:	opens a driver
+;________________________________________________________________________________________
+
+OpenDRVR	LEA		-ioQElSize(SP),SP				; Allocate IO stack frame
+			MOVE.L	SP,A0							; set a0 to point to the pb
+			MOVE.L	A1,ioVNPtr(A0)					; load pointer to name
+			MOVE.B	#fsCurPerm,ioPermssn(A0)		; set permission (not used)
+			_Open
+
+			MOVE.W	ioRefNum(A0),D0					; return ioRefNum (D0.W:HI)
+			SWAP	D0								; move ioRefNum HI
+			MOVE.W	ioResult(A0),D0					; return result (D0.W:LO)
+			LEA		ioQElSize(SP),SP				; Release stack frame
+			RTS										; Sucess returned in status
+
+
+			ENDP
+
+
+myGetIcn	PROC	EXPORT
+			move.l	4(sp), d0					; pick up index
+			lsl		#7, d0						; multiply by 128
+			lea		myIcons, a0					; pick up icon base
+			add.l	a0,d0						; point to icon.
+			rts
+myIcons
+			; resource 'ICN#' (1, "Outline Mac") {
+			
+			dc.b		$0F, $FF, $FF, $E0, $18, $00, $00, $30, $10, $00, $00, $10, $11, $FF, $FF, $10
+			dc.b		$12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90
+			dc.b		$12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90
+			dc.b		$12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90
+			dc.b		$12, $00, $00, $90, $11, $FF, $FF, $10, $10, $00, $00, $10, $10, $00, $00, $10
+			dc.b		$10, $00, $00, $10, $10, $00, $00, $10, $13, $00, $3F, $10, $10, $00, $00, $10
+			dc.b		$10, $00, $00, $10, $10, $00, $00, $10, $10, $00, $00, $10, $1F, $FF, $FF, $F0
+			dc.b		$08, $00, $00, $20, $08, $00, $00, $20, $08, $00, $00, $20, $0F, $FF, $FF, $E0
+			
+			; resource 'ICN#' (2, "Mac with eyes") {
+			
+			dc.b		$0F, $FF, $FF, $E0, $18, $00, $00, $30, $10, $00, $00, $10, $11, $FF, $FF, $10
+			dc.b		$12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90, $12, $10, $10, $90
+			dc.b		$12, $10, $10, $90, $12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90
+			dc.b		$12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90
+			dc.b		$12, $00, $00, $90, $11, $FF, $FF, $10, $10, $00, $00, $10, $10, $00, $00, $10
+			dc.b		$10, $00, $00, $10, $10, $00, $00, $10, $13, $00, $3F, $10, $10, $00, $00, $10
+			dc.b		$10, $00, $00, $10, $10, $00, $00, $10, $10, $00, $00, $10, $1F, $FF, $FF, $F0
+			dc.b		$08, $00, $00, $20, $08, $00, $00, $20, $08, $00, $00, $20, $0F, $FF, $FF, $E0
+			
+			;resource 'ICN#' (3, "mac with eyes&nose") {
+			
+			dc.b		$0F, $FF, $FF, $E0, $18, $00, $00, $30, $10, $00, $00, $10, $11, $FF, $FF, $10
+			dc.b		$12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90, $12, $11, $10, $90
+			dc.b		$12, $11, $10, $90, $12, $01, $00, $90, $12, $01, $00, $90, $12, $03, $00, $90
+			dc.b		$12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90, $12, $00, $00, $90
+			dc.b		$12, $00, $00, $90, $11, $FF, $FF, $10, $10, $00, $00, $10, $10, $00, $00, $10
+			dc.b		$10, $00, $00, $10, $10, $00, $00, $10, $13, $00, $3F, $10, $10, $00, $00, $10
+			dc.b		$10, $00, $00, $10, $10, $00, $00, $10, $10, $00, $00, $10, $1F, $FF, $FF, $F0
+			dc.b		$08, $00, $00, $20, $08, $00, $00, $20, $08, $00, $00, $20, $0F, $FF, $FF, $E0
+			ENDP
+
+myGetMask	PROC	EXPORT
+
+			dc.b		$0F, $FF, $FF, $E0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0
+			dc.b		$1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0
+			dc.b		$1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0
+			dc.b		$1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0
+			dc.b		$1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0
+			dc.b		$1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0
+			dc.b		$1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0, $1F, $FF, $FF, $F0
+			dc.b		$0F, $FF, $FF, $E0, $0F, $FF, $FF, $E0, $0F, $FF, $FF, $E0, $0F, $FF, $FF, $E0
+			ENDP
+			
+			END

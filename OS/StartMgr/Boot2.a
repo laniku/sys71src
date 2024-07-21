@@ -1,0 +1,751 @@
+;
+;	File:		Boot2.a (formerly StartSystem.a)
+;
+;	Contains:	boot code for the Macintosh system
+;
+;				This code lives in the 'boot' 2 resource in the System file.
+;
+;				This code takes over after the boot blocks and does some primary setup,
+;				then passes the boot process on to a CPU Gibbly. We won’t ever put this
+;				code in ROM; instead, we will make it call traps (or specific addresses)
+;				in ROM.
+;
+;				This contains all the code necessary to get from boot to the Process Mgr.
+;				It also contains the code that was formerly in INIT 31 that loads INIT resources
+;				from INIT, RDEV, and cdev files.
+;
+;	Written by: Darin Adler, based on old boot blocks and StartBoot.a
+;
+;	Copyright:	© 1990-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		<77>	 6/27/92	DTY		#1033818: Leave the Gibbly the current resource map before
+;									handing control over so it can tell it’s own resource reference
+;									number.
+;		<76>	 6/24/92	DTY		#1033818 <csd>: Move the Gibbly underneath the system resource
+;									map before handing control over to 'boot' 3, so that the Gibbly
+;									won’t get closed if the system heap grows before Resource
+;									Overrides are implemented.  Also added call to HGetVInfo to get
+;									the System Folder directory ID, since the value that’s being
+;									passed in A4 by the boot blocks might be another directory.
+;		<75>	 5/28/92	DTY		#1030972: If no Gibbly capable of booting this machine is found,
+;									the code used to call SysError(dsOldSystem).  This call doesn’t
+;									bring up the dialog any more, because 'DSAT' 0 isn’t set up
+;									until 'boot' 3.  Now, set a bit in low memory, and call the
+;									System file’s 'boot' 3 resource, which will look at this bit,
+;									and display the message if the bit is set.
+;		<74>	 4/20/92	JSM		Moved this file from StartSystem.a to Boot2.a, keeping all
+;									revisions; remove some equates that are no longer needed now
+;									that some of the code originally in this file has been moved to
+;									Boot3.a.
+;		<73>	 4/15/92	DTY		#1027491: ioVRefNum needs to be initialized before calling
+;									_HGetFileInfo to find a Gibbly, now that nothing does it for us.
+;		<72>	 4/14/92	DTY		Get rid of unecessary includes.
+;		<71>	  4/2/92	DTY		#1025555,<BBM>: StartSystem.a used to call
+;									MakeSystemHeapGrowable right after it sets up the globals. That
+;									call got lost in the shuffle between here and BootCode.a. Since
+;									A/UX wants an early call to make the system heap growable, we’ll
+;									put it back in here, before any Gibblies are opened, so we don’t
+;									have to worry about them being closed when _InitApplZone is
+;									called before the _RsrcZoneInit patch is installed.
+;		<70>	 3/25/92	FM		last checkin was #1025326
+;		<69>	 3/25/92	FM		Rolling everything except gibbly loading code into BootCode.a so
+;									that StartSystem.a will be as machine independent as possible!
+;		<68>	 2/17/92	DTY		#1020172: D6 used to hold a handle to DSAT 0, but now I use it
+;									to keep track of the number of Gibblies. Save d6 before I use
+;									it.
+;		<67>	 2/11/92	DTY		Dean’s on a memory reduction spree. Release each 'gbly' resource
+;									after setting up information about each Gibbly on the stack.
+;		<66>	  2/7/92	DTY		I missed the addq in LoadGibbly last time. Make this an addq.l
+;									also.
+;		<65>	 1/27/92	DTY		addq #1,d6 is getting compiled to addq.w #1,d6, but the full
+;									long of d6 is significant. Change the addq to an addq.l to make
+;									the addition right.
+;		<64>	 1/17/92	DTY		Includes LinkedPatchMacros.a to get the kROMVersion equates.
+;		<63>	 1/14/92	csd		Move the BootGlobals record and other equates to BootEqu.a so we
+;									don’t have to keep the StartSystem.a and BootCode.a versions in
+;									sync.
+;		<62>	 12/2/91	DTY		BoxFlag doesn’t exist on the Mac Plus. Check the ROM version in
+;									CanGibblyBootThisMachine to see if this is a Plus. If it is, set
+;									up the box value manually instead of fetching it from BoxFlag.
+;		<61>	 12/2/91	SAM		Using official boxflag equates now.
+;		<60>	11/19/91	DTY		Use bhi instead of bgt to do a proper unsigned longword compare
+;									of the time stamp.
+;		<59>	11/18/91	DTY		_HOpenResFile isn’t around yet. Use _OpenResFile instead.
+;		<58>	11/15/91	DTY		Change the resource ID of the 'gbly' resource to match the ones
+;									in the Gibbly ERS.
+;		<57>	 11/8/91	DTY		Add code which finds CPU Gibblies, and determines who should
+;									boot the machine.  Split off all the code to do the actual
+;									booting into BootCode.a (everything from LoadVMAndDebugger and
+;									later.)
+;		<56>	 11/4/91	YK		Register components in the INIT loading loop.
+;		<55>	 11/4/91	JSM		Take out SysPrivateEqu.a again.
+;		<54>	10/28/91	SAM		Added a default define of false to has3rdFloppy.
+;		<53>	10/28/91	SAM/KSM	Rolled in Regatta file:
+;										On Spike with caches diabled, we patch the MFM WrData vector of
+;											the Sony driver so we can use an updated timing constant in the
+;											Write code.  The original constant is *barely* within spec and
+;											with caches disable it is no longer even close.
+;										Changed CheckFor040CacheInhibit to use the hwPriv call to push
+;											the caches, added a clock rate calculation to determine the
+;											amount of adjustment TimeDBRA will require with the caches off
+;											on the differently clocked 040s.  Added a Terror2 (ROM minor
+;											version 17) check to the Zap PRAM routine so it will work on
+;											Zydeco.
+;										Updated the kNo040CacheTimeDBRA value.
+;										Slam a slower/lower TimeDBRA when the 040 caches are inhibited.
+;										(jmp) Make the System cmd-opt-r-p PRAM Reset work on TERROR
+;											machines to fix a TERROR bug.
+;										Changed HighestSupportedBoxFlag to Eclipse33.
+;										Added code to inhibit the 68040 caches if the high bit of the
+;											MMFlags byte is set (PRAM 8A).
+;										Add back the check for Gestalt after loading VM cuz if VM does
+;											not load, Gestalt is not yet implemented on non IIci ROM
+;											machines.
+;										Adding free memory checks after VM loads.
+;										Removed the previous revision -- Macsbug has been fixed to load
+;											in copyback!
+;										Inhibited all 040 caches while loading Macsbug cuz its too
+;											brain-damaged to load in copyback.
+;		<52>	 9/16/91	JSM		Cleanup header, don’t include SysPrivateEqu.a (already in dump
+;									file).
+;		<51>	  7/2/91	JSM		Remove obsolete 7.0 related SysVers conditionals.
+;		<50>	 6/12/91	LN		added #include 'InternalOnlyEqu.a'
+;		<49>	 6/11/91	gbm		Take out conditional for Regatta
+;		<48>	 4/13/91	stb		dty, BRC#86692:  Replace WhichCPU (borrowed from ROM) with
+;									HandleMacIIWith030.  Now handle exactly one case where we help
+;									accelerators be VM-capable.
+;		<47>	  4/2/91	SAM		Bumping HighestSupportedBoxFlag for Regatta build.
+;		<46>	 3/31/91	csd		dba: Changed the test for 040 in the WhichCPU routine so that it
+;									doesn’t jam 0 into the CACR, thereby possibly nuking any data
+;									which has not been flushed out of the cache.
+;		<45>	 3/13/91	stb		bbm, #83253: setup and use new ExpandMem global
+;									emMinSysHeapFreeSpace which specifies how much elbow room to
+;									leave in the system/process mgr heaps.
+;		<44>	 2/19/91	gbm		csd, #Go5 approved: Make sure _MemoryDispatch is NOT implemented
+;									on machines without PMMUs. Also fix the related bug in the ci
+;									ROM that sets MMUType wrong.
+;		<43>	 2/15/91	gbm		stb & dba, BRC # 82829: Fix the WhichCPU routine so that is
+;									stops turning off data cache and data bursting on '030s
+;		<42>	 2/11/91	stb		gbm, WS #stb211: change BSR.S back to BSR so MacsBug won’t die
+;									if you bail during install (by holding down the mouse button).
+;									Disassembler, too.
+;		<41>	 2/11/91	stb		gbm, BRC # 82423: implement StripAddress early enough to use
+;									when installing VM
+;		<40>	 1/29/91	csd		stb, Whiteboard Bug: Moved the SetDefaults code to an earlier
+;									position so that it executes before code that uses the
+;									variables.
+;		<39>	 1/23/91	stb		TED,81551: test a result code before BCC’ing.
+;		<38>	 1/19/91	stb		& DC (& dfh for some of it) change 'dbex' id; adjust file cache
+;									allowance; coordinate upward and downward growth limits.
+;		<37>	 1/14/91	stb		& mda; more net booting stuff; disable extension disabling if
+;									desired; do DoWeHaveEnoughRAMToBoot earlier; give file cache a
+;									little less BufPtr room. add culprit names for VM, Debugger,
+;									Disassembler; jam CPUflag to support 3rd-party processors for
+;									VM.
+;		<36>	12/18/90	stb		& JDR; add error check after _MemoryDispatch.
+;									fix infinite loop in MakeSysFree if couldn’t get desired amount.
+;		<35>	12/15/90	stb		& KSM; move the currently-executing filename to avoid conflict
+;									with INITs which check CurApName to see if it’s post-boot time.
+;									Replace error 106 with 25. Remove _MemoryDispatch declaration.
+;		<34>	12/13/90	stb		& gbm; no longer load AppleTalk from a file.
+;									Use source to GetDefaultStartup to avoid problem on Plus.
+;									Reserve 100K for post-boot allocations by Process Mgr & Finder.
+;	    <33>	12/12/90	stb 	& gbm; pass bufPtrLimit to LoadFileSystemCache code
+;									& dba; added 'appe' (background app) to the list of boot-executables.
+;									& bbm; add Cmd-Option-pr to reset PRAM on Plus, SE, II, Portable
+;									& k s; add net booting hooks
+;		<32>	11/15/90	stb		& JDR; move dsBufPtrTooLow to SysErr.a
+;		<31>	 11/9/90	dba		& JSM; move 8•24 GC loading before script system loading
+;		<30>	 11/1/90	dba		& stb; some misc. cleanup; fix bug where we were checking
+;									against the wrong value for the barrier; fix obscure error
+;									handling bug in NewPtrStartup; add NewPtrStartup for post-boot
+;									that returns an error; add an ellipsis on the end of long file
+;									names, instead of relying on smart code in the DSAT; put in the
+;									file name for all files opened outside the system file, not just
+;									for files with INIT resources
+;		<29>	10/31/90	dba		& csd; add code to load the 8•24 GC support code
+;		<28>	10/30/90	stb		& BBM; make booting safer and more predictable in low-memory
+;									conditions.
+;		<27>	10/22/90	JJ		Rex V8: Change all box flag references to use boxMacLC. Get rid
+;									of boxElsie and boxElsieV8.
+;		<26>	 10/1/90	dba		add innocuous value for location 0
+;		<25>	 9/25/90	SAM		Bumped highestBoxFlag to ElsieV8.
+;		<24>	 9/22/90	gbm		(with dba) change the routines that could kill ApplZone so that
+;									they do InitApplZone to get rid of the old contents
+;		<23>	 9/16/90	gbm		Fix detatching of system INITs. I don't think it ever worked...
+;		<22>	 9/10/90	dba		fix name copy bug
+;		<21>	 8/27/90	VL		(actually dba) set TheZone to SysZone when doing
+;									MakeSystemHeapGrowable since the application heap goes away.
+;		<20>	 8/10/90	dba		load A/ROSE and AppleTalk; this obsoletes INIT 18 and prevents
+;									the need for INIT 16
+;		<19>	  8/6/90	stb		add test for at least 1.5MB to make sure we can boot 7.0
+;		<18>	 7/20/90	dba		get rid of PTCH -1
+;		<17>	 6/22/90	dba		(with emt) move this code onto the stack to avoid fragmenting
+;									the system heap
+;		<16>	 6/11/90	EMT		Moved alternate trap dispatcher loading from patch files.
+;		<15>	 5/29/90	DDG		NEEDED FOR SIXPACK: Changed all the sixpack conditionals from
+;									six-point-oh-seven to six-point-oh-six.
+;		<14>	 5/11/90	PKE		NEEDED FOR SIXPACK: if this file is used for 6.0.6:
+;									Conditionalized early loading of script systems (see <9> and
+;									<13>) on SysVers >= $700. ALSO (for 7.0 only): Added call to new
+;									Script Mgr _AddScriptFonts routine after all INITs.
+;		<13>	  5/5/90	PKE		Added call to Script Mgr _InitScripts (new) after script system
+;									installation.
+;		<12>	 4/25/90	dba		change MMU check in LoadVM section (also add feature to load
+;									MacsBug before VM)
+;		<11>	 4/20/90	dba		check to see that the Shift key is the only key held down for
+;									Extensions Disabled
+;		<10>	 4/20/90	dba		close QD port much earlier; it isn’t doing anyone any good; do
+;									InitApplZone for each INIT file; rely on patch to SetAppBase to
+;									do InitApplZones
+;		 <9>	 4/19/90	dba		add support for Script Systems; increase system heap size
+;		 <8>	 4/19/90	dba		make StartupScreens and Disable Extensions work
+;		 <7>	 4/18/90	dba		change bsr.s to bsr (I will never check in w/o building)
+;		 <6>	 4/18/90	dba		change branch from pl to mi to fix MakeSysFree bug (INITs were
+;									not being loaded); restuff dirID to make setting of the noINITs
+;									bit work right
+;		 <5>	 4/17/90	dba		fix bug with InitApplZone stuff
+;		 <4>	 4/16/90	csd		save registers around calls to ptch and PTCH resources since
+;									they don’t obey the register saving conventions.
+;		 <3>	 4/11/90	dba		put dynamic system heap size code for the Plus and SE back here;
+;									do InitApplZone before each INIT, instead of after each
+;									MakeSysFree; detach ourselves so we can support remote booting
+;									closing the System file and opening a new one
+;		 <2>	 4/10/90	dba		fix bugs in MakeSysFree (wrong register d2 vs. d0 and possible
+;									error where size is odd)
+;		 <1>	  4/9/90	dba		new today
+;
+;	Change History from data fork of System file:
+;
+;		 <5>	 3/22/90	dba 	change name of LoadPatch to LoadLinkedPatches
+;		 <4>	 3/21/90	dba 	take out the lingering Debugger statement
+;		 <3>	 3/21/90	dba 	change to work with new boot blocks for 7.0
+;		 <2>	12/28/89	dba 	use MAIN instead of PROC to get dead code stripping; also get
+;									rid of wierd header that was required by a strange build rule in
+;									the old Make file; a corresponding change was made in
+;									SysObj.Make
+;	   <1.5>	11/17/89	dba 	got rid of checks for 64K ROMs
+;	   <1.4>	10/14/89	EMT 	Always load in RAM cache in system 7.
+;	   <1.3>	  6/5/89	EMT 	One more try.
+;	   <1.2>	  6/2/89	EMT 	Fixed coding errors in 1.1.
+;	   <1.1>	  6/1/89	EMT 	Removed ROM69 stuff. Bootstrap StripAddress if it doesn’t exist.
+;									Use StripAddress before executing 'PTCH's.
+;	   <1.0>	11/16/88	CCH 	Added to EASE.
+;	  <S174>	 4/10/87	bbm 	Save off the A5 world for the inits. (Some inits relied on
+;									CurrentA5 to be set up.)
+;	  <S145>	 3/27/87	bbm 	The algorithm that S115 used to grow the heap was to enlarge the
+;									heap by 16k or the size of the patch - whichever was bigger.
+;									What you really want is 16k free in addition to the size of the
+;									patch.
+;	  <S128>	 3/23/87	JTC 	On 64K ROMs be sure not to use nonexistent traps (such as
+;									SizeRsrc) or resize heap (since boot blocks are loaded at 64K).
+;	  <S115>	 3/19/87	JTC 	Ensure sufficient sys heap space before loading patches, using
+;									SizeResource to figure the local min. Then guarantee MinSysExtra
+;									space after loading last one. Code borrowed from INIT=31.
+;	  <S109>	 3/18/87	bbm 	Added the code for ‘PTCH $FFFF’. This enables general patches
+;									for all machines before the patches are read in by ‘PTCH 0’ and
+;									general patches after the patches are read in by ‘PTCH $FFFF’.
+;	  <S108>	 3/17/87	bbm 	For system heaps larger than 58k, rom69patch needed to move the
+;									boot code (the boot code is loaded in at $10000). Since the boot
+;									code has moved, the return address on the stack should be
+;									modified. If you change the nature of the stack — which rom69fix
+;									depends on - you must also modify rom69fix.a.
+;	  <P029>	 1/22/87	JTC 	JTC The above dates should surely be ‘86 and the res type is now
+;									'PTCH', despite the above comments. This change is to
+;									accommodate the new PTCH=0 patch file for all systems.
+;				11/20/86	BB		Changed resource type for patch files from 'PTCH' to 'ptch'.
+;				11/15/86	BB		New today.
+;
+;	Change History from INIT 31:
+;
+;		 <2>	 2/19/90	sad		<version 5>
+;									look into Extensions and Control Panels folders using Folder
+;									Mgr; use 1-deep resource calls instead of 64K ROM-compatible
+;									hacks; got rid of d7 hack for 64K ROMs; assures MinSysFree after
+;									last INIT file instead of before first
+;	   <1.4>	11/17/89	dba		got rid of checks for 64K ROMs
+;	   <1.3>	 6/19/89	CCH		Removed check for files of type 'mntr' from version 1.2.
+;	   <1.2>	 2/21/89	CCH 	Added 'mntr' type to list of files that contain INITs.
+;	   <1.1>	 1/17/89	CCH 	Merged changes from 6.0.3.
+;	   <1.0>	11/16/88	CCH 	Added to EASE.
+;	  <S424>	 3/15/88	DBG 	Prevent invisible INIT files from running
+;	  <S393>	 2/12/88	JRM 	Use fndrInfo bit to eliminate extra OpenResFiles. Set the bit if
+;									no INIT resources are found for a file. Check the bit before
+;									calling OpenResFile
+;	 <SB293>	 10/2/87	DAF 	Added an InitGraf before the InitPalettes so that all gDevices
+;									will be active.
+;	  <S285>	 9/21/87	DAF 	Changed the ROM85 test in s277 to test MacII or greater, rather
+;									than equal.
+;	  <S277>	 9/16/87	DAF 	Added InitPalettes here before INIT files are loaded. This
+;									causes the data structures to be allocated early rather than
+;									during the first init that calls _InitWindows.
+;	  <S173>	 4/10/87	JTC 	Fix CDEV to be cdev.
+;	  <S114>	 3/19/87	JTC 	Fix to get 16K min in sys heap even if no RDEV,INIT,CDEV files.
+;									Also, look for CDEV files too.
+;		<S9>	 2/14/87	JTC 	Call InitApplZone after SetApplBase to get initialation
+;									attendant thereto.
+;		<S6>	  1/5/87	JTC 	Add new resource 'sysz' comprising just one long word to request
+;									said amount of system heap space. Put code into inner loop of
+;									loading and executing INITs below to guarantee #MinSysExtra
+;									(borrowed from start code) free space at every execution.
+;				  8/4/86	DLD 	Converted source to MPW.
+;
+;		System 3.1
+;
+;				  2/8/86	JTC&LAK Fixed bug in patching return address into boot blocks after the
+;									boot blocks have been moved.  Also added a BCLR to assure that
+;									the half-way point in memory is even after the DIV by 2.
+;				  2/5/86	LAK 	Fixed bug for Shuffle: return address needs to be updated after
+;									stack move.
+;
+;		for InfoSphere
+;
+;				  1/7/86	LAK 	On old ROMs: if not called from $10000 space or BufPtr has been
+;									moved below MemTop/2 + 1K already then punt the normalization.
+;									Someone has probably already 'normalized' the world, hopefully
+;									correctly.
+;
+;		System Tools Disk for Plus
+;
+;				12/10/85	LAK 	Modified to look for files of both INIT and RDEV types.
+;				 12/6/85	ELR 	New Today
+;
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+; equates
+
+			load 'StandardEqu.d'
+			include 'MMUEqu.a'
+			include	'BootEqu.a'				;													<63>
+			include 'LinkedPatchMacros.a'	;													<64>
+			include	'ResourceMgrPriv.a'		; <76> Needed for mNext
+			
+bFInvisible 			equ 	7			; bit in ilFlUsrWds+fdFlags which means an invisible file
+
+kCPUGibblyFileType		equ		'gbly'		; Type of file containing boot code for CPU’s
+kGibblyResourceType		equ		'gbly'		; Resource type containing CPU information			<57>
+kGibblyResourceID		equ		-16385		; Resource ID of gibbly resource					<57>
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+StartSystem main
+
+; Registers passed in from boot blocks:
+;	A3 = handle to this resource
+;	A4 = dirID of the startup application (for pre-7.0 systems; used by the remote booting INIT)
+;	A5 = pointer to globals (SP + 400)
+;	A6 = pointer to boot blocks (used by the remote booting INIT)
+
+			move.l	a3,a0					; get the size of this boot code
+			_GetHandleSize
+			lea		@continue,a0			; copy from @continue to the end of the boot code
+			lea		StartSystem,a1
+			sub.l	a0,a1					; get StartSystem-@continue
+			add.l	a1,d0					; fix up size
+
+			sub.l	d0,sp					; make room on the stack
+			move.l	sp,a1					; copy onto the stack
+			_BlockMove						; move it up
+			jmp		(a1)					; pass control there
+@continue
+			move.l	a3,-(sp)				; get rid of the resource
+			_ReleaseResource				; and continue with booting as normal
+
+			move.l	ROMBase,a0				; point into a safe place in ROM
+			add.l	#$10000,a0				; 64K into the ROM is always safe
+			move.l	a0,0					; jam this nice value into location 0
+
+			move.l	sp,CurStackBase 		; MacsBug works better if CurStackBase is set up
+			move.l	a5,CurrentA5			; INITs like to have CurrentA5
+			clr.l	ResumeProc				; there is no ResumeProc before applications load
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+SetDefaults									;												<33><34>
+
+; Set the lower limit to bufPtr’s descent.
+;	This includes consideration for:
+;		boot globals
+;		sufficient room past the system heap for the process mgr heap (including the Finder)	<38>
+
+			lea		BootGlobals.lowestBufPtr(a5),a0	; the top of the boot globals
+			move.l	a0,BootGlobals.bufPtrLimit(a5)
+
+; Set the amount to reserve in the system heap for after booting.
+
+			move.l	#minSysHeapFreeAfterBoot,BootGlobals.reservedForAfterBoot(a5)	;			<34>
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+			bsr		MakeSystemHeapGrowable	; <71> Back from the dead for A/UX.
+			
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+HandOffBootProcess
+
+; <57> Look through the System, ROM, and CPU Gibblies for the newest startup code that
+; can boot this box, and pass the boot process off to it.
+
+			bsr		GetNewestStartupCode	; Find the newest startup code
+			jmp		(a0)					; And, pass it off.
+
+			; ——— End of boot arbitration ———
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+ApplZoneExists
+
+			move.l	ApplZone,d0
+			cmp.l	SysZone,d0
+			rts
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+MakeSystemHeapGrowable
+
+; Set things up so the system heap and the application heap are the same, so the system heap will
+; grow (this is only needed for the Plus and the SE, other ROMs do something like this already).
+
+			bsr.s	ApplZoneExists
+			beq.s	@noApplZone				; if no ApplZone exists, no need to kill it
+			_InitApplZone
+@noApplZone
+			move.l	SysZone,a0				; calculate a new minimum size for the heap			<28>
+			add.l	#initialSysHeapSize,a0	; make it big enough so it won’t need to grow much	<28>
+			bsr.s	PinSysHeapTop			; don’t go farther than we really can				<28>
+			_SetApplBase					; SetApplBase will never shrink the heap			<28>
+
+			move.l	SysZone,a0				; the one true heap
+			move.l	a0,ApplZone				; coincident heaps
+			move.l	a0,TheZone				; make it the current heap too
+			move.l	bkLim(a0),HeapEnd		; end of dynamic system/application heap
+			move.l	sp,a0					; find the stack
+			sub.l	DefltStack,a0			; keep room for the stack
+			sub.l	#minBootAppHeapSize,a0	; and the application heap
+			_SetApplLimit					; this is the highest we should grow
+			rts
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+PinSysHeapTop								;												<28><34>
+
+; Things above sysZone include the stack (which starts in the middle) and applZone (if any).
+; This is only called when SysZone is being made ApplZone so it can grow, so there is never
+; an ApplZone to worry about.  However, we do have to leave room so we can create one later.
+;
+; Other things above that include:  this code (on the stack), BufPtr, MemTop.
+;
+;	a0	->	where they think they want the top of heap
+;	a0	<-	where they get to put the top of the system heap
+;
+; Trashes a1
+;
+; To Do:
+;	Consider the case where the recommended top of the sysheap/bottom of the app heap is lower
+;	than the current top of the system heap.  Bad, but what should happen?  We can't cut into
+;	the stack or app heap sizes, can we?  Maybe we just stop trying to load inits because we
+;	ran out of room.  How would we get into this state, anyway?  Would it (could it) ever happen?
+
+			move.l	sp,a1
+			sub.l	DefltStack,a1							; leave room for the stack
+			sub.l	#minBootAppHeapSize,a1					; leave room for an app heap later	<34>
+			sub.l	BootGlobals.reservedForAfterBoot(a5),a1	; leave room for post-boot 			<34>
+
+			cmp.l	a0,a1
+			bhi.s	@ok
+			move.l	a1,a0
+@ok
+			rts
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+CloseTheFile
+
+; Close the current resource file.
+;
+; d4.W	->	file refnum
+; d4.W	<-	-1, indicating no file is open
+; Trashes d0/a0
+
+			cmp.w	#-1,d4
+			beq.s	@done
+			move	d4,-(sp)				; refNum of the open file
+			_CloseResFile
+			moveq	#-1,d4					; no file is open
+@done
+			rts
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+GetNewestStartupCode
+
+; <57> Look for 'gbly' resources in the System, ROM, and CPU Gibbly files and determine
+; which one has the latest boot code that can boot this machine.
+
+			movem.l	d6/d7,-(sp)				; D7 flags whether to display welcome DSAT messages; D6 holds the handle to the DSAT <68>
+
+; <76> We used to use the directory ID in a4 to search for Gibblies in.  This is the
+;		wrong place to search, so get the real dirID of the System Folder out of the
+;		master directory block.
+
+			moveq	#0,d7					; <76>
+			lea		BootGlobals.paramBlock(a5),a0	; <76> Get our IO block
+			clr.l	ioFileName(a0)			; <76> we don’t want the disk’s name
+			clr.w	ioVolIndex(a0)			; <76> use the vRefNum left over from MountVol
+			_HGetVInfo						; <76> see if there is a system folder
+			bnz.s	@gotSystemFolderDirID	; <76> if we fail, try with a dirID of 0
+			move.l	ioVFndrInfo(a0),d7		; <76> get the dirID of system folder
+
+@gotSystemFolderDirID
+			moveq	#-1,d6					; Keep count of how many bootable Gibblies are found
+			bsr		GetGibbly				; See if there’s a gibbly in the System file
+			bz.s	@noSystemGibbly
+			
+			bsr		CanThisGibblyBootThisMachine	; See if it knows about this machine
+			bmi.s	@noSystemGibbly			; If N flag is set, System gibbly is too old
+
+			moveq	#0,d6					; Got one gibbly
+			move.l	(a4),a0					; The System Gibbly knows how to boot this machine.
+			move.l	2(a0),-(sp)				; Remember time stamp
+			move.w	SysMap,-(sp)			; And the file it came from
+			move.l	a4,-(sp)				; <67>
+			_ReleaseResource				; <67> Done with the 'gbly' resource
+			
+@noSystemGibbly
+			move.w	#MapTrue,ROMMapInsert	; Look for a gibbly in ROM
+			bsr		GetGibbly				; Go fetch it
+			bz.s	@noROMGibbly
+
+			addq.l	#1,d6					; Got another one							<65>
+			move.l	(a4),a0					; Gibblies in ROM always know how to boot
+			move.l	2(a0),-(sp)				; the machine with the ROM, so don’t bother
+			move.w	#1,-(sp)				; checking if it can or not.
+			move.l	a4,-(sp)				; <67>
+			_ReleaseResource				; <67> Done with 'gbly' resource
+			
+@noROMGibbly
+
+; Now look for CPU Gibbly files in the root level of the System folder
+
+			lea 	BootGlobals.fileName(a5),a0		; store pointer to file’s name
+			move.l	a0,BootGlobals.paramBlock+ioFileName(a5)
+			clr.w	BootGlobals.paramBlock+ioFileType(a5)	; "version" and permissions
+
+			moveq	#0,d3					; start looping through the files
+@nextGibbly
+			addq.w	#1,d3					; increment the file index
+
+			lea 	BootGlobals.paramBlock(a5),a0	; point at IO block
+			clr.w	ioVRefNum(a0)			; <73> Search the default volume.  (At this stage, this is the boot volume.)
+			move	d3,ioFDirIndex(a0)
+			move.l	d7,ioDirID(a0)
+			_HGetFileInfo					; d3 file in the folder
+			bnz		@noMoreGibblies 		; no more files in the folder, stop loading
+
+			move.l	ioFlUsrWds+fdType(a0),d0	; grab file type for testing
+			cmp.l	#kCPUGibblyFileType,d0	; is this the type we’re looking for?
+			bne.s	@nextGibbly				; no, move along
+@goodFile
+			btst	#bFInvisible,ioFlUsrWds+fdFlags(a0)	; is it invisible?
+			bnz.s	@nextGibbly				; yes, skip it, since it may be evil
+
+			bsr		LoadGibbly				; Get the Gibbly out of this file
+			bra		@nextGibbly
+
+@noMoreGibblies
+
+; All usable gibblies and the file they came from are on the stack.  Search
+; through these gibblies for the newest one.
+
+			tst.l	d6
+			bpl.s	@thereAreGibblies		; <75> Gibblies that can boot this machine were found.  Pick the newest one.
+			
+; If there are no Gibblies that can boot this machine, set a bit in low memory, call
+; the 'boot' 3 in the System file, and let it display the System Too Old version.
+
+			bset	#systemEnabledBit,ExtensionsEnabledByte	; <75> Set this bit if no useable Gibblies could be found.
+			move.w	SysMap,d3				; <75> Fetch the 'boot' 3 from the System file
+			bra.s	@notROMGibbly			; <75> And let it show the error
+			
+@thereAreGibblies
+			bclr	#systemEnabledBit,ExtensionsEnabledByte	; Clear this bit if a useable Gibbly was found
+			moveq	#0,d2					; Initial time stamp value
+			moveq	#-1,d3					; Initial reference number
+@findNewestGibbly
+			move.w	(sp)+,d4				; Get resource reference number
+			move.l	(sp)+,d1				; Get gibbly time stamp
+			cmp.l	d1,d2					; Is this gibbly newer?
+			bhi.s	@releaseOlderGibbly		; <60> No.
+			
+			exg		d3,d4					; Switch handle’s resource map and one to close
+			move.l	d1,d2					; Remember the latest date to beat.
+@releaseOlderGibbly
+			cmp.w	SysMap,d4				; Don’t allow the System file to be closed
+			beq.s	@dontCloseSystemFile
+			bsr.s	CloseTheFile			; Close the resource file in D4
+@dontCloseSystemFile
+			dbra	d6,@findNewestGibbly	; Keep going until no more gibblies
+			
+; All old gibblies are closed off and gone away.  Get the 'boot' 3 resource from the
+; one remaining Gibbly file, and return it.
+
+			cmpi.w	#1,d3					; Check to see if the ROM has the newest gibbly
+			bne.s	@notROMGibbly
+			move.w	#MapTrue,ROMMapInsert	; If it is, turn on ROMMapInsert
+@notROMGibbly
+			move.w	d3,CurMap				; Make sure to get the right boot code.
+			subq	#4,sp
+			move.l	#'boot',-(sp)
+			move.w	#3,-(sp)				; Get 'boot' 3
+			_Get1Resource					; Get the boot code
+			move.l	(sp)+,d0				; Get the handle
+			bz.s	NoBootCode				; Uh oh!
+
+; <76> Move the Gibbly’s resource map underneath the system resource map so the Gibbly
+;		won’t get closed by RsrcZoneInit until it’s ready to be made into an override
+;		map.  Note that this code assumes that only two files are open at this time,
+;		the System, and the Gibbly.
+
+			move.w	SysMap,d1				; <76>
+			cmp.w	CurMap,d1				; <76> If there is no Gibbly, don’t do all this.
+			beq.s	@noExternalGibbly		; <76>
+			move.l	SysMapHndl,a0			; <76> Get the system resource map
+			move.l	(a0),a0					; <76>
+			move.l	TopMapHndl,a1			; <76> We assume that the Gibbly is at the top of the resource chain
+			move.l	(a1),a1					; <76>
+			move.l	mNext(a0),mNext(a1)		; <76> Put whatever’s after the system after the Gibbly
+			move.l	TopMapHndl,mNext(a0)	; <76> Put the Gibbly after the system
+			move.l	SysMapHndl,TopMapHndl	; <76> Put the system on top.
+@noExternalGibbly
+			move.l	d0,a3					; Boot code expects handle in A3 on entry
+			move.l	(a3),a0
+			
+			move.l	d7,a4					; Restore A4 boot volume directory
+			movem.l	(sp)+,d6/d7				; <68>
+			rts								; Let ’er rip.
+
+NoBootCode
+			moveq	#dsOldSystem,d0			; Report system too old if no boot could be found
+			_SysError						; Bombs away!
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+LoadGibbly
+
+; Get the 'gbly' resource from the CPU Gibbly file, and put it’s time stamp on the stack if it can boot
+; this machine
+;
+; a5	->	globals, including parameter block and file name storage
+; d7.L	->	folder type to look in, then folder dirID
+; d0.W	<-	error result
+; ResErr <-	error result
+;
+; d4.W	=	refnum of opened file
+;
+
+
+			bsr.s	OpenTheFile 			; go open the resource file
+			bnz.s	@skip					; skip file if bad open
+
+			bsr		GetGibbly
+			bz.s	@noGibbly 				; no gibbly, go on
+			bsr		CanThisGibblyBootThisMachine	; See if it knows about this machine
+			bmi.s	@noGibbly				; If N flag is set, System gibbly is too old
+			
+			move.l	(sp)+,a0				; Take off the return address before pushing the gibbly handle
+			addq.l	#1,d6					; Got another gibbly													<66>
+			move.l	(a4),a1
+			move.l	2(a1),-(sp)				; Remember the time stamp of the gibbly if it can boot this machine
+			move.w	d4,-(sp)				; And remember the file it came from
+			move.l	a0,-(sp)				; Push the return address back on
+			move.l	a4,-(sp)				; <67>
+			_ReleaseResource				; <67> We don’t need the 'gbly' resource around any more.
+			bra.s	@skip
+@noGibbly
+			bsr.s	CloseTheFile			; Close the Gibbly if it won’t be used
+@skip
+			rts
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+OpenTheFile
+
+; Open the current resource file with preloading off.
+;
+;	a5		->	globals, including file name at BootGlobals.fileName(a5)
+;	d7.L	->	parent directory id
+;	d4.W	<-	file refnum
+;	d0.W	<-	error result
+;	ResErr	<-	error result
+;
+; Trashes d0/a0
+
+			move.l	a1,-(sp)
+
+			clr.b	ResLoad 				; no preloads please
+			subq	#2,sp					; room for result
+			pea 	BootGlobals.fileName(a5)
+			_OpenResFile					; <59> _HOpenResFile doesn’t exist yet.
+			move	(sp)+,d4				; save the refnum
+			st		ResLoad 				; restore resLoad to proper state
+
+			move.l	(sp)+,a1
+			move.w	ResErr,d0
+			rts
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+GetGibbly
+
+; Get a 'gbly' resource from the current resource map.
+;
+; A4 <- Handle to 'gbly' resource
+; CCR	Z if didn’t find a 'gbly', z otherwise
+
+			subq	#4,sp
+			move.l	#kGibblyResourceType,-(sp)
+			move.w	#kGibblyResourceID,-(sp)
+			_Get1Resource					; Get the Gibbly
+			move.l	(sp)+,d0				; Get handle in d0 to set the condition code
+			move.l	d0,a4					; And get handle into A4
+			rts
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+CanThisGibblyBootThisMachine
+
+; See if a CPU gibbly can boot this machine.
+; 
+; A4 -> Handle to 'gbly' resource
+; D0 <- -1 = Can’t boot
+;		0+ = Can boot
+; A1	Hosed
+; D1	Hosed
+
+			move.l	(a4),a0					; Get pointer to resource
+			addq	#6,a0					; Point to boxflag count
+			move.w	(a0)+,d0				; Get count
+			subq	#1,d0					; Make count zero based for dbra
+			moveq	#0,d1
+			
+			move.l	ROMBase,a1				; <62>
+			cmp.w	#kROMVersionPlus,8(a1)	; <62> Plus ROM?
+			bne.s	@notPlus				; <62> No, get box value from BoxFlag
+			move.b	#boxPlus,d1				; <62> Otherwise, set it up ourselves
+			bra.s	@findBoxFlagInGibbly	; <62>
+
+@notPlus
+			move.b	BoxFlag,d1				; Get BoxFlag into a register
+@findBoxFlagInGibbly
+			cmp.w	(a0)+,d1				; Compare a boxflag from the Gibbly against BoxFlag
+			dbeq	d0,@findBoxFlagInGibbly	; If not equal, keep looking
+@gibblyCanBoot
+			tst.w	d0						; Set the condition code
+			rts
+			ENDP
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+
+			end

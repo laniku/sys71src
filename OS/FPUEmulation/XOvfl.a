@@ -1,0 +1,231 @@
+;
+;	File:		XOvfl.a
+;
+;	Contains:	Routines to handle the FP Overflow exception
+;
+;	Originally Written by:	Motorola Inc.
+;	Adapted to Apple/MPW:	Jon Okada
+;
+;	Copyright:	© 1990, 1991 by Apple Computer, Inc., all rights reserved.
+;
+;   This file is used in these builds:   Mac32
+;
+;	Change History (most recent first):
+;
+;		<2+>	 6/24/91	BG		Force vectoring to user INEX handler for OVFL if
+;							OVFL is not enabled but INEX2 is enabled (per
+;							Motorola release 2.0).
+;		 <2>	 3/30/91	BG		Rolling in Jon Okada's latest changes.
+;		 <1>	12/14/90	BG		First checked into TERROR/BBS.
+
+;  xovfl.a
+
+;  Based upon Motorola file 'x_ovfl.sa'.
+
+;  CHANGE LOG:
+;  08 Jan 91	JPO	Inserted label "ovfl" at top of code.  Deleted
+;			  label "take_inex" (not referenced).  Renamed
+;			  labels "no_e3_1", "ck_inex", "no_e3_2", "e1_set",
+;			  and "not_opc011" to "ofno_e3_1", "ofck_inex",
+;			  "ofno_e3_2", "ofe1_set", and "ofnot_opc011",
+;			  respectively.  Modified code to branch to user
+;			  handlers for OVFL and INEX.  Changed "bra fpsp_done"
+;			  to "rte".
+;  04 Mar 91	JPO	Changed source of destination registers from CMDREG1B
+;			  to CMDREG3B for E3 exceptions.
+;  10 Jun 91	JPO	Force vectoring to user INEX handler for OVFL if
+;			  OVFL is not enabled but INEX2 is enabled (per
+;			  Motorola release 2.0).
+;
+
+*
+*	x_ovfl.sa 3.1 12/10/90
+*
+*	fpsp_ovfl --- FPSP handler for overflow exception
+*
+*	Overflow occurs when a floating-point intermediate result is
+*	too large to be represented in a floating-point data register,
+*	or when storing to memory, the contents of a floating-point
+*	data register are too large to be represented in the
+*	destination format.
+*		
+* Trap disabled results
+*
+* If the instruction is move_out, then garbage is stored in the
+* destination.  If the instruction is not move_out, then the
+* destination is not affected.  For 68881 compatibility, the
+* following values should be stored at the destination, based
+* on the current rounding mode:
+*
+*  RN	Infinity with the sign of the intermediate result.
+*  RZ	Largest magnitude number, with the sign of the
+*	intermediate result.
+*  RM   For pos overflow, the largest pos number. For neg overflow,
+*	-infinity
+*  RP   For pos overflow, +infinity. For neg overflow, the largest
+*	neg number
+*
+* Trap enabled results
+* All trap disabled code applies.  In addition the exceptional
+* operand needs to be made available to the users exception handler
+* with a bias of $6000 subtracted from the exponent.
+*
+*
+
+*		Copyright (C) Motorola, Inc. 1990
+*			All Rights Reserved
+*
+*	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA 
+*	The copyright notice above does not evidence any  
+*	actual or intended publication of such source code.
+
+* X_OVFL	IDNT    2,1 Motorola 040 Floating Point Software Package
+
+
+ovfl:					; <1/8/91, JPO>
+fpsp_ovfl:
+	link	a6,#-LOCAL_SIZE
+	fsave	-(a7)
+	movem.l	d0-d1/a0-a1,USER_DA(a6)
+	fmovem.x fp0-fp3,USER_FP0(a6)
+	fmovem.l fpcr/fpsr/fpiar,USER_FPCR(a6)
+*
+*	The 040 doesn't set the AINEX bit in the FPSR, the following
+*	line temporarily rectifies this error.
+*
+	bset.b	#ainex_bit,FPSR_AEXCEPT(a6)
+*
+	bsr	ovf_adj		;denormalize, round & store interm op
+*
+*	if overflow traps not enabled check for inexact exception
+*
+	btst.b	#ovfl_bit,FPCR_ENABLE(a6)
+	beq.b	ofck_inex		; label renamed <1/8/91, JPO>
+*
+	btst.b	#E3,E_BYTE(a6)
+	beq.b	ofno_e3_1		; label renamed <1/8/91, JPO>
+;	bfextu	CMDREG1B(a6){6:3},d0	;get dest reg no - DELETED <3/4/91, JPO>
+	bfextu	CMDREG3B(a6){6:3},d0	;get dest reg no <3/4/91, JPO>
+	bclr.b	d0,FPR_DIRTY_BITS(a6)	;clr dest dirty bit
+	bsr	b1238_fix
+	move.l	USER_FPSR(a6),FPSR_SHADOW(a6)
+	or.l	#sx_mask,E_BYTE(a6)
+ofno_e3_1:				; label renamed <1/8/91, JPO>
+	movem.l	USER_DA(a6),d0-d1/a0-a1
+	fmovem.x USER_FP0(a6),fp0-fp3
+	fmovem.l USER_FPCR(a6),fpcr/fpsr/fpiar
+	frestore (a7)+
+	unlk	a6
+;	bra.l	real_ovfl		; deleted <1/8/91, JPO>
+
+	move.l	(FPOVFL_VEC040).W,-(sp)	; push vector to user OVFL handler <1/8/91, JPO>
+	rts				; execute user handler <1/8/91, JPO>
+
+*
+* It is possible to have either inex2 or inex1 exceptions with the
+* ovfl.  If the inex enable bit is set in the FPCR, and either
+* inex2 or inex1 occured, we must clean up and branch to the
+* real inex handler.
+*
+;
+; Enabled INEX2 trap must occur for overflow if ovfl is not enabled <6/10/91, JPO>
+;
+ofck_inex:				; label renamed <1/8/91, JPO>
+;	move.b	FPCR_ENABLE(a6),d0	; DELETED <6/10/91, JPO>					<T3>
+;	and.b	FPSR_EXCEPT(a6),d0	; DELETED <6/10/91, JPO>					<T3>
+;	andi.b	#$3,d0			; DELETED <6/10/91, JPO>					<T3>
+	btst.b	#inex2_bit,FPCR_ENABLE(a6); added <6/10/91, JPO>					<T3>
+	beq.b	ovfl_exit
+*
+* Inexact enabled and reported, and we must take an inexact exception.
+*
+;take_inex:				; label deleted <1/8/91, JPO>
+	btst.b	#E3,E_BYTE(a6)
+	beq.b	ofno_e3_2		; label renamed <1/8/91, JPO>
+;	bfextu	CMDREG1B(a6){6:3},d0	;get dest reg no - DELETED <3/4/91, JPO>
+	bfextu	CMDREG3B(a6){6:3},d0	;get dest reg no <3/4/91, JPO>
+	bclr.b	d0,FPR_DIRTY_BITS(a6)	;clr dest dirty bit
+	bsr	b1238_fix
+	move.l	USER_FPSR(a6),FPSR_SHADOW(a6)
+	or.l	#sx_mask,E_BYTE(a6)
+ofno_e3_2:					; label renamed <1/8/91, JPO>
+	move.b	#INEX_VEC,EXC_VEC+1(a6)
+	movem.l	USER_DA(a6),d0-d1/a0-a1
+	fmovem.x USER_FP0(a6),fp0-fp3
+	fmovem.l USER_FPCR(a6),fpcr/fpsr/fpiar
+	frestore (a7)+
+	unlk	a6
+;	bra.l	real_inex			; deleted <1/8/91, JPO>
+
+	move.l	($00C4).W,-(sp)			; push vector to user INEX handler <1/8/91, JPO>
+	rts					; execute user handler <1/8/91, JPO>
+	
+ovfl_exit:
+	bclr.b	#E3,E_BYTE(a6)		;test and clear E3 bit
+	beq.b	ofe1_set		; label renamed <1/8/91, JPO>
+*
+* Clear dirty bit on dest register in the frame before branching
+* to b1238_fix.
+*
+;	bfextu	CMDREG1B(a6){6:3},d0	;get dest reg no - DELETED <3/4/91, JPO>
+	bfextu	CMDREG3B(a6){6:3},d0	;get dest reg no <3/4/91, JPO>
+	bclr.b	d0,FPR_DIRTY_BITS(a6)	;clr dest dirty bit
+	bsr	b1238_fix		;test for bug1238 case
+
+	move.l	USER_FPSR(a6),FPSR_SHADOW(a6)
+	or.l	#sx_mask,E_BYTE(a6)
+	movem.l	USER_DA(a6),d0-d1/a0-a1
+	fmovem.x USER_FP0(a6),fp0-fp3
+	fmovem.l USER_FPCR(a6),fpcr/fpsr/fpiar
+	frestore (a7)+
+	unlk	a6
+;	bra.l	fpsp_done		; deleted <1/8/91, JPO>
+
+	rte				; <1/8/91, JPO>
+
+ofe1_set:				; label renamed <1/8/91, JPO>
+	movem.l	USER_DA(a6),d0-d1/a0-a1
+	fmovem.x USER_FP0(a6),fp0-fp3
+	fmovem.l USER_FPCR(a6),fpcr/fpsr/fpiar
+	unlk	a6
+;	bra.l	fpsp_done		; deleted <1/8/91, JPO>
+
+	rte				; <1/8/91, JPO>
+
+*
+*	ovf_adj
+*
+ovf_adj:
+*
+* Have a0 point to the correct operand. 
+*
+	btst.b	#E3,E_BYTE(a6)	;test E3 bit
+	beq.b	ovf_e1
+
+	lea	WBTEMP(a6),a0
+	bra.b	ovf_com
+ovf_e1:
+	lea	ETEMP(a6),a0
+
+ovf_com:
+	bclr.b	#sign_bit,LOCAL_EX(a0)
+	sne	LOCAL_SGN(a0)
+
+	bsr	g_opcls		;returns opclass in d0
+	cmpi.w	#3,d0		;check for opclass3
+	bne.b	ofnot_opc011	; label renamed <1/8/91, JPO>
+
+*
+* FPSR_CC is saved and restored because ovf_r_x3 affects it. The
+* CCs are defined to be 'not affected' for the opclass3 instruction.
+*
+	move.b	FPSR_CC(a6),L_SCR1(a6)
+ 	bsr	ovf_r_x3	;returns a0 pointing to result
+	move.b	L_SCR1(a6),FPSR_CC(a6)
+	bra	store		;stores to memory or register
+	
+ofnot_opc011:			; label renamed <1/8/91, JPO>
+	bsr	ovf_r_x2	;returns a0 pointing to result
+	bra	store		;stores to memory or register
+
+

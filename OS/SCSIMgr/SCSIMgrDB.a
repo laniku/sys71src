@@ -1,0 +1,265 @@
+;
+;	File:		SCSIMgrDB.a
+;
+;	Contains:	DB Lite SCSI Manager c80 routines
+;
+;	Written by:	James Blair
+;
+;	Copyright:	© 1992, 1994 by Apple Computer, Inc.  All rights reserved.
+;
+;   This file is used in these builds:   ROM
+;
+;	Change History (most recent first):
+;
+;	   <SM3>	 1/26/94	rab		Removed padForOverpatch stuff from the end of this file
+;									(SuperMario does not use it…).
+;	   <SM2>	   9/1/93	SKH		Rolled in changes from Horror
+;	   <SM1>	  2/5/93	CSS		Checkin from Horror.
+;		<H3>	 6/25/92	SWC		jab/Change to fix bus failed arbitration recovery bug. Changed
+;									the algorithm to try the external bus if arbitration fails on
+;									the first access to the internal bus (diskless DB Lite). There
+;									is still the problem as to why arbitration fails when no devices
+;									are attached.
+;		<H2>	  3/3/92	SWC		Added overpatch padding.
+;		<H1>	 2/10/92	SWC		jab/Added dual SCSI bus code for DBLite to HORROR.
+;
+
+
+			MACHINE		MC68020			; '020-level
+			BLANKS		ON				; assembler accepts spaces & tabs in operand field
+			STRING		ASIS			; generate string as specified
+			PRINT		OFF				; do not send subsequent lines to the listing file
+										;	don't print includes
+
+	IF (&TYPE('dbugSCSIDB') = 'UNDEFINED') THEN
+dbugSCSIDB	EQU		0					; for debugging purposes (builds an INIT if set)
+	ENDIF
+
+
+			LOAD		'StandardEqu.d'			; from StandardEqu.a and for building ROMs
+			INCLUDE		'HardwareEqu.a'																	
+			INCLUDE		'SCSI.a'				; <SM1> CSS
+			INCLUDE 	'SCSIPriv.a'
+			INCLUDE		'SCSIEqu96.a'
+			INCLUDE		'UniversalEqu.a'		; for TestFor											
+
+			PRINT		ON						; do send subsequent lines to the listing files
+			
+SCSIDB		PROC		EXPORT	
+
+			EXPORT	DoSCSIReset_DB, SCSIMgr_DB, DoSCSIGet_DB												
+			EXPORT	DoSCSISelect_Dc80																	
+
+			IMPORT	SCSIExitCleanup, SCSIStdExit, Select, Arbitrate, NoByteExit					
+			
+			WITH	scsiPB, scsiPrivPB 				; access record without explicit qualification
+			WITH	scsiGlobalRecord, dcInstr
+			WITH	ExpandMemRec					; For File System hook
+			WITH	PmgrRec,SleepqRec,pmCommandRec
+
+;==========================================================================
+
+SCSIMgr_DB
+
+;--------------------------------------------------------------------------
+;
+;	FUNCTION SCSIReset: INTEGER;
+;						(8)
+;
+;	If we have two scsi buses, hard reset both since the interface does not provide a					
+;	way for the client to specify a target bus in a dual-SCSI bus system.								
+;
+; Uses: a0,a3
+;
+; Input:
+; 	d0 -> copy of trap selector
+; 	a3 -> base address of targetted controller
+; 	a4 -> SCSIGlobals pointer
+;
+; Return Codes:
+;		noErr
+
+DoSCSIReset_DB								
+			move.l	a0, -(sp)				; save a0												
+			move.l	base5380_1(a4), a3		; load ptr for SBus0										
+			movea.l	jvResetBus(a4), a0		; get address of SCSI reset routine							
+			jsr		(a0)					; reset SCSI bus and kill all requests						
+			bsr.l	SCSIExitCleanup			; clean up to leave							
+
+			move.l	base5380_2(a4), d0		; is the external SCSI chip base address valid?
+			beq.s	@noSCSIc80_2			; -> no, nothing to reset
+			movea.l	d0,a3					; load ptr for SBus1										
+			movea.l	jvResetBus(a4), a0		; get address of SCSI reset routine							
+			jsr		(a0)					; reset SCSI bus and kill all requests						
+			bsr.l	SCSIExitCleanup			; clean up to leave								
+@noSCSIc80_2
+			move.l	(sp)+, a0				; restore a0
+			move.w	zeroReg, 8(a6)			; always returns 0 status
+
+			moveq.l	#0, d0					; no arguments to clean up
+			bra.l 	SCSIStdExit
+			
+
+;--------------------------------------------------------------------------
+;
+;	FUNCTION SCSIGet: INTEGER;
+;						(8)
+;
+;	Arbitrate for the SCSI bus. Returns 0 for success, or error.
+;
+
+DoSCSIGet_DB
+			bset.b	#scBusy,G_State(a4)			; wait for the free state					
+			bne.s	@wasBusy					; if nonzero, SCSI Mgr was in use			
+
+			move.w	sr,-(sp)					; hold onto status register
+			ori.w	#HiIntMask,sr				; lock out interrupts during critical section
+			move.w	(sp),d0						; get original status register contents
+			andi.w	#HiIntMask,d0				; mask out all but the interrupt level bits
+			beq.s	@enqueueDummy				; not at interrupt level, so continue normally
+			tst.l	scsiQHead(a4)				; is the queue currently empty ?
+			beq.s	@enqueueDummy				; if so, we'll be at the front
+
+@notFirst
+			move.w	(sp)+,sr					; restore interrupt level					
+@wasBusy
+			moveq.l	#scMgrBusyErr,d0			; pretend SCSI Mgr was not free				
+			bra.s	@exit						; bail out in order to avoid deadlock		
+
+@enqueueDummy
+			lea.l	dummy(a4),a1				; point to placeholder SCSI request
+			moveq.l	#enqNormal,d0				; normal enqueue call
+			movea.l	jvEnDequeue(a4),a0			; addr of enqueue/dequeue routine
+			jsr		(a0)						; stick the placeholder in the queue
+			move.w	(sp)+,sr					; restore interrupt level
+@wait
+			cmpa.l	scsiQHead(a4),a1			; are we on the front of the queue ?
+			bne.s	@wait						; if so, keep waiting
+@arbitrate
+			move.l	zeroReg,d0					; disable SCSI interrupts with old SCSI Mgr	
+												
+			movea.l	jvDisEnable(a4),a0			
+			jsr		(a0)						
+												
+		If isUniversal Then
+			TestFor	hwCbPwrMgr					; do we have a power manager?
+			beq.s	@nopmgr
+		Endif
+
+;	This portion of code freezes the "Spin Down" timer for the hard disk, preventing
+;	the Power Mgr from cutting hard disk power during ANY SCSI transaction.
+
+			movea.l	PmgrBase,a0						; point to Pmgr locals
+			move.l	zeroReg,LastHd(a0)				; always freeze the spin down timer
+			bset.b	#HDPowerOn,PmgrFlags(a0)		; set flag indicating drive is now spun up	<t11> djw
+			bne.s	@nopmgr							; drive already spun up - skip PmgrOp call	<t11> djw
+
+@startItUp											; power up the hard drive
+			link	a6,#-14							; Power Mgr task, and 2-byte buffer
+			lea.l	-14(a6),a0						; point to the parameter block
+			move.w	#powerCntl,pmCommand(a0)		; power up the SCSI +5V and +12V
+			move.w	#1,pmLength(a0)					; one byte of data in buffer
+			move.w	#hdOn*256,-2(a6)				; hdOn command
+			pea.l	-2(a6)							; address of the send buffer
+			move.l	(sp)+,pmSBuffer(a0)				; save the send buffer pointer
+			move.l	zeroReg,pmRBuffer(a0)			; no data to be received
+			_PmgrOp									; send it off to the Power Mgr
+			unlk	a6								; release local storage
+@nopmgr
+
+@exit
+			move.w	d0,8(a6)					; return code
+			bra.l	NoByteExit
+
+
+
+;--------------------------------------------------------------------------
+;
+;	FUNCTION SCSISelect(TargID:INTEGER): INTEGER;
+;	FUNCTION SCSISelAtn(TargID:INTEGER): INTEGER;	<A370/07Nov86>
+;						  (8) 			   (10)
+;
+;	Select the target on the bus. Returns 0 for success, or error.
+;	Selection can be done with or without the ATN line.
+
+DoSCSISelect_Dc80
+DoSCSISelAtn_Dc80
+
+			bset.b	#scBusy,G_State(a4)			; make sure we are marked busy (for dudes who bypass SCSIGet)
+
+			moveq.l	#0,d0						; clear upper bits							
+			move.w	8(a6),d0					; get the target's ID 
+			cmp.w	#scsiSelAtn, d1				; select with ATN?	
+			bne.s	@noATN						; no ATN	
+;@wATN
+			bset.l	#31, d0						; use ATN
+@noATN
+			move.l	d0, G_TargetID(a4)			; remember destination ID & ATN bit				
+
+			move.l	d0,d6						; make a copy
+			btst.b	d0, G_SCSIDevMap1(a4)		; if this device is marked as on bus 1...			
+			bne.s	@SBus1						; then try select on bus 1
+			
+@SBus0											; else try select on bus 0	
+			move.l	base5380_1(a4),a3			; base address of the internal c80 bus
+			move.l	a3,base5380(a4)				; expected SCSI base adrs for this ID for SCSIRead/Write/Complete etc.
+			move.l	pdma5380_1(a4),pdma5380(a4)	; load SCSI base 1
+			move.l	hhsk5380_1(a4),hhsk5380(a4)	; load SCSI base 1
+			bsr.l 	Arbitrate
+			beq.s	@arbsucc_1					; branch if no error
+@arberr_1
+			btst.b	d0,G_SCSIDevMap0(a4)		; check if device was supposed to be on this bus	<H3>
+			beq.s	@SBus1						; no, so try other bus (this one may be hung)		<H3>
+			move.l	d0,-(sp)					; save d0
+			bsr.l	SCSIExitCleanUp				; clean up to leave							
+			move.l	(sp)+,d0					; restore d0
+			bra.s	@exit						; if we fail here we may have to try external bus 			
+@arbsucc_1
+			move.l	d6,d0 						; restore destination ID & ATN bit				
+			bsr.l 	Select						; try it
+			bne.s	@fldSel0					; branch if select failed
+			bset.b	d0, G_SCSIDevMap0(a4)		; else record this device's existence
+			bra.s	@exit	
+@fldSel0
+			btst.b	d0, G_SCSIDevMap0(a4)		; if this device was marked as on bus 0
+			bne.s	@error						; then we return an error							<H3>
+												; else we try bus 1
+
+@SBus1
+			move.l	base5380_2(a4),d2			; is the external SCSI chip base address valid?
+			beq.s	@NoSCSIBus2					; -> no, cleanup and bail
+			movea.l	d2,a3						; base address of the external c80 bus
+			move.l	a3,base5380(a4)				; expected SCSI base adrs for this ID for SCSIRead/Write/Complete etc.
+			move.l	pdma5380_2(a4),pdma5380(a4)	; load SCSI base 2
+			move.l	hhsk5380_2(a4),hhsk5380(a4)	; load SCSI base 2
+			bsr.l 	Arbitrate
+			beq.s	@arbsucc_2					; branch if no error
+@arberr_2
+			move.l	d0,-(sp)					; save d0
+			bsr.l	SCSIExitCleanUp				; clean up to leave							
+			move.l	(sp)+,d0					; restore d0
+			bra.s	@exit
+@arbsucc_2
+			move.l	d6,d0 						; restore destination ID & ATN bit				
+			bsr.l	Select						; try it
+			bne.s	@error						; branch if select failed
+			bset.b	d6,G_SCSIDevMap1(a4)		; else record this device's existence
+			bra.s	@exit
+@error
+			move.l	d0,-(sp)					; save d0
+			bsr.l	SCSIExitCleanUp				; clean up to leave							
+			move.l	(sp)+,d0					; restore d0
+@exit
+			move.w	d0,10(a6)					; return the result
+			moveq.l	#2,d0						; stack cleanup
+			bra.l 	SCSIStdExit
+
+@NoSCSIBus2	CLR.B	G_SCSIDevMap1(a4)			; no external SCSI bus, so show no devices
+			MOVEQ	#scCommErr,D0				; return a communications error
+			BRA.S	@error						; exit												<H3>
+
+
+
+		ENDWITH
+
+		END 

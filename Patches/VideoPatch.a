@@ -1,0 +1,1228 @@
+;
+;	File:		VideoPatch.a
+;
+;	Contains:	Patches to fix problems in various Apple Video Drivers.
+;
+;	Written by:	George Norman, Dave Fung, Mike Puckett.
+;
+;	Copyright:	© 1987-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	 5/16/92	kc		Include ROMEqu instead of ROMPrivateEqu.
+;		 <9>	  1/8/92	RB		Removed definition of drHwJMFB, since it is now in ROMEqu.a
+;		 <8>	12/31/91	RB		Removed definition of DAFB_PgMdEn, it is now in
+;									HardwarePrivateEqu.a
+;		 <7>	 12/2/91	SAM		Using official boxflag equates now.
+;		 <6>	10/28/91	SAM/KSM	Rolled in Regatta file.
+;
+;	Regatta change history:
+;
+;		<10>	 10/2/91	SAM		(jmp) Fixed a problem when looking at gDevices that don’t
+;									actually contain associated video drivers.
+;		 <9>	 8/25/91	SAM		(jmp) Put the DAFB/JMFB WITH statements around the DAFB/JMFB
+;									code.  The reason I had to do this is because the DAFB equates
+;									have similar names as the TFB equates and this was causing
+;									incorrect code to be generated in the TFB part of this patch.
+;		 <8>	 8/21/91	SAM		(jmp) Code Review Changes:  1) Removed the unnecessary saves &
+;									restores of register D0 after & before calling SwapMMUMode,
+;									respectively, and 2) changed the slot searching from 9 to 0 in
+;									both the TFB & JMFB fixes for slot expansion boxes.
+;		 <7>	 8/19/91	SAM		(jmp) Added support for the Bungee (1.1) version of the 4•8/
+;									8•24 Card ROM for TERROR ROM CPUs.
+;		 <6>	 8/15/91	SAM		(jmp) Fixed a problem with the DAFB sRsrc patches where I was
+;									not updating the driver privates correctly.
+;		 <5>	  8/8/91	SAM		(jmp) Added two “patches” for DAFB built-in video. The first one
+;									just enables PageMode, while the second fixes a problem with NTSC
+;									and PAL sRsrcs when going from 2 Megs of VRam to 1 Meg of VRam
+;									across reboots.
+;		 <4>	 7/30/91	SAM		Removed redefinition of drHwDAFB.
+;		 <3>	 7/29/91	SAM		(jmp) Added code to check for Zydeco ROM and to skip the boxflag
+;									check for Spike & Eclipse that corrects a 16bpp capable sRsrc on
+;									those machines.
+;		 <2>	 7/18/91	SAM		(jmp) Video SResoure stuff.
+;		 <1>	 7/18/91	SAM		Split off from 7.0 GM sources.
+;
+;	7.0 Change History:
+;
+;		 <5>	 11/8/90	jmp		Removed a debugger statement I accidently left in.
+;		 <4>	 11/6/90	jmp		Renamed DepVideoEqu.a to TFBDepVideoEqu.a; had to change INCLUDE
+;									name.
+;		 <3>	 11/2/90	jmp		For 6.0.X and 7.0 builds: Fixed version comparison problem (word
+;									instead of byte alignment), and updated version number from
+;									DepVideoEqu.a.
+;		 <2>	 7/11/90	gbm		add align, so assembler is happy
+;	   <1.6>	11/28/89	DAF		FOR 6.0.5 and 7.0 BUILDS - Somehow, the 1.5 version change
+;									didn't stick, so I once again updated the CurrentVersion equate
+;									to version 4 to match the latest version of the driver in this
+;									build
+;	   <1.5>	11/27/89	DAF		FOR 6.0.5 AND 7.0 BUILDS - Updated file to latest TFBDrvr
+;									version number.
+;	   <1.5>	11/27/89	DAF		Updated the version.
+;	   <1.4>	 8/14/89	DAF		FOR 6.0.4 BUILD - Fixed a register clearing problem. Also made
+;									the label names local to avoid conflicts in the patch files.
+;	   <1.3>	  8/6/89	DAF		FOR 6.0.4 BUILD - This version of VidInit (included in
+;									PatchIIROM.a and PatchIIciROM.a) properly deallocates the slot
+;									interrupt queue element when it does it's voodoo on the startup
+;									TFB driver.
+;	   <1.2>	  5/3/89	GGD		TFBDrvr v3 fixes an inverted gamma table problem. This fix
+;									corrects the problem if the TFB is the boot device. (DAF under
+;									the initials of GGD)
+;	   <1.1>	  5/2/89	DAF		Changed video driver version to 3 for the new TFB release
+;	   <1.0>	11/16/88	CCH		Added to EASE.
+;	  <S376>	 1/31/88	DAF		Updated driver version number for test
+;	  <S237>	 9/15/87	DAF		Cleared the high half of a register to guarantee unit table code
+;									works OK under adverse conditions
+;
+;	To Do:
+;
+
+;------------------------------------------------------------------------
+;
+; Copyright Apple Computer, Inc. 1987
+; All Rights Reserved
+;
+;------------------------------------------------------------------------
+;
+;	File   		: VideoPatch.a
+;
+;	Author 		: George Norman, February 16, 1987
+;	Converted into system patch and integrated into system disk build : David Fung, 19 Aug 1987
+;
+;	This code scans the graphics DeviceList, testing all open video drivers
+;	  against a video driver in the system file.  If the disk version is 
+;	  newer, then the slot driver is closed and the system driver is opened
+;	  in its place.  This patch works in conjunction with changes to the
+;	  Open routine for slot drivers so that only the boot device will
+;	  be operated on by the code.  This mechanism allows Apple to place
+;	  newer versions of the driver in the system file without nasty side
+;	  effects.  Third party vendors should perform this override from an
+;	  INIT 31 file.
+;
+;   <Since 1.3 this Bug note is purely historical.  See comment below>
+;   Bug note: The ROM version of the TFBDrvr has a bug in the Close routine, where it 
+;	  neglects to set the slot number in D0 when calling _SIntRemove.  This leaves a 
+;	  pointer to a disposed block in the slot interrupt queue element when the code
+;	  in this file is executed on the boot video device.  When the RAM driver is re-opened
+;	  a new, correct queue element is built and installed ahead of the disposed one.
+;	  The dead element will not cause any problems, but should be corrected in future
+;	  video ROMs.  The override driver is corrected and all future close calls should work
+;	  OK.  This problem could be fixed here, but it involves brutally clobbering the
+;	  dead queue element, since the ROM close must be executed, and the pointer block
+;	  is disposed within the call.  Since the bug is fairly benevolent, we'll let it 
+;	  go.
+;
+;	1.3 Bug Update : Turns out that the _SIntRemove bug is NOT a big deal to fix.  In
+;	  addition, it seemed that it could possibly cause problems if the SetInterrupt
+;	  routine was used (it can cause multiple queue elements that point to the same
+;	  handler), so I corrected the problem here.
+;
+;------------------------------------------------------------------------
+				
+				INCLUDE	'TFBDepVideoEqu.a'			; To get current TFB Driver version.
+				Include	'InternalOnlyEqu.a'			; To get boxFlags for Spike & Eclipse.
+				Include 'VideoEqu.a'				; Various video-related equates.
+				Include	'ROMEqu.a'					; Various DAFB equates.
+
+;-------------------------------------------------------------------
+;	Local Vars, definitions, etc....
+;-------------------------------------------------------------------
+
+; This is device storage which is stored in the dCtlStorage field of the DCE (for TFB).
+
+DCEPtr						EQU		0				; pointer to our DCE
+saveMode					EQU		DCEPtr+4		; the current mode setting
+savePage					EQU		saveMode+2		; the current page setting
+saveBaseAddr 				EQU		savePage+2		; the current base address
+saveSQElPtr 				EQU		saveBaseAddr+4	; the SQ element pointer (for _SIntRemove).		<C497>
+GammaPtr 					EQU		saveSQElPtr+4	; the pointer to the Gamma correction table		<C522> DAF
+GFlags						EQU		GammaPtr+4		; flags word
+VRAM256K					EQU		GFlags+2		; boolean - TRUE if 256K vidRAM, FALSE if 512K	<C804> DAF
+dCtlSize					EQU		VRAM256K+2		; size of dCtlStorage							<C497>
+
+; These equates have been extracted directly from the TERROR ROM project (for DAFB).
+
+DAFBVidPrivates				RECORD	0				; Similar to the TFB privates above, but for DAFB.
+saveBaseAddr 				DS.L	1				; the screen base address (NOT ST corrected!)
+saveScreenBase				DS.L	1				; ST corrected version of saveBaseAddr.
+saveSQElPtr 				DS.L	1				; the SQ element pointer (for _SIntRemove)
+saveGammaPtr 				DS.L	1				; the pointer to the Gamma correction table
+saveGamDispPtr				DS.L	1				; the pointer to the Gamma block
+saveVDACBase				DS.L	1				; the base addr of the VDAC
+saveDAFBBase				DS.L	1				; the base addr of the DAFB
+saveVidPtr					DS.L	1				; pointer to a big block of DAFB video parameters
+GFlags						DS.W	1				; flags word
+has16bppACDC				Ds.b	1				; true if AC842A is around
+pageModeSet					Ds.b	1				; true if the pRam PageMode enable bit is set
+saveMode					DS.W	1				; the current mode setting
+saveMonID					DS.W	1				; monitor type ID
+saveSlotId					DS.W	1				; spID of video sRsrc (hi-order byte only!)
+DAFBVidPrivSize				EQU		*
+							ENDR
+
+sRsrc_Vid_DAFB_NTSCSTa		EQU		$D0				; NTSC ST 1,2,4,8
+sRsrc_Vid_DAFB_NTSCSTb		EQU		$D1				; NTSC ST 1,2,4,8,32
+sRsrc_Vid_DAFB_NTSCFFa		EQU		$D2				; NTSC FF 1,2,4,8
+sRsrc_Vid_DAFB_NTSCFFb		EQU		$D3				; NTSC FF 1,2,4,8,32
+
+sRsrc_Vid_DAFB_PALSTa		EQU		$D4				; PAL ST 1,2,4,8
+sRsrc_Vid_DAFB_PALSTb		EQU		$D5				; PAL ST 1,2,4,8,32
+sRsrc_Vid_DAFB_PALFFa		EQU		$D6				; PAL FF 1,2,4,8
+sRsrc_Vid_DAFB_PALFFb		EQU		$D7				; PAL FF 1,2,4,8,32
+
+sRsrc_Vid_DAFB_RGBFPb		EQU		$CD				; RGBPort  8bpp
+sRsrc_Vid_DAFB_RGB2Pb		EQU		$CF				; Vesuvio  8bpp
+sRsrc_Vid_DAFB_RGBFPbx		Equ		$ED				; RGBPort 16bpp
+sRsrc_Vid_DAFB_RGB2Pbx		Equ		$EF				; Vesuvio 16bpp
+
+kMegRAM						EQU		$100000			; constant for 1Mb
+k1536KvRAM					Equ		$180000			; constant for 1.5Mb		
+k256KvRAM					EQU		(256*1024)		; constant for 256Kb
+k512KvRAM					EQU		(512*1024)		; constant for 512Kb
+k1MvRAM						EQU		(1024*1024) 	; constant for 1MB
+k2MvRAM						EQU		2*k1MvRAM		; constant for 2MB
+
+DAFBStdOffset				EQU		$1000			; Active video offset from base of frame buffer vRAM for most displays.
+DAFBBSOffset				EQU		$0E00			; Active video offset for Big Screens:  2P, LP, & SVGA.
+DAFBNTSCOffset				Equ		$1020			; Active video offset for NTSC Displays.
+DAFBPALOffset				Equ		$0E20			; Active video offset for PAL Displays.
+
+DAFBBase					Equ		$800000			; Offset from $Fs000000 address for DAFB registers.
+; <8> rb	DAFB_PgMdEn					Equ		$18				; DAFB page mode enable register.
+
+; DAFB houses it's mode parameters in a table in the functional sRsrc list.  Here's
+;	the ID for it.  It's in the reserved range, but it's highly likely that this
+;	will be forever OK - I'll bet on it.
+
+sVidParmDir					EQU		126				;
+
+; Slot pRAM
+;
+; Slot pRam is used in various ways.  The first two bytes are used by the Slot Manager to record
+; the slot’s boardID.  The remaining bytes are left undefined by the Slot Manager.  Built-in
+; video uses Slot pRam as follows:
+;
+SP_Params					Record	0
+SP_BoardID					Ds.w	1				; BoardID.
+SP_Depth					Ds.b	1				; spID of Depth (Mode).						(vendorUse1)
+SP_LastConfig				Ds.b	1				; spID of last boot-up configuration.		(vendorUse2)
+SP_DfltConfig				Ds.b	1				; spID of default configuration.			(vendorUse3)
+SP_MonID					Ds.b	1				; Sense code of last display.				(vendorUse4)
+SP_Flags					Ds.b	1				; Various flags.							(vendorUse5)
+SP_NoConnect				Ds.b	1				; Sense ID of monitor to use on no-connect	(vendorUse6)
+SP_Size						Equ		*
+							EndR
+					
+; Slot pRAM flag bits
+;
+spPageMode					Equ		3				; True if we’re enabling DAFB’s PageMode.
+					
+; Various extra Control/Status calls used by built-in video
+;
+cscPageMode					Equ		130				; Used by DAFBDriver for enabling/disabling page mode.
+
+; These are all non-pruned and/or unsupported IDs of the sRsrcs left over from the TERROR ROM JMFB patch.
+;
+sRsrc_Vid12A				Equ		$8C				; Video sResource ID for  NTSC, standard memory
+sRsrc_Vid12B				Equ		$AC				; Video sResource ID for  NTSC, expanded memory
+sRsrc_Vid12C				Equ		$9C				; 24 bit sResource duplicate of sRsrc_Vid12A
+sRsrc_Vid12D				Equ		$BC				; 24 bit sResource duplicate of sRsrc_Vid12B
+
+sRsrc_Vid14A				Equ		$88				; Video sResource ID for  PAL, standard memory
+sRsrc_Vid14B				Equ		$A8				; Video sResource ID for  PAL, expanded memory
+sRsrc_Vid14C				Equ		$98				; 24 bit sResource duplicate of sRsrc_Vid14A
+sRsrc_Vid14D				Equ		$B8				; 24 bit sResource duplicate of sRsrc_Vid14B
+sRsrc_Vid14Au				Equ		$80				; Video sResource ID for  PAL underscan, standard memory
+sRsrc_Vid14Bu				Equ		$A0				; Video sResource ID for  PAL underscan, expanded memory
+sRsrc_Vid14Cu				Equ		$90				; 24 bit sResource duplicate of sRsrc_Vid14A
+sRsrc_Vid14Du				Equ		$B0				; 24 bit sResource duplicate of sRsrc_Vid14B
+
+TERRORBungeeVers			Equ		$0110			; TERROR ROM version of the Bungee video driver.
+
+;************************************************************************
+;
+;	Video driver override init.
+;	Registers used:
+;		A6 - Stack frame pointer.
+;		A4 - ioCore parameter block pointer.
+;		A3 - SDM parameter block pointer.
+;		A2 - Control/Status parameter block pointer.
+;		A1 - Misc.
+;		A0 - Misc.
+;
+;		D7 - Saved ptr to GDev (TFB)/Framebuffer offset value (DAFB)
+;		D6 - Saved ptr to the original DCE (TFB)/Re-inserted sRsrc ID (DAFB)
+;		D5 - Saved pointer to the original video driver entry (TFB)/Misc (DAFB)
+;		D4 - Saved handle to the original video driver (TFB)/Misc (DAFB)
+;
+;************************************************************************
+				
+;  Define stack-frame
+;
+StackFrame		RECORD {A6Link},DECR
+Return			DS.L	1			;Return address
+A6Link			DS.L	1			;Old A6
+sMode			DS.W	1			;Saved mode.
+sPage			DS.W	1			;Saved page.
+sBaseAddr		DS.L	1			;Saved base address.
+sGammaPtr		DS.L	1			;Saved gamma table pointer.
+sGFlags			DS.W	1			;Saved gamma flags.
+sSQEl			DS.L	1			;Saved slot interrupt handler queue element ptr		<1.3>
+
+minorVers		Ds.b	1			;Flag for remebering which ROM we’re fixing.
+downSizeSRsrc	Ds.b	1			;True if downSizing instead of upSizing.
+hasFamilies		Ds.b	1			;True if SP_LastConfig should be reset (config has family members).
+				Ds.b	1			;Padding.
+bootRefNum		Ds.w	1			;RefNum of boot screen’s video driver (for JMFB).
+bootDrvrHndl	Ds.l	1			;Handle to the boot screen’s video driver (for JMFB).
+
+saveA5			Ds.l	1			;For a local QuickDraw world.
+localA5			Ds.l	1
+thePort			Ds.l	1
+				Ds.b	GrafSize-4
+aRect			Ds.w	4
+aPort			Ds.b	PortRec
+
+LocalSize		EQU		*			;Size of local vars.
+				ENDR
+
+				Bra		BeginVideoPatch	
+
+;----------------------------------------------------------------------
+; Data
+;----------------------------------------------------------------------
+				
+				STRING	PASCAL
+TFBVideoTitle	DC.B	'.Display_Video_Apple_TFB'		;Name of TFB driver.
+				ALIGN	2
+				
+JMFBVideoTitle	Dc.b	'.Display_Video_Apple_MDC'		;Name of JMFB driver.
+				Align	2
+				
+JMFBSRsrcTable
+				Dc.w	JMFBTabEnd-JMFBTabStart-1		;Block size.
+				
+JMFBTabStart
+				Dc.b	sRsrc_Vid14A,sRsrc_Vid14B		; All the PAL under/overscan sRsrcs.
+				Dc.b	sRsrc_Vid14C,sRsrc_Vid14D
+				Dc.b	sRsrc_Vid14Au,sRsrc_Vid14Bu
+				Dc.b	sRsrc_Vid14Cu,sRsrc_Vid14Du
+				
+				Dc.b	sRsrc_Vid12A,sRsrc_Vid12B		; All the NTSC overscan sRsrcs.
+				Dc.b	sRsrc_Vid12C,sRsrc_Vid12D
+JMFBTabEnd
+				
+;----------------------------------------------------------------------
+; Utilities
+;----------------------------------------------------------------------
+
+SwitchDepths
+;---------------------------------------------------------------------
+;	
+;	SwitchDepths -- switches the bit depth of the specified boot-up
+;		screen to the specified depth, rounds the corners, and draws
+;		the arrow.  Note that this utiltiy should only be called within
+;		the confines of the VideoPatch StackFrame.
+;
+;	Input:		D0.w = Video Driver RefNum,
+;				D1.l = VidMode.
+;
+;	Trashes:	A0/A1.
+;---------------------------------------------------------------------
+;
+				With	StackFrame
+
+; Set up to switch depths…
+
+				Move.l	A2,-(Sp)						; Save a work register.
+				
+				Move.w	D0,-(Sp)						; Push the driver refNum.
+				Move.l	D1,-(Sp)						; Push the mode to change to.
+				Move.l	DeviceList,-(Sp)				; Push the GDHandle.
+				
+				_HideCursor								; Hide the cursor (to prevent visual artifacts).
+				Move.b	#1,CrsrBusy						; Say its busy for now.
+				
+				_InitGDevice							; Switch depths.
+				
+; Gray screen with rounded corners using Horst’s patented methods…
+				
+				Move.l	A5,saveA5(A6)					; Save the current A5.
+				Lea		localA5(A6),A5					; Point to our A5.
+				Move.l	A5,CurrentA5					; Update CurrentA5 for QD.
+				Pea		thePort(A6)						; Push thePort.
+				_InitGraf								; Init our QD world.
+				Pea		aPort(A6)						; Push aPort.
+				_OpenPort								; Open it.
+				
+				Move.l	(A5),A2							; Point to QD globals.
+				Lea		ScreenBits+Bounds(A2),A0		; Point to screen rectangle.
+				Move.l	A0,-(Sp)						; Push for FrameRoundRect.
+				
+				Lea		aRect(A6),A1					; Point to aRect.
+				Move.l	A1,-(Sp)						; Push for FrameRoundRect.
+				Move.l	A1,-(Sp)						; Push for InsetRect.
+				
+				Move.l	(A0)+,(A1)+						; aRect <- ScreenRect.
+				Move.l	(A0),(A1)						;
+				
+				Move.l	#$FFFDFFFD,-(Sp)				; Make aRect bigger by 3 on each side.
+				_InsetRect
+				Move.l	#$00030003,-(Sp)				; Make pen 3 pixels wide.
+				_PenSize
+
+				Move.l	#$00160016,-(Sp)				; Rounding factor ($00100010 + 2 * $00030003).
+				_FrameRoundRect							; Draw black corners.
+				_PenNormal								; Restore the pen.
+				
+				Move.l	#$00100010, -(SP)				; Push the rounding factor.
+				Pea 	Gray(A2)						; Push gray.
+				_FillRoundRect							; Fill a round rectangle gray.
+				
+; Clean up…
+								
+				Pea		aPort(A6)						; Push aPort.
+				_ClosePort								; Close it.
+				
+				Move.l	saveA5(A6),A5					; Restore A5.
+				Move.l	A5,CurrentA5					; Restore CurrentA5.
+				
+				Clr.b	CrsrBusy						; Un-busy the cursor.
+				_AllocCursor							; Update all its structs.
+				_InitCursor								; Reshow it as an arrow (balances the hide above).
+				
+				Move.l	(Sp)+,A2						; Restore work register.
+				Rts
+
+				EndWith
+				
+;----------------------------------------------------------------------
+; Main
+;----------------------------------------------------------------------
+
+BeginVideoPatch
+
+				WITH	StackFrame,spBlock
+				
+;  Allocate local vars…
+;
+				LINK	A6,#LocalSize
+				MOVEM.L	A2-A4/D4-D7,-(SP)				;Save registers.
+				
+				SUB.W	#IOQElSize,SP					;Allocate ioCore pBlock.
+				MOVE.L	SP,A4							;Save pointer.
+
+				SUB.W	#spBlockSize,SP					;Allocate SDM pBlock.
+				MOVE.L	SP,A3							;Save pointer.
+				
+				SUB.W	#12,SP							;Allocte CS parameter block.
+				MOVE.L	SP,A2							;Save pointer.
+				
+				TST.L	DeviceList						;Test DeviceList for nil.
+				BEQ		AllDone							;Done if empty list.
+							
+				Move.l	DeviceList,A0					; Get the DeviceList Handle.				<10>
+				Move.l	(A0),A0							; Make it a pointer.						<10>
+				Move.w	gdRefNum(A0),D0					; If there’s no driver, then				<10>
+				Beq		AllDone							;	we can’t do anything here.				<10>
+
+; If this is a TERROR ROM machine, the TFB Driver has already been patched out
+;	because of a byte-lane smearing problem on ’040 CPUs.  So, we can just
+;	skip the TFB patch.  But, we need to fix a couple of problems on Spike &
+;	Eclipse CPUs that involve 16/32bpp-capable sRsrcs being enabled when they
+;	shouldn’t be and vice-versa.
+;
+; Also, for Spike, Eclipse, and Zydeco, we’re enabling DAFB PageMode.  For
+;	TERROR ROM machines, this means we have to do all the work ourselves.
+;	The Zydeco ROM takes care of everything if either the pRAM bit is set 
+;	(at VidOpen if we aren’t the startup screen) or if we make the
+;	driver call.  (NOTE:  The TERROM ROM DAFB driver does NOT intelligently
+;	handle the PageMode register, while the Zydeco ROM DAFB driver does.
+;	This basically means that with TERROR ROM CPUs, DAFB PageMode will
+;	ALWAYS be on, and for Zydeco ROM CPUs, PageMode will only be on
+;	when it’s applicable.  At some point, it might be reasonable to
+;	patch the Zydeco ROM DAFB driver into TERROR ROM CPUs.)
+;
+
+				With	SP_Params,VDPageInfo,DAFBVidPrivates
+
+TERROR_MajVer	Equ		$067C							; ROM Major version for TERROR.
+TERROR_MinVer	Equ		$15								; ROM Minor version for TERROR.
+Zydeco_MinVer	Equ		$17								; ROM Minor version for Zydeco.
+
+ROMMajVer		Equ		$08								; Offset from ROMBase to ROM Major version word.
+ROMMinVer		Equ		$12								; Offset from ROMBase to RAM Major version word.
+		
+				Move.l	RomBase,A0						; Get RomBase into A0.
+				Move.w	ROMMajVer(A0),D0				; Get the major version.
+				Cmp.w	#TERROR_MajVer,D0				; If this is NOT a IIci-class ROM,
+				Bne		StartTFB						;	then just do the TFB stuff.
+				Move.b	ROMMinVer(A0),D0				; Otherwise, get the minor version.
+				Move.b	D0,minorVers(A6)				; Save it for later.
+				Cmp.b	#TERROR_MinVer,D0				; If this is a TERROR ROM,
+				Beq.s	@FixJMFB						;	then do the JMFB fixes, followed by the DAFB fixes.
+				Cmp.b	#Zydeco_MinVer,D0				; If this is a Zydeco ROM,
+				Beq		@ChkBoxFlag						;	then just check the boxFlag for the DAFB fixes.
+				Bra		StartTFB						; Otherwise, do the TFB stuff (just for safety).
+				
+@FixJMFB
+				Bsr		StartJMFB						; Go do the JMFB fixes.
+
+@ChkBoxFlag		
+				Move.b	BoxFlag,D0						; Get the BoxFlag.
+				Cmp.b	#boxQuadra700,D0				; If this is a Spike, 						<7>
+				Beq.s	StartDAFB						;	then start doing DAFB stuff.
+				Cmp.b	#boxQuadra900,D0				; If this is an Eclipse,					<7>
+				Beq.s	StartDAFB						;	then start doing DAFB stuff.
+				Cmp.b	#boxZydeco,D0					; If this is a Zydeco (Eclipse 33),
+				Beq.s	StartDAFB						;	then start doing DAFB stuff.
+				Bra		AllDone							; Otherwise, just go home.
+
+StartDAFB		
+				Move.l	A3,A0							; Get spBlock ptr into A0.
+				Clr.b	spSlot(A0)						; We only care about Slot $0.
+				Clr.b	spExtDev(A0)					; (No external device.)
+				Move.w	#catDisplay,spCategory(A0)		; Look for:	Display,
+				Move.w	#typVideo,spCType(A0)			;  			Video,
+				Move.w	#drSwApple,spDrvrSW(A0)			;  			Apple,
+				Move.w	#drHwDAFB,spDrvrHW(A0)			;  			DAFB.
+				Clr.l	spParamData(A0)					; Look only for enabled sRsrcs.
+				Bset	#foneslot,spParamData+3(A0)		; Limit search to this slot only.
+				_GetTypeSRsrc							; If built-in video is not on, then
+				Bne		AllDone							;	just quit.
+				
+				Move.w	spRefNum(A0),D5					; If we aren’t the startup screen,
+				Beq.s	@NoDrvr							;	then do the pRAM stuff.
+				
+				Clr.b	csMode(A2)						; To enable page mode, clear csMode.
+				Move.l	A4,A0							; Set up for the Control call:
+				Move.w	D5,ioRefNum(A0)					;	ioRefNum.
+				Move.w	#cscPageMode,csCode(A0)			;	csCode.
+				Move.l	A2,csParam(A0)					;	csParam.
+				_Control ,Immed							; SetPageMode.
+				
+				Cmp.b	#Zydeco_MinVer,minorVers(A6)	; If this is a Zydeco ROM,
+				Beq		AllDone							;	then we’re done.
+
+				Bra.s	@SRsrcPatches					; Otherwise, just go on.				
+				
+@NoDrvr
+				Suba	#SizesPRAMRec,Sp				; Make an sPRAM block on the stack.
+				Move.l	Sp,spResult(A0)					; Point to it.
+				_sReadPRamRec							; Get pRAM.
+				
+				Bset	#spPageMode,SP_Flags(Sp)		; Tell the PrimaryInit to turn PageMode on,
+				Beq.s	@EnableIt						;	if it isn’t already.
+				Adda	#SizesPRAMRec,Sp				; Otherwise, restore the stack.
+				
+				Cmp.b	#Zydeco_MinVer,minorVers(A6)	; If this is a Zydeco ROM,
+				Beq		AllDone							;	then we’re done.
+				
+				Bra.s	@SRsrcPatches					; Otherwise, just go on.
+
+@EnableIt				
+				Move.l	Sp,spsPointer(A0)				; Set up to whack pRam.
+				_sPutPRAMRec							; Whack it.
+				Adda	#SizesPRAMRec,Sp				; Restore the stack.
+				
+				Cmp.b	#Zydeco_MinVer,minorVers(A6)	; If this is a Zydeco ROM,
+				Beq		AllDone							;	then we’re done.
+				
+				_sFindDevBase							; Otherwise, get the DAFB baseAddress…
+				Move.l	spResult(A0),D0					; 	…into D0.
+				Andi.l	#$FF000000,D0					; Strip it of any offsets.
+				Addi.l	#DAFBBase,D0					; Point to DAFB registers.
+				Move.l	D0,A0							; Get it into A0.
+				
+				Moveq	#true32b,D0						; Setup to swap into 32-bit addressing mode.
+				_SwapMMUMode							; Do swap.
+
+				Move.l	#1,DAFB_PgMdEn(A0)				; Enable DAFB PageMode (unconditionally).
+				
+				_SwapMMUMode							; Swap back into previous addressing mode.
+		
+;
+; Note:  If I had the time, I would re-write the following code in a table-driven sort of way.
+;		 But this patch started out small, and I ran out time.
+;
+				
+@SRsrcPatches				
+				Move.b	#0,downSizeSRsrc(A6)			; Genererally, we’re going from a 'b' to an 'a' sRsrc.
+				Move.b	#1,hasFamilies(A6)				; All the interlaced displays have family members.
+				
+				Move.l	A3,A0							; Get spBlock ptr back into A0.
+				Clr.b	spSlot(A0)						; We only care about Slot $0.
+				Clr.b	spExtDev(A0)					; (No external device.)
+				Clr.l	spParamData(A0)					; Clear the fNext flag; we want THIS sRsrc.
+				Bset	#foneslot,spParamData+3(A0)		; Limit search to this slot only.
+				Move.b	#sRsrc_Vid_DAFB_RGBFPbx,spID(A0) ; Look for the RGB Portrait’s sRsrc.
+				_GetsRsrc								; If we found the RGB Portrait sRsrc,
+				Beq		@SetupForRGBPort				; 	then do specifics.
+				
+				Move.b	#sRsrc_Vid_DAFB_RGB2Pbx,spID(A0) ; Otherwise, look for Vesuvio’s sRsrc.
+				_GetsRsrc								; If we found it,
+				Beq		@SetUpForVesuvio				; 	then do specifics.
+				
+				Move.b	#sRsrc_Vid_DAFB_NTSCSTb,spID(A0) ; Otherwise, look for NTSC STb’s sRsrc.
+				_GetsRsrc								; If we found it,
+				Beq		@SetUpForNTSCST					; 	then do specifics.
+				
+				Move.b	#sRsrc_Vid_DAFB_NTSCSTa,spID(A0) ; Otherwise, look for NTSC STa’s sRsrc.
+				_GetsRsrc								; If we found it,
+				Beq		@SetUpForNTSCSTa				; 	then do specifics.
+
+				Move.b	#sRsrc_Vid_DAFB_NTSCFFb,spID(A0) ; Otherwise, look for NTSC FFb’s sRsrc.
+				_GetsRsrc								; If we found it,
+				Beq		@SetUpForNTSCFF					; 	then do specifics.
+				
+				Move.b	#sRsrc_Vid_DAFB_NTSCFFa,spID(A0) ; Otherwise, look for NTSC FFa’s sRsrc.
+				_GetsRsrc								; If we found it,
+				Beq		@SetUpForNTSCFFa				; 	then do specifics.
+				
+				Move.b	#sRsrc_Vid_DAFB_PALSTb,spID(A0) ; Otherwise, look for PAL STb’s sRsrc.
+				_GetsRsrc								; If we found it,
+				Beq		@SetUpForPALST					; 	then do specifics.
+				
+				Move.b	#sRsrc_Vid_DAFB_PALSTa,spID(A0) ; Otherwise, look for PAL STa’s sRsrc.
+				_GetsRsrc								; If we found it,
+				Beq		@SetUpForPALSTa					; 	then do specifics.
+				
+				Move.b	#sRsrc_Vid_DAFB_PALFFb,spID(A0) ; Otherwise, look for PAL FFb’s sRsrc.
+				_GetsRsrc								; If we found it,
+				Beq		@SetUpForPALFF					; 	then do specifics.
+				
+				Move.b	#sRsrc_Vid_DAFB_PALFFa,spID(A0) ; Otherwise, look for PAL FFa’s sRsrc.
+				_GetsRsrc								; If we found it,
+				Beq		@SetUpForPALFFa					; 	then do specifics.
+				Bra		AllDone							; Otherwise, just go home.
+				
+@SetupForRGBPort
+				Move.l	#DAFBStdOffset,D7				; Set up for vRam check below.
+				Move.b	#sRsrc_Vid_DAFB_RGBFPb,D6		; SpID of sRsrc we’ll need to re-insert.
+				Move.b	#0,hasFamilies(A6)				; This configuration has no families.
+				Bra		@DoDrvrChk
+				
+@SetupForVesuvio
+				Move.l	#DAFBBSOffset,D7				; Set up for vRam check below.
+				Move.b	#sRsrc_Vid_DAFB_RGB2Pb,D6		; SpID of sRsrc we’ll need to re-insert.
+				Move.b	#0,hasFamilies(A6)				; This configuration has no families.
+				Bra.s	@DoDrvrChk
+
+@SetupForNTSCST
+				Move.l	#DAFBNTSCOffset,D7				; Set up for vRam check below.
+				Move.b	#sRsrc_Vid_DAFB_NTSCSTa,D6		; SpID of sRsrc we’ll need to re-insert.
+				Bra.s	@DoDrvrChk
+				
+@SetupForNTSCSTa
+				Move.l	#DAFBNTSCOffset,D7				; Set up for vRam check below.
+				Move.b	#sRsrc_Vid_DAFB_NTSCSTb,D6		; SpID of sRsrc we’ll need to re-insert.
+				Move.b	#1,downSizeSRsrc(A6)			; DownSize instead of upSize sRsrc.
+				Bra.s	@DoDrvrChk
+
+@SetupForNTSCFF
+				Move.l	#DAFBNTSCOffset,D7				; Set up for vRam check below.
+				Move.b	#sRsrc_Vid_DAFB_NTSCFFa,D6		; SpID of sRsrc we’ll need to re-insert.
+				Bra.s	@DoDrvrChk
+				
+@SetupForNTSCFFa
+				Move.l	#DAFBNTSCOffset,D7				; Set up for vRam check below.
+				Move.b	#sRsrc_Vid_DAFB_NTSCFFb,D6		; SpID of sRsrc we’ll need to re-insert.
+				Move.b	#1,downSizeSRsrc(A6)			; DownSize instead of upSize sRsrc.
+				Bra.s	@DoDrvrChk
+
+@SetupForPALST
+				Move.l	#DAFBPALOffset,D7				; Set up for vRam check below.
+				Move.b	#sRsrc_Vid_DAFB_PALSTa,D6		; SpID of sRsrc we’ll need to re-insert.
+				Bra.s	@DoDrvrChk
+				
+@SetupForPALSTa
+				Move.l	#DAFBPALOffset,D7				; Set up for vRam check below.
+				Move.b	#sRsrc_Vid_DAFB_PALSTb,D6		; SpID of sRsrc we’ll need to re-insert.
+				Move.b	#1,downSizeSRsrc(A6)			; DownSize instead of upSize sRsrc.
+				Bra.s	@DoDrvrChk
+
+@SetupForPALFF
+				Move.l	#DAFBPALOffset,D7				; Set up for vRam check below.
+				Move.b	#sRsrc_Vid_DAFB_PALFFa,D6		; SpID of sRsrc we’ll need to re-insert.
+				Bra.s	@DoDrvrChk
+				
+@SetupForPALFFa
+				Move.l	#DAFBPALOffset,D7				; Set up for vRam check below.
+				Move.b	#sRsrc_Vid_DAFB_PALFFb,D6		; SpID of sRsrc we’ll need to re-insert.
+				Move.b	#1,downSizeSRsrc(A6)			; DownSize instead of upSize sRsrc.
+				
+; In the TERROR ROM, some sRsrcs are not pruned because vRam is tested incorrectly.  So,
+;	we must ensure that 2 Megs of vRam actually exist.  If the driver is already installed,
+;	then we can get the device baseAddress from the AuxDCE.  If it isn’t installed, then
+;	we must ask the Slot Manager what it is.  A similar, but opposite problem, exists
+;	on the NTSC/PAL non-convolved displays when going from 2 Megs of RAM down to 1 Meg;
+;	that is, the 1 Meg sRsrc is not pruned when it should be.
+;
+; Note:  The Nop in the vRAM check below is used because DAFB’s address space is non-serial,
+;		 and we must have the writes occur before the reads.
+;
+
+@DoDrvrChk
+				Moveq	#0,D5							; Zero out D5 for the refNum.
+				Move.w	spRefNum(A0),D5					; If we aren’t the startup screen,
+				Beq.s	@DrvrNotInstalled				; 	the driver won’t be installed.
+				Move.w	D5,D4							; Save refNum for later.
+				Not.w	D5								; Otherwise, convert the refNum into
+				Lsl.w	#2,D5							; 	a UTable index.
+				
+				Add.l	UTableBase,D5					; Get a ptr to AuxDCEHandle.
+				Move.l	D5,A0							; Get it into A0.
+				
+				Move.l	(A0),A0							; Get the AuxDCEHandle.
+				Move.l	(A0),A0							; Get the AuxDCEPtr.
+				Move.l	A0,D5							; Save it for later.
+				
+				Move.l	dCtlDevBase(A0),A0				; Get the DAFB baseAddress into A0.
+				Bra.s	@DoDAFBVRamChk
+				
+@DrvrNotInstalled
+				_sFindDevBase							; Get the DAFB baseAddress…
+				Move.l	spResult(A0),A0					; 	…into A0.
+
+@DoDAFBVRamChk				
+				Moveq	#true32b,D0						; Setup to swap into 32-bit addressing mode.
+				_SwapMMUMode							; Do swap.
+				
+				Sub.l	D7,A0							; Subtract off the offset to get the raw base.
+				Move.l	#'2MEG',(k2MvRAM-4,A0)			; Attempt to write to the last four bytes of bank 3.
+				Nop										; (See note above.)
+				
+				Cmp.l	#'2MEG',(k2MvRAM-4,A0)			; If there really are 2 Megs of vRam,
+				Seq		D1								;	then say so.
+
+				_SwapMMUMode							; Swap back into previous addressing mode.
+				
+				Tst.b	D1								; If we found 2 Megs, then see
+				Bne.s	@ChkDownSize					;	if we need to downSize before leaving.
+				
+				Tst.b	downSizeSRsrc(A6)				; If we think we need to do a downSize
+				Bne		AllDone							;	then go home (this is the upSize case).
+				Bra.s	@UpdtSRsrcs						; Otherwise, do upSize updated.
+				
+@ChkDownSize	
+				Tst.b	downSizeSRsrc(A6)				; If we need to downSize,
+				Bne.s	@UpdtSRsrcs						;	then do downSize update.
+				Bra		AllDone							; Otherwise, go home.
+				
+
+; Delete the bad sRsrc and insert a good one.
+;
+
+@UpdtSRsrcs
+				Move.l	A3,A0							; Get the spBlock ptr back into A0.
+				_sDeleteSRTRec							; Delete the wrong sRsrc.
+				
+				Move.b	D6,spID(A0)						; Say that we want to re-insert the right sRsrc.
+				Clr.l	spsPointer(A0)					; Tell the Slot Manager to look for it in ROM.
+				Clr.l	spParamData(A0)					; And enable it.
+				_InsertSRTRec
+								
+				Clr.l	spParamData(A0)					; Enable NTSC/PAL disabled sRsrc.
+				_SetSRsrcState
+				
+; Check Slot pRAM.  If the depth is set to 16/32bpp, then someone probably had two megs of vRam and
+;	took them out.  In this case, we switch back to 1bpp to be consistent with the other configs
+;	where a change in memory size forces us back to firstVidMode.  We don’t invalidate the
+;	'scrn' resource explicitely so that other displays aren’t torched.
+;
+; Note:  If we’re the boot screen and we have to switch from 16/32bpp to 1bpp, the “Welcome To Mac”
+;	box is going to go away sooner than usual.
+;
+				
+				Suba	#SizesPRAMRec,Sp				; Allocate a Slot PRAM record on the stack.
+				Move.l	Sp,spResult(A0)					; Point to it.
+				_sReadPRAMRec
+			
+				Tst.l	D5								; If the driver is not installed,
+				Beq.s	@ChkDepth						;	just check the depth.
+				
+				Move.l	D5,A0							; Otherwise get the AuxDCEPtr back into A0, and
+				Move.b	D6,dCtlSlotID(A0)				;	update the spID.
+				
+				Move.l	dCtlStorage(A0),A0				; Get the Handle to DAFB private storage.
+				Move.l	(A0),A0							; Make it a pointer.
+				Move.b	D6,saveSlotId(A0)				; Update the saved slot ID.
+				
+				Move.l	saveVidPtr(A0),A0				; Set up to dispose old vidParms ptr.
+				_DisposPtr								; Dispose it.
+				
+				Move.l	A3,A0							; Get the spBlock ptr back into A0.
+				_sRsrcInfo								; Get the spsPointer to the functional sRsrc.
+				
+				Move.b	#sVidParmDir,spID(A0)			; Get the vidParams directory.
+				_sFindStruct
+				
+				Move.b	D6,spID(A0)						; Get the vidParams.
+				_sGetBlock
+				
+				Move.l	spResult(A0),-(Sp)				; Save the vidParams ptr on the stack.
+				Move.l	D5,A0							; Get the AuxDCEPtr back into A0.
+				Move.l	dCtlStorage(A0),A0				; Get the Handle to DAFB private storage.
+				Move.l	(A0),A0							; Make it a pointer.
+				Move.l	(Sp)+,saveVidPtr(A0)			; Save the vidParams into the DAFB privates.
+
+@ChkDepth
+				Move.b	SP_Depth(Sp),D0					; Get the current pixel depth.
+				Cmp.b	#FifthVidMode,D0				; If it’s not at 16/32bpp, then
+				Bne.s	@WhackEm						;	just whack pRAM.
+				
+				Move.b	#FirstVidMode,SP_Depth(Sp)		; Otherwise, set up pRam for 1bpp.
+				Tst.l	D5								; If the driver is not installed,
+				Beq.s	@WhackEm						;	just whack pRam.
+								
+; Set the depth to 1bpp…
+;
+				Move.w	D4,D0							; Pass the driver refNum in D0.
+				Move.l	#FirstVidMode,D1				; Pass the vidMode in D1.
+				Bsr		SwitchDepths					; Switch depths by calling our utility.
+				
+@WhackEm		
+				Move.l	A3,A0							; Get spBlock ptr back into A0.
+				Tst.b	hasFamilies(A6)					; If this config doesn’t have families,
+				Beq.s	@NoFamilies						;	then just go on.
+				Move.b	D6,SP_LastConfig(Sp)			; Otherwise, set up pRAM for next re-boot.
+
+@NoFamilies				
+				Move.l	Sp,spsPointer(A0)				; Set up Slot PRAM block, and
+				_sPutPRAMRec							;	write it out.
+				
+				Adda	#SizesPRAMRec,Sp				; Restore the stack.
+				Bra		AllDone							; Go home.
+
+; In the TERROR ROM, the Bungee (1.1) version of the 4•8/8•24 Card ROM is incorrectly patched out.
+;	This problem occurs because the Trident (1.0/1.0.1) version of the 4•8/8•24 Card ROM is a
+;	subset of the Bungee ROM.  However, the Bungee code was used to patch out the Trident (byte-
+;	lane smearing) problems.  Because Trident doesn’t support PAL displays, that part of the Bungee
+;	code was removed in the TERROR ROM.  This is fine on Trident, but blows up on Bungee because
+;	none of the PAL sRsrcs are removed, ever.  So, what we have to do in the System is to
+;	remove the non-pruned & unsupported sRsrcs left around by the TERROR ROM version of Bungee
+;	for both Bungee & Trident.  The net side-effect for Bungee is that PAL is no longer
+;	a valid configuration.
+;
+; Notes:	
+;		1) This problem is fixed in the Zydeco ROM and does NOT occur with the CheapDate (1.2)
+;		   version of the 4•8/8•24 Card ROM on either the TERROR or Zydeco CPU ROMs.
+;
+;		2) There is one case in the TERROR ROM that we can’t patch out.  It’s pretty obscure,
+;		   but here goes.  If a Bungee Card is selected as the boot screen by the TERROR ROM’s
+;		   Start Manager and there is no monitor connected to that card, the machine will hang.
+;		   A way this can happen, for example, is if someone moves their Bungee Card from
+;		   one slot to another, doesn’t connect a monitor, and then restarts.  Note that if
+;		   the machine didn’t hang, we’d still be hosed because we would have to reset the
+;		   entire gDevice world, including rebuilding the dummy gDevice if there are no
+;		   other cards around.  But that’s starting to get beyond the scope of this file,
+;		   especially in code size!  Also, it’s getting pretty late in the (Regatta) project.
+;
+;		3) On screens smaller than 640x480, MacsBug gets somewhat confused because the boot
+;		   rectangle is bigger than the final rectangle.  Does anyone know how to fix
+;		   this?  For Bungee, this is only a problem on Rubik and NTSC underscan
+;		   displays.  Luckily, the lowest-numbered unpruned PAL sRsrc is underscan,
+;		   which is 640x480, MacsBug’s normal, uncentered size.
+;
+;		4) We can’t support the NTSC 640x480 (overscan) mode because switching to it from
+;		   Monitors causes the subsequent reboot to crash before we get here.  The problem
+;		   is that the unpruned PAL baseAddress is too high for NTSC overscan and, hence,
+;		   causes QuickDraw to bus error.  So, we just delete the NTSC overscan sRsrcs so
+;		   they aren’t seen by Monitors.
+;
+
+StartJMFB
+				Movem.l	D3-D7,-(Sp)						; Save work registers.
+				
+; Get the boot device info up front so we don’t have to keep looking.
+;
+				Move.l	DeviceList,A0					; Get the device list Handle.
+				Move.l	(A0),A0							; Make it a pointer.
+				
+				Moveq	#0,D5							; Zero out D5 for refNum.
+				Move.w	gdRefNum(A0),D5					; Get the refNum.
+				Move.w	D5,bootRefNum(A6)				; Save it for later.
+				Not.w	D5								; Convert the refNum into
+				Lsl.w	#2,D5							; 	a UTable index.
+				
+				Add.l	UTableBase,D5					; Get a ptr to AuxDCEHandle.
+				Move.l	D5,A0							; Get it into A0.
+				
+				Move.l	(A0),A0							; Get the AuxDCEHandle.
+				Move.l	(A0),A0							; Get the AuxDCEPtr.
+				
+				Move.b	dCtlSlot(A0),D4					; Remember which slot contains the boot device.
+				Move.l	dCtlDriver(A0),bootDrvrHndl(A6)	; Save the Handle to its driver. 
+				
+				Moveq	#0,D3							; Start search from slot 0.
+				Bra.s	@StartSearch
+				
+; Find the next Trident/Bungee.
+;
+@NextSlot		Addq	#1,D3							; Seed search with the next slot number.
+				Cmp.b	#$F,D3							; If we’re trying to search in a slot ≥ $F
+				Bge.s	@ExitJMFB						;	then just leave.
+
+@StartSearch
+				Move.l	A3,A0							; Get the spBlock ptr into A0.
+				Move.b	D3,spSlot(A0)					; Set the slot number to search in.
+				Clr.b	spId(A0)						; Begin at id 0.
+				Clr.b	spExtDev(A0)					; No external device.
+				Clr.b	spTBMask(A0)					; No mask in search.
+				Move.w	#catDisplay,spCategory(A0)		; Look for:	Display,
+				Move.w	#typVideo,spCType(A0)			;  			Video,
+				Move.w	#drSwApple,spDrvrSW(A0)			;  			Apple,
+				Move.w	#drHwJMFB,spDrvrHW(A0)			;  			JMFB.
+				Clr.l	spParamData(A0)					; Look only for enabled sRsrcs.
+				_GetTypeSRsrc							; If we find a Trident/Bungee,
+				Beq.s	@ChkJMFB						;	the go check it out.
+				
+@ExitJMFB
+				Movem.l	(Sp)+,D3-D7						; Otherwise, restore work regs
+				Rts										;	and leave.
+				
+; We found a Trident/Bungee.
+;
+@ChkJMFB
+				Move.b	spSlot(A0),D3					; Save the slot number we’re on for later.
+				
+				Cmp.b	D4,D3							; If this isn’t the boot device,
+				Bne.s	@NoDrvr							;	the driver isn’t loaded.
+				
+; Check to see if the boot screen is a Trident/Bungee.
+;
+				Move.l	bootDrvrHndl(A6),A0				; Get Handle to video driver.
+				Move.l	(A0),A0							; Get pointer to video driver.
+				Lea		drvrName(A0),A0					; Point to driver’s name.
+				Move.l	A0,D5							; Save it for later.
+				Move.b	(A0)+,D0						; Get the length.
+				Swap	D0								; Save it.
+				Lea		JMFBVideoTitle,A1				; Point to the driver name we want.
+				Move.b	(A1)+,D0						; Get its length.
+				_CmpString								; Compare the names.
+				Tst.w	D0								; If they are not equal,
+				Bne.s	@NoDrvr							;	then our driver is not installed.
+				Move.l	D5,A0							; Otherwise, reload A0 with a ptr to our driver name,
+				Bra.s	@ChkVersion						; 	and check the driver version.
+				
+@NoDrvr			
+				_sGetDriver								; If we can’t load the driver
+				Bne.s	@NextSlot						;	then search the next slot.
+				
+				Moveq	#0,D5							; Flag that the driver is not installed.
+				Move.l	spResult(A0),A0					; Get Handle to the driver.
+				Move.l	A0,-(Sp)						; Save it (for disposal).
+				Move.l	(A0),A0							; Get driver pointer.
+				Lea		drvrName(A0),A0					; Get driver name.
+			
+@ChkVersion
+				Moveq	#0,D0							; Clear D0 (for use as an index).
+				Move.b	(A0),D0							; Get the length of the driver name.
+				Addq	#2,D0							; Adjust offset to version field.
+				Bclr	#0,D0							; Adjust offset for word alignment.
+				Move.w	(A0,D0),D6						; Save the version number.
+				Tst.l	D5								; If the driver is already loaded,
+				Bne.s	@ChkIt							;	then just go do the check.
+				Move.l	(Sp)+,A0						; Otherwise, get the driver handle, and
+				_DisposHandle							;	dispose of it.
+				
+@ChkIt
+				Cmp.w	#TERRORBungeeVers,D6			; If this isn’t TERROR’s Bungee,
+				Bne.s	@NextSlot						;	then search the next slot.
+				
+; Make sure we’ve really got a Bungee in this slot & not a Trident.
+;
+				Move.l	A3,A0							; Get the spBlock ptr back into A0.
+				Move.b	D3,spSlot(A0)					; Set the slot number we’re in.
+				Move.b	#sRsrc_Vid14Au,spID(A0)			; Look for this sRsrc.
+				Clr.b	spExtDev(A0)					; No external device.
+				Clr.b	spTBMask(A0)					; No mask in search.
+				Move.w	#catDisplay,spCategory(A0)		; Look for:	Display,
+				Move.w	#typVideo,spCType(A0)			;  			Video,
+				Move.w	#drSwApple,spDrvrSW(A0)			;  			Apple,
+				Move.w	#drHwJMFB,spDrvrHW(A0)			;  			JMFB.
+				Clr.l	spParamData(A0)					; Look only for enabled sRsrcs.
+				Bset	#foneslot,spParamData+3(A0)		; Limit search to this slot only.
+				_GetSRsrc								; If this is not a Bungee (must be a Trident),
+				Bne.s	@NextSlot						;	then search the next slot.
+
+				Tst.l	D5								; If the driver is not already loaded,
+				Beq.s	@PruneEm						;	then start pruning.
+				
+				Move.l	A4,A0							; Otherwise, point A0 at the I/O param block.
+				Move.w	bootRefNum(A6),ioRefNum(A0)		; Set the refNum.
+				_Close									; Close the driver.
+				
+@PruneEm
+				Lea		JMFBSRsrcTable,A1				; Point to the table of unsupported sRsrc IDs.
+				Move.w	(A1)+,D1						; Load D1 with the size of the table.
+
+				Move.l	A3,A0							; Get the spBlock ptr back into A0.
+@NextSRsrc		Move.b	(A1)+,spID(A0)					; Get one of the sRsrc IDs to prune.
+				Clr.l	spParamData(A0)					; Set up to enable any disabled sRsrc.
+				_SetSRsrcState							; Enable it.
+				_sDeleteSRTRec							; Prune it.
+				Dbra	D1,@NextSRsrc					; Repeat until done.
+				
+				Tst.l	D5								; If the driver is not already loaded,
+				Beq.s	@NextSlot						; 	then search next slot.
+								
+				Move.b	D3,spSlot(A0)					; Set the slot number to search in.
+				Clr.b	spId(A0)						; Begin at id 0.
+				Clr.b	spExtDev(A0)					; No external device.
+				Move.w	#catDisplay,spCategory(A0)		; Look for:	Display,
+				Move.w	#typVideo,spCType(A0)			;  			Video,
+				Move.w	#drSwApple,spDrvrSW(A0)			;  			Apple,
+				Move.w	#drHwJMFB,spDrvrHW(A0)			;  			JMFB.
+				Clr.l	spParamData(A0)					; Look only for enabled sRsrcs.
+				Bset	#foneslot,spParamData+3(A0)		; Limit search to this slot only.
+				_GetTypeSRsrc							; If all the spIDs were not deleted,
+				Beq.s	@CleanupDevice					; 	then go clean up this gDevice.
+; •••
+				_Debugger								; Call 911, we’re dead.  (See note #2 above.)
+; •••				
+				Bra.s	@NextSlot						; Search the next slot.
+				
+@CleanupDevice				
+				Move.b	spID(A0),D6						; Save the remaining spID for later.
+				
+				Suba	#SizesPRAMRec,Sp				; Make an sPRAM block on the stack.
+				Move.l	Sp,spResult(A0)					; Point to it.
+				_sReadPRamRec							; Get pRAM.
+				Moveq	#0,D7							; Clear D7 (because InitGDevice likes longs).
+				Move.b	SP_Depth(Sp),D7					; Save the bit depth.
+				Adda	#SizesPRAMRec,Sp				; Restore the stack.
+
+				Move.l	D5,ioFileName(A4)				; Point to our driver name.
+				Move.b	D3,ioSlot(A4)					; Set the slot number we’re on.
+				Move.b	D6,ioId(A4)						; Set the sRsrc ID.
+				Clr.l	ioMix(A4)						; No extra data.
+				Clr.w	ioFlags(A4)						; Clear the flags.
+				Clr.b	ioPermssn(A4)					; R/W permissions.
+				Move.l	A4,A0							; Point A0 at the I/O param block.
+				_HOpen									; Re-open the video driver.
+
+				Subq	#2,Sp							; Make a DefVideoRec on the stack.
+				Move.l	Sp,A0							; Point to it.
+				_GetVideoDefault						; Get it.				
+				
+				Moveq	#0,D0							; Set up to compare current status with default.
+				Move.b	D3,D0							; Get the slot number we’re on.
+				Lsl.w	#8,D0							; Shift it over.
+				Move.b	D6,D0							; Get the sRsrc (spID).
+				Cmp.w	(A0),D0							; If the current status is the default,
+				Beq.s	@SkipReset						;	then no need to reset.
+				Move.b	#firstVidMode,D7				; Otherwise, set up to switch to 1bpp, and
+				Move.w	D0,(A0)							;	reset the DefVideoRec for the next reboot.
+				_SetVideoDefault						; Do it.
+@SkipReset		Addq	#2,Sp							; Clean up the stack.
+
+				Move.l	Devicelist,A0					; Get Handle to device list.
+				Move.l	(A0),A0							; Make it a pointer.
+				
+				Move.w	ioRefNum(A4),D0					; Get the driver’s new refNum into D0.
+				Move.w	D0,gdRefNum(A0)					; Update the gDevice with the new refNum.
+				
+				Clr.l	gdMode(A0)						; Make InitGDevice clean up for us.
+				
+				Move.l	D7,D1							; Push the depth in D1.
+				Bsr		SwitchDepths					; Switch depths using our utility.
+				Bra.s	@NextSlot						; Search the next slot.
+				
+				EndWith
+
+; Start looking for TFB frame buffer cards on non-TERROR/Zydeco ROM CPUs.
+;
+				
+StartTFB
+				MOVE.B	#0,spSlot(A3)					;Begin at Slot-0.
+				CLR.B	spId(A3)						;Begin at id-0
+				CLR.B	spExtDev(A3)					;No external device.
+				CLR.B	spTBMask(A3)					;No mask.
+				MOVE.W	#catDisplay,spCategory(A3)		;Look for:	Display,
+				MOVE.W	#TypVideo,spCType(A3)			;  			Video,
+				MOVE.W	#DrSwApple,spDrvrSW(A3)			;  			Apple,
+				MOVE.W	#DrHwTFB,spDrvrHW(A3)			;  			TFB.
+				
+; Find next video driver of type 'Display_Video_Apple_TFB'.
+;
+@Repeat			
+				MOVE.L	A3,A0
+				_sNextTypeSRsrc
+				BNE		AllDone
+				
+; Check the revision.
+;
+				MOVEQ	#0,D5							;clear the hi half of the register <PB273> DAF
+				MOVE.W	spRefNum(A3),D5					;Get the refnum.
+				BEQ.S	@Repeat							;if zero, then continue
+				NOT.W	D5								;Convert it to a unit table index, step 1.
+				LSL.W	#2,D5							;Convert it to a unit table index, step 2.
+				
+				ADD.L	UTableBase,D5					;Saved pointer to video driver entry.
+				MOVE.L	D5,A0							;Pointer to video driver entry.
+				
+				MOVE.L	(A0),A0							;Get handle to DCE.
+				MOVE.L	(A0),A0							;Get pointer to DCE.
+				MOVE.L	A0,D6							;Save pointer to DCE.
+				MOVE.L	dCtlDriver(A0),A0				;Get handle to driver.
+				MOVE.L	A0,D4							;Save handle to driver.
+				MOVE.L	(A0),A0							;Get pointer to driver.
+				LEA		drvrName(A0),A0					;Point to the driver name.
+
+; Compare the driver names so we don't kill the stupid SuperMac card that thinks it's a TFB…
+;
+				MOVEQ	#0,D0							;Prepare D0.
+				MOVE.B	(A0),D0							;Get the length of the driver name.
+				MOVE.W	D0,D1							;make a copy 					<1.4>
+				ADDQ	#2,D1							;Adjust offset to version field (len + 1)
+				BCLR	#0,D1							;Adjust offset for Word alignment.
+				MOVE.W	(A0,D1.W),D1					;Get the version number
+				CMP.W	#CurTFBDrvrVersion,D1			;Check version.
+				BGE.S	@Repeat							;Branch if current version is greater or same.
+				
+				SWAP    D0								; get 1st str length in hi word	<SXXX/28Oct87> DAF
+				Addq	#1,A0							; point to text of driver name (skip length byte).
+				LEA		TFBVideoTitle,A1				; get pointer to video title	<SXXX/28Oct87> DAF
+				MOVE.B	(A1)+,D0						; get 2nd str length in lo word	<SXXX/28Oct87> DAF
+				_CmpString								; are they equal? (case-insensitive)
+				TST		D0								; test result
+				BNE.S	@Repeat							; different name, so continue search
+				
+;  Search device list for this driver.
+;
+				MOVE.L	DeviceList,A1					;Get head of device list.
+				MOVE.L	A1,D7							;Save handle to first entry.
+				MOVE.L	(A1),D0							;Point to the first entry in the list.
+				BEQ		AllDone							;Done if empty list.
+
+@10				MOVE.L	D0,A1							;Put ptr in A1.				
+				MOVE.W	spRefNum(A3),D0					;Get RefNum.
+				CMP.W	GDRefNum(A1),D0					;Have we found the RefNum?
+				BEQ.S	@GetPStorage					;Branch if found.
+				
+				MOVE.L	GDNextGD(A1),D7					;Save handle to next GD.
+				BEQ.S	@Repeat							;Branch if no more GD's.
+				MOVE.L	D7,A1							;Put ptr in A1.
+				MOVE.L	(A1),D0							;Point to GD.
+				BEQ.S	@Repeat							;Branch if no more GD's.
+				BRA.S	@10								;Continue looking for RefNum.
+				
+;  Get the necessary private storage.
+;
+
+@GetPStorage	
+				MOVE.L	D6,A0							;Pointer to DCE.
+				MOVE.L	dCtlStorage(A0),A0				;Handle to private storage.
+				MOVE.L	(A0),A0							;Pointer to private storage.
+				MOVE.W	saveMode(A0),sMode(A6)			;Save the mode.
+				MOVE.W	savePage(A0),sPage(A6)			;Save the Page.
+				MOVE.W	GFlags(A0),sGFlags(A6)			;Save the GFlags.
+				MOVE.L	GammaPtr(A0),A1					;Get the GammaPtr.
+				MOVE.L	saveSQElPtr(A0),sSQEl(A6)		;get the slot interrupt queue pointer 	<1.3>
+
+				MOVE.L	A1,A0							; copy the gamma ptr
+				_GetPtrSize								; get the size of the current table
+				MOVE.L	D0,D1							; make a copy of it
+				_NewPtr ,SYS							; allocate another ptr of that size in sys
+				BNE		@Repeat							;Branch if error
+
+				MOVE.L	D1,D0							; get the gamma table size again
+				EXG		A0,A1							; copy the gamma table
+				_BlockMove								; duplicate it
+				BNE		@Repeat							; 
+				
+				MOVE.L	A1,sGammaPtr(A6)				;Save the GammaPtr
+
+; Since the gamma data in the boot driver is still inverted, invert the data in place
+;
+
+				MOVE.W	GFormulaSize(A1),D0				; get the size of the formula data
+				MOVE.W	GChanCnt(A1),D1					; get the number of channels
+				SUBQ	#1,D1							; adjust for DBRA
+				ADDA	#GFormulaData,A1				; point to formula data
+				ADDA	D0,A1							; advance to gamma data
+@ChanLoop		MOVE.W	#255,D0							; loop count within each channel
+@entryLoop		NOT.B	(A1)+							; invert the values
+				DBRA	D0,@entryLoop					; for each entry in channel
+				DBRA	D1,@ChanLoop					; and each channel
+
+; Close and dispose of the driver.
+;
+				
+				MOVE.L	D7,A1							;Restore A1.
+				MOVE.L	(A1),A1							; get pointer		<!!!DAF>
+				CLR.L	ioCompletion(A4)				;No completion routine.
+				MOVE.W	GDRefNum(A1),ioRefNum(A4)		;The device RefNum.	
+				MOVE.L	A4,A0							;Set A0 for use by ioCore.
+				_Close									;Close the driver.
+				BNE		@Repeat							;Branch if error.
+				
+				MOVE.L	sSQEl(A6),A0					;deallocate the slot interrupt queue elem <1.3>
+				MOVEQ	#0,D0							;clear the register				<1.3>
+				MOVE.B	spSlot(A3),D0					;get slot number in D0			<1.3>
+				_SIntRemove								;take it out of the queue		<1.3>
+				
+				MOVE.L	D4,A0							;Get handle to driver.
+				_DisposHandle							;Dispose of the driver.
+				
+				MOVE.L	D5,A1							;Get ptr to UT entry.
+				MOVE.L	(A1),A0							;Get handle to DCE.
+				_DisposHandle							;Dispose of the DCE.
+				
+				CLR.L	(A1)							;Clear entry in UT.
+				
+				LEA		TFBVideoTitle,A1				;Get the name of the driver.
+				MOVE.L	A1,ioFileName(A4)				;Set parameter.
+				MOVE.B	spSlot(A3),ioSlot(A4)			;Slot and
+				MOVE.B	spId(A3),ioId(A4)				;sResource Id.
+				CLR.L	ioMix(A4)						;No extra data.
+				CLR.W	ioFlags(A4)						;Clear the flags.
+				CLR.B	ioPermssn(A4)					;R/W permissions.
+				MOVE.L	A4,A0							;Set A0 for use by ioCore.
+
+				_HOpen									;Open the video driver, using the extended parameter block. <C208>
+				
+				MOVE.L	D7,A0							;Handle to the GDev.
+				MOVE.L	(A0),A0							;Pointer to the GDev.
+				MOVE.W	ioRefNum(A4),GDRefNum(A0)		;Save the new RefNum.
+
+; Detach the resource and restore the private storage.
+;
+				
+				MOVE.W	ioRefNum(A4),D0					;Get the refnum.
+				EXT.L	D0								; <!!!DAF>
+				NOT.L	D0								;Convert it to a unit table index, step 1.
+				LSL.L	#2,D0							;Convert it to a unit table index, step 2.
+				ADD.L	UTableBase,D0					;Saved pointer to video driver entry.
+				MOVE.L	D0,A0							;Pointer to video driver entry.
+				MOVE.L	(A0),A0							;Get handle to DCE.
+				MOVE.L	(A0),A0							;Get pointer to DCE.
+
+				MOVE.L	A0,-(SP)						;Save A0
+				MOVE.L	dCtlDriver(A0),-(SP)			;Get handle to driver.
+				_DetachResource							;Detach it.
+				MOVE.L	(SP)+,A0						;Restore A0
+				
+				MOVE.L	dCtlStorage(A0),A0				;Handle to private storage.
+				MOVE.L	(A0),A0							;Pointer to private storage.
+				MOVE.W	sMode(A6),saveMode(A0)			;Restore the mode.
+				MOVE.W	sPage(A6),savePage(A0)			;Restore the Page.
+				MOVE.W	sGFlags(A6),GFlags(A0)			;Restore the GFlags.
+
+				MOVE.L	GammaPtr(A0),A1					;Get the new gammaPtr.
+				MOVE.L	sGammaPtr(A6),GammaPtr(A0)		;Restore the original gamma table.
+				MOVE.L	A1,A0							;Prepare to dispose of new gamma table.
+				_DisposPtr								;Dispose it.
+				
+				BRA		@Repeat							;Continue loop.
+				
+; Clean up and go home.
+;
+
+AllDone			
+				ADD.W	#IOQElSize+spBlockSize+12,SP	;Deallocate parameter blocks.
+				MOVEM.L	(SP)+,A2-A4/D4-D7				;Restore registers.
+				UNLK	A6								;Deallocate stack frame.					
+				
+				ENDWITH

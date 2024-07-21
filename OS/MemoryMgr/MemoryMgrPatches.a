@@ -1,0 +1,1925 @@
+;
+;	File:		MemoryMgrPatches.a
+;
+;	Contains:	patches for the Memory Mgr.
+;
+;	Written by:	Darin Adler
+;
+;	Copyright:	© 1990-1993 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;	   <SM4>	 6/14/93	kc		Roll in Ludwig.
+;	   <LW2>	 5/11/93	chp		MoveHLow was depending on the CCR to indicate error conditions
+;									reported by _RecoverHandle. This weirdass trap only returns its
+;									result in MemErr, so insert an explicit test to avoid crashing
+;									in the subsequent _HGetState. Partial fix for RADAR #1081681.
+;		<17>	  6/8/92	JSM		In TheFuture, use emResrvMemSemaphore from ExpandMem in the
+;									ResrvMemGrowSystemHeap patch instead of defining the semaphore
+;									in code space here.
+;		<16>	 4/29/92	gbm		#1027970,<csd>: Include change 15 in Cube-E (they said it was
+;									okay, honest!)
+;		<15>	 4/29/92	gbm		Fix an obscure (but kind of cool) bug in MMHPrologue in 32-bit
+;									mode. Conditionalized for TheFuture, because Cube-E hasn’t said
+;									they want it yet.
+;		<14>	  1/6/92	DTY		Roll in the final version of _MoveHLow from the System 7 Tooner
+;									Extension.  Revert back to the 7.0 behaviour for _MoveHHi on
+;									system heap handles.  Added 7 Up patches for NewHandle and
+;									ReallocHandle, but keep them inactive until we know whether or
+;									not XTND really slows down with these patches.
+;		<13>	 12/4/91	csd		#1016449: Added support for Scruffy. In the patch to CompactMem
+;									which fixes a bug in MoveHHi, check first to see if Scruffy in
+;									installed. If it is, just jump to the old CompactMem since
+;									MoveHHi will be the fixed version.
+;		<12>	11/25/91	DTY		Replaced _MoveHHi patch which did nothing for a system heap
+;									handle with the patch from 7-Up which moves system heap handles
+;									low.
+;		<11>	11/21/91	DTY		Adding _MoveHLow. This is the version from the 7-Up file
+;									Senile.a. Someone needs to remember to bother Greg about a new
+;									version in the next few days.
+;		<10>	12/13/90	BBM		(stb) move the patch to compactmem into memorymgrpatches.a.
+;		 <9>	12/13/90	DFH		(JSM) Rolled in MacPlus MakePtrSpc fix from BassPatches.a.  More
+;									use of linked patch macros, tho.
+;		 <8>	 12/8/90	DFH		Added additional speedups to MoreMasters, ResrvMem, and NewPtr.
+;									Required replacing MakeCBkF, since that routine sometimes
+;									changed AllocPtr from a better value to a worse value.
+;		 <7>	 12/6/90	DFH		& stb.  Speedups for MoreMasters, ResrvMem, and NewPtr on IIci
+;									ROMs.
+;		 <6>	 10/9/90	stb		& DFH. Move the MoveHHi patch from Process Mgr to an earlier
+;									point in the booting process
+;		 <5>	  9/2/90	csd		Fixed the ResrvMem patch to preserve the error when it doesn’t
+;									call NewPtr
+;		 <4>	 8/31/90	stb		& DFH. teach NewPtr and ResrvMem to allocate wisely in the
+;									system heap if growth is required.
+;		 <3>	 8/15/90	dba		make DisposPtr tolerant of NIL pointers
+;		 <2>	 4/20/90	dba		add patch that does InitApplZone before and after SetAppBase
+;		 <1>	 3/21/90	dba		added today; the first real linked patch
+;				 3/20/90	dba		made an InitApplZone patch here for Plus and SE
+;
+
+		IF (&TYPE('ForSpeedyMacIIciINIT') = 'UNDEFINED') THEN
+ForSpeedyMacIIciINIT	EQU		0
+		ENDIF
+		
+		IF (&TYPE('XTNDSlowsDownWithThesePatches') = 'UNDEFINED') THEN
+XTNDSlowsDownWithThesePatches	equ	0
+		ENDIF
+		
+		print push,off
+		load 'StandardEqu.d'
+		include 'LinkedPatchMacros.a'
+
+		IF ForSpeedyMacIIciINIT THEN
+			include 'GestaltEqu.a'
+		ENDIF
+
+_MoveHLow	OPWORD	$A09D
+		
+		print pop
+
+		IF NOT ForSpeedyMacIIciINIT THEN
+
+AfterSetRetryFlagInMMHPrologue	ROMBind (IIci,$dc7c)
+
+; ——————————————————————————————————————————<15>———————————————————————————————————————————————————————
+; MMHPrologue — One of the things the handle prologue does is to retry the zone check if it fails
+;				once.  Before retrying the check, though, it switches modes (from 24 to 32 or from
+;				32 to 24).  It does this because the ROZ is always a 32-bit zone, no matter what the
+;				startup mode is.  A ROZ handle will fail the zone self-check if the machine was
+;				booted in 24-bit mode, so the prologue does the switch and tries again.
+;				Unfortunately, the switch also occurs if you’re already in 32-bit mode.  The switch
+;				to 24-bit mode can have dire consequences for handles above the 16M mark in memory.
+;				The handle’s high byte get masked off, and the rest of the address may actually
+;				pass the zone check.  (In a bizarre coincidence, the “uninitialized” memory pattern
+;				of $b6db6d... tends to pass the self check with suprising frequency!)
+;
+;				This is a head patch to MMHPrologue installed when the machine is booted in 32-bit
+;				mode.  The patch sets a flag which will cause the second try to be avoided, and then
+;				rejoins the ROM.
+;
+MMHPrologueFix PatchProc vMMHPrologue,(IIci,using32bitheaps)
+		move.l	(sp)+, a1				; code from the ROM, to do whatever ROMs do
+		movem.l	a2-a6/d3-d7, -(sp)
+		move.b	MMFlags, -(sp)
+		move.l	a1, a4
+
+	; and here’s the fix you’ve been waiting for!!!
+	;	move.w	#0, -(sp)				; the code used to look like this, but we’re changing it so it
+		move.w	#1,	-(sp)				; sets the retry flag to look like we’ve already retried
+		jmpROM	AfterSetRetryFlagInMMHPrologue
+
+		endproc
+
+FlushApplVBLs ROMBind (Plus,$F522),(SE,$9974)
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+; InitApplZone — more initialization
+
+; This makes InitApplZone do extra initialization on Plus and SE ROMs that it does on all newer ones.
+
+MoreInitApplZone PatchProc _InitApplZone,(Plus,SE)
+
+		move.l	MinusOne,LastSPExtra	; invalidate cache for next SwapFont (needed for Plus only)
+
+; The following initialization is in Launch on the Plus and SE, but it should be here, too
+
+		clr.l	DragHook
+		clr.l	DeskHook
+		clr.l	CloseOrnHook
+		clr.l	ResumeProc
+		clr.w	TaskLock				; clear TaskLock and FScaleDisable
+		clr.l	ResErrProc
+		clr.l	EjectNotify
+		move.l	jSoundDead,a0			; get vector to kill all current sounds in ...
+		jsr		(a0)					; ...the application heap
+		jsrROM 	FlushApplVBLs			; kill off doomed VBL tasks
+		; *** currently, the Notification Mgr. patch kills NM tasks (move it here?)
+
+		jsrOld							; call the old InitApplZone
+
+		move.l	sp,d1					; current stack
+		sub.l	DefltStack,d1			; standard stack size
+		move.l	d1,ApplLimit			; use stack limit, NOT BufPtr’s
+		move.l	d1,HiHeapMark			; start HiHeapMark in sync with ApplLimit for glue MaxApplZone
+
+		clr.w	CurApRefNum				; since the resource file was just closed
+		_RDrvrInstall
+
+		rts
+
+				endproc
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+; SetAppBase — bracket with InitApplZone
+
+; The initialization of the ApplZone that SetAppBase does is insufficient, so we do two extra
+; InitApplZone calls.
+
+BracketSetAppBaseWithInitApplZones PatchProc _SetAppBase,(Plus,SE,II,Portable,IIci)
+
+		_InitApplZone
+		jsrOld
+		_InitApplZone
+		rts
+
+				endproc
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+; DisposePtr — allow NIL pointers
+
+AllowNILDisposePtr PatchProc _DisposePtr,(Plus,SE,II,Portable,IIci)
+
+		move.l	a0,d0
+		bnzOld							; call the real thing
+		move.w	d0,MemErr				; no error
+		rts
+
+				EndProc
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+; ResrvMem - make it grow System Heap, too.
+
+; ResrvMem will not grow any heap other than ApplZone.  This is a problem with the new, growable system heap.
+; Process Mgr will grow the system heap for NewHandle calls.  ResrvMem usually precedes a NewHandle,
+; HLock sequence.  If ResrvMem fails, the following NewHandle will cause the heap to grow (if it can).
+; Then the block is allocated where the free space was made -- at the top.
+;
+; This proc not only causes the heap to grow, it also calls ResrvMem again to see how low the free block
+; can be made.
+;
+; Notes:
+; NewPtr calls ResrvMem again while doing the StdGZProc.  We want it to call the user gzproc, so
+; it’s important that ResrvMem return an error when it’s reentered.  That’s why we have a semaphore.
+;
+; See also:  NewPtrGrowSystemHeapCleanly
+;
+;——————————————————————————————————————————————————————————————————————
+;
+; PROCEDURE ResrvMem;
+; On exit:
+;	A0 - ptr to free block made or found.
+;	D0 - 0 if large enough block was found, memfullerr if not.
+;
+; Arguments:
+;		D0: size of block required (logical size).
+;
+; Registers:
+;		A0: semaphore address, zone comparing
+
+ResrvMemGrowSystemHeap PatchProc _ResrvMem,(Plus,SE,II,Portable,IIci)
+
+	IF TheFuture THEN				;														<17>
+		move.l	ExpandMem,a0		; get ExpandMem											<17>
+		add.l	#ExpandMemRec.emResrvMemSemaphore,a0	; a0 points to emResrvMemSemaphore	<17>
+	ELSE							;														<17>
+		lea		@ResrvMemSemaphore,a0
+	ENDIF							; TheFuture												<17>
+
+		tst.l	(a0)				; is this a reentry?
+		bne.s	@leaveNowStillBusy	; yup, get out.
+		move.l	#1,(a0)				; nope, set the semaphore
+
+		movem.l	d0-d1,-(sp)			; save how much was asked for
+		jsrOld						; go get it
+		tst.w	d0					; test for os error
+		beq.s	@leaveNowPopEm		; if zero, space was reserved and we’re done
+
+		move.l	4(sp),d1			; restore the trap word our caller used					<5>
+		btst	#tSysOrCurZone,d1	; is this a _Resrvmem ,SYS?
+		bne.s	@yupItsTheSystemHeap
+		move.l	sysZone,a0			; is this the (growable) system zone?
+		cmp.l	theZone,a0
+		bne.s	@leaveNowPopEm		; no, get out and leave other heaps alone
+
+@yupItsTheSystemHeap
+		move.l	(sp),d0				; restore the amount being requested					<5>
+		_NewPtr	,SYS				; force open a slot, even though it’s probably at the top of the heap
+									; 	because we just made the heap grow.
+		bne		@leaveNowPopEm		; leave if we couldn’t get any space
+
+		_DisposPtr					; ok, we got it.  now free it
+		movem.l	(sp),d0-d1			; ask ResrvMem again for this much.  It will do a better job now that
+		jsrOld						;   we know we have enough free space.
+									; dispatcher sets the z flag based on the function result
+
+@leaveNowPopEm
+		addq	#8,sp
+@leaveNow
+
+	IF TheFuture THEN				;														<17>
+		move.l	ExpandMem,a0		; get ExpandMem											<17>
+		add.l	#ExpandMemRec.emResrvMemSemaphore,a0	; a0 points to emResrvMemSemaphore	<17>
+	ELSE							;														<17>
+		lea		@ResrvMemSemaphore,a0
+	ENDIF							; TheFuture												<17>
+
+		clr.l	(a0)
+		rts
+
+@leaveNowStillBusy
+		moveq	#memFullErr,d0		; failure		
+		move.w	d0,MemErr
+		rts
+
+	IF NOT TheFuture THEN			; use emResrvMemSemaphore instead if we’re in TheFuture	<17>
+@ResrvMemSemaphore
+		dc.l	0					; non-zero means we’ve reentered
+	ENDIF							; NOT TheFuture											<17>
+
+		endproc
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+; NewPtr - make it grow System Heap and place the block down low, too.
+
+; Now that the system heap can grow, all of a sudden NewPtr is dropping locked blocks at the top of
+; the heap.  This stems from the fact the routine which reserves the block (MkPtrSpace) only grows ApplZone.
+; This proc calls NewPtr, then checks to see whether the heap grew.  If it did, this throws away the
+; newly allocated block and calls NewPtr again.  This gives MkPtrSpace the chance to allocate space
+; down low because now there’s room to put relocatable blocks (the space the heap growing gave us).
+; 
+; See also:  ResrvMemGrowSystemHeap
+;——————————————————————————————————————————————————————————————————————
+;
+; FUNCTION NewPtr(byteCount: LongInt): Ptr;
+;
+; On entry:   D0 - size in bytes to allocate
+; On exit :   A0 - Returns a pointer to a block of (data) size byteCount.
+;
+;——————————————————————————————————————————————————————————————————————
+
+NewPtrGrowSystemHeapCleanly PatchProc _NewPtr,(Plus,SE,II,Portable,IIci)
+		movem.l	d0-d1,-(sp)			; save how much was asked for and the trap word (may have sys bit set)
+		move.l	#-1,-(sp)
+		move.l	SysZone,a1
+		btst	#tSysOrCurZone,d1	; is this a NewPtr ,SYS?
+		bne.s	@useSys
+		cmp.l	theZone,a1
+		bne.s	@callOld
+@useSys
+		move.l	bkLim(a1),(sp)		; end of system zone
+@callOld
+		jsrOld						; NewPtr
+		tst.w	d0					; test for success (this could be a MemErr test instead…)
+		bne.s	@leaveNow			; it failed to allocate, so we don’t care
+
+		move.l	sysZone,a1
+		move.l	bkLim(a1),d1
+		cmp.l	(sp),d1				; did the heap grow?
+		bls.s	@leaveNow			; no, get out
+
+		addq	#4,sp				; pop bkLim (or fake-o 0xFFFFFFFF)
+		_DisposPtr					; A0 has the pointer to blow away
+		movem.l	(sp)+,d0-d1			; save how much was asked for
+		jsrOld						; now allocate it again, this time maybe lower in the heap
+		rts
+
+@leaveNow
+		lea		12(sp),sp
+		rts
+
+		endproc
+
+;
+;  These patches were a part of 7-Up.  Rumour has it that XTND slows down by a factor
+;  of two.  Don’t build these into the System until we know whether or not this is true.
+;
+
+	if not(XTNDSlowsDownWithThesePatches) then
+	
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+;
+; SetRovingPointerBeforeNewHandle
+;
+; info:
+;			This is a patch to NewHandle that sets the roving pointer to the start of
+;			the heap before calling through.
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+SetRovingPointerBeforeNewHandle	PatchProc	_NewHandle,(Plus,SE,II,IIci,Portable)
+		move.l	SysZone,a0						; a0 <- SysZone
+		cmpa.l	TheZone, a0						; is this handle going in the System heap?
+		beq.s	@inSysZone						; handle was in System heap
+		btst	#tSysOrCurZone, d1				; is the "sys" bit set in the trapword?
+		beq.s	@ExitPatchAndCallThrough		; nope...
+		
+@inSysZone
+		clr.l	allocPtr(a0)					; a0 has the system zone ptr in it
+	
+@ExitPatchAndCallThrough
+		jmpOld
+		EndProc
+		
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+;
+; SetRovingPointerBeforeReallocHandle
+;
+; info:
+;			This is a patch to ReallocHandle that sets the roving pointer to the start of
+;			the heap before calling through.
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+SetRovingPointerBeforeReallocHandle	PatchProc	_ReallocHandle,(Plus,SE,II,IIci,Portable)
+		movem.l	d0/a0/a1,-(sp)					; save a0
+		move.l	SysZone,a1						; a1 <- SysZone
+		_HandleZone								; a0 has caller’s handle
+		cmp.l	a0,a1							; is this handle in the System heap?
+		bne.s	@ExitPatchAndCallThrough		; nope...
+		
+@inSysZone
+		clr.l	allocPtr(a1)					; a1 has the system zone ptr in it
+	
+@ExitPatchAndCallThrough
+		movem.l	(sp)+,d0/a0/a1					; save a0
+		jmpOld
+		EndProc
+	endif
+	
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+; MoveHHi - do not let it happen to a handle in the System Heap.
+;
+; MoveHHi is usually called because the caller is about to lock the handle down.  This is
+; the right thing to do in app heaps, but is bad for the System Heap.  Immobile blocks in
+; the System Heap limit the extendability of the Process Mgr heap.
+;
+; Assumptions:
+;  This assumes that the system heap is the lowest heap in memory.  In particular, this check will
+;  disable MoveHHi in subzones residing in the system heap.  This behavior has been around for a
+;  while in MultiFinder, but should go away when we rewrite this patch.
+;
+; To Do:	Rewrite, using the relative handle to find the zone start, comparing that to
+;			SysZone.  This will need a safe dereference, perhaps borrowed from the IIci ROM,
+;			which would include a bus-error handler.
+; 
+;——————————————————————————————————————————————————————————————————————
+;
+; PROCEDURE MoveHHi(blockHandle: Handle);
+;
+; On entry:		A0 - Handle for block to move
+; On exit :		D0 - OSErr (also in MemErr)
+;				A0 - Handle
+;
+;——————————————————————————————————————————————————————————————————————
+
+MoveHHiPatch	 PatchProc _MoveHHi,(Plus,SE,II,Portable,IIci)
+		move.l	a4,-(sp)						; <12> save a4
+		move.l	a0,a4							; <12> save caller’s A0,
+		move.l	SysZone,a1						; <12> a1 <- SysZone
+		_HandleZone								; <12> a0 has caller’s handle
+		cmp.l	a0,a1							; <12> is this handle in the System heap?
+		move.l	a4,a0							; <12> put caller’s handle back into a0
+		move.l	(sp)+,a4						; <12> restore a4
+		beq.s	@DoNothing						; <12> handle was in System heap
+		jmpOld									; if not, let the ROM have at it
+
+; handle in System heap.  Set up return codes like we did something, then return.
+@DoNothing										; just return since in sys heap
+		moveq.l	#noErr,d0						; say there was no err
+		move.w	d0,MemErr						; and agree in lomem
+		rts										; return without calling through
+
+		endproc									; MoveHHiPatch
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+;
+; MoveHLow
+;
+; entry:
+;			A0 - handle requested
+; exit:
+;			D0 - error (word)
+; internal:
+;			A4 - (long) handle to original block
+;			A3 - (long) pointer to new block
+;			D3 - (long) size of block
+;			D4 - (long) offset to block tags (24 = -8; 32 = -12)
+; info:	
+;			This code does the opposite in principle to MoveHHi.  The handle input
+;			is moved as low as possible in the heap that it belongs.  This call works
+;			with 24 and 32 bit zones.
+; to do:
+;		•	roving pointer point at newly freed block (is this good?)
+
+myError			EQU		nsStackErr	;QuickDraw error meaning not enough stack
+blkSize			EQU		-8			;note that this offset is the same for 24/32 bit zones
+StackSlop		EQU		(3*1024)	;3k slop for interupts and our minimal buffer
+BlockTagBits	EQU		$C0			;
+
+MakeBlocksNonPurgeableStack	record	{a6Link},decr
+startParams				equ		*
+paramSize				equ		startParams-*
+return					ds.l	1
+a6Link					ds.l	1
+HPurgeAddress			ds.l	1						;trap address for HPurge
+hNoPurgeAddress			ds.l	1						;trap address for HNoPurge
+RecoverHAddress			ds.l	1						;trap address for RecoverHandle
+HGetStateAddress		ds.l	1						;trap address for HGetState
+largestFreeSpace		ds.l	1						;size of largest free space available
+freeSpaceAccumulator	ds.l	1						;a place to add up free space
+keepCheckingFreeSpace	ds.w	1						;should we keep checking free space?
+passedOurBlock			ds.w	1						;are we past our block yet?
+localSize				equ 	*						;size of all the local variables
+						endR
+
+MoveHLow	PatchProc	$A09D,(Plus,SE,II,IIci,Portable)
+
+@Regs	REG	a3-a6/d3-d7
+
+		movem.l	@Regs,-(sp)						;save regs
+		move.l	theZone,-(sp)					;save theZone
+		move.l	a0,a4							;save callers A0,
+												; original MoveHHi did this
+
+	;check for nil master pointer
+		move.w	#nilHandleErr,MemErr			;
+		move.l	(a0),d0							;check for nil MP
+		beq		@RestoreZoneStateAndExit		;
+
+	;check for locked handle passed in, and save the state of the handle
+		;move.l	a4,a0							;get handle to original block
+		_HGetState								;
+		move.b	d0,d2							;save handle state of original block
+		move.w	#memLockedErr,MemErr			;
+		btst	#lock,d0						;
+		bne.s	@RestoreZoneStateAndExit		;
+
+	;set theZone to zone that this handle lives in
+		move.l	a4,a0							;get handle to original block
+		_HandleZone								;
+		tst.w	d0								;
+		bne.s	@RestoreZoneStateAndExit		;
+		move.l	a0,theZone						;temporarily set theZone to contain block
+
+	;set up offset in d4 to MemMgr Block tags (be 24/32 bit zone friendly)
+		moveq	#-8,d4							;-8 offset MemMgr Block tags in 24 zone
+		move.l	Lo3Bytes,d6						;setup mask for MakeBlocksNonPurgeable
+		tst.b	maxNRel(a0)						;check if 32 zone
+		beq.s	@not32bitzone					;
+		add.l	#-4,d4							;-12 offset MemMgr Block tags in 32 zone
+		moveq	#-1,d6							;setup mask for MakeBlocksNonPurgeable
+@not32bitzone
+
+	;mark all purgeable blocks as non-purgeable when/if we call Newptr
+	
+	;mark our block as non-purgeable
+		move.l	a4,a0							;get handle to original block
+		_HNoPurge
+
+	;always allocate a buffer on the stack
+		link	A6,#MakeBlocksNonPurgeableStack.localSize	;Unlk A6 happens in RestorePurgeableBlocks
+		clr.l	-(sp)							;ensure end of handle list is a nil
+		bsr.s	MakeBlocksNonPurgeable			;
+		bne.s	@DoCommonExit					;condition codes are set for failure
+
+	;allocate block of same size in lower in this heap. (first get size of handle)
+		move.l	a4,a0							;get handle to original block
+		_GetHandleSize							;
+		move.l	d0,d3							;save size of block and check for error
+		bmi.s	@DoCommonExit					;
+		_NewPtr									;d0 from _GetHandleSize
+		bne.s	@DoCommonExit					;check for error
+		move.l	a0,a3							;save pointer to new block
+
+	;the result from NewPtr may actually be higher in memory than Handle passed in
+	;check for this and leave handle where it is
+		move.l	(a4),d0							;get pointer to old block
+		_StripAddress							;in 24 bit world, this call needed
+		cmp.l	a0,d0							;is new block higher in memory than old?
+		blt.s	@DisposeBlock					;yes, go dispose the new block
+
+	;copy junk from old handle to new pointer
+		move.l	a0,a1							;set up destination for blockmove
+		move.l	(a4),a0							;set up source for blockmove
+		move.l	d3,d0							;set up size for blockmove
+		_BlockMove
+
+	;make the handle point at the new block, and make the old block a pointer block
+		;fix relhandle
+		;move.l	(a4),a0							;point a0 at old block
+		move.l	-(a0),-4(a3)					;fix relhandle for new block
+		move.l	theZone,(a0)+					;change relhandle to pointer block info
+
+		;change master pointer to point at new
+		move.l	a3,(a4)							;no more references to old block
+
+		;mark old block as pointer block, and new block as relocateable
+		eori.b	#BlockTagBits,(a3,d4)			;toggle new block from nonrel to rel
+		eori.b	#BlockTagBits,(a0,d4)			;toggle old block from rel to nonrel
+
+	;Dispose of the old block (this frees the block)
+@DisposeBlock
+		_DisposePtr
+	;fall through to exit code (ResoreHandleStateAndExit)
+
+@DoCommonExit									;
+	;walk the heap to restore Purgeable Blocks and cleanup the stack
+		bsr		RestorePurgeableBlocks			;
+		move.l	(sp)+,d0						;remove the nil marker
+		unlk	a6								;distroy stack buffer
+		
+	;restore the master pointer flags
+		move.w	MemErr,d3						;preserve MemErr across _HSetState call
+		move.l	a4,a0							;get handle to new block
+		move.b	d2,d0							;restore handle state of original block
+		_HSetState								;
+		move.w	d3,MemErr						;restore MemErr after _HSetState call
+	;set up D0, fall through to exit code (RemoveStackBuffer)
+		moveq	#0,d0							;
+
+@RestoreZoneStateAndExit
+		move.l	(sp)+,theZone					;restore theZone
+		move.l	a4,a0							;preserve handle across MoveHHi
+		move.w	MemErr,d0						;make d0 agree with MemErr
+		movem.l	(sp)+,@Regs						;restore regs, leave cc's unchanged
+		rts										;return without calling through
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+;
+; MakeBlocksNonPurgeable
+;
+; entry:
+;			theZone	- the zone we will walk
+;			d4		- negative size of heapblock header.
+; exit :
+;			a0-a1	- trashed
+;			a2-a3	- unchanged
+;			a4		- unchanged; handle of block passed to MoveHLow
+;			a5		- trashed, used to jump through as return address 
+;			a6		- should be used to unlink buffer on stack
+;			a7,sp	- points to buffer on stack (first long is number of entries)
+;			d0		- error (long) (0 means no error, else bail; leave buffer on stack)
+;			d1		- trashed
+;			d2		- unchanged
+;			d3		- address of block passed to MoveHLow
+;			d4-d6	- unchanged
+;			d7		- trashed
+;
+; info:
+;			Walk the heap and mark purgeable blocks Non-purgeable.  The problem is that
+;			the original MoveHHi did not purge any blocks.  We need to save all purgeable
+;			handles, make a NewPtr call, and then restore them.  Remember which
+;			blocks we change by putting the master pointers in a buffer on the stack.
+;			Warning!  This routine leaves a buffer on the stack, which will be
+;			removed by calling RestorePurgeableBlocks.  That means this routine
+;			can’t save anything on the stack except master pointers.
+;
+; todo:
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+		with MakeBlocksNonPurgeableStack
+MakeBlocksNonPurgeable
+		move.l	a3,d1							;preserve a3 across call
+		move.l (sp)+,a5							;get return address
+
+
+	;see if we can make a buffer with storage for at least entry
+		_StackSpace								;
+		sub.l	#StackSlop,d0					;need some slop on stack for interupts
+		bmi		@ErrorExit						;
+		
+	;initialize regs for @loop
+	;clear free space counters
+	;clear flags to see if we should check free space and if we’ve passed our block
+	;set up our block address for free space counter
+	;A1 points at end of stack buffer
+	;A3 points at first block in heap
+	;D7 points at end of heap
+		clr.l	largestFreeSpace(a6)			;start with zero as the largest free space
+		clr.l	freeSpaceAccumulator(a6)		;and the accumulator starts out empty, too
+		clr.w	keepCheckingFreeSpace(a6)		;clear the flag for free space checks
+		clr.w	passedOurBlock(a6)				;clear the flag for our block in the heap
+		move.l	sp,a1							;pointer to stack buffer
+		sub.l	d0,a1							;point to the end of the stack buffer
+		move.l	(a4),d0							;get address of our block
+		_StripAddress							;shave off nasty bits, ’cause we’re gonna compare against it
+		move.l	d0,d3							;keep block address in d3
+		move.l	theZone,a3						;get pointer to start of this zone
+		move.l	bkLim(a3),d7					;save end of heap
+		add.l	#heapData,a3					;skip past zone header
+		sub.l	d4,a3							;skip past heap block header
+	;this loop walks the heap, and marks all purgeable blocks non-purgeable
+@loop
+		cmp.l	a1,sp							;check if stack buffer is full
+		ble		@ErrorExit						;no more room in buffer, signal error
+		cmp.l	a3,d7							;check if end of heap
+		blt		@NormalExit						;successfull, exit loop
+		cmp.l	a3,d3							;check if we’re to our block
+		bgt.s	@pastCheckForOurBlock			;if we’re not there, then move on
+		move.w	#-1, passedOurBlock(a6)			;otherwise, set the flag that says we’re past our block
+	;now treat block passed in as a special case terminator for free space checks
+		cmp.l	a3,d3
+		beq.s	@resetFreeSpaceAccumulator
+@pastCheckForOurBlock
+
+	;low two bits in d0 will be the block type
+		move.b	(a3,d4),d0						;get the blocktype
+		lsr.b	#6,d0							;only use the tag bits
+
+	;if free d0 = 0
+		beq.s	@addToFreeSpaceAccumulator
+
+@notFreeBlock
+	;bail if pointer block
+		cmp.b	#tybkNRel,d0					;check if pointer block
+		beq.s	@resetFreeSpaceAccumulator		;advance to next block
+
+	;we are sure it is a relocateable block now, but check just in case.
+		cmp.b	#tybkRel,d0						;check if relocateable block
+		bne.s	@resetFreeSpaceAccumulator		;if not relocatateable, error, go next?
+		
+	;we have a pointer to the relocatable block, we need a handle to mark it non-purgeable
+		move.l	a3,a0							;set up pointer to block
+		_RecoverHandle							;if this fails, then this block is
+												;orphaned, and we can move it at will
+		tst.w	MemErr							;(RecoverHandle result in MemErr only!)			<LW2>
+		bmi.s	@pastFreeSpaceChecks			;
+
+	;if already locked, we don’t need to change its state
+		_HGetState								;
+		btst	#lock,d0						;check if handle is locked
+		bne.s	@resetFreeSpaceAccumulator		;is locked, go to nextBlock 
+
+	;last test, is it a purgeable block?
+		btst	#purge,d0						;check if handle is purgeable
+		beq.s	@pastFreeSpaceChecks			;if not purgable go to nextBlock 
+
+	;change its state, and save a handle to this block in our buffer.
+		_HNoPurge								;keep this block from purgeing
+		move.l	a0,-(sp)						;save handle to this block on stack
+		bra.s	@pastFreeSpaceChecks
+
+	;we found a relocatable or free block, so add this block to the possible space for our ptr
+@addToFreeSpaceAccumulator
+		move.l	blkSize(a3),d0					;get size of this block
+		and.l	d6,d0							;strip off tags 24 bit world (32 is ok)
+		tst.w	keepCheckingFreeSpace(a6)		;should we bother (have we passed our block)
+		bmi.s	@endOfLoop						;don’t bother if we’ve passed our block
+		add.l	d0, freeSpaceAccumulator(a6)	;and add the size to the free space for this island
+		bra.s	@endOfLoop
+		
+	;we ran across an immovable block, so reset our counter and update the largest free area we’ve found
+@resetFreeSpaceAccumulator
+		tst.w	keepCheckingFreeSpace(a6)		;should we bother with this? (past our block?)
+		bmi.s	@pastFreeSpaceChecks			;if the flag is set, skip the free space stuff
+		tst.w	passedOurBlock(a6)				;have we (just now) passed our block in the heap
+		beq.s	@pastPreflightCheck				;if the flag is not set, keep checking free spaces
+	;now comes the good part... should we bail out early because there isn’t sufficient free space
+	;lower that our block in the heap?
+		move.l	a3, -(sp)						;save block pointer, ’cause we need an address register
+		move.l	d3,a3							;put block passed in here
+		move.l	blkSize(a3),d0					;get size of our block
+		and.l	d6,d0							;strip off tags 24 bit world (32 is ok)
+		cmp.l	largestFreeSpace(a6),d0			;do we have room for our block lower in the heap?
+		move.l	(sp)+, a3						;put old block pointer back, don’t affect cc
+		bgt.s	@ErrorExit						;no room in heap, bail out!
+		move.w	#-1,keepCheckingFreeSpace(a6)	;now that we have good news, stop checking free space
+		bra.s	@pastFreeSpaceChecks
+@pastPreflightCheck
+		move.l	freeSpaceAccumulator(a6), d0	;get the space we counted this time
+		cmp.l	largestFreeSpace(a6), d0		;see if the largest is still king of the hill
+		ble.s	@pastFreeSpaceChecks			;if so, move on
+		move.l	d0, largestFreeSpace(a6)		;else make a new king
+		clr.l	freeSpaceAccumulator(a6)		;and clear the accumulator
+@pastFreeSpaceChecks
+		move.l	blkSize(a3),d0					;get size of this block
+		and.l	d6,d0							;strip off tags 24 bit world (32 is ok)
+
+	;end of @loop, bump a3 to point at next block
+@endOfLoop
+		add.l	d0,a3							;point at next block
+		bra		@loop							;loop back for more
+
+
+	;if error occured, we must signal error by putting a zero count into stack buffer
+@ErrorExit
+		move.w	#myError,d0						;signal an error to the main routine
+		move.w	d0,MemErr						;set MemErr
+		bra.s	@CommonExit						;exit through CommonExit
+
+@NormalExit
+		moveq	#0,d0							;signal no error to the main routine
+
+@CommonExit
+		;condition codes must be set at this point, caller depends on this
+		movea.l	d1,a3							;preserve a3 across call
+		jmp		(a5)							;rts
+		endwith
+
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+;
+; RestorePurgeableBlocks
+;
+; entry:
+;			A6 - should be used to unlink buffer on stack
+; exit :
+;			D1 - trashed
+;			A5 - trashed
+;			A6 - restored
+;
+; info:
+;			Traverse the stack buffer and restore the saved handles to their purgeable
+;			state.  Deallocate the stack buffer.
+;			Warning!  This routine removes the buffer on the stack.  This buffer was
+;			allocated by MakeBlocksNonPurgeable.
+; todo:
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+RestorePurgeableBlocks
+		move.l	(sp)+,a5						;get return address
+		
+@loop
+		tst.l	(sp)							;check for end of list
+		beq.s	@ExitRestorePurgeableBlocks		;nil meant end of list
+		move.l	(sp)+,a0						;get handle
+		_HPurge									;mark as purgeable, ignore any error
+		bra.s	@loop							;check if anymore
+
+@ExitRestorePurgeableBlocks
+		jmp		(a5)							;return to caller
+		EndProc
+
+		ENDIF						; NOT ForSpeedyMacIIciINIT
+; ——————————————————————————————————————————————————————————————————————————————————————————————————
+
+;***************************************************************************************
+; These patches fix a Memory Manager bug in the IIci based ROMs.  The bug causes NewPtr,
+; ResrvMem and MoreMasters to be slower than they have to be, especially when there are
+; many relocatable blocks in the heap.  The basic problem is that the benefit of the
+; “rover pointer” (AllocPtr in the zone header) is lost.  There are two causes a)
+; RelocRel stores a dirty address in AllocPtr, and later uses of that address treat it as
+; “too high”, so the search must start the beginning of the heap, and 2) MakeSpace zeros
+; AllocPtr if the block moved by RelocRel ends up being the AllocPtr, which causes further
+; RelocRels in MakeSpace to not benefit as much as possible from the previous ones.
+;
+; Our fix is to replace MakeSpace as called by NewPtr, ResrvMem and MoreMasters.  The
+; new MakeSpace 1) cleans AllocPtr after RelocRel (24-bit patch only), and 2) advances
+; AllocPtr to the next block, rather than clearing it, when it matches what RelocRel
+; returned.  MakeSpace is replaced by patching NewPtr and ResrvMem to call our own
+; MakePtrSpc, which in turn calls our own MakeSpace.  Additional subroutine calls in
+; these routines were not replaced: we just call the ROM.  Also, where possible, we patch
+; only the first part of a routine and jump into the ROM to finish it.
+;
+; NOTE: We jam the vectors rather than patching the traps.  This is justified since these
+; patches partially replace the traps, and partially call the ROM routines.
+;***************************************************************************************
+
+; ROMBinds so things are ever so cute
+ROMBackToResrvMem24				ROMBind	(IIci,$0D1AC)
+ROMBackToNewPtr24				ROMBind	(IIci,$0D372)
+ROMBackToMoreMasters24			ROMBind	(IIci,$0D746)
+ROMBackToa24HMakeMoreMasters	ROMBind	(IIci,$0E982)
+ROMa24ActualS					ROMBind	(IIci,$0E58E)
+ROMa24GrowZone					ROMBind	(IIci,$0E4F6)
+ROMa24PurgeBlock				ROMBind	(IIci,$0DEAE)
+ROMBackToResrvMem32				ROMBind	(IIci,$0D1CC)
+ROMBackToNewPtr32				ROMBind	(IIci,$0D38A)
+ROMBackToMoreMasters32			ROMBind	(IIci,$0D758)
+ROMBackToa32HMakeMoreMasters	ROMBind	(IIci,$0E9B4)
+ROMa32ActualS					ROMBind	(IIci,$0E5A2)
+ROMa32GrowZone					ROMBind	(IIci,$0E542)
+ROMa32PurgeBlock				ROMBind	(IIci,$0DEC6)
+ROMSubtractFree					ROMBind	(IIci,$0E92A)
+ROMa24GetSize					ROMBind	(IIci,$0E5BA)
+ROMa32GetSize					ROMBind	(IIci,$0E5D2)
+ROMAdjustFree					ROMBind	(IIci,$0E91C)
+ROMa24AllocBk					ROMBind	(IIci,$0E1E6)
+ROMa32AllocBk					ROMBind	(IIci,$0E234)
+ROMHBlockMove					ROMBind	(IIci,$0E334)
+ROMReleaseMP					ROMBind	(IIci,$0E9D0)
+
+; the Memory Manager vectors we replace
+vectorResrvMem24	EQU		$00001E28
+vectorResrvMem32	EQU		$00001F28
+vectorNewPtr24		EQU		$00001E40
+vectorNewPtr32		EQU		$00001F40
+vectorMoreMasters24	EQU		$00001E98
+vectorMoreMasters32	EQU		$00001F98
+
+SpeedyCiMemory		InstallProc			(IIci)
+
+		IMPORT		(PatchResrvMem24, PatchNewPtr24, PatchMoreMasters24):CODE
+		IMPORT		(PatchResrvMem32, PatchNewPtr32, PatchMoreMasters32):CODE
+
+		IF ForSpeedyMacIIciINIT THEN
+; Do nothing but leave if we're not on a IICi ROM
+		movea.l	RomBase,a0
+		cmpi.w	#$67C,8(a0)						; check ROM version number
+		bne.s	AllDone							; jump if it doesn't match
+		
+		move.w	#$01AD,d0						; _Gestalt
+		_GetTrapAddress	,NEWOS
+		move.l	a0,a2
+		move.w	#$009F,d0						; _Unimplemented
+		_GetTrapAddress	,NEWTOOL
+		cmpa.l	a0,a2							; is _Gestalt _Unimplemented?
+		beq.s	GoAhead							; then it can't be 7.0!!
+		
+		move.l	#gestaltSystemVersion,d0		; ask for the system version
+		_Gestalt								; ask Gestalt, that is
+		bne.s	AllDone							; if error, play it safe!
+		move.l	a0,d0							; move version to data register for cmp
+		cmpi.l	#$0700,d0						; is system version at least 7.0?
+		bcc.s	AllDone							; jump if so, patch is not needed
+GoAhead
+		ENDIF
+		
+; set up our patches
+		leaResident		PatchResrvMem24,a0		; calc address of our 24-bit ResrvMem
+		move.l	a0,vectorResrvMem24				; jam it in a memory mgr vector
+
+		leaResident		PatchNewPtr24,a0		; calc address of our 24-bit NewPtr
+		move.l	a0,vectorNewPtr24				; jam it in a memory mgr vector
+
+		leaResident		PatchMoreMasters24,a0	; calc address of our 24-bit MoreMasters
+		move.l	a0,vectorMoreMasters24			; jam it in a memory mgr vector
+
+		leaResident		PatchResrvMem32,a0		; calc address of our 32-bit ResrvMem
+		move.l	a0,vectorResrvMem32				; jam it in a memory mgr vector
+
+		leaResident		PatchNewPtr32,a0		; calc address of our 32-bit NewPtr
+		move.l	a0,vectorNewPtr32				; jam it in a memory mgr vector
+
+		leaResident		PatchMoreMasters32,a0	; calc address of our 32-bit MoreMasters
+		move.l	a0,vectorMoreMasters32			; jam it in a memory mgr vector
+AllDone
+		rts
+
+		ENDPROC
+		
+;***************************************************************************************
+;							j24ResrvMem
+;***************************************************************************************
+				PROC
+				EXPORT		(PatchResrvMem24, PatchNewPtr24, PatchMoreMasters24):CODE
+				
+PatchResrvMem24
+				TST.L	HFstFree(A6)			;Any masters left?
+				BNE.S	@1						;br if so
+				Move.W	mAllocCnt(A6),D2		;Number of masters to make.
+				Ext.L	D2
+				ASL.L	#2,D2					;Convert MP count to byte count.
+				AddQ.L	#BlkData24,D2 			;And block header						<v1.1>
+				Add.L	D2,D0					;Increase req count by ptr blk
+
+@1				bsr.s	Mya24MakePtrSpc			;Make room at the low end.				<v1.1>
+				JmpROM	ROMBackToResrvMem24		;re-join the ROM
+
+;***************************************************************************************
+;							j24NewPtr
+;***************************************************************************************
+
+PatchNewPtr24
+				Sub.L	a1,a1
+				bsr.s	Mya24MakePtrSpc			; call our copy of the ROM routine
+				JmpROM	ROMBackToNewPtr24		; re-join the ROM
+
+;***************************************************************************************
+;							j24MoreMasters
+;***************************************************************************************
+
+PatchMoreMasters24
+				MOVEQ	#0,D0					; assume success
+				bsr.s	Mya24HMakeMoreMasters	; call our copy of the ROM routine
+				JmpROM	ROMBackToMoreMasters24	; re-join the ROM
+
+;***************************************************************************************
+;							a24HMakeMoreMasters
+;***************************************************************************************
+
+Mya24HMakeMoreMasters
+				MoveM.L A0/D0-D1,-(SP)			;Save registers.
+
+				Move	mAllocCnt(A6),D0		;Number of masters to make.
+				Ext.L	D0
+				BGT.S	@1						;Make sure count is > 0
+
+				MoveQ	#DfltMasters,D0 		;If not, use default number.
+@1
+				Move.L	D0,D1					;Count of master pointers.
+				ASL.L	#2,D0					;Convert MP count to byte count.
+
+				bsr.s	Mya24MakePtrSpc			;Clear some room at the low end.
+				JmpROM	ROMBackToa24HMakeMoreMasters	; re-join the ROM
+
+;***************************************************************************************
+;							a24MakePtrSpc
+;***************************************************************************************
+
+Mya24MakePtrSpc
+				MoveM.L D0-D4/A0-A1/A3-A4,-(SP) ;Preserve registers, nowadays D4,A4, too.	<14Apr85>
+				JsrROM	ROMa24ActualS 			;Returns real sAct.
+				MoveA.l A6,A4					;Presume it's not ApplZone case             <14Apr85>
+				CmpA.L	ApplZone,A6 			;If EQ & GrowDown then must fix A4			<14Apr85>
+				SEq 	D3						;$FF if so (i.e. we can grow)				<14Apr85>
+
+; search for good region
+
+@MPSpc1											;											<14Apr85>
+				LEA 	HeapData(A4),A0 		;Start at first block in 'heap' 			<14Apr85>
+				Move.L	BkLim(A6),A3			;Last block in zone
+				Move.L	A0,A2					;bRgn := first zone block ptr.
+				MoveQ	#0,D2					;sRgn := 0.
+@RegionLoop
+				Move.L	TagBC24(A0),D1			;Block header
+				And.L	MaskBC,D1				;Byte count only
+				Tst.B	TagBC24(A0)				;Is this block free?
+				BEq.S	@1						;Br if so (add to region)
+				BPl.S	@2						;Br if non-rel
+				Move.L	Handle24(A0),A1			;Handle offset.
+				Add.L	A6,A1					;Handle
+				Tst.B	(A1)					;Is block locked?
+				BMi.S	@2						;Br if so
+@1				Add.L	D1,D2					;Add to sRgn
+				Add.L	D1,A0					;Point to next block
+				Cmp.L	D0,D2					;Do we have enough?
+				BCS.S	@4						;Br if not
+				BSR.S	Mya24MakeSpace			;MakeSpace(bRgn,s)
+;
+; Loop to relocate search in case growZone purged starting point.				<29jan85>
+; Labels offset by 90, to protect the innocent. 								<29jan85>
+; Just relocate at next block beyond current end ptr in A0. 					<20May85>
+@91 			MOVE.L	A2,D2					; get the space?				<29jan85>
+				BNE.S	@96 					; br if so						<29jan85>
+				LEA 	HeapData(A4),A2 		; start where the original search did		<14Apr85>
+@92 											;								<29jan85>
+				MOVE.L	TagBC24(A2),D1			; get size of current block 	<29jan85>
+				AND.L	MaskBC,D1
+				ADD.L	D1,A2					; point to next block			<29jan85>
+												;								<29jan85>
+				; The following snippet of code was foolishly omitted	<14Apr86>
+				; from the Mac+ ROM.  It turns out that RelocRel depends
+				; on there being an immovable block just below the handle
+				; being moved, so we skip ahead to the next FREE or
+				; IMMOVABLE, the point of the FREE being that SafeReloc
+				; will lock any leading free space down before calling RelocRel,
+				; thus effectively starting the painful process at a locked
+				; place.
+				TST.B	TagBC24(A2)				; is this block free or locked?	<14apr86>
+				BPL.S	@93						; free & non-rel blocks OK		<14apr86>
+				MOVE.L  Handle24(A2),A1			; recover master pointer		<14apr86>
+				ADD.L	A6,A1					;								<14apr86>
+				TST.B	(A1)					; is block locked?				<14apr86>
+				BPL.S	@94						; skip if movable				<14apr86>
+@93												;								<14apr86>
+				CMP.L	A0,A2					; past or equal to current checkpt? 		<29jan85>
+				BHI.S	@95 					; want HIgher, not CarryClear as before 	<20May85>
+@94 											;								<29jan85>
+				CMP.L	A3,A2					; end of heap reached?			<29jan85>
+				BCS.S	@92 					; br if not 					<29jan85>
+@95 											;								<29jan85>
+				MOVE.L	A2,A0					; A0 should now be cool 		<29jan85>
+				SUB.L	A2,A2					; restore A2					<29jan85>
+@96 											;								<29jan85>
+; Now continue with the original MakePtrSpc code... 							<29jan85>
+;
+				Move.L	A2,D2					;Did we find it?
+				BNE.S	@MPSExit 				;Exit if so
+				BRA.S	@3						;Otherwise, look some more.
+@2				Add.L	D1,A0					;Point to next block
+@3				Move.L	A0,A2					;bRgn := next block ptr.
+				MoveQ  #0,D2					;sRgn := 0. (next region)
+@4				Cmp.L	A3,A0					;End of zone reached?
+				BCS.S	@RegionLoop				;Loop if not
+				AddQ.B	#1,D3					;Try to grow zone?
+				BNE.S	@MPSOuter				;Exit if not possible				<14Apr85>
+				JsrROM	ROMa24GrowZone			;Do it
+;
+; EXCRUCIATING SUBTLETY HERE:  Two cases can arise, A4 is OrgApplZone (which is 	<14Apr85>
+; always a cool place to start searching, or A4 is an incarnation of ApplZone.		<14Apr85>
+; In the latter case, ApplZone may have changed as a result of the recent call to	<14Apr85>
+; GrowZone.  Even though A4 may now be in the midst of a big new free block,		<14Apr85>
+; bkLim(A4) should nonetheless be the same block it was last time through the loop, <14Apr85>
+; since no coalescing is done in GrowZone.											<14Apr85>
+; The following sequence would fix the problem by adjusting A4 if it turned out that<14Apr85>
+; the first block after the previous ApplZone header could be coalesced.			<14Apr85>
+;
+
+				BrA.S	@MPSpc1
+
+@MPSOuter										;inner loop failed					<14Apr85>
+				Sub.L	A2,A2					;No luck.
+@MPSExit
+				MoveM.L (SP)+,D0-D4/A0-A1/A3-A4 ;Restore registers, D4&A4,too		<14Apr85>
+				RTS 							;Return to caller.
+
+;***************************************************************************************
+;							a24MakeSpace
+;***************************************************************************************
+
+Mya24MakeSpace
+				MoveM.L A0-A1/A3/D0-D3,-(SP)	;Save registers.
+
+				Move.L	D0,D1					;Size needed.
+				Move.L	A2,A3					;Advances through following blks.
+				MoveQ	#0,D3					;Cumulative free byte count.
+@MSpLoop
+				Cmp.L	D1,D3					;Enough room yet?
+				BCC.S	@MSpDone 				;Yes, exit loop.
+
+				Cmp.L	BkLim(A6),A3			;At end of zone?
+				BCC.S	@MSpDone 				;Yes, give up search.
+
+				Tst.B	TagBC24(A3)				;Is this block free?
+				BEq.S	@MSpFree 				;Yes, let's grab it!
+				BPl.S	@MSpDone 				;Can't move a Non-Rel block.
+
+				Move.L	Handle24(A3),A1			;Get relative handle.
+				Add.L	A6,A1					;Convert to absolute handle.
+				Move.B	(A1),D2 				;This block locked?
+				BMi.S	@MSpDone 				;Yes, give up.
+
+				bsr.s	Mya24SafeReloc			;Move this block safely.
+				BEq.S	@MSpFree 				;All is well.
+
+				BTst	#Purge,D2				;Can we purge this block?
+				BEq.S	@MSpDone 				;No, give up.
+
+				Move.L	(A1),A0 				;Set up pointer to purgeable.
+				SubQ.L	#BlkData24,A0 			;Point to block text field.
+				JsrROM	ROMa24PurgeBlock		;Purge this block.
+@MSpFree
+				Move.L	A3,A0					;Address of block being released.
+				Move.L	TagBC24(A0),D0			;Size of block
+				AndI.l	#$00FFFFFF,AllocPtr(A6)
+				Cmp.L	AllocPtr(A6),A0 		;Does the rover point here?
+				BNE.S	@MSpNext 				;Skip if not . . .
+				And.L	Lo3Bytes,D0				;
+				Add.L	D0,AllocPtr(A6)			;
+@MSpNext
+				Add.L	D0,D3					;Inc. amount of space found.
+				Add.L	D0,A3					;Inc. base address of block.
+				BrA.S	@MSpLoop 				;Release or move next block.
+@MSpDone
+				And.L	MaskBC,D3				;Extract only byte count.
+				BEq.S	@1						;No space found.
+
+				Move.L	D3,TagBC24(A2)			;Set free block size.
+@1
+				Cmp.L	D1,D3					;sFnd >= s?
+				BCC.S	@MSpExit 				;Yes, success return.
+
+				Sub.L	A2,A2					; reason to call MakeBkf . . .
+@MSpExit
+				Move.l	A2,AllocPtr(A6)			; let our children learn from us
+
+				MoveM.L (SP)+,A0-A1/A3/D0-D3	;Restore registers.
+				RTS 							;Return to caller.
+
+;***************************************************************************************
+;							a24SafeReloc
+;***************************************************************************************
+
+Mya24SafeReloc
+				Move.L	A0,-(SP)				;Save register.
+				Move.L	D3,D0					;Is there a free block yet?
+				BEq.S	@1						;No, skip consistency code.
+
+				Move.L	D3,TagBC24(A2)			;Set free block length.
+				Or.L	#NRelTag,TagBC24(A2)	;Fake Non-Rel block.
+				Move.L	A6,Handle24(A2)			;Including zone reference.
+				jsrROM	ROMSubtractFree			;Adjust free space for Non-Rel blk.	<v1.7>
+@1
+				Move.L	(A1),A0 				;Get pointer to block from handle.
+				jsrROM	ROMa24GetSize			;Get logical size of block.
+				bsr.s	Mya24RelocRel			;Move the block.
+				Move.L	D0,A0					;Save error code.
+				Move.L	D3,D0					;Cumulative free space.
+				BEq.S	@2						;Nothing so far, skip magic.
+
+				Move.L	D3,TagBC24(A2)			;Make the block free again.
+				jsrROM	ROMAdjustFree			;Return space to space pool.
+@2
+				Move.L	A0,D0					;Return error code and set cond.
+				Move.L	(SP)+,A0				;Restore register.
+				RTS 							;Return to caller.
+
+;***************************************************************************************
+;							a24RelocRel
+;***************************************************************************************
+
+Mya24RelocRel
+				MoveM.L D1-D2/A0-A2,-(SP)		;Save registers.				<06May85>
+				Move.L	A1,A2					;Handle being moved
+				Move.L	A1,GZMoveHnd			;record the moving target
+				; Don't mess with purge bit here -- let caller (SetSize) do it.     <10Apr85>
+
+				Move.B	(A2),D1 				;Save flags byte (for SafeReloc case) <23Apr85>
+				Sub.L	A1,A1					;get a nonrelocatable
+				jsrROM	ROMa24AllocBk 			;Get a dest block, if we can.
+				BEq.S	@RRFail					;No luck, restore flags and exit
+
+												; Note... if the object was purged,
+												; by GZ, by definition, there must
+												; be enough space to reallocate it
+												; (esp. if the size is the same -
+												; MakeSpace case), So A2 is valid
+												; for the exit through RRFail
+
+				Tst.L	(A2)					;was object handle purged?
+				BEq.S	@RRFree					;assume success
+				Move.L	A0,A1					;Points to destination block.
+;				Move.L	(A2),A0 				;Points to source block
+
+				Move.L	(A2),D0 				;Points to source block				<kaar>
+				And.L	Lo3Bytes,D0 			;don't store the naughty bits		<kaar>
+				Move.L	D0,A0					;									<kaar>
+
+				jsrROM	ROMa24GetSize			;Get original size (for SetSize)
+				jsrROM	ROMHBlockMove			;Copy source to destination.
+												; (only logical bytes)
+
+; Make the new nrel a rel, and vice versa.	Do so preserving the leading nibble of tag	<06May85>
+; information and but not messing up the logical blocksize in the low nibble.			<06May85>
+; It's ugly, but someone has to do it.
+; It's really ugly: $F0 is -$10, not -$F as first attempted.                            <13May85>
+				SubQ.L	#8,A0					;Source reloc block
+				SubQ.L	#8,A1					;Dest nrel block
+				MoveQ	#-$10,D0				;nibble mask = -$10 = $EF+1 = $F0 UGH!	<13May85>
+				And.B	(A0),D0 				;Source high nibble 					<06May85>
+				EOr.B	D0,(A0) 				;Clear high nibble						<06May85>
+				MoveQ	#-$10,D2				;Mask for high nibble.					<13May85>
+				And.B	(A1),D2 				;Dest high nibble						<06May85>
+				EOr.B	D2,(A1) 				;Clear high nibble						<06May85>
+				Or.B	D0,(A1) 				;Dest becomes reloc 					<06May85>
+				Or.B	D2,(A0) 				;Source becomes nonreloc				<06May85>
+				AddQ.L	#4,A0					;relative handle of original reloc		<06May85>
+				AddQ.L	#4,A1					;relative handle of new nonreloc		<06May85>
+				Move.L	(A0),(A1)+				;complete transformation of new block	<06May85>
+				Move.L	A1,(A2) 				;point the master pointer here			<06May85>
+				Move.B	D1,(A2) 				;Restore flags byte.					<23Apr85>
+				Move.L	A6,(A0)+				;Source block is nrel now
+@RRFree
+				bsr.s	Mya24FreeBk				;Discard source block as nrel.
+				MoveQ	#0,D0					;Success return.
+@RRExit
+				Clr.L	GZMoveHnd				;clear the moving target
+				MoveM.L (SP)+,D1-D2/A0-A2		;Restore registers. 					<06May85>
+				RTS 							;Return to caller.
+@RRFail
+				Move.B	D1,(A2) 				;Restore flags byte.			   <23Apr85>
+				MoveQ	#memFullErr,D0			;No room in memory to move block.
+				BrA.S	@RRExit					;Common exit code.
+
+;***************************************************************************************
+;							a24FreeBk
+;***************************************************************************************
+
+Mya24FreeBk
+				MoveM.L A0-A1/D0-D1,-(SP)		;Save registers.
+
+				SubQ.L	#BlkData24,A0 			;Point to block header.
+				Move.L	TagBC24(A0),D0			;Tag and byte count.
+				Move.L	D0,D1					;Make a copy.
+				And.L	MaskBC,D0				;Extract byte count
+				EOr.L	D0,D1					;Tag, size delta only.
+				BEq.S	@FBDone					;Free block, do nothing.
+				BPl.S	@FBNRel					;Non-relocatable block.
+
+				Move.L	Handle24(A0),A1			;Handle offset.
+				Add.L	A6,A1					;Add base to make handle.
+				jsrROM	ROMReleaseMP			;Release handle.
+@FBNRel
+				bsr.s	Mya24MakeCBkF 			;Free block.					<v1.5>
+				jsrROM	ROMAdjustFree			;Increase free space.
+@FBDone
+				MoveM.L (SP)+,A0-A1/D0-D1		;Restore registers.
+				RTS 							;Return to caller.
+
+;***************************************************************************************
+;							a24MakeCBkF
+;***************************************************************************************
+
+Mya24MakeCBkF
+				Movem.L	A1/D0,-(SP)				;save A1, D0						<v1.5>
+				Move.L	A0,A1					;get start of free block address	<v1.5>
+				Add.L	D0,A1					;get beginning of next block		<v1.5>
+@tryNext										;									<v1.5>
+				Tst.B	TagBC24(A1)				;is next block free 				<v1.5>
+				Bne.S	@notFree				;branch if not a free block			<v1.5>
+				CmpA.L	BkLim(A6),A1			;is it the last free block			<v1.5>
+				Bcc.S	@notFree				;branch, if yes						<v1.5>
+				
+				Cmp.L	AllocPtr(A6),A1			; kaar 90.11.14
+				Bne.S	@1						; kaar 90.11.14
+				Move.L	A0,AllocPtr(A6)			; kaar 90.11.14
+@1
+				Add.L	TagBC24(A1),D0			;add size of next free block		<v1.5>
+				AddA.L	TagBC24(A1),A1			;advance A1 to next block			<v1.5>
+				Bra.S	@trynext				;check next block					<v1.5>
+@notFree										;									<v1.5>		
+				Move.L	D0,TagBC24(A0)			;Set tag and byte count.
+				Clr.B	TagBC24(A0)				;Clear tag and offset.
+				Movem.L	(SP)+,A1/D0				;restore A1 ,D0						<v1.5>
+				RTS 							;Return to caller.
+
+				ENDPROC
+
+				PROC
+				EXPORT		(PatchResrvMem32, PatchNewPtr32, PatchMoreMasters32):CODE
+
+;***************************************************************************************
+;							j32ResrvMem
+;***************************************************************************************
+
+PatchResrvMem32									; 32 bit version of ResrvMem			<v1.1>
+				TST.L	HFstFree(A6)			;Any masters left?
+				BNE.S	@1						;br if so
+				Move.W	mAllocCnt(A6),D2		;Number of masters to make.
+				Ext.L	D2
+				ASL.L	#2,D2					;Convert MP count to byte count.
+				Add.L	#BlkData32,D2 			;And block header						<v1.1>
+				Add.L	D2,D0					;Increase req count by ptr blk
+
+@1				bsr.s	Mya32MakePtrSpc			;Make room at the low end.				<v1.1>
+				JmpROM	ROMBackToResrvMem32		;re-join the ROM
+
+;***************************************************************************************
+;							j32NewPtr
+;***************************************************************************************
+
+PatchNewPtr32
+				Sub.L	a1,a1
+				bsr.s	Mya32MakePtrSpc
+				JmpROM	ROMBackToNewPtr32
+
+;***************************************************************************************
+;							j32MoreMasters
+;***************************************************************************************
+
+PatchMoreMasters32
+				MOVEQ	#0,D0					; assume success
+				bsr.s	Mya32HMakeMoreMasters	; call our copy of the ROM routine
+				JmpROM	ROMBackToMoreMasters32	; re-join the ROM
+
+;***************************************************************************************
+;							a32HMakeMoreMasters
+;***************************************************************************************
+
+Mya32HMakeMoreMasters
+				MoveM.L A0/D0-D1,-(SP)			;Save registers.
+
+				Move	mAllocCnt(A6),D0		;Number of masters to make.
+				Ext.L	D0
+				BGT.S	@1						;Make sure count is > 0
+
+				MoveQ	#DfltMasters,D0 		;If not, use default number.
+@1
+				Move.L	D0,D1					;Count of master pointers.
+				ASL.L	#2,D0					;Convert MP count to byte count.
+
+				bsr.s	Mya32MakePtrSpc			;Clear some room at the low end.
+				JmpROM	ROMBackToa32HMakeMoreMasters
+
+;***************************************************************************************
+;							a32MakePtrSpc
+;***************************************************************************************
+
+Mya32MakePtrSpc
+				MoveM.L D0-D4/A0-A1/A3-A4,-(SP) ;Preserve registers, nowadays D4,A4, too.	<14Apr85>
+				JsrROM	ROMa32ActualS 			;Returns real sAct.
+				MoveA.l A6,A4					;Presume it's not ApplZone case             <14Apr85>
+				CmpA.L	ApplZone,A6 			;If EQ & GrowDown then must fix A4			<14Apr85>
+				SEq 	D3						;$FF if so (i.e. we can grow)				<14Apr85>
+
+; search for good region
+
+@MPSpc1											;											<14Apr85>
+				LEA 	HeapData(A4),A0 		;Start at first block in 'heap' 			<14Apr85>
+				Move.L	BkLim(A6),A3			;Last block in zone
+				Move.L	A0,A2					;bRgn := first zone block ptr.
+				MoveQ	#0,D2					;sRgn := 0.
+@RegionLoop
+				Move.L	Blksize32(A0),D1			;Block byte count						<v1.1>
+				Tst.B	TagBC32(A0)				;Is this block free?
+				BEq.S	@1						;Br if so (add to region)
+				BPl.S	@2						;Br if non-rel
+
+				Tst.B	MPtag32(A0)				;is block locked?							<v1.1>
+				BMi.S	@2						;Br if so
+
+@1				Add.L	D1,D2					;Add to sRgn
+				Add.L	D1,A0					;Point to next block
+				Cmp.L	D0,D2					;Do we have enough?
+				BCS.S	@4						;Br if not
+				BSR.S	Mya32MakeSpace			;MakeSpace(bRgn,s)
+;
+; Loop to relocate search in case growZone purged starting point.				<29jan85>
+; Labels offset by 90, to protect the innocent. 								<29jan85>
+; Just relocate at next block beyond current end ptr in A0. 					<20May85>
+@91 			MOVE.L	A2,D2					; get the space?				<29jan85>
+				BNE.S	@96 					; br if so						<29jan85>
+				LEA 	HeapData(A4),A2 		; start where the original search did		<14Apr85>
+@92 											;								<29jan85>
+				MOVE.L	BlkSize32(A2),D1		; get size of current block 	<v1.1>
+				ADD.L	D1,A2					; point to next block			<29jan85>
+												;								<29jan85>
+				; The following snippet of code was foolishly omitted	<14Apr86>
+				; from the Mac+ ROM.  It turns out that RelocRel depends
+				; on there being an immovable block just below the handle
+				; being moved, so we skip ahead to the next FREE or
+				; IMMOVABLE, the point of the FREE being that SafeReloc
+				; will lock any leading free space down before calling RelocRel,
+				; thus effectively starting the painful process at a locked
+				; place.
+				TST.B	TagBC32(A2)				; is this block free or locked?	<v1.1>
+				BPL.S	@93						; free & non-rel blocks OK		<14apr86>
+
+				TST.B	MPtag32(A2)				; is block locked?				<v1.1>
+				BPL.S	@94						; skip if movable				<14apr86>
+@93												;								<14apr86>
+				CMP.L	A0,A2					; past or equal to current checkpt? 		<29jan85>
+				BHI.S	@95 					; want HIgher, not CarryClear as before 	<20May85>
+@94 											;								<29jan85>
+				CMP.L	A3,A2					; end of heap reached?			<29jan85>
+				BCS.S	@92 					; br if not 					<29jan85>
+@95 											;								<29jan85>
+				MOVE.L	A2,A0					; A0 should now be cool 		<29jan85>
+				SUB.L	A2,A2					; restore A2					<29jan85>
+@96 											;								<29jan85>
+; Now continue with the original MakePtrSpc code... 							<29jan85>
+;
+				Move.L	A2,D2					;Did we find it?
+				BNE.S	@MPSExit 				;Exit if so
+				BRA.S	@3						;Otherwise, look some more.
+@2				Add.L	D1,A0					;Point to next block
+@3				Move.L	A0,A2					;bRgn := next block ptr.
+				MoveQ  #0,D2					;sRgn := 0. (next region)
+@4				Cmp.L	A3,A0					;End of zone reached?
+				BCS.S	@RegionLoop				;Loop if not
+				AddQ.B	#1,D3					;Try to grow zone?
+				BNE.S	@MPSOuter				;Exit if not possible				<14Apr85>
+				JsrROM	ROMa32GrowZone			;Do it
+;
+; EXCRUCIATING SUBTLETY HERE:  Two cases can arise, A4 is OrgApplZone (which is 	<14Apr85>
+; always a cool place to start searching, or A4 is an incarnation of ApplZone.		<14Apr85>
+; In the latter case, ApplZone may have changed as a result of the recent call to	<14Apr85>
+; GrowZone.  Even though A4 may now be in the midst of a big new free block,		<14Apr85>
+; bkLim(A4) should nonetheless be the same block it was last time through the loop, <14Apr85>
+; since no coalescing is done in GrowZone.											<14Apr85>
+; The following sequence would fix the problem by adjusting A4 if it turned out that<14Apr85>
+; the first block after the previous ApplZone header could be coalesced.			<14Apr85>
+;
+
+				BrA.S	@MPSpc1
+
+@MPSOuter										;inner loop failed					<14Apr85>
+				Sub.L	A2,A2					;No luck.
+@MPSExit
+				MoveM.L (SP)+,D0-D4/A0-A1/A3-A4 ;Restore registers, D4&A4,too		<14Apr85>
+				RTS 							;Return to caller.
+
+;***************************************************************************************
+;							a32MakeSpace
+;***************************************************************************************
+
+Mya32MakeSpace
+				MoveM.L A0-A1/A3/D0-D3,-(SP)	;Save registers.
+
+				Move.L	D0,D1					;Size needed.
+				Move.L	A2,A3					;Advances through following blks.
+				MoveQ	#0,D3					;Cumulative free byte count.
+@MSpLoop
+				Cmp.L	D1,D3					;Enough room yet?
+				BCC.S	@MSpDone 				;Yes, exit loop.
+
+				Cmp.L	BkLim(A6),A3			;At end of zone?
+				BCC.S	@MSpDone 				;Yes, give up search.
+
+				Tst.B	TagBC32(A3)				;Is this block free?
+				BEq.S	@MSpFree 				;Yes, let's grab it!
+				BPl.S	@MSpDone 				;Can't move a Non-Rel block.
+
+				Move.L	Handle32(A3),A1			;Get relative handle.
+				Add.L	A6,A1					;Convert to absolute handle.
+				Move.B	MPtag32(A3),D2			;Get master pointer tag byte	<v1.1>
+				BMi.S	@MSpDone 				;Yes, give up.
+
+				bsr.s	Mya32SafeReloc			;Move this block safely.
+				BEq.S	@MSpFree 				;All is well.
+
+				BTst	#Purge,D2				;Can we purge this block?
+				BEq.S	@MSpDone 				;No, give up.
+
+				Move.L	(A1),A0 				;Set up pointer to purgeable.
+				Sub.L	#BlkData32,A0 			;Point to block text field.		<v1.1>
+				JsrROM	ROMa32PurgeBlock		;Purge this block.
+@MSpFree
+				Move.L	A3,A0					;Address of block being released.
+				Move.L	BlkSize32(A0),D0		;Size of block					<v1.1>
+				Cmp.L	AllocPtr(A6),A0 		;Does the rover point here?
+				BNE.S	@MSpNext 				;Skip if not . . .
+				Add.L	D0,AllocPtr(A6)			;Point to next block instead
+@MSpNext
+				Add.L	D0,D3					;Inc. amount of space found.
+				Add.L	D0,A3					;Inc. base address of block.
+				BrA.S	@MSpLoop 				;Release or move next block.
+@MSpDone
+				Tst.L	D3						;is byte count zero				<v1.1>
+				BEq.S	@1						;No space found.
+
+				Clr.L	TagBC32(A2)				;set free block					<v1.1>
+				Move.L	D3,BlkSize32(A2)		;Set free block size.			<v1.1>
+@1
+				Cmp.L	D1,D3					;sFnd >= s?
+				BCC.S	@MSpExit 				;Yes, success return.
+
+				Sub.L	A2,A2					; reason to call MakeBkf . . .
+@MSpExit
+				Move.L	A2,AllocPtr(A6)			;let our children learn from us
+
+				MoveM.L (SP)+,A0-A1/A3/D0-D3	;Restore registers.
+				RTS 							;Return to caller.
+
+;***************************************************************************************
+;							a32SafeReloc
+;***************************************************************************************
+
+Mya32SafeReloc
+				Move.L	A0,-(SP)				;Save register.
+				Move.L	D3,D0					;Is there a free block yet?
+				BEq.S	@1						;No, skip consistency code.
+
+				Move.L	D3,BlkSize32(A2)		;Set free block length.				<v1.1>
+				Move.L	#NRelTag,TagBC32(A2)	;Fake Non-Rel block.				<v1.1>
+				Move.L	A6,Handle32(A2)			;Including zone reference.
+				jsrROM	ROMSubtractFree			;Adjust free space for Non-Rel blk.	<v1.7>
+@1
+				Move.L	(A1),A0 				;Get pointer to block from handle.
+				jsrROM	ROMa32GetSize 			;Get logical size of block.
+				BSR.S	Mya32RelocRel				;Move the block.
+				Move.L	D0,A0					;Save error code.
+				Move.L	D3,D0					;Cumulative free space.
+				BEq.S	@2						;Nothing so far, skip magic.
+
+				Clr.L	TagBC32(A2)				;make free block					<v1.1>
+				Move.L	D3,BlkSize32(A2)		;Make the block free again.		<v1.1>
+				jsrROM	ROMAdjustFree			;Return space to space pool.
+@2
+				Move.L	A0,D0					;Return error code and set cond.
+				Move.L	(SP)+,A0				;Restore register.
+				RTS 							;Return to caller.
+
+;***************************************************************************************
+;							a32RelocRel
+;***************************************************************************************
+
+Mya32RelocRel
+				MoveM.L D1-D2/A0-A2,-(SP)		;Save registers.				<06May85>
+				Move.L	A1,A2					;Handle being moved
+				Move.L	A1,GZMoveHnd			;record the moving target
+				; Don't mess with purge bit here -- let caller (SetSize) do it.     <10Apr85>
+
+				Sub.L	A1,A1					;get a nonrelocatable
+				jsrROM	ROMa32AllocBk 			;Get a dest block, if we can.
+				BEq.S	@RRFail					;No luck, restore flags and exit
+
+												; Note... if the object was purged,
+												; by GZ, by definition, there must
+												; be enough space to reallocate it
+												; (esp. if the size is the same -
+												; MakeSpace case), So A2 is valid
+												; for the exit through RRFail
+
+				Tst.L	(A2)					;was object handle purged?
+				BEq.S	@RRFree					;assume success
+				Move.L	A0,A1					;Points to destination block.
+				Move.L	(A2),A0 				;Points to source block
+				jsrROM	ROMa32GetSize 			;Get original size (for SetSize)
+				jsrROM	ROMHBlockMove			;Copy source to destination.
+												; (only logical bytes)
+
+; Make the new nrel a rel, and vice versa.	Do so preserving the leading nibble of tag	<06May85>
+; information and but not messing up the logical blocksize in the low nibble.			<06May85>
+; It's ugly, but someone has to do it.
+; It's really ugly: $F0 is -$10, not -$F as first attempted.                            <13May85>
+				Sub.L	#blkData32,A0			;Source reloc block						<v1.1>
+				Sub.L	#blkData32,A1			;Dest nrel block						<v1.1>
+				Move.B	tagBC32(A0),D0			;get source tag							<v1.1>
+				Move.B	tagBc32(A1),D2			;get dest tag							<v1.1>				
+				Move.B	D0,tagBc32(A1)			;Dest becomes reloc 					<v1.1>
+				Move.B	D2,tagBc32(A0)			;Source becomes nonreloc 				<v1.1>
+				Move.B	MPtag32(A0),MPtag32(A1)	;copy master pointer tag				<v1.1>
+
+				AddQ.L	#handle32,A0			;relative handle of original reloc		<v1.1>
+				AddQ.L	#handle32,A1			;relative handle of new nonreloc		<v1.1>
+				Move.L	(A0),(A1)+				;complete transformation of new block	<06May85>
+				Move.L	A1,(A2) 				;point the master pointer here			<06May85>
+				Move.L	A6,(A0)+				;Source block is nrel now
+@RRFree
+				bsr.s	Mya32FreeBk				;Discard source block as nrel.
+				MoveQ	#0,D0					;Success return.
+@RRExit
+				Clr.L	GZMoveHnd				;clear the moving target
+				MoveM.L (SP)+,D1-D2/A0-A2		;Restore registers. 					<06May85>
+				RTS 							;Return to caller.
+@RRFail
+				MoveQ	#memFullErr,D0			;No room in memory to move block.
+				BrA.S	@RRExit					;Common exit code.
+
+;***************************************************************************************
+;							a32FreeBk
+;***************************************************************************************
+
+Mya32FreeBk
+				MoveM.L A0-A1/D0-D1,-(SP)		;Save registers.
+
+				Sub.L	#BlkData32,A0 			;Point to block header.			<v1.1>
+				Move.L	BlkSize32(A0),D0		;get byte count.				<v1.1>
+				Tst.B	TagBC32(A0)				;test block						<v1.1>
+				BEq.S	@FBDone					;Free block, do nothing.
+				BPl.S	@FBNRel					;Non-relocatable block.
+
+				Move.L	Handle32(A0),A1			;Handle offset.
+				Add.L	A6,A1					;Add base to make handle.
+				jsrROM	ROMReleaseMP			;Release handle.
+@FBNRel
+				bsr.s	Mya32MakeCBkF 			;Free block.					<v1.5>
+				jsrROM	ROMAdjustFree			;Increase free space.
+@FBDone
+				MoveM.L (SP)+,A0-A1/D0-D1		;Restore registers.
+				RTS 							;Return to caller.
+
+;***************************************************************************************
+;							a32MakeCBkF
+;***************************************************************************************
+
+Mya32MakeCBkF
+				Movem.L	A1/D0,-(SP)				;save A1, D0						<v1.5>
+				Move.L	A0,A1					;get start of free block address	<v1.5>
+				Add.L	D0,A1					;get beginning of next block		<v1.5>
+@tryNext										;									<v1.5>
+				Tst.B	TagBC32(A1)				;is next block free 				<v1.5>
+				Bne.S	@notFree				;branch if not a free block			<v1.5>
+				CmpA.L	BkLim(A6),A1			;is it the last free block			<v1.5>
+				Bcc.S	@notFree				;branch, if yes						<v1.5>
+				
+				Cmp.L	AllocPtr(A6),A1			; kaar 90.11.14
+				Bne.S	@1						; kaar 90.11.14
+				Move.L	A0,AllocPtr(A6)			; kaar 90.11.14
+@1
+				Add.L	BlkSize32(A1),D0		;add size of next free block		<v1.5>
+				AddA.L	BlkSize32(A1),A1		;advance A1 to next block			<v1.5>
+				Bra.S	@trynext				;check next block					<v1.5>
+@notFree										;									<v1.5>						
+				Move.L	D0,BlkSize32(A0)		;save size of free block			<v1.1>
+				Clr.L	TagBC32(A0)				;clear first long word				<v1.1>
+
+;				Move.L	A0,AllocPtr(A6)			;update allocPtr to point here		<v1.5><kaar>
+				Movem.L	(SP)+,A1/D0				;restore A1, D0						<v1.5>
+				RTS 							;Return to caller.
+
+				ENDPROC
+
+; ——————————————————————————————————————————————————————————————————————————————
+; Patch MacPlus BlockMove to fix bug in the Memory Mgr MakePtrSpc routine.
+;
+; Background: MakePtrSpc tries to allocate a block low in the heap.  It does
+; it by locating "regions" of moveable/free/purgeable blocks bounded by
+; immoveable/locked blocks, then calling the MakeSpace routine to create a
+; free block therein.  When MakeSpace fails, it rescans from the bottom of the
+; heap for the next higher region.  Someone erroneously commented out the
+; code in the re-scan that made sure the block before the new region is an
+; immobile block.  This causes trouble when that block is a relocatable, and
+; gets moved by (calls several routines down from) MakeSpace.   When control
+; returns to MakeSpace, the "region address" is now in the middle of a block!
+; Attempts to walk further through the heap become infinite loops or bus errors.
+; The correct scan is in the newer (SE and later) ROMs, so this fix is only
+; needed on the MacPlus.
+;
+; Our strategy to fix this:  We patch BlockMove to catch it when moving blocks
+; on behalf of MakePtrSpc, and use that chance to have MakePtrSpc do the
+; correct scan.  The fix is two patches.  The primary one is on BlockMove.
+; BlockMove is down deep in the chain, so we examine several return addresses
+; to guarantee that BlockMove is being (indirectly) called from MakeSpace being
+; called by MakePtrSpc.  We then replace MakeSpace's return address so that
+; MakeSpace returns to the secondary patch, instead of to MakePtrSpc.  The
+; secondary patch implements the correct rescan (swiped from the newer ROMs)
+; and rejoins the ROM with the result of the scan.  Note that if MakeSpace
+; never calls this BlockMove, the patch is not needed since the region address
+; didn't get walked on!
+;
+; That was simple, too simple!  The spare1 growzone procedure can also be called.
+; We patch it in a similar way to BlockMove.
+;
+; ——————————————————————————————————————————————————————————————————————————————
+
+
+; for BlockMove call chain checking
+OffsHBlock		EQU		0								; rts from "jsr	(a2)"
+
+OffsHBMRTS		EQU		OffsHBlock+(6*4)+4				; rts from "BSR.S HBlockMove"
+
+OffsCHRTS		EQU		OffsHBMRTS+(9*4)+4				; rts from "BSR.S ToCompactHp"
+
+OffsMakePtr1	EQU		OffsHBMRTS+(6*4)+(2*4)+(7*4)+4	; rts from "BSR.S MakeSpace"
+OffsMakePtr2	EQU		OffsHBMRTS+(30*4)+(5*4)+4		; rts from "BSR.S MakeSpace"
+OffsMakePtr3	EQU		OffsMakePtr2+(5*4)+(1*4)		; rts from "BSR.S MakeSpace"
+
+ROMFromHBlock		ROMBind		(Plus,$107AC)			; BlockMove from HBlockMove
+ROMFromCompact		ROMBind		(Plus,$10808)			; HBlockMove from CompactHp
+ROMFromRelocRel		ROMBind		(Plus,$10C0C)			; HBlockMove from RelocRel
+ROMFromPurgeHeap	ROMBind		(Plus,$105FC)			; ToCompactHp from PurgeHeap
+
+; for spare1 call chain checking		
+OffsetSpare1RTS	EQU		0								; rts from "jsr	(a1)"
+OffsetCallGCRTS	EQU		OffsetSpare1RTS+(16*4)+4		; rts from "BSR.S ToCompactHp"
+OffsetMSRTS		EQU		OffsetCallGCRTS+(21*4)+(4*4)+4	; rts from "BSR.S MakeSpace"
+
+ROMFromCGZ			ROMBind		(Plus,$10656)			; spare1 from CallGZProc
+ROMFromBCS			ROMBind		(Plus,$1068E)			; CompactHp from BkCompactS
+
+; for both BlockMove and spare1 call chain checking
+ROMFromMakePtr		ROMBind		(Plus,$10B18)			; MakeSpace from MakePtrSpc
+
+; for rejoining ROM after doing correct scan 
+ROMBackMPS			ROMBind		(Plus,$10B34)			; resume MakePtrSpc
+		
+;***************************************************************************************
+; Primary patch #1. Patch BlockMove to stuff address of secondary patch.  BlockMove is
+; low in the call chain, and there are three ways of getting to it that we care about.
+;***************************************************************************************
+BlockMoveFixMPS	ComeFromPatchProc	_BlockMove,,(Plus)
+
+; Do the initial come-from check ourselves, since the ComeFromPatchProc macro takes into
+; account the dispatcher stack usage, but HBlockMove jsr's directly to the routine,
+; bypassing the dispatcher.  The return address, therefore, is on the stack top.
+        cmpROM	ROMFromHBlock,OffsHBlock(sp)			; BlockMove from HBlockMove?
+        bneOld											; if not, I give up!
+
+; (1) MakePtrSpc -> MakeSpace -> SafeReloc -> RelocRel -> HBlockMove
+        cmpROM	ROMFromRelocRel,OffsHBMRTS(sp)			; HBlockMove in RelocRel?
+        bne.s	tryFromCompactHp						; if not, try check (2)			
+        cmpROM	ROMFromMakePtr,OffsMakePtr1(sp)			; working for MakePtrSpc?
+        bneOld											; if not, I give up!
+        peaResident    PatchMakePtrSpc					; address of secondary patch
+        move.l	(sp)+,OffsMakePtr1(sp)					; MakeSpace returns there instead
+        jmpOld											; chain through to old trap address
+
+; (2) MakePtrSpc -> MakeSpace -> AllocBk -> BkCompactS -> CompactHp -> HBlockMove
+; Shares part of check (3).
+tryFromCompactHp
+        cmpROM	ROMFromCompact,OffsHBMRTS(sp)			; HBlockMove in CompactHp?
+        bneOld											; if not, I give up!
+        cmpROM	ROMFromMakePtr,OffsMakePtr2(sp)			; working for MakePtrSpc?
+        bne.s	tryFromPurge							; if not, try check (3)
+        peaResident    PatchMakePtrSpc					; address of secondary patch
+        move.l	(sp)+,OffsMakePtr2(sp)					; MakeSpace returns there instead
+        jmpOld											; chain through to old trap address
+
+; (3) MakePtrSpc -> MakeSpace -> AllocBk -> BkCompactS -> PurgeHeap -> CompactHp -> HBlockMove
+tryFromPurge
+        cmpROM	ROMFromPurgeHeap,OffsCHRTS(sp)			; CompactHp in PurgeHeap?
+        bneOld											; if not, I give up!
+        cmpROM	ROMFromMakePtr,OffsMakePtr3(sp)			; working for MakePtrSpc?
+        bneOld											; if not, I give up!
+        peaResident    PatchMakePtrSpc					; address of secondary patch
+        move.l	(sp)+,OffsMakePtr3(sp)					; MakeSpace returns there instead
+        jmpOld											; chain through to old trap address
+
+		EndProc											; BlockMoveFixMPS
+	
+;***************************************************************************************
+; Secondary patch.  MakeSpace returns here instead of to MakePtrSpc. Implement the
+; correct scan for new region, then rejoin the ROM with the scan results.  Note that
+; this routine is just the (uncommented!) code from the newer ROMs.
+;
+;   A0 = end of previously searched region
+;   A1 = junk
+;   A2 = ptr to found space, or NIL
+;   A3 = end of zone
+;   A4 = zone
+;   A5-A7 = reserved
+;   D0/D2-D7 = reserved
+;   D1 = junk
+;***************************************************************************************
+
+PatchMakePtrSpc	Proc
+        move.l	    a2,d2	    						; NE --> we got the space
+        bne.s	    goROMBackMPS
+
+        lea     	HeapData(a4),a2						; start the search for a new region
+rgnLoop
+        move.l	    TagBC(a2),d1						; size of current block
+        and.l	    Lo3Bytes,d1							; stripped of flags
+        add.l	    d1,a2								; ptr to next block
+
+        tst.b	    TagBC(a2)							; status of block at hand
+        beq.s	    @4									; free block is bad place
+        bpl.s	    @3		    						; ptr block is good place
+        move.l	    Handle(a2),a1						; recover master ptr
+        adda.l	    a4,a1	    						; a1 := master ptr
+        tst.b	    (a1)								; PL --> unlocked
+        bpl.s	    @4									; loose block is bad place
+@3
+        cmpa.l	    a0,a2								; a0 < a2 is desired, past old rgn
+        bhi.s	    @5
+@4
+        cmpa.l	    a3,a2								; a3 <= a2 means beyond heap end
+        bcs.s	    rgnLoop								; Carry Set means a3 > a2
+@5
+        move.l	    a2,a0								; reset rgn base
+        suba.l	    a2,a2								; clear a2 for return to MakePtrSpc
+goROMBackMPS
+        jmpROM		ROMBackMPS							; rejoin ROM after scan
+		
+		EndProc											; PatchMakePtrSpc
+
+;***************************************************************************************
+; Primary patch #2. Patch spare1 call to stuff address of secondary patch.
+;***************************************************************************************
+
+InstallPlusGrowZone		InstallProc			(Plus)		
+		movea.l	SysZone, a1								; system zone header address
+		leaResident		OriginalSpare1,a0				; get address of embedded long
+		move.l	spare1(A1), (a0)						; save off old grow zone
+		leaResident		PatchSpare1, a0					; primary patch address #2
+		move.l	a0, spare1(a1)							; replace system heap grow zone vector
+		rts
+
+		EndProc											; InstallPlusGrowZone
+
+; A6 == zone address
+; MakePtrSpc -> MakeSpace -> SafeReloc -> RelocRel -> AllocBk -> BkCompactS -> CallGZProc
+PatchSpare1	Proc
+		entry	OriginalSpare1
+
+		cmpROM	ROMFromCGZ, OffsetSpare1RTS(sp)			; were we called from CallGZProc?
+		bne.s	@callThrough							; if not, fix not needed
+		cmpROM	ROMFromBCS, OffsetCallGCRTS(sp)			; CallGZProc from BkCompactS?
+		bne.s	@callThrough							; if not, fix not needed
+		cmpROM	ROMFromMakePtr, OffsetMSRTS(sp)			; MakeSpace from MakePtrSpc?
+		bne.s	@callThrough							; if not, fix not needed
+        peaResident    PatchMakePtrSpc					; address of secondary patch
+		move.l	(sp)+, OffsetMSRTS(sp)					; MakeSpace returns there instead
+
+; call the old growzone procedure
+@callThrough
+		move.l	OriginalSpare1, -(sp)					; spare1 address our InstallProc saw
+		rts
+
+; Place to remember call-through address
+OriginalSpare1		dc.l		0
+
+		EndProc											; PatchSpare1
+
+
+;-----------------------------------------------------------------------------------------
+;
+; myCompactMem					<see InstallProc named fixMyCompactMemComeFromPatchProc>
+;
+;	Fix bug in MoveHHi, a BCS.S that should have been a BCC.S.  In CompactMem, look for a
+;	call from MoveHHi routine DoCompact when in turn called from just below label goCont.
+;	In this case replace that second return address with alternate code that gets the
+;	miserable branch right.
+;
+;	The CompactMem stack looks like:
+;	rts to dispatch < a0-a1 < d1-d2/a2 < junk long < rts to app < rts to goCont???
+;	so we look 32 bytes in for our magic address.
+;
+;	WARNING:	The equate for MyStkBuf on a plus is different than on a II or SE.
+;				Hence, this ComeFromPatchProc is followed by a InstallProc which fixes
+;				the problem on an Plus.
+;-----------------------------------------------------------------------------------------
+
+myCompactMem	ComeFromPatchProc	_CompactMem,,(Plus,SE,II,notAUX)
+
+				EXPORT	ModifyMyStkBuf
+
+MyBufCnt		equ		4			; constant from MoveHHi header
+MyStkBuf		equ		22			; II: 22	+: 18	se: 22
+myMinFree		equ		12			; min size of a block
+
+AfterBsrDoCompactInGoCont	ROMBind (Plus,$10354),(SE,$a8a8),(II,$e480)
+CompactMem					ROMBind (Plus,$0ffbe),(SE,$a4ce),(II,$e06c)
+FindRgnTop					ROMBind (Plus,$103dc),(SE,$a936),(II,$e50e)
+MNSFinish					ROMBind (Plus,$103b0),(SE,$a904),(II,$e4dc)
+MoveRest					ROMBind (Plus,$1033A),(SE,$a88E),(II,$e466)
+FillStkBuf					ROMBind (Plus,$10416),(SE,$a970),(II,$e548)
+DoCompact					ROMBind (Plus,$10454),(SE,$a9AE),(II,$e586)
+
+mhhCMFrame		equ		32			; 8 longs in is the return from DoCompact
+
+		cmp.l	#$00002000, SysZone		; is Scruffy installed?						<13>
+		bne.s	@hasDirtyMemoryManager	; if not, we need the patch					<13>
+		jmpOld							; if so, just call the “real” CompactMem	<13>
+@hasDirtyMemoryManager					;											<13>
+
+		cmpROM	AfterBsrDoCompactInGoCont,mhhCMFrame(sp)	; are we coming from GoCont?
+		bne.s	@goCompact			; if not, proceed
+		lea		myGoCont,a0			; get bogus return address
+		move.l	a0,mhhCMFrame(sp)	; jammed into stack
+@goCompact							; go on back to rom
+		jmpROM	CompactMem			; let rom work
+
+; Just do the usual rom number for GoCont, but get the danged branch right...
+; The code here is copied from MoveHHi, up to MNSEscape.
+myGoCont
+		jsrROM	FindRgnTop
+myMoveNextSeg
+		move.l	TagBC(A2),D1
+		move.l	MyBufCnt(a5),d0
+ModifyMyStkBuf	EQU	*+2
+		lea		MyStkBuf(a5),a0
+		move.l	a2,a1
+		add.l	d1,a1
+		sub.l	d0,a1
+		add.l	d0,d6
+		sub.l	d0,ZCBFree(a6)
+		_BlockMove
+		tst.l	d7
+		beq.s	@MNSFinish
+
+		move.l	a1,d0
+		sub.l	a2,d0
+		beq.s	@MNSExact
+		move.l	d0,d1
+		subq.l	#BlkData,d1
+		sub.l	d7,d1
+		bcs.s	@MNSAdj
+		beq.s	@MNSEscape
+		moveq	#myMinFree,d2
+		cmp.l	d1,d2
+		bcc.s	@MNSAdj				; the BUG was that bcs.s was used here
+
+; This section is entered directly from raw MoveHHi code in ROM.
+@MNSEscape
+		MOVE.L	(A4),A0 			;yes, move it.	get source ptr
+		jmpROM	MoveRest			; back to ROM for last bytes
+@MNSAdj
+		MOVE.L	D0,TagBC(A2)		; adjust size of remaining free blk
+@MNSExact
+		MOVEM.L (A1),D4-D5			; save 2 longs at front of blk
+		MOVE.L	A6,Handle(A1)
+		MOVE.L	D6,TagBC(A1)		; data size is blk size in this case . . .
+		MOVE.B	#$40,TagBC(A1)		; make it an nrel blk
+
+		MOVE.L	A1,-(SP)
+		JSRROM	FillStkBuf			; this does it and also adjusts handlesize
+		JSRROM	DoCompact			; then move everything down
+		JSRROM	FindRgnTop			; point A2 to free bk at top . . .
+		MOVE.L	(SP)+,A1
+		MOVEM.L D4-D5,(A1)			; restore data at front of blk
+		BRA 	myMoveNextSeg		; then go again
+
+@MNSFinish
+		JMPROM	MNSFinish
+		ENDPROC						; myCompactMem
+
+;-----------------------------------------------------------------------------------------
+; fixMyCompactMemComeFromPatchProc				<see ComeFromPatchProc named MyCompactMem>
+;
+;	The Plus equate for MyStkBuf is different than on a II or SE.  Hence, this InstallProc
+;	follows the ComeFromPatchProc named MyCompactMem, which fixes the problem on an Plus.
+;-----------------------------------------------------------------------------------------
+
+fixMyCompactMemComeFromPatchProc	InstallProc		(Plus)
+
+		IMPORT	ModifyMyStkBuf
+
+		lea		ModifyMyStkBuf,a0
+		move.w	#18,(a0)
+		rts
+
+
+				end

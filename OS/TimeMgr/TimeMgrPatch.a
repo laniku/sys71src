@@ -1,0 +1,266 @@
+;
+;	File:		TimeMgrPatch.a
+;
+;	Contains:	code to patch in a new version of the Time Mgr. for various machines
+;
+;	Written by:	Darin Adler
+;
+;	Copyright:	© 1990-1992 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <4>	 2/12/92	JSM		Moved this file to TimeMgr folder, keeping all the old
+;									revisions.
+;		 <3>	  9/9/91	JSM		Cleanup header.
+;		 <2>	 12/8/90	dba		<gbm> turn off Time Mgr. patches for A/UX
+;		 <1>	 9/22/90	dba		Created today. Contains a complete patch of TimeMgr for Plus,
+;									SE, and II ROMs, and a patch for the Portable and IIci ROMs that
+;									adds the _Microseconds trap.
+;
+
+			load	'StandardEqu.d'
+			include	'HardwarePrivateEqu.a'
+			include	'LinkedPatchMacros.a'
+
+AfterFreezeTimeInRmvTime		ROMBind	(Portable,$5EC8),(IIci,$AE96)
+MultAndMerge					ROMBind	(Portable,$5F34),(IIci,$AF02)
+AfterFreezeTimeInPrimeTime		ROMBind	(Portable,$5F9A),(IIci,$AF3E)
+AfterFreezeTimeInTimer2Int		ROMBind	(Portable,$6090),(IIci,$B02E)
+
+OldTimeMgrGlobalsSize	equ		16
+
+; globals in system heap (same RECORD in TimeMgr.a; move it to an equate file if you like)
+
+TimeMgrPrivate	record	0,increment			; time manager private storage
+ActivePtr		ds.l	1					; pointer to soonest active request
+TimerAdjust		ds.b	1					; number of VIA ticks used loading timer
+TimerLowSave	ds.b	1					; low byte of VIA timer from last FreezeTime		<4>
+RetryAdjust		ds.w	1					; number of via ticks for underflow retry
+CurrentTime		ds.l	1					; number of virtual ticks since boot
+BackLog			ds.l	1					; number of virtual ticks of ready tasks
+**** NOTE: The ordering of the following 4 fields must not change (FreezeTime Depends on it)	<4>
+HighUSecs		ds.l	1					; high 32 bits of microsecond count					<4>
+LowUSecs		ds.l	1					; low 32 bits of microsecond count					<4>
+FractUSecs		ds.w	1					; 16 bit fractional microsecond count				<4>
+CurTimeThresh	ds.w	1					; CurrentTime threshold for updating µsec count		<4>
+**** end of order dependent fields																<4>
+PrivateSize		equ		*-TimeMgrPrivate	; size of this record
+				endr
+
+			TITLE	'Time Manager - Equates'
+
+TaskActiveBit		equ		7			; high bit of QType word is active flag
+ExtendedTmTaskBit	equ		6			; indicates an extended TmTask record
+T2IntBit			equ		5			; VIER/VIFR bit num for VIA Timer 2
+
+;_______________________________________________________________________
+;
+;	Representations of time in the Time Manager.
+;
+;	Time is represented externally in two ways, both are stored in a longword,
+;	if the value is positive, it represents milliseconds, and if it is
+;	negative, it represents negated microseconds.  This representation is used
+;	as the delay time input to PrimeTime, and as the unused remaining time
+;	output by RmvTime.
+;
+;	The VIA1 Timer2 is the 16 bit hardware timer used by the time manager.
+;	On all current machines, it decrements at a rate of 783360 Hz, and
+;	generates an interrupt, and keeps counting, when it counts through zero.
+;	This provides resolution of 1.276 µsec, and a range of 83.660 msec.
+;
+;	Internally the time manager represents time as a virtual unsigned 36 bit
+;	VIA timer, which gives a range of about 1 day.  However, since we only
+;	have 32 bits to store time in, we drop the low 4 bits of the timer,
+;	which reduces the resolution by a factor of 16 to 20.425 µsec.
+;
+;	Converting between the external and internal forms of time is done by
+;	multiplying by the proper fixed point constants, and shifting the binary
+;	point of the 64 bit result to get just the integer portion of the result.
+;	The computation of the 32 bit conversion constants requires 64 bit
+;	intermediate results, and unfortunatly the assembler only provides 32
+;	bit expression evaluation, so the proper constants were computed with
+;	a 64 bit hex caculator, and hard coded here (yuck!).  These are not
+;	"Magic Numbers", the formula for computing them is provided, so that
+;	they may be re-computed if any of the parameters ever change.
+;
+;_______________________________________________________________________
+
+TicksPerSec			equ		783360		; VIA Timer clock rate
+TickScale			equ		4			; Internal time is VIA ticks >> TickScale
+
+MsToIntFractBits	equ		26			; number of fraction bits in 64 bit result
+*MsToInternal		equ		((TicksPerSec<<(MsToIntFractBits-TickScale))\
+							+999)/1000
+MsToInternal		equ		$C3D70A3E	; msec to internal time multiplier
+
+UsToIntFractBits	equ		32			; number of fraction bits in 64 bit result
+*UsToInternal		equ		((TicksPerSec<<(UsToIntFractBits-TickScale))\
+							+999999)/1000000
+UsToInternal		equ		$0C88A47F	; µsec to internal time multiplier
+
+IntToMsFractBits	equ		32			; number of fraction bits in 64 bit result
+*InternalToMs		equ		((1000<<(IntToMsFractBits+TickScale))\
+							+TicksPerSec-1)/TicksPerSec
+InternalToMs		equ		$053A8FE6	; internal time to msec multiplier
+
+IntToUsFractBits	equ		27			; number of fraction bits in 64 bit result
+*InternalToUs		equ		((1000000<<(IntToUsFractBits+TickScale))\
+							+TicksPerSec-1)/TicksPerSec
+InternalToUs		equ		$A36610BC	; internal time to µsec multiplier
+
+
+			macro	;	Macro for interfacing with the MultAndMerge routine.
+			Convert	&Multiplier,&FractionBits
+			jsrROM	MultAndMerge			; input/output is D0
+			dc.l	&Multiplier			; conversion multiplier
+			if		&eval(&FractionBits)=32 then
+			dc.l	0						; merge mask (low 32 bits all fraction)
+			else
+			dc.l	-1<<&FractionBits	; merge mask (some low bits not fraction)
+			rol.l	#32-&FractionBits,d0	; position result after merge
+			endif
+			endm
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+
+GetRidOfPowerMgrInFreezeTime InstallProc (Plus,SE,II,IIci,notAUX)
+
+			import	PoundThreeNOPsHereIfNoPowerMgr
+
+			lea		PoundThreeNOPsHereIfNoPowerMgr,a0
+			move.w	#$4E71,d0				; get the NOP opcode
+			move.w	d0,(a0)+				; NOP
+			move.w	d0,(a0)+				; NOP
+			move.w	d0,(a0)+				; NOP
+
+			rts
+
+			EndProc
+
+InstallTimeMgrPlusSEII InstallProc (Plus,SE,II,notAUX)
+
+			import	InitTimeMgr
+
+			move.w	sr,-(sp)				; save interrupt level
+			ori.w	#$0700,sr				; no interrupts while swapping Time Mgrs
+
+			leaResident __InsTime,a0
+			moveq	#$58,d0					; _InsTime
+			_SetTrapAddress newOS
+
+			leaResident __RmvTime,a0
+			moveq	#$59,d0					; _RmvTime
+			_SetTrapAddress newOS
+
+			leaResident __PrimeTime,a0
+			moveq	#$5A,d0					; _PrimeTime
+			_SetTrapAddress newOS
+
+			leaResident __Microseconds,a0
+			moveq	#$93-$100,d0			; SetTrapAddress(os) only looks at the low byte
+			_SetTrapAddress newOS
+
+			movea.l	TimeVars,a0				; get pointer to time manager globals
+			movea.l	MSQueue+qHead(a0),a1	; save header of queue
+			_DisposPtr						; dispose the old globals
+			jsr		InitTimeMgr				; initialize the new TimeMgr (trashes no registers)
+@loop
+			move.l	a1,d0					; test for end of list
+			beq.s	@done					; exit when queue empty
+			move.l	a1,a0					; setup a0 for _PrimeTIme
+			move.l	qLink(a0),a1			; remember queue successor
+			move.l	tmCount(a0),d1			; save time remaining for _PrimeTime
+			_InsTime						; re-install the time manager task
+			move.l	d1,d0					; pass time remaining to _PrimeTime
+			beq.s	@loop					; if not running, don't prime it
+			_PrimeTime						; restart the timer with new time mgr
+			bra.s	@loop					; loop through entire queue
+@done
+			move.w	(sp)+,sr				; restore interrupt level
+			rts
+
+			EndProc
+
+InstallTimeMgrPortableIIci InstallProc (Portable,IIci,notAUX)
+
+			move.w	sr,-(sp)				; save interrupt level
+			ori.w	#$0700,sr				; no interrupts while swapping Time Mgrs
+
+			leaResident RmvTimeNewFreezeTime,a0
+			moveq	#$59,d0					; _RmvTime
+			_SetTrapAddress newOS
+
+			leaResident PrimeTimeNewFreezeTime,a0
+			moveq	#$5A,d0					; _PrimeTime
+			_SetTrapAddress newOS
+
+			leaResident Timer2IntNewFreezeTime,a0
+			move.l	a0,Lvl1DT+(T2IntBit*4)	; put into interrupt table
+
+			leaResident __Microseconds,a0
+			moveq	#$93-$100,d0			; SetTrapAddress(os) only looks at the low byte
+			_SetTrapAddress newOS
+
+			moveq	#TimeMgrPrivate.PrivateSize,d0
+			_NewPtr	sys,clear				; allocate and clear the structure
+			move.l	a0,a1					; keep the pointer for reference
+			move.l	TimeVars,a0				; get the old globals
+			moveq	#OldTimeMgrGlobalsSize,d0
+			_BlockMove						; copy over the ones we care about
+			_DisposPtr						; get rid of the old globals
+			move.l	a1,TimeVars				; point to the new globals
+
+			move.w	(sp)+,sr				; restore interrupt level
+			rts
+
+			EndProc
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+; patch to RmvTime that calls our copy of FreezeTime, and then rejoins the ROM
+
+RmvTimeNewFreezeTime proc export
+
+			import	FreezeTime
+
+			move.l	d3,-(sp)				; save d3 also
+			jsr		FreezeTime				; setup to manipulate time queue
+			jmpROM	AfterFreezeTimeInRmvTime	; rejoin the ROM
+
+			endproc
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+; patch to PrimeTime that calls our copy of FreezeTime, and then rejoins the ROM
+
+PrimeTimeNewFreezeTime proc export
+
+			import	FreezeTime
+
+			move.l	d3,-(sp)				; save d3 also
+
+			tst.l	d0						; see if +msec or -µsec
+			bpl.s	@msec					; µsec are negated, msec pos
+
+@usec		neg.l	d0						; get positive number of µsecs
+			convert	UsToInternal,UsToIntFractBits	; convert µsec to internal
+			bra.s	@ConvertDone			; join common code
+
+@msec		convert	MsToInternal,MsToIntFractBits	; convert msec to internal
+@ConvertDone
+			jsr		FreezeTime				; setup to manipulate time queue
+			jmpROM	AfterFreezeTimeInPrimeTime	; rejoin the ROM
+
+			endproc
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+; patch to Timer2Int that calls our copy of Timer2Int, and then rejoins the ROM
+
+Timer2IntNewFreezeTime proc export
+
+			import	FreezeTime
+
+			jsr		FreezeTime				; stop the timer, adjust time remaining
+			jmpROM	AfterFreezeTimeInTimer2Int	; rejoin the ROM
+
+;ÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑÑ
+
+			End

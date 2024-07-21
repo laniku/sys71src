@@ -1,0 +1,4283 @@
+;
+;	File:		JMFBDriver.a
+;
+;	Contains:	Driver for 4•8/8•24 Cards.
+;
+;	Written by:	Casey King/Mike Puckett
+;
+;	Copyright:	© 1986-1992 by Apple Computer, Inc.  All rights reserved.
+;
+;   This file is used in these builds: Mac32
+;
+;
+;	Change History (most recent first):
+;
+;	   <SM2>	11/18/92	SWC		Changed SlotEqu.a->Slots.a and VideoEqu.a->Video.a.
+;		 <1>	  1/7/92	RB		first checked in
+;	=============== Terror History ========================
+;
+;		 <4>	 6/17/91	jmp		Fixed a “memory leak” bug in SetGamma when changing the size of
+;									the current gamma table (i.e., form size 3 to 1, or vice-versa).
+;									Also, eliminated support for PAL displays & encoder boxes since
+;									the versions of the 4•8 & 8•24 cards that we’re patching out
+;									don’t have the sRsrcs.
+;		 <3>	  4/4/91	jmp		Cleaned up the conditional assembly stuff (i.e., now use ForRom
+;									instead of PadForOverPatch).
+;		 <2>	 2/25/91	jmp		Rolled in Casey’s latest changes.
+;		 <1>	01/06/91	jmp		Checked into TERROR ROM for the first time.
+;		 <0>	11/19/90	jmp		Formatted for use with TERROR ROM (as opposed to a
+;									declaration ROM).
+
+
+;-------------------------------------------------------------------
+;
+; (c) Apple Computer, Inc.	1986-1990
+; All rights reserved.
+;
+;-------------------------------------------------------------------
+;	File   		: ElmerDrvr.a
+;	Author 		: Casey King (based extensively on Bob and Blackjack)
+;-------------------------------------------------------------------
+;	This file contains the video driver for use by the Macintosh
+;	OS.  It is structured as a normal Mac slot device driver.
+;
+;-------------------------------------------------------------------
+;	Mod History :
+;		Refer to Projector change history for revision details
+;-------------------------------------------------------------------
+
+
+			BLANKS		ON
+			STRING		ASIS
+			MACHINE		MC68020
+			
+			LOAD		'StandardEqu.d'
+			
+			Print		Off
+			INCLUDE		'ColorEqu.a'
+			INCLUDE		'ROMEqu.a'
+			INCLUDE		'Slots.a'
+			INCLUDE		'Video.a'
+		
+			INCLUDE		'JMFBDepVideoEqu.a'
+			Print		On
+
+			If ForRom Then
+JMFBDrvr	Proc		Export
+			Else
+VideoDrvr	Main		Export
+			Endif
+		
+;-------------------------------------------------------------------
+;	Equates for privates have been moved to efdepvideoequ.a since
+;	one of the values is used in SecondaryInit.a and cannont be 
+;	forward referenced.  They are duplicated here for convenience.
+;-------------------------------------------------------------------
+
+; This is device storage which is stored in the dCtlStorage field of the DCE.
+
+;	saveMode			EQU		0						; the current mode setting
+;	savePage			EQU		saveMode+2				; the current page setting
+;	saveBaseAddr 		EQU		savePage+2				; the current base address
+;	saveSQElPtr 		EQU		saveBaseAddr+4			; the SQ element pointer (for _SIntRemove).
+;	saveGammaPtr 		EQU		saveSQElPtr+4			; the pointer to the Gamma correction table
+;	GFlags				EQU		saveGammaPtr+4			; flags word
+;	saveVidParms		EQU		GFlags+2				; pointer to video configuration data
+;	saveID				EQU		saveVidParms+4			; saved sense value
+;	saveHardBase		EQU		saveID+2				; hardware base address
+;	saveMonSense		EQU		saveHardBase+4			; reformatted sense line combo from videoOpen
+;	moreGFlags			EQU		saveMonSense+2
+;	saveGammaPtrHead	EQU		moreGFlags+2
+;	dCtlSize			EQU		saveGammaPtrHead+4			; size of dCtlStorage
+
+; Flags within GFlags word
+
+;	GrayFlag		EQU		15						; luminance mapped if GFlags(GrayFlag) = 1
+;	IntDisFlag		EQU		14						; interrupts disabled if GFlags(IntFlag) =1
+;	RAM512KFlag		EQU		13						; 512K vidRAM if GFlags(RAM512K) = 1
+;	MonoFlag		EQU		12						; true if monochrome monitor
+;	Interlaced		EQU		11						; true if 12MHz NTSC mode
+;	DirectModeFlag	EQU		10						; true if direct mode (24 BPP) otherwise indexed
+;	BigScreen		EQU		9						; true if Kong or Portrait, false otherwise
+;	sRsrc32Bit		EQU		8						; true if the spID indicates it's a 32 bit sRsrc
+
+; Flags within moreGFlags word
+
+;	UnderScanFlag	EQU		15
+;	ConvOnFlag		EQU		14
+;	PALFlag			EQU		13
+;	NationalFlag	EQU		12
+;-------------------------------------------------------------------
+;	Video Driver Header
+;-------------------------------------------------------------------
+
+			
+VidDrvr		DC.W	$4C00					; ctl,status,needsLock
+			DC.W	0,0,0					; not an ornament
+
+; Entry point offset table
+
+			DC.W	VideoOpen-VidDrvr 		; open routine
+			DC.W	VidDrvr-VidDrvr			; no prime
+			DC.W	VideoCtl-VidDrvr		; control
+			DC.W	VideoStatus-VidDrvr		; status
+			DC.W	VideoClose-VidDrvr		; close
+
+
+			STRING		Pascal
+VideoTitle	DC.B		'.Display_Video_Apple_MDC'
+			STRING		ASIS
+			ALIGN							; make sure we're aligned
+			DC.W		CurJMFBDrvrVersion	;
+
+;
+; Here are the Elmer miscellaneous data and hardware parameters for the 4 different monitors. 
+; The interlaced monitor has 2 sets of parameters (no convolution and convolution).  
+;
+; The miscellaneous data contains page size, rowbytes, and number of scanlines for all allowable
+; modes of operation for a particular monitor.
+;
+; The six lines of hardware parameters data correspond to the initialization setup sequence 
+; summarized below.  
+;
+;	Line 1  - CLUT PBCR
+;	Line 2  - JMFB CSR, JMFB load divisor register, JMFB base register,JMFB row long words register
+;	Line 3  - Programable clock generator registers (interlaced convolved only)
+;	Line 4  - Stopwatch horizontal timing control parameters (see Stopwatch spec)
+;	Line 5  - Stopwatch vertical   timing control parameters (see Stopwatch spec)
+;	Line 6  - Stopwatch composite  timing control parameters (see Stopwatch spec)
+;
+; Note that the ROM can be built for the prototype VRAM or production VRAM.  This ROM can now be
+; used independent of whether the National or Endeavor clock generators are present.  The implication
+; of this is that the first JMFB register is setup in the data tables below for the National Part,
+; (i.e. the PIXSEL1 bit = 1 for Kong and 0 for all other cases).  In JMFBSetDepth, a check is made to
+; see which clock part we're using and if it's Endeavor, PIXSEL1 will be set to 1.  Otherwise the
+; National setup would result in reseting Endeavor (to 10MHz) except for the Kong.
+;
+
+Mode100Data
+Pages1024	DC.B	OBMPages100B,TBMPages100B,FBMPages100B,EBMPages100B,TFBMPages100B
+Pages512	DC.B	OBMPages100A,TBMPages100A,FBMPages100A,EBMPages100A,TFBMPages100A								
+RowBites	DC.W	OBM100RB,TBM100RB,FBM100RB,EBM100RB,TFBM100RB								
+Height		DC.W	defmBounds_B100												
+
+Mode100
+OBM100Parms		DC.W	$00C0	
+			IF ProtoVRAM THEN
+				DC.W	$2003,$00F8,defmBaseOffsetBS>>5,OBM100RB/4
+			ELSE
+				DC.W	$2002,$00F8,defmBaseOffsetBS>>5,OBM100RB/4
+			ENDIF
+				DC.W	$0003,$0000,$0090,$011E,$0016,$001E,$0012
+				DC.W	$0003,$0000,$06CC,$004E,$0006,$0006
+				DC.W	$0000,$014c
+
+TBM100Parms		DC.W	$00C8	
+			IF ProtoVRAM THEN
+				DC.W	$2003,$00FC,defmBaseOffsetBS>>5,TBM100RB/4
+			ELSE
+ 				DC.W	$2002,$00FC,defmBaseOffsetBS>>5,TBM100RB/4
+			ENDIF
+				DC.W	$0003,$0000,$0090,$011E,$001A,$001E,$000E
+				DC.W	$0003,$0000,$06CC,$004E,$0006,$0006
+				DC.W	$0000,$014c
+
+FBM100Parms		DC.W	$00D0	
+			IF ProtoVRAM THEN
+				DC.W	$2003,$00FE,defmBaseOffsetBS>>5,FBM100RB/4
+			ELSE
+ 				DC.W	$2002,$00FE,defmBaseOffsetBS>>5,FBM100RB/4
+			ENDIF
+				DC.W	$0003,$0000,$0090,$011E,$001C,$001E,$000C
+				DC.W	$0003,$0000,$06CC,$004E,$0006,$0006
+				DC.W	$0000,$014c
+
+EBM100Parms		DC.W	$00D8	
+			IF ProtoVRAM THEN
+				DC.W	$2003,$00FF,defmBaseOffsetBS>>5,EBM100RB/4
+			ELSE
+				DC.W	$2002,$00FF,defmBaseOffsetBS>>5,EBM100RB/4
+ 			ENDIF
+				DC.W	$0003,$0000,$0090,$011E,$001D,$001E,$000B
+				DC.W	$0003,$0000,$06CC,$004E,$0006,$0006
+				DC.W	$0000,$014c
+
+Mode57Data
+				DC.B	OBMPages57B,TBMPages57B,FBMPages57B,EBMPages57B,TFBMPages57B												
+				DC.B	OBMPages57A,TBMPages57A,FBMPages57A,EBMPages57A,TFBMPages57A													
+				DC.W	OBM57RB,TBM57RB,FBM57RB,EBM57RB,TFBM57RB							
+				DC.W	defmBounds_B57												
+
+Mode57
+OBM57Parms		DC.W	$00A0	
+			IF ProtoVRAM THEN
+				DC.W	$0003,$00F0,defmBaseOffsetBS>>5,OBM57RB/4
+			ELSE
+				DC.W	$0002,$00F0,defmBaseOffsetBS>>5,OBM57RB/4
+ 			ENDIF
+				DC.W	$0003,$0000,$00A0,$013E,$0012,$0026,$0022
+				DC.W	$0003,$0000,$06CC,$0054,$0006,$0006
+				DC.W	$0000,$0178
+
+TBM57Parms		DC.W	$00A8	
+			IF ProtoVRAM THEN
+				DC.W	$0003,$00F8,defmBaseOffsetBS>>5,TBM57RB/4
+			ELSE
+				DC.W	$0002,$00F8,defmBaseOffsetBS>>5,TBM57RB/4
+ 			ENDIF
+				DC.W	$0003,$0000,$00A0,$013E,$001A,$0026,$001A
+				DC.W	$0003,$0000,$06CC,$0054,$0006,$0006
+				DC.W	$0000,$0178
+
+FBM57Parms		DC.W	$00B0	
+			IF ProtoVRAM THEN
+				DC.W	$0003,$00FC,defmBaseOffsetBS>>5,FBM57RB/4
+			ELSE
+				DC.W	$0002,$00FC,defmBaseOffsetBS>>5,FBM57RB/4
+ 			ENDIF
+				DC.W	$0003,$0000,$00A0,$013E,$001E,$0026,$0016
+				DC.W	$0003,$0000,$06CC,$0054,$0006,$0006
+				DC.W	$0000,$0178
+
+EBM57Parms		DC.W	$00B8	
+			IF ProtoVRAM THEN
+				DC.W	$0003,$00FE,defmBaseOffsetBS>>5,EBM57RB/4
+			ELSE
+				DC.W	$0002,$00FE,defmBaseOffsetBS>>5,EBM57RB/4
+ 			ENDIF
+				DC.W	$0003,$0000,$00A0,$013E,$0020,$0026,$0014
+				DC.W	$0003,$0000,$06CC,$0054,$0006,$0006
+				DC.W	$0000,$0178
+
+Mode30Data
+				DC.B	OBMPages30B,TBMPages30B,FBMPages30B,EBMPages30B,TFBMPages30B													
+				DC.B	OBMPages30A,TBMPages30A,FBMPages30A,EBMPages30A,TFBMPages30A														
+				DC.W	OBM30RB,TBM30RB,FBM30RB,EBM30RB,TFBM30RB								
+				DC.W	defmBounds_B30												
+
+Mode30
+OBM30Parms		DC.W	$0080
+			IF ProtoVRAM THEN
+				DC.W	$0083,$00E0,defmBaseOffset>>5,OBM30RB/4			
+			ELSE
+				DC.W	$0082,$00E0,defmBaseOffset>>5,OBM30RB/4	
+ 			ENDIF
+				DC.W	$0003,$0000,$013A,$027E,$0034,$003E,$0068
+				DC.W	$0003,$0000,$03C0,$004E,$0006,$0006
+				DC.W	$0004,$0320
+
+TBM30Parms		DC.W	$0088
+			IF ProtoVRAM THEN
+				DC.W	$0083,$00F0,defmBaseOffset>>5,TBM30RB/4				
+			ELSE
+ 				DC.W	$0082,$00F0,defmBaseOffset>>5,TBM30RB/4	
+			ENDIF
+				DC.W	$0003,$0000,$012A,$027E,$0044,$003E,$0058
+				DC.W	$0003,$0000,$03C0,$004E,$0006,$0006
+				DC.W	$0004,$0320
+				
+FBM30Parms		DC.W	$0090
+			IF ProtoVRAM THEN
+				DC.W	$0083,$00F8,defmBaseOffset>>5,FBM30RB/4				
+			ELSE
+ 				DC.W	$0082,$00F8,defmBaseOffset>>5,FBM30RB/4				
+			ENDIF
+				DC.W	$0003,$0000,$0122,$027E,$004C,$003E,$0050
+				DC.W	$0003,$0000,$03C0,$004E,$0006,$0006
+				DC.W	$0004,$0320
+
+EBM30Parms		DC.W	$0098
+			IF ProtoVRAM THEN
+				DC.W	$0083,$00FC,defmBaseOffset>>5,EBM30RB/4				
+			ELSE
+				DC.W	$0082,$00FC,defmBaseOffset>>5,EBM30RB/4				
+ 			ENDIF
+				DC.W	$0003,$0000,$011E,$027E,$0050,$003E,$004C
+				DC.W	$0003,$0000,$03C0,$004E,$0006,$0006
+				DC.W	$0004,$0320
+
+TFBM30Parms		
+			IF ProtoVRAM THEN
+				DC.W	$009A													
+				DC.W	$0087,$00FF,(defmBaseOffset*3/4)>>5>>1,(TFBM30RB*3/4/4)>>1			
+			ELSE
+				DC.W	$009A													
+				DC.W	$0086,$00FF,(defmBaseOffset*3/4)>>5>>1,(TFBM30RB*3/4/4)>>1	
+ 			ENDIF
+				DC.W	$0003,$0000,$0140,$027E,$0053,$003E,$0049
+				DC.W	$0003,$0000,$03C0,$004E,$0006,$0006
+				DC.W	$0004,$0320
+
+Mode16Data
+				DC.B	OBMPages16B,TBMPages16B,FBMPages16B,EBMPages16B,TFBMPages16B													
+				DC.B	OBMPages16A,TBMPages16A,FBMPages16A,EBMPages16A,TFBMPages16A														
+				DC.W	OBM16RB,TBM16RB,FBM16RB,EBM16RB,TFBM16RB								
+				DC.W	defmBounds_B16												
+
+Mode16
+OBM16Parms		DC.W	$0080
+			IF ProtoVRAM THEN
+				DC.W	$0083,$00E0,defmBaseOffset>>5,OBM16RB/4				
+			ELSE
+				DC.W	$0082,$00E0,defmBaseOffset>>5,OBM16RB/4				
+ 			ENDIF
+				DC.W	$0003,$0000,$0100,$01FE,$024,$001E,$0038
+				DC.W	$0003,$0000,$0300,$0026,$0006,$0002
+				DC.W	$0004,$0260
+
+TBM16Parms		DC.W	$0088
+			IF ProtoVRAM THEN
+				DC.W	$0083,$00F0,defmBaseOffset>>5,TBM16RB/4				
+			ELSE
+ 				DC.W	$0082,$00F0,defmBaseOffset>>5,TBM16RB/4				
+			ENDIF
+				DC.W	$0003,$0000,$0100,$01FE,$034,$001E,$0028
+				DC.W	$0003,$0000,$0300,$0026,$0006,$0002
+				DC.W	$0004,$0260
+				
+FBM16Parms		DC.W	$0090
+			IF ProtoVRAM THEN
+				DC.W	$0083,$00F8,defmBaseOffset>>5,FBM16RB/4			
+			ELSE
+ 				DC.W	$0082,$00F8,defmBaseOffset>>5,FBM16RB/4				
+			ENDIF
+				DC.W	$0003,$0000,$0100,$01FE,$03C,$001E,$0020
+				DC.W	$0003,$0000,$0300,$0026,$0006,$0002
+				DC.W	$0004,$0260
+
+EBM16Parms		DC.W	$0098
+			IF ProtoVRAM THEN
+				DC.W	$0083,$00FC,defmBaseOffset>>5,EBM16RB/4				
+			ELSE
+				DC.W	$0082,$00FC,defmBaseOffset>>5,EBM16RB/4				
+ 			ENDIF
+				DC.W	$0003,$0000,$0100,$01FE,$040,$001E,$001C
+				DC.W	$0003,$0000,$0300,$0026,$0006,$0002
+				DC.W	$0004,$0260
+
+TFBM16Parms		
+			IF ProtoVRAM THEN
+				DC.W	$009A													
+				DC.W	$0087,$00FF,(defmBaseOffset*3/4)>>5>>1,(TFBM16RB*3/4/4)>>1			
+			ELSE
+				DC.W	$009A													
+				DC.W	$0086,$00FF,(defmBaseOffset*3/4)>>5>>1,(TFBM16RB*3/4/4)>>1	
+ 			ENDIF
+				DC.W	$0003,$0000,$0100,$01FE,$043,$001E,$0019
+				DC.W	$0003,$0000,$0300,$0026,$0006,$0002
+				DC.W	$0004,$0260
+
+Mode14Data
+				DC.B	InvalPageCnt,InvalPageCnt,InvalPageCnt,InvalPageCnt,InvalPageCnt												
+				DC.B	OBMPages14A,TBMPages14A,FBMPages14A,EBMPages14A,TFBMPages14A										
+				DC.W	OBM14RB,TBM14RB,FBM14RB,EBM14RB,TFBM14RB								
+				DC.W	defmBounds_B14												
+
+;
+; There is an interesting twist to all of the PAL timing parameters and it is in the vertical
+;  timing section.  Since PAL doesn't have a half line at the top of one field and a half 
+;  line at the bottom of the other field, but rather has a full line at the top of both
+;  fields and half lines at both bottoms, we have to adjust for this in Stopwatch.  The way
+;  that this happens is a half line is taken of from active video and added to the back
+;  porch and then Stopwatch is reset as it normally is.  Hey it works and it's late!
+;
+Mode14
+
+OBM14Parms		DC.W	$0080
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00E0,defmBaseOffset12>>5,OBM14RB/4
+			ELSE
+ 				DC.W	$8112,$00E0,defmBaseOffset12>>5,OBM14RB/4
+			ENDIF
+				DC.W	$0003,$0000,$0160,$02FE,$0031,$0043,$0036
+				DC.W	$0003,$0000,$023F,$0028,$0005,$0005
+				DC.W	$005E,$0193
+
+TBM14Parms		DC.W	$0088
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00F0,defmBaseOffset12>>5,TBM14RB/4
+			ELSE
+ 				DC.W	$8112,$00F0,defmBaseOffset12>>5,TBM14RB/4
+			ENDIF
+				DC.W	$0003,$0000,$0150,$02FE,$0041,$0043,$0026
+				DC.W	$0003,$0000,$023F,$0028,$0005,$0005
+				DC.W	$005E,$0193
+
+FBM14Parms		DC.W	$0090
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00F8,defmBaseOffset12>>5,FBM14RB/4
+			ELSE
+				DC.W	$8112,$00F8,defmBaseOffset12>>5,FBM14RB/4
+ 			ENDIF
+				DC.W	$0003,$0000,$0148,$02FE,$0049,$0043,$001E
+				DC.W	$0003,$0000,$023F,$0028,$0005,$0005
+				DC.W	$005E,$0193
+
+EBM14Parms		DC.W	$0098
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00FC,defmBaseOffset12>>5,EBM14RB/4
+			ELSE
+ 				DC.W	$8112,$00FC,defmBaseOffset12>>5,EBM14RB/4
+			ENDIF
+				DC.W	$0003,$0000,$0144,$02FE,$004D,$0043,$001A
+				DC.W	$0003,$0000,$023F,$0028,$0005,$0005
+				DC.W	$005E,$0193
+
+Mode14CData
+				DC.B	OBMPages14CB,TBMPages14CB,FBMPages14CB,EBMPages14CB,TFBMPages14CB													
+				DC.B	InvalPageCnt,InvalPageCnt,InvalPageCnt,InvalPageCnt,InvalPageCnt														
+				DC.W	OBM14CRB,TBM14CRB,FBM14CRB,EBM14CRB,TFBM14CRB								
+				DC.W	defmBounds_B14												
+Mode14C
+
+OBM14CParms		DC.W	$00C1
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00F8,(defmbaseOffset12-convBOfix)>>5,OBM14CRB/4
+			ELSE
+				DC.W	$8132,$00F8,(defmbaseOffset12-convBOfix)>>5,OBM14CRB/4
+ 			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$01,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0160,$02FE,$0031,$0043,$0036
+				DC.W	$0003,$0000,$023F,$0028,$0005,$0005
+				DC.W	$005E,$0193
+				
+TBM14CParms		DC.W	$00C9
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00FC,(defmbaseOffset12-convBOfix)>>5,TBM14CRB/4
+			ELSE
+ 				DC.W	$8132,$00FC,(defmbaseOffset12-convBOfix)>>5,TBM14CRB/4
+			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$01,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0150,$02FE,$0041,$0043,$0026
+				DC.W	$0003,$0000,$023F,$0028,$0005,$0005
+				DC.W	$005E,$0193
+				
+FBM14CParms		DC.W	$00D1
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00FE,(defmbaseOffset12-convBOfix)>>5,FBM14CRB/4
+			ELSE
+ 				DC.W	$8132,$00FE,(defmbaseOffset12-convBOfix)>>5,FBM14CRB/4
+			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$01,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0148,$02FE,$0049,$0043,$001E
+				DC.W	$0003,$0000,$023F,$0028,$0005,$0005
+				DC.W	$005E,$0193
+				
+EBM14CParms		DC.W	$00D9
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00FF,(defmbaseOffset12-convBOfix)>>5,EBM14CRB/4
+			ELSE
+ 				DC.W	$8132,$00FF,(defmbaseOffset12-convBOfix)>>5,EBM14CRB/4
+			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$01,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0144,$02FE,$004D,$0043,$001A
+				DC.W	$0003,$0000,$023F,$0028,$0005,$0005
+				DC.W	$005E,$0193
+;
+; 24 bpp is not an allowable mode for overscan PAL, so no table here!
+;
+
+Mode14uData
+				DC.B	InvalPageCnt,InvalPageCnt,InvalPageCnt,InvalPageCnt,InvalPageCnt												
+				DC.B	OBMPages14Au,TBMPages14Au,FBMPages14Au,EBMPages14Au,TFBMPages14Au										
+				DC.W	OBM14uRB,TBM14uRB,FBM14uRB,EBM14uRB,TFBM14uRB								
+				DC.W	defmBounds_B14u												
+
+Mode14u
+
+OBM14uParms		DC.W	$0080
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00E0,defmBaseOffset12>>5,OBM14uRB/4
+			ELSE
+ 				DC.W	$8112,$00E0,defmBaseOffset12>>5,OBM14uRB/4
+			ENDIF
+				DC.W	$0003,$0000,$0120,$027e,$0071,$0043,$0076
+				DC.W	$0003,$0000,$020f,$0058,$0005,$0005
+				DC.W	$005E,$0193
+
+TBM14uParms		DC.W	$0088
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00F0,defmBaseOffset12>>5,TBM14uRB/4
+			ELSE
+ 				DC.W	$8112,$00F0,defmBaseOffset12>>5,TBM14uRB/4
+			ENDIF
+				DC.W	$0003,$0000,$0110,$027e,$0081,$0043,$0066
+				DC.W	$0003,$0000,$020f,$0058,$0005,$0005
+				DC.W	$005E,$0193
+
+FBM14uParms		DC.W	$0090
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00F8,defmBaseOffset12>>5,FBM14uRB/4
+			ELSE
+				DC.W	$8112,$00F8,defmBaseOffset12>>5,FBM14uRB/4
+ 			ENDIF
+				DC.W	$0003,$0000,$0108,$027e,$0089,$0043,$005e
+				DC.W	$0003,$0000,$020f,$0058,$0005,$0005
+				DC.W	$005E,$0193
+
+EBM14uParms		DC.W	$0098
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00FC,defmBaseOffset1212>>5,EBM14uRB/4
+			ELSE
+ 				DC.W	$8112,$00FC,defmBaseOffset12>>5,EBM14uRB/4
+			ENDIF
+				DC.W	$0003,$0000,$0104,$027e,$008d,$0043,$005a
+				DC.W	$0003,$0000,$020f,$0058,$0005,$0005
+				DC.W	$005E,$0193
+
+Mode14CuData
+				DC.B	OBMPages14CB,TBMPages14CB,FBMPages14CB,EBMPages14CB,TFBMPages14Bu													
+				DC.B	InvalPageCnt,InvalPageCnt,InvalPageCnt,InvalPageCnt,InvalPageCnt														
+				DC.W	OBM14CRB,TBM14CRB,FBM14CRB,EBM14CRB,TFBM14uRB								
+				DC.W	defmBounds_B14u												
+Mode14Cu
+
+OBM14CuParms		DC.W	$00C1
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00F8,(defmbaseOffset12-convBOfix)>>5,OBM14CRB/4
+			ELSE
+				DC.W	$8132,$00F8,(defmbaseOffset12-convBOfix)>>5,OBM14CRB/4
+ 			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$01,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0120,$027e,$0071,$0043,$0076
+				DC.W	$0003,$0000,$020f,$0058,$0005,$0005
+				DC.W	$005E,$0193
+				
+TBM14CuParms		DC.W	$00C9
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00FC,(defmbaseOffset12-convBOfix)>>5,TBM14CRB/4
+			ELSE
+ 				DC.W	$8132,$00FC,(defmbaseOffset12-convBOfix)>>5,TBM14CRB/4
+			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$01,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0110,$027e,$0081,$0043,$0066
+				DC.W	$0003,$0000,$020f,$0058,$0005,$0005
+				DC.W	$005E,$0193
+				
+FBM14CuParms		DC.W	$00D1
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00FE,(defmbaseOffset12-convBOfix)>>5,FBM14CRB/4
+			ELSE
+ 				DC.W	$8132,$00FE,(defmbaseOffset12-convBOfix)>>5,FBM14CRB/4
+			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$01,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0108,$027e,$0089,$0043,$005e
+				DC.W	$0003,$0000,$020f,$0058,$0005,$0005
+				DC.W	$005E,$0193
+				
+EBM14CuParms		DC.W	$00D9
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00FF,(defmbaseOffset12-convBOfix)>>5,EBM14CRB/4
+			ELSE
+ 				DC.W	$8132,$00FF,(defmbaseOffset12-convBOfix)>>5,EBM14CRB/4
+			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$01,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0104,$027e,$008d,$0043,$005a
+				DC.W	$0003,$0000,$020f,$0058,$0005,$0005
+				DC.W	$005E,$0193
+;
+;  Note that the 24 BPP convolution parameters are identical to the 24 BPP no convolution parameters
+;  since convolution cannot be performed in 24 BPP mode.  The no convolution parameters will be used
+;  when only one bank of vRAM is present on the card and the convolution parameters will be used 
+;  when the second bank is present.  
+;
+TFBM14CuParms	DC.W	$009A
+			IF ProtoVRAM THEN
+				DC.W	$8117,$00FF,$0000,(TFBM14uRB*3/4/4)>>1
+			ELSE
+				DC.W	$8116,$00FF,$0000,(TFBM14uRB*3/4/4)>>1
+			ENDIF
+				DC.W	$0000,$0000,$0000
+				DC.B	$0D,$09,$01,$00,$06,$04,$00,$01
+				DC.B	$01,$03,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0101,$027e,$0090,$0043,$0057
+				DC.W	$0003,$0000,$020f,$0058,$0005,$0005
+				DC.W	$005E,$0193
+				
+Mode12Data
+				DC.B	OBMPages12B,TBMPages12B,FBMPages12B,EBMPages12B,TFBMPages12B												
+				DC.B	OBMPages12A,TBMPages12A,FBMPages12A,EBMPages12A,TFBMPages12A										
+				DC.W	OBM12CRB,TBM12CRB,FBM12CRB,EBM12CRB,TFBM12CRB								
+				DC.W	defmBounds_B12												
+
+Mode12
+
+; There is a bug with the 1 BPP ntsc parameters since we can't meet the horizontal timing requirements!!
+
+OBM12Parms		DC.W	$0080
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00E0,defmbaseOffset12>>5,OBM12CRB/4
+			ELSE
+ 				DC.W	$8112,$00E0,defmbaseOffset12>>5,OBM12CRB/4
+			ENDIF
+				DC.W	$0003,$0000,$0136,$027E,$0012,$003A,$003a
+				DC.W	$0003,$0000,$01E0,$0021,$0006,$0006
+				DC.W	$006E,$014a
+
+TBM12Parms		DC.W	$0088
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00F0,defmbaseOffset12>>5,TBM12CRB/4
+			ELSE
+ 				DC.W	$8112,$00F0,defmbaseOffset12>>5,TBM12CRB/4
+			ENDIF
+				DC.W	$0003,$0000,$0126,$027E,$0022,$003A,$002a
+				DC.W	$0003,$0000,$01E0,$0021,$0006,$0006
+				DC.W	$006E,$014a
+
+FBM12Parms		DC.W	$0090
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00F8,defmbaseOffset12>>5,FBM12CRB/4
+			ELSE
+				DC.W	$8112,$00F8,defmbaseOffset12>>5,FBM12CRB/4
+ 			ENDIF
+				DC.W	$0003,$0000,$011e,$027E,$002a,$003A,$0022
+				DC.W	$0003,$0000,$01E0,$0021,$0006,$0006
+				DC.W	$006E,$014a
+
+EBM12Parms		DC.W	$0098
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00FC,defmbaseOffset12>>5,EBM12CRB/4
+			ELSE
+ 				DC.W	$8112,$00FC,defmbaseOffset12>>5,EBM12CRB/4
+			ENDIF
+				DC.W	$0003,$0000,$011a,$027E,$002e,$003A,$001e
+				DC.W	$0003,$0000,$01E0,$0021,$0006,$0006
+				DC.W	$006E,$014a
+
+Mode12CData
+				DC.B	OBMPages12CB,TBMPages12CB,FBMPages12CB,EBMPages12CB,TFBMPages12B													
+				DC.B	OBMPages12CA,TBMPages12CA,FBMPages12CA,EBMPages12CA,TFBMPages12CA														
+				DC.W	OBM12CRB,TBM12CRB,FBM12CRB,EBM12CRB,TFBM12CRB								
+				DC.W	defmBounds_B12C												
+Mode12C
+
+OBM12CParms		DC.W	$00C1
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00F8,(defmbaseOffset12-convBOfix)>>5,OBM12CRB/4
+			ELSE
+				DC.W	$8132,$00F8,(defmbaseOffset12-convBOfix)>>5,OBM12CRB/4
+ 			ENDIF
+BeginEndeavor
+				DC.W	$006C,$00B0,$0000
+EndEndeavor
+Natl			DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$02,$0D,$06,$00,$01,$00,$00
+EndNatl
+				DC.W	$0003,$0000,$0136,$027E,$0012,$003A,$003A
+				DC.W	$0003,$0000,$01E0,$0021,$0006,$0006
+				DC.W	$006E,$014a
+				
+TBM12CParms		DC.W	$00C9
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00FC,(defmbaseOffset12-convBOfix)>>5,TBM12CRB/4
+			ELSE
+ 				DC.W	$8132,$00FC,(defmbaseOffset12-convBOfix)>>5,TBM12CRB/4
+			ENDIF
+				DC.W	$006C,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$02,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$0126,$027E,$0022,$003A,$002A
+				DC.W	$0003,$0000,$01E0,$0021,$0006,$0006
+				DC.W	$006E,$014a
+				
+FBM12CParms		DC.W	$00D1
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00FE,(defmbaseOffset12-convBOfix)>>5,FBM12CRB/4
+			ELSE
+ 				DC.W	$8132,$00FE,(defmbaseOffset12-convBOfix)>>5,FBM12CRB/4
+			ENDIF
+				DC.W	$006C,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$02,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$011e,$027E,$002A,$003A,$0022
+				DC.W	$0003,$0000,$01E0,$0021,$0006,$0006
+				DC.W	$006E,$014a
+				
+EBM12CParms		DC.W	$00D9
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00FF,(defmbaseOffset12-convBOfix)>>5,EBM12CRB/4
+			ELSE
+ 				DC.W	$8132,$00FF,(defmbaseOffset12-convBOfix)>>5,EBM12CRB/4
+			ENDIF
+				DC.W	$006C,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$02,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$011a,$027E,$002E,$003A,$001E
+				DC.W	$0003,$0000,$01E0,$0021,$0006,$0006
+				DC.W	$006E,$014a
+;
+;  Note that the 24 BPP convolution parameters are identical to the 24 BPP no convolution parameters
+;  since convolution cannot be performed in 24 BPP mode.  The no convolution parameters will be used
+;  when only one bank of vRAM is present on the card and the convolution parameters will be used 
+;  when the second bank is present.  
+;
+TFBM12CParms	DC.W	$009A
+			IF ProtoVRAM THEN
+				DC.W	$8117,$00FF,$0000,(TFBM12RB*3/4/4)>>1
+			ELSE
+				DC.W	$8116,$00FF,$0000,(TFBM12RB*3/4/4)>>1
+			ENDIF
+				DC.W	$001B,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$04,$0D,$06,$00,$01,$00,$00
+				DC.W	$0003,$0000,$011d,$027E,$002B,$003A,$0021
+				DC.W	$0003,$0000,$01E0,$0021,$0006,$0006
+				DC.W	$006E,$014a
+				
+Mode12uData
+				DC.B	OBMPages12B,TBMPages12B,FBMPages12B,EBMPages12B,TFBMPages12B												
+				DC.B	OBMPages12A,TBMPages12A,FBMPages12A,EBMPages12A,TFBMPages12A										
+				DC.W	OBM12CRB,TBM12CRB,FBM12CRB,EBM12CRB,TFBM12CRB								
+				DC.W	defmBounds_B12u												
+
+Mode12u
+
+OBM12uParms		DC.W	$0080
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00E0,defmbaseOffset12>>5,OBM12CRB/4
+			ELSE
+ 				DC.W	$8112,$00E0,defmbaseOffset12>>5,OBM12CRB/4
+			ENDIF
+; Based on lab measurements the delta value to fp/bp is $8 rather than $20.
+				DC.W	$0003,$0000,$00f4,$01fe,$0054,$003A,$0078
+				DC.W	$0003,$0000,$01B0,$0051,$0006,$0006
+				DC.W	$006E,$014A
+
+TBM12uParms		DC.W	$0088
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00F0,defmbaseOffset12>>5,TBM12CRB/4
+			ELSE
+ 				DC.W	$8112,$00F0,defmbaseOffset12>>5,TBM12CRB/4
+			ENDIF
+; Based on lab measurements the delta value to fp/bp is $8 rather than $20.
+				DC.W	$0003,$0000,$00e4,$01fe,$0064,$003A,$0068
+				DC.W	$0003,$0000,$01B0,$0051,$0006,$0006
+				DC.W	$006E,$014A
+
+FBM12uParms		DC.W	$0090
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00F8,defmbaseOffset12>>5,FBM12CRB/4
+			ELSE
+				DC.W	$8112,$00F8,defmbaseOffset12>>5,FBM12CRB/4
+ 			ENDIF
+; Based on lab measurements the delta value to fp/bp is $8 rather than $20.
+				DC.W	$0003,$0000,$00dc,$01fe,$006c,$003A,$0060
+				DC.W	$0003,$0000,$01B0,$0051,$0006,$0006
+				DC.W	$006E,$014A
+
+EBM12uParms		DC.W	$0098
+			IF ProtoVRAM THEN
+				DC.W	$8113,$00FC,defmbaseOffset12>>5,EBM12CRB/4
+			ELSE
+ 				DC.W	$8112,$00FC,defmbaseOffset12>>5,EBM12CRB/4
+			ENDIF
+; Based on lab measurements the delta value to fp/bp is $8 rather than $20.
+				DC.W	$0003,$0000,$00d8,$01fe,$0070,$003A,$005c
+				DC.W	$0003,$0000,$01B0,$0051,$0006,$0006
+				DC.W	$006E,$014A
+
+Mode12CuData
+				DC.B	OBMPages12CB,TBMPages12CB,FBMPages12CB,EBMPages12CB,TFBMPages12B													
+				DC.B	OBMPages12CA,TBMPages12CA,FBMPages12CA,EBMPages12CA,TFBMPages12CA														
+				DC.W	OBM12CRB,TBM12CRB,FBM12CRB,EBM12CRB,TFBM12CRB								
+				DC.W	defmBounds_B12u												
+Mode12Cu
+
+OBM12CuParms		DC.W	$00C1
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00F8,(defmbaseOffset12-convBOfix)>>5,OBM12CRB/4
+			ELSE
+				DC.W	$8132,$00F8,(defmbaseOffset12-convBOfix)>>5,OBM12CRB/4
+ 			ENDIF
+				DC.W	$006C,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$02,$0D,$06,$00,$01,$00,$00
+; Based on lab measurements the delta value to fp/bp is $8 rather than $20.
+				DC.W	$0003,$0000,$00f4,$01fe,$0054,$003A,$0078
+				DC.W	$0003,$0000,$01B0,$0051,$0006,$0006
+				DC.W	$006E,$014A
+				
+TBM12CuParms		DC.W	$00C9
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00FC,(defmbaseOffset12-convBOfix)>>5,TBM12CRB/4
+			ELSE
+ 				DC.W	$8132,$00FC,(defmbaseOffset12-convBOfix)>>5,TBM12CRB/4
+			ENDIF
+				DC.W	$006C,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$02,$0D,$06,$00,$01,$00,$00
+; Based on lab measurements the delta value to fp/bp is $8 rather than $20.
+				DC.W	$0003,$0000,$00e4,$01fe,$0064,$003A,$0068
+				DC.W	$0003,$0000,$01B0,$0051,$0006,$0006
+				DC.W	$006E,$014A
+				
+FBM12CuParms		DC.W	$00D1
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00FE,(defmbaseOffset12-convBOfix)>>5,FBM12CRB/4
+			ELSE
+ 				DC.W	$8132,$00FE,(defmbaseOffset12-convBOfix)>>5,FBM12CRB/4
+			ENDIF
+				DC.W	$006C,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$02,$0D,$06,$00,$01,$00,$00
+; Based on lab measurements the delta value to fp/bp is $8 rather than $20.
+				DC.W	$0003,$0000,$00dc,$01fe,$006c,$003A,$0060
+				DC.W	$0003,$0000,$01B0,$0051,$0006,$0006
+				DC.W	$006E,$014A
+				
+EBM12CuParms		DC.W	$00D9
+			IF ProtoVRAM THEN
+				DC.W	$8133,$00FF,(defmbaseOffset12-convBOfix)>>5,EBM12CRB/4
+			ELSE
+ 				DC.W	$8132,$00FF,(defmbaseOffset12-convBOfix)>>5,EBM12CRB/4
+			ENDIF
+				DC.W	$006C,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$02,$0D,$06,$00,$01,$00,$00
+; Based on lab measurements the delta value to fp/bp is $8 rather than $20.
+				DC.W	$0003,$0000,$00d8,$01fe,$0070,$003A,$005c
+				DC.W	$0003,$0000,$01B0,$0051,$0006,$0006
+				DC.W	$006E,$014A
+;
+;  Note that the 24 BPP convolution parameters are identical to the 24 BPP no convolution parameters
+;  since convolution cannot be performed in 24 BPP mode.  The no convolution parameters will be used
+;  when only one bank of vRAM is present on the card and the convolution parameters will be used 
+;  when the second bank is present.  
+;
+TFBM12CuParms	DC.W	$009A
+			IF ProtoVRAM THEN
+				DC.W	$8117,$00FF,$0000,(TFBM12RB*3/4/4)>>1
+			ELSE
+				DC.W	$8116,$00FF,$0000,(TFBM12RB*3/4/4)>>1
+			ENDIF
+				DC.W	$001B,$00B0,$0000
+				DC.B	$0c,$01,$02,$00,$07,$03,$00,$00
+				DC.B	$00,$04,$0D,$06,$00,$01,$00,$00
+; Based on lab measurements the delta value to fp/bp is $8 rather than $20.
+				DC.W	$0003,$0000,$00d5,$01fe,$0073,$003A,$0059
+				DC.W	$0003,$0000,$01B0,$0051,$0006,$0006
+				DC.W	$006E,$014A
+				
+;
+; Here are the offsets to each of the various data fields.  The size of all miscellaneous data blocks
+; is the same.
+;
+
+D_Pages1024	EQU		Pages1024-Mode100
+D_Pages512	EQU		Pages512-Mode100
+D_RowBytes	EQU		RowBites-Mode100
+D_Height	EQU		Height-Mode100
+D_OBP		EQU		OBM100Parms-Mode100
+D_TBP		EQU		TBM100Parms-Mode100
+D_FBP		EQU		FBM100Parms-Mode100
+D_EBP		EQU		EBM100Parms-Mode100
+D_TFBP		EQU		TFBM30Parms-Mode30			; Use Mode30 here since Mode100 doesn't do 24 BPP
+D_ClockParams	EQU	EndNatl-BeginEndeavor
+D_Endeavor	EQU		EndEndeavor-BeginEndeavor
+D_Natl		EQU		EndNatl-Natl
+
+;
+; CountTbl is the number of entries to change in each mode, set up to be indexed
+;	via the modeID.  
+;
+
+CountTbl	DC.B	$01,$03,$0F,$FF,$FF
+			DC.B	'Software by Casey King, Hardware by James Lundblad and Mohammed Sriti'
+
+
+			ALIGN	2							; correct odd alignment
+
+*******************************************************************
+*
+*  VideoOpen allocates private storage for the device in the DCE and locks
+*  it down for perpetuity. Also, install the interrupt handler and enable
+*  the interrupts.
+*
+*  VideoOpen is broken up into 7 main steps:
+*
+*       1. Allocate private storage and point to it with dCtlStorage from DCE.
+*		2. Form 32 bit base address and store in privates.
+*		3. Determine whether it's a 24 bit or 32 bit sRsrc and store in privates.
+*		4. Size VRAM and store in privates.
+*		5. Read sense lines from hw and ...
+*			a.  Save a ptr to the appropriate hw setup params.
+*			b.  Calc and save the BigScreen, GrayFlag, MonoFlag, Interlaced, PALFlag, and underScan flags.
+*			c.  If connected to interlaced monitor, determine whether to ntsc or pal and to oscan or uscan
+*		6. Get and install the interrupt handler.
+*		7. Load the correct gamma table as a f(monitor).
+*
+*  Called by:
+*		
+*		Normally only Mac OS and A/UX.
+*
+*  Traps and Utilities called:
+*
+*		_ResrvMem, _NewHandle, _HLock, _StripAddress, _SwapMMUMode, _sReadPRAMRec,
+*		EnableVGuts
+*
+*  Register usage:
+*
+*       Input:
+*			A0 = param block pointer
+*			A1 = DCE pointer
+*
+*  		Output
+*			D0 = error code.
+*
+*		Locally used
+*			D0 = scratch
+*			D1 = scratch
+*			D3 = saves the spID from the AuxDCE
+*
+*			A0 = points to the cards base address
+*			   = later points to the hw setup params
+*			   = later as a ptr to a parameter block
+*			A3 = pointer to private storage
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+
+		WITH	VDPageInfo,SlotIntQElement,SEBlock,spBlock
+
+VideoOpen	
+
+
+;
+; Allocate private storage (since block is CLEAR, GFlags are zeroed) and get
+;	a pointer to it in A3
+;
+
+			MOVEQ	#dCtlSize,D0				; get size of parameters
+			_ResrvMem  ,SYS 					; make room as low as possible
+			MOVEQ	#dCtlSize,D0				; get size of parameters
+			_NewHandle ,SYS,CLEAR				; get some memory for private storage
+			BNE   	OpError						; => return an error in open
+			MOVE.L	A0,dCtlStorage(A1)			; save returned handle in DCE
+			_HLock								; and lock it down
+			
+			MOVE.L	(A0),D0						; get a pointer to it
+			_StripAddress						; strip it since we'll use it in 32 bit addressing
+			MOVE.L	D0,A3						; and put it in A3
+						
+;
+; form the 32 bit base address in A0 and save in saveHardBase(A3).  We
+;   cannot be assured that dctlDevBase(A1) contains  the correct 32 bit
+;   address since a 24 bit sRsrc may be the active one if the new version of
+;   the slot manager is not present.
+;
+			MOVE.L	#$F0000000,D1
+			MOVE.B	dCtlSlot(A1),D0
+			BFINS	D0,D1{4:4}
+			MOVE.L	D1,A0
+			MOVE.L	A0,saveHardBase(A3)			; save this in privates for the interrupt handler
+			
+;
+; determine if we're using a National or Endeavor Clock
+;
+			MOVE.L	A0,-(SP)					; save A0 as it is used later
+			SUBA	#spBlockSize,SP				; get slot param block
+			MOVE.L	SP,A0						; save pointer to it in A0
+			MOVE.B	D0,spSlot(A0)				; put slot in slot param block
+			SUBA	#sizesPRAMRec,SP			; get PRAM record
+			MOVE.L	SP,spResult(A0)				; set up a pointer to result
+			_SReadPRAMRec
+			
+			CMP.B	#0,SavedClockType(SP)		; check for Endeavor
+			BEQ.S	EndClkCheck
+			BSET	#NationalFlag,moreGFlags(A3)
+EndClkCheck
+			ADDA	#sizesPRAMRec+spBlockSize,SP	; flush param blocks
+			MOVE.L	(SP)+,A0					; restore A0
+			
+; determine if the installed sResource is 24 bit (0) or 32 bit (1) from the AuxDCE record
+;	- Refer to OMD software ERS for definition of all spID bits
+;
+			MOVE.B	dCtlSlotID(A1),D3			; get the current sResource ID
+			BTST	#fSRsrc24Bit,D3				; check for b4 state (24 bit=1, 32 bit=0)
+			BNE.S	@sizeVRAM
+			BSET	#sRsrc32bit,GFlags(A3)		; set the 32bit sRsrc bit in GFlags
+
+;
+; determine the memory size of the active sRsrc from the AuxDCE spID and set private storage bit
+;
+
+@sizeVRAM
+			BTST	#fSRsrcXMemBit,D3
+			BNE.S	@monSense
+			BSET	#RAM512KFlag,GFlags(A3)		; and set 512K vRAM flag (this is why we strip address)
+
+;
+; read the monitor sense lines to determine the configuration. Use this info
+;	to pick up a pointer to the parameter table for this hardware mode and
+;	save this pointer off in private storage.  Since we had to get through
+;	primary init, the monitor sense line must be valid.  The monitor sense 
+;	combination is read from the JMFB CSR which is located at zero offset 
+;   from the JMFB control space.  Note that we can't use the sRsrc ID from
+;	the AuxDCE here because not all bits are saved in the spID.  To support
+;	the RGB Kong and Portrait in the future we must go back out to the 
+;	card and get the whole sense!
+;
+;	Note that we're providing minimal functionality with the Sarnoff breakout
+;	box.  We use the extended sense scheme to support both the Sarnoff NTSC mode
+;	and the Sarnoff PAL mode.  At this time there is no support for the monitor
+;	connected to the auxillary DB15 connector on Sarnoff.
+;
+
+@monSense
+			MOVEQ		#true32b,D0				; change to 32 bit addressing to get
+			_SwapMMUMode						; sense lines
+			MOVE	D0,-(SP)					; save the past mode on the stack
+	
+			MOVE.L	#JMFB,D0					; get offset in register
+			BFEXTU	(A0,D0.L){20:3},D1			; get the state of the sense lines
+			
+			CMP.B	#NoSense,D1					; check for no sense
+			BNE.S	@DoNext						; if we get a valid sense, go on
+
+			MOVE.L	D0,D1						; setup for GetXtndSense (so we use same interface as pinit)
+			MOVE.L	A1,-(SP)					; setup for GetXtndSense (save A1)
+			MOVE.L	A0,A1						; setup for GetXtndSense (so we use same interface as pinit)
+			BSR		GetXtndSense				; go see if we see an xtended sense
+			MOVE.L	(SP)+,A1					; restore A1
+			
+			CMP.B		#Sarnoff,D0				; we only understand sarnoff
+			
+		If ForROM Then
+			Bne.s		@NoConnect				; if not Sarnoff (NTSC), then no connect
+		Else
+			BNE.S		@TryPAL					; if not Sarnoff (NTSC), then try for PAL
+		EndIf
+				
+			MOVE.B		#_NTSC_,D1				; force sarnoff to ntsc timing for now
+			BRA.S		@SwapBack				; we have a current mode so go on
+
+		If Not ForROM Then
+@TryPAL		CMP.B		#PAL,D0					; check for PAL xtnded sense
+			BNE.S		@TryPAL2
+			MOVE.B		#rPAL,D1
+			BRA.S		@SwapBack
+@TryPAL2	CMP.b		#PALmonitor,D0			; check for PAL monitor xtnded sense
+			BNE.S		@NoConnect				; if not found then do no connect
+			MOVE.B		#rPAL,D1
+			BRA.S		@SwapBack
+		EndIf
+				
+@NoConnect	MOVE.B	#0,D1						; no valid xtnd sense so do no connect
+			BRA.S	@SwapBack					; 
+@DoNext				
+			CMP.B	#RGBKong,D1					; check to see if its an RGBKong
+			BNE.S	@SwapBack					; if not skip and go on
+			MOVE.B	#rRGBKong,D1				; if it is, reformat to maintain convention 
+						
+; All done with 32 bit addressing needs so go back into 24 bit addressing.
+			
+@SwapBack	MOVE	(SP)+,D0					; restore old addr mode into D0
+			_SwapMMUMode						
+
+			BTST	#fSRsrcBigScrnBit,D1		; check for Kong or Portrait monitor (bit 0 = 1)
+			BEQ.S	@colorMon					; if its other (0), then branch
+			BSET	#BigScreen,GFlags(A3)		; while we are here not that it's a big screen!
+			BCLR	#fSRsrcRGBBit,D1			; b2 is not significant in Portrait or Kong sRsrcs so get rid of it
+			BNE.S	@colorMon					; remember BCLR tests before CLR, so check for color
+			BSET	#GrayFlag,GFlags(A3)
+			BSET	#MonoFlag,GFlags(A3)
+	
+@colorMon	
+			MOVE.L	D1,D0						; use D0 for the jump tbl, since we want to keep D1 intact for interlaced selection.
+			CMP.W	#7,D0						; range check the monitor id
+			BHI		OpError						;   Error, out of bounds
+			MOVE.W	VOpenJumpTbl(PC,D0.W*2),D0	; Get the relative offset to the routine
+			JMP		VOpenJumpTbl(PC,D0.W)		; GOTO the proper routine
+				
+VOpenJumpTbl	
+			DC.W	VOPAL-VOpenJumpTbl			; $00 => PAL monitor (use common code)
+			DC.W	VOPortrait-VOpenJumpTbl		; $01 => B/W Portrait (no difference between RGB and BW)
+			DC.W	VORubik-VOpenJumpTbl		; $02 => Rubik monitor 
+			DC.W	VOKong-VOpenJumpTbl			; $03 => B/W Kong (no difference between RGB and BW)
+			DC.W	VONTSC-VOpenJumpTbl			; $04 => NTSC monitor (use common code)
+			DC.W	VOPortrait-VOpenJumpTbl		; $05 => RGB Portrait (no difference between RGB and BW)
+			DC.W	VOStandard-VOpenJumpTbl		; $06 => Standard monitor
+			DC.W	VOKong-VOpenJumpTbl			; $07 => RGB Kong (no difference between RGB and BW)
+
+VOStandard	LEA		Mode30,A0					; else it better be standard size monitor
+			BRA		SaveIt						; branch to the setup code
+			
+VORubik	LEA			Mode16,A0						; point to the parameters 
+			BRA		SaveIt						; branch to the setup code
+				
+VOKong		LEA		Mode100,A0					; point to the parameters 
+			BRA		SaveIt						; branch to the setup code
+				
+VOPortrait	LEA		Mode57,A0					; point to the parameters
+			BRA		SaveIt						; branch to the setup code
+				
+VOPAL		BSET	#PALFlag,moreGFlags(A3)		; set PALFlag for PAL
+			BRA.S	VOInterlaced				; go to common code
+			
+VONTSC		BCLR	#PALFlag,moreGFlags(A3)		; set PALFlag for NTSC (not PAL)
+
+VOInterlaced
+			BSET	#Interlaced,GFlags(A3)		; set 12MHz mode flag
+
+;
+; if we're doing ntsc, check the underscan/overscan bit in the sRsrc ID (again from AuxDCE)
+;
+			
+			BTST	#fSRsrcOscanBit,D3				; test the state of the underscan (0) / overscan (1) flag
+			BNE.S	testRAMFlag
+			BSET	#underScanFlag,moreGFlags(A3)	; it was 0 so set it for underscan
+			
+testRAMFlag			
+			BTST	#RAM512KFlag,GFlags(A3)		; test to see if we have one bank (no convol) or two (convol)
+			BEQ.S	useNTSCcon					; if two banks then its convolution capable so use Mode12C
+			
+			BTST	#underScanFlag,moreGFlags(A3)	; test to see if we're underscan or overscan	
+			BNE.S	useNTSCu					; if 1 then underscan so branch
+			CMP.B	#_NTSC_,D1
+			BEQ.S	@useNTSC
+			LEA		Mode14,A0
+			BRA.S	SaveIt
+@useNTSC	
+			LEA 	Mode12,A0					; otherwise point to the overscan interlace flicker ones
+
+			BRA.S	SaveIt
+			
+useNTSCu
+			CMP.B	#_NTSC_,D1
+			BEQ.S	@useNTSC
+			LEA		Mode14u,A0
+			BRA.S	SaveIt
+@useNTSC	
+			LEA		Mode12u,A0					; point to the underscan interlace flicker params
+			BRA.S	SaveIt
+			
+useNTSCcon	
+			BSET	#convOnFlag,moreGFlags(A3)	; set if we're in a convolution mode
+			BTST	#underScanFlag,moreGFlags(A3)	; test to see if we're underscan or overscan
+			BNE.S	useConvUscan				; if 1 then underscan so branch
+			CMP.B	#_NTSC_,D1
+			BEQ.S	@useNTSC
+			LEA		Mode14C,A0
+			BRA.S	SaveIt
+@useNTSC	
+			LEA		Mode12C,A0					; must have both vRAM banks and be overscanning so use Oscan convolution
+			BRA.S	SaveIt
+			
+useConvUscan
+			CMP.B	#_NTSC_,D1
+			BEQ.S	@useNTSC
+			LEA		Mode14Cu,A0
+			BRA.S	SaveIt
+@useNTSC	
+			LEA		Mode12Cu,A0					; we have 2 banks and doing underscan so use Uscan convolution
+			
+SaveIt		MOVE.L	A0,saveVidParms(A3)			; and save it for later
+			MOVE.W	D1,saveMonSense(A3)			; also save the LS 3 bits of reformatted monitor value
+;
+; clear a couple of bits in D3 since it will be used to get the right gamma table in a second
+;
+			BCLR	#fSRsrcOscanBit,D3			; clear the underscan/overscan bit if set
+			BCLR	#fSRsrc24Bit,D3				; clear the 24b/32b sRsrc bit if set
+			BCLR	#fSRsrcXMemBit,D3			; clear the 512k/1024k bit if set
+
+			SUBA	#spBlockSize,SP				; make room for the spBlock (done here so I can conveniently flush operror1)
+;
+; Get and install the interrupt handler.  Call the SetInterrupt utility code to do 
+;	this.  This utility also starts the interrupts going.  If there is an error
+;	condition, EnableVGuts returns with Z-bit cleared.
+			
+			MOVEQ	#sqHDSize,D0				; allocate a slot queue element
+			_NewPtr	,SYS,CLEAR					; get it from system heap cleared
+			BNE  	OpError1					; if not allocated, return bad
+			MOVE.L	A0,saveSQElPtr(A3)			; save the queue element for eventual disposal
+
+			BSR		EnableVGuts					; do it
+			BNE		OpError1					; 
+;
+; load the default gamma table from the slot resource list
+;
+			MOVE.L	SP,A0						; get pointer to block in A0
+			MOVE.B	dCtlSlot(A1),spSlot(A0)		; copy the slot number
+			CLR.W	spID(A0)					; zero the spID.B,spExtDev.B
+			CLR.B	spTBMask(A0)				; we're going for an exact match to this card
+			MOVE.W	#CatDisplay,spCategory(A0)	; look for this card
+			MOVE.W	#TypVideo,spCType(A0)		; 
+			MOVE.W	#DrSwApple,spDrvrSW(A0)		;
+			MOVE.W	#DrHwJMFB,spDrvrHW(A0)		;
+			CLR.B	spHWDev(A0)					; ????
+			_sNextTypesRsrc						; get the spsPointer
+			
+			MOVE.B	#sGammaDir,spID(A0)			; look for the gamma directory
+			_sFindStruct						; get that baby
+			
+			MOVE.B	#128,spID(A0)				; get the default gamma table, (always 128)
+			_sGetBlock							; we can use this since we want a ptr in sysheap
+			BNE.S	DoLinear					; if we can't find it, use linear one!
+
+;
+; skip over header
+;
+			
+			MOVE.L	spResult(A0),A0				; point to head of the block
+			MOVE.L	A0,saveGammaPtrHead(A3)		; save head of the GammaPtr for disposal
+			ADDA	#2,A0						; skip resID
+@Name		TST.B	(A0)+						; skip over gamma name
+			BNE.S	@Name						;
+			ADDA	#1,A0						; word align pointer
+			MOVE.L	A0,D0						; get in d-reg
+			AND.L	#$FFFFFFFE,D0				; round it
+			
+			MOVE.L	D0,saveGammaPtr(A3)			; put it in private storage
+			BRA.S	OpenDone
+;
+; build a linear default gamma table
+;
+
+DoLinear	MOVEQ.L	#gFormulaData,D0			; get gamma table header size
+			ADD		#256,D0						; and one byte per element for data
+			_NewPtr ,SYS,CLEAR					; and clear it too
+			BNE.S	OpError1						; die if allocation failed
+			
+			MOVE.L	A0,saveGammaPtrHead(A3)		; save head of the GammaPtr for disposal
+			MOVE.L	A0,saveGammaPtr(A3)			; save a pointer to it
+			MOVE.W	#DrHwJMFB,gType(A0)			;
+			MOVE.W	#1,gChanCnt(A0)				;
+			MOVE.W	#256,gDataCnt(A0)			;
+			MOVE.W	#8,gDataWidth(A0)			; eight bits/value
+			ADD 	#gFormulaData,A0			; point to data table
+			MOVE.W	#$FF,D0						; put linear data in table
+			MOVEQ	#0,D1
+@Loop		MOVE.B	D1,(A0)+					; write the value
+			ADDQ	#1,D1
+			DBRA	D0,@Loop					; for all positions
+			
+;
+; all done!
+;
+
+OpenDone
+			ADDA	#spBlockSize,SP				; release the slot manager block			
+			MOVEQ	#0,D0						; no error
+EndOpen		RTS 								; return
+
+OpError1	MOVE.L	dCtlStorage(A1),A0			; dispose of private storage
+			_DisposHandle						; do it
+			ADDA	#spBlockSize,SP				; get rid of spBlock
+			
+OpError		MOVE.L	#OpenErr,D0					; say can't open driver
+			BRA.S	EndOpen
+
+			
+			
+*******************************************************************
+*
+*  Video Driver Control Call Handler.  There are ten calls- the nine 
+*  calls from the Bob driver and a new one that allows alteration of the
+*  CLUT when operating as a direct device (24 bpp for us).
+*
+*	(0)  Reset (VAR mode, page: INTEGER; VAR BaseAddr: Ptr);
+*	(1)  KillIO
+*	(2)	 SetMode(mode, page: INTEGER; VAR BaseAddr: Ptr);
+*	(3)	 SetEntries ( Table: Ptr; Start,Count : integer );
+*	(4)	 SetGamma ( Table : Ptr );
+*   (5)  GrayPage (page);
+*   (6)  SetGray (csMode = 0 for color, 1 for gray)
+*	(7)	 SetInterrupt ( csMode = 0 for enable, 1 for disable)
+*	(8)  DirectSetEntries ( Table: Ptr; Start,Count : integer );
+*	(9)  SetDefaultMode (mode);
+*
+*  The Control Call Handler is broken up into 4 main steps:
+*
+*       1. Strip the upper byte of the DCE pointer (A1).  It can be used in 32 bit mode.  
+*		2. Get the pointer to private storage in A3 and strip the upper byte.
+*		3. Get the pointer to the csParams in A2.
+*		4. Get the csCode and dispatch the call to the right control call.
+*
+*  Called by:
+*		
+*		Device Manager
+*
+*  Traps and Utilities called:
+*
+*		_StripAddress, appropriate control call
+*
+*  Register usage:
+*
+*       Input:
+*			A0 		= param block pointer
+*			A1 		= DCE pointer
+*
+*  		Output:
+*			D0	  	= error code
+*
+*		Locally used:
+*			D0 		= scratch, then returns error code as output
+*
+*			A2		= cs parameters (ie. A2 <- csParam(A0))  (must be preserved)
+*			A3 		= ptr to private storage (passed to all control calls) 
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+
+VideoCtl	MOVE.L	A0,-(SP)					; save work registers (A0 is saved because it is used by ExitDrvr)
+
+			MOVE.L	A1,D0						; need to clean up the pointer to the DCE
+			_StripAddress						;  because it is used in 32 bit mode later
+			MOVE.L	D0,A1						;  in DisableVGuts
+			
+			MOVE.L	dCtlStorage(A1),A3
+			MOVE.L	(A3),D0						; get pointer to private storage
+			_StripAddress						; strip the hi byte for 32 bit addressing
+			MOVE.L	D0,A3						; move back into A3
+			
+			MOVE.L	csParam(A0),D0				; A2 <- Ptr to control parameters
+			_StripAddress						; strip the hi byte for 32 bit addressing
+			MOVE.L	D0,A2						; put into A2
+			
+			MOVE.W	csCode(A0),D0				; get the opCode
+
+			CMP.W	#9,D0						; IF csCode NOT IN [0..10] THEN
+			BHI.S	CtlBad						;   Error, csCode out of bounds
+			MOVE.W	CtlJumpTbl(PC,D0.W*2),D0	; Get the relative offset to the routine
+			JMP		CtlJumpTbl(PC,D0.W)			; GOTO the proper routine
+				
+CtlJumpTbl	DC.W	VidReset-CtlJumpTbl			; $00 => VidReset
+			DC.W	CtlGood-CtlJumpTbl			; $01 => CtlGood
+			DC.W	SetVidMode-CtlJumpTbl		; $02 => SetVidMode
+			DC.W	SetEntries-CtlJumpTbl		; $03 => SetEntries
+			DC.W	SetGamma-CtlJumpTbl			; $04 => SetGamma
+			DC.W	GrayPage-CtlJumpTbl			; $05 => GrayPage
+			DC.W	SetGray-CtlJumpTbl			; $06 => SetGray
+			DC.W	SetInterrupt-CtlJumpTbl		; $07 => SetInterrupt
+			DC.W	DirectSetEntries-CtlJumpTbl	; $08 => DirectSetEntries
+			DC.W	SetDefaultMode-CtlJumpTbl	; $09 => SetDefault mode
+
+CtlBad		MOVEQ	#controlErr,D0				; else say we don't do this one
+			BRA.S	CtlDone						; and return
+			
+CtlGood		MOVEQ	#noErr,D0					; return no error
+
+CtlDone		MOVE.L	(SP)+,A0					; restore registers.
+			BRA		ExitDrvr
+
+
+	
+*******************************************************************
+*
+*  VidReset resets the card to its default mode (1bpp).
+*
+*  VidReset is broken up into 1 main steps:
+*
+*       1. Reset the card to 1 bpp mode.  
+*
+*  Called by:
+*		
+*		No one that I know of today.
+*
+*  Traps and Utilities called:
+*
+*		JMFBSetDepth, JMFBSetPage, GrayScreen
+*
+*  Register usage:
+*
+*       Input:
+*			A2 - pointer to the csParams
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0				- error code
+*
+*			csMode(A2)		- new mode (1bpp)
+*			csPage(A2)		- new page (0)
+*			csBaseAddr(A2)	- base address
+*			saveMode(A3)	- new mode saved in privates
+*
+*		Locally used:
+*			D1 - used to pass the requested depth to JMFBSetDepth
+*			D4 - used to pass the requested page to JMFBSetPage
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+VidReset
+
+			MOVE	#FirstVidMode,csMode(A2)	; return default mode 
+			MOVE	#FirstVidMode,saveMode(A3)	; remember firstVidMode as the requested mode
+			MOVE	#1,D1						; get default depth in D1
+			MOVEQ	#0,D4						; get page in D4 (used since SwapMMUMode uses D0)
+			MOVE	D4,csPage(A2)				; return the page
+			BSR		JMFBSetDepth				; set the depth	from D1
+			BSR		JMFBSetPage					; set the page from D4
+			MOVE.L	saveBaseAddr(A3),csBaseAddr(A2)	; return the base address
+			BSR		GrayScreen					; paint the screen gray
+			BRA.S	CtlGood						; => no error
+
+
+*******************************************************************
+*
+*  SetVidMode sets the card to the specified mode and page. If either
+*  is invalid, returns badMode error.  If the card is already set to 
+*  the specified mode, then do nothing.
+*
+*  SetVidMode is broken up into 7 main steps:
+*
+*       1. Check the requested mode against allowable modes and exit if bad.  
+*		2. Check the requested page number against max pages and exit if bad.
+*		3. If the requested mode is the same as the current mode then exit.
+*		4. Get the gamma corrected value for half intensity gray.
+*		5. Set the entire CLUT to the value in above step prior to changing modes.
+*		6. Call JMFBSetDepth to change modes.
+*		7. Call JMFBSetPage to change pages (will reset the hw base address)
+*
+*  Called by:
+*		
+*		Control Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		ChkMode, ChkPage, _SwapMMUMode, WaitVSync, JMFBSetDepth, JMFBSetPage
+*
+*  Register usage:
+*
+*       Input:
+*			A2 - pointer to the csParams
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0					- error code
+*
+*			csBaseAddr(A2)		- base address of frame buffer
+*
+*		Locally used:
+*			D0 - scratch
+*			D1 - used to pass requested mode to ChkMode (comes back as depth)
+*			   - later used to pass depth to JMFBSetDepth
+*			D2 - scratch
+*			D3 - used to hold the gamma corrected half intensity value for gray
+*			D4 - used to pass requested page to ChkMode
+*
+*			A0 - used to point to CLUT address space
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+SetVidMode
+
+			MOVE.W	csMode(A2),D1				; D1 = mode
+			BSR		ChkMode						; check mode, map to depth in D1 (1,2,4,8, or 24) 
+			BNE.S	CtlBad						; => not a valid mode
+
+			MOVE.W	csPage(A2),D0				; D0 = page
+			MOVE.W	D0,D4						; use d4 as the parameter since SwapMMU mode uses D0
+			BSR		ChkPage						; check page
+			BNE.S	CtlBad						; => not a valid page
+
+; Only set the mode if it has changed
+; JMFBSetDepth and JMFBSetPage update the saved data in the dCtlStorage
+
+SetEm
+			MOVE.W	csMode(A2),D2				; D2 = mode
+			CMP		saveMode(A3),D2				; has the mode changed?
+			BEQ.S	ModeOK1						; => no, check the page
+			
+; remember the newly requested mode
+
+			MOVE.W	csMode(A2),saveMode(A3)		; remember requested mode
+			
+; set the entire color table to gray before switching to avoid screen anomalies
+
+			MOVE.L	saveGammaPtr(A3),A0			; get pointer to gamma data structure
+			MOVE	GFormulaSize(A0),D3			; get the size of formula data
+			MOVE.W	GDataCnt(A0),D2				; get number of gamma entries
+			LSR.W	#1,D2						; divide by two to find midpoint
+			LEA		GFormulaData(A0),A0			; point to formula data
+			ADD		D3,A0						; first correction table starts here
+			MOVE.B	(A0,D2),D3					; get corrected gray from middle of red table
+			
+			MOVE.L	saveHardBase(A3),A0			; A0 <- base address of device.
+			ADD.L	#CLUT+CLUTDataReg,A0		; add offset to color table data register for later
+
+; switch to 32 bit addressing here since all calls to WaitVSync must be done in 32 bit mode, and
+;  we also need to be in 32 bit mode to get up to the CLUT.
+
+			MOVEQ	#true32b,D0					; we'll be addr in 32 bit so get ready
+			_SwapMMUMode						; swap to 32 bit mode
+			MOVE	D0,-(SP)					; save past addr mode on stack
+			
+			MOVE.W	SR,-(SP)					; get the current interrupt level
+			MOVEQ.L	#7,D0						; setup to get interrupt level
+			AND.B	(SP),D0						; D0 now holds current interrupt level
+			SUBQ	#2,D0						;
+			BGE.S	@itsOK						; if >= 2 then intr level is ok
+			ORI.W	#$0200,SR					; if <2 then raise intr level to at least 2
+			ANDI.W	#$FAFF,SR					; may have to drop it to 2
+@itsOK
+
+			BSR		WaitVSync					; wait for next blanking period (A0 saved)
+
+			MOVE.L	#$00,CLUTAddrReg-CLUTDataReg(A0)	; hit that baby (all writes to Trident hw must be longs!)
+
+ 			MOVE.W	#$FF,D2						; get count
+@Repeat		MOVE.L	D3,(A0)						; put red (all writes to Trident hw must be longs!)
+			MOVE.L	D3,(A0)						; put green (all writes to Trident hw must be longs!)
+			MOVE.L	D3,(A0)						; put blue (all writes to Trident hw must be longs!)
+			DBRA	D2,@Repeat					; 
+			
+			MOVE	(SP)+,SR					; restore the status reg
+			
+			MOVE	(SP)+,D0					; restore past addr mode in D0
+			_SwapMMUMode						; swap back to previous addr mode
+	
+			BSR		JMFBSetDepth				; set the depth, get rowbytes
+ModeOK1		
+			BSR		JMFBSetPage					; set the page
+			
+NoChange	MOVE.L	saveBaseAddr(A3),csBaseAddr(A2)	; return the base address
+			BRA 	CtlGood						; => return no error
+
+
+*******************************************************************
+*
+*  The SetEntries call has two modes.  In SEQUENCE mode, csCount entries are changed
+*  in the CLUT, starting at csStart.  In INDEX mode, csCount entries are
+*  installed into the CLUT at the positions specified by their .value fields.
+*  This mode is selected by passing csStart = -1.  In both cases, entries are
+*  range-checked to the dynamic range of the video mode (bits/pixel).
+*
+*  This call has common code that is shared between SetEntries and DirectSetEntries.
+*  
+*  Before the entries in the CLUT are actually set up, they are first gamma corrected.
+*  The gamma table has the following structure:
+*	
+*	record GammaTable of
+*		gVersion		: integer		(0 for all current cards)
+*		gType			: integer		(holds drHWId to identify board the table was measured for)
+*		gFormulaSize	: integer		(size of gFormulaData in bytes, 0 for Apple cards)
+*		gChanCnt		: integer		(number of gamma tables in gData, 1 for Apple cards)
+*		gDataCnt		: integer		(number of elements in each channels correction table, 2**gDataWidth)
+*		gDataWidth		: integer		(width of each element in a channels correction table)
+*		gFormulaData	: array [0..gFormulaSize] of byte		(not used for Apple cards)
+*		gData			: array [0..gDataCnt] of byte			(correction table data)
+*	end
+*
+*  SetEntries is broken up into 4 main steps:
+*
+*       1. If there is no requested color table or if we're in 24 bpp mode, then exit.  
+*		2. Get the current gamma table.
+*		3. Construct a gamma corrected and hw specific color table on the stack.
+*		4. Write to the hardware in requested mode ( for mono BigScreens, use 1 channel only).
+*
+*  Called by:
+*		
+*		Control Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		_StripAddress, GetGammaCSpec, _SwapMMUMode, WaitVSync
+*
+*  Register usage:
+*
+*       Input:
+*			A1 - pointer to the AuxDCE
+*			A2 - pointer to the csParams
+*						csTable -> table of colorSpecs (not colortable)
+*						csStart -> where to start setting, or -1
+*						csCount -> # of entries to change
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0 - error code
+*
+*		Locally used:
+*			D0 - scratch
+*			D1 - scratch
+*			D2 - holds the reformatted cSpec that is hw dependent
+*			D3 - scratch
+*			D4 - Size of the stack color table buffer
+*			D5 - GFlags word from private storage
+*			D6 - holds the max number of entries to change as a f(mode)
+*			   - later used to save SR state
+*			D7 - holds the csStart parameter
+*
+*			A0 - scratch
+*			A3 - points to the color spec table
+*			A4 - pointer to gamma red table
+*			A5 - pointer to gamma red table
+*			A6 - pointer to gamma red table
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+SetEntries
+			MOVE.L	csTable(A2),D0				; Check for a nil pointer
+			BEQ 	CtlBad
+			
+			BTST	#DirectModeFlag,GFlags(A3)	; SetEntries is not allowed for direct devices
+			BNE		CtlBad						; Indexed Mode (0) and Direct Mode (1)
+
+SetEntCom			
+			MOVEM.L	A4-A6/D4-D7,-(SP)			; save registers for gamma (D4 saved by VideoCtl)
+			
+			MOVE.W	GFlags(A3),D5				; get GFlags word in D5 to be used to determine gray mode
+			
+			MOVE.L	saveGammaPtr(A3),A0			; get pointer to gamma table data structures
+			LEA		GFormulaData(A0),A4			; get a pointer to the first gammatable
+			ADDA	GFormulaSize(A0),A4			; 
+			
+			MOVE.L	A4,A5						; get default pointer to green data (assuming gChanCnt=1)
+			MOVE.L	A4,A6						; get default pointer to blue data  (assuming gChanCnt=1)
+			
+			MOVE	GDataWidth(A0),D7			; get width of each entry in bits to be used later
+			
+			CMP		#1,GChanCnt(A0)				; if only only one table, we're set
+			BEQ.S	OneTbl						; => just one table
+												
+			MOVE	GDataCnt(A0),D0				; get # entries in table
+			MOVE	D7,D1						; copy it to goof around
+			ADD		#7,D1						; round to nearest byte
+			LSR		#3,D1						; get bytes per entry
+			MULU	D1,D0						; get size of table in bytes
+
+			ADDA	D0,A5						; calc base of green (red base + D0)
+			ADDA	D0,A6						; calc base of blue
+			ADDA	D0,A6						; calc base of blue  (red base + D0 + D0)
+
+OneTbl
+
+; get the maximum number of entries, zero based from a convenient table
+
+			MOVE.W	saveMode(A3),D1				; get the current video mode
+			SUB.W	#FirstVidMode,D1			; convert to index
+			LEA		CountTbl,A3					; point to little table of counts
+			MOVEQ	#0,D6						; clear the entire long (only need word tho!)
+			MOVE.B	(A3,D1),D6					; pick the zero-based byte
+						
+;
+; allocate a temporary color table on the stack.  We'll pre-process all the entries that will 
+;	change here so we can hit the hardware as quickly as possible.
+;
+
+			MOVE.W	csCount(A2),D3				; get the number of entries to change
+			CMP.W	D6,D3						; is it in the allowable range?
+			BHI		BadExit						; if outside, then exit w/bad result
+			MOVE.W	csStart(A2),D0				; get the start number to range check
+			ADDQ.W	#1,D0
+			BMI		BadExit						; if csStart < -1 then it's out of range
+
+			MOVE.L	SP,D1						; get stack
+			MOVE.L	D1,D0						; copy stack
+			NEG		D0							; get amount to subtract
+			AND		#$3,D0						; get low bits
+			BEQ.S	StkOk						; => already long aligned
+			SUB		D0,SP						; else make stack long aligned
+StkOk		MOVE.L	D1,-(SP)					; save original stack on stack
+			
+			MOVE.L	D3,D4						; make a copy of the table size (zero-based!)
+			ADDQ	#1,D4						; make it a counting number
+			ASL		#2,D4						; multiply times 4 (always less than 1024)
+			SUB.W	D4,SP						; allocate the buffer
+			
+;
+; construct the stack version of the color table.  This table includes all translations and
+;	inversion required to drive the hardware.  It looks like a color table, but each of the
+;	four components is only eight bits (rather than 16).
+;
+
+			MOVE.L	SP,A0						; copy the stack buffer pointer
+			MOVE.L	csTable(A2),D0				; get colorSpec pointer in D0
+			_StripAddress						; clear upper byte for 32 bit mode
+			MOVE.L	D0,A3						; put it in A3
+			
+@a			BSR		GetGammaCSpec				; go get a reformatted colorSpec in D2
+			MOVE.L	D2,(A0)+					; put the BBGGRRVV colorSpec in stack table
+			DBRA	D3,@a						; do it for all cSpecArray records
+	
+; Hit the hardware as quick as possible!
+			
+			MOVE.W	csCount(A2),D3				; get the number of entries to change again
+			MOVE.L	dCtlStorage(A1),A3
+			MOVE.L	(A3),D0						; get pointer to private storage again
+			_StripAddress						; strip address for 32 bit addressing
+			MOVE.L	D0,A3
+			
+			MOVEQ	#true32b,D0					; we'll be addr in 32 bit so get ready
+			_SwapMMUMode						; swap over from 24 bit to 32 bit mode
+			MOVE	D0,D1						; save past addr mode for later (can't use stack here!)
+			
+			MOVE.W	SR,D6						; get the current interrupt level
+			MOVEQ.L	#7,D0						; setup to get interrupt level
+			ROR.W	#8,D6						; roll to get the 3 interrupt bits in low byte
+			AND.B	D6,D0						; D0 now holds current interrupt level
+			ROL.W	#8,D6						; restore D6 since it holds the sr to be restored
+			SUBQ	#2,D0						;
+			BGE.S	@itsOK						; if >= 2 then intr level is ok
+			ORI.W	#$0200,SR					; if <2 then raise intr level to at least 2
+			ANDI.W	#$FAFF,SR					; may have to drop it to 2
+@itsOK
+			BSR	WaitVSync						; wait for next VSync before writing to CLUT
+			
+			MOVE.L	saveHardBase(A3),A3			; point to the base address of device
+			ADD.L	#CLUT+CLUTDataReg,A3		; add offset to get to the data register
+			
+			MOVE.W	csStart(A2),D7				; get the starting position (also indicates mode)
+			BPL.S	SeqWrite					; do sequence mode if its sequence
+
+
+
+IndexWrite	MOVE.L	(SP)+,D2					; get a stack table reformatted colorSpec
+			MOVE.L	D2,CLUTAddrReg-CLUTDataReg(A3) 	; write the addr to be modified to CLUT addr register
+			LSR.L	#8,D2						; get red CLUT data in low byte of D2
+			IF NOT ProtoVRAM THEN
+				BTST	#MonoFlag,D5				; if it's a monochrome monitor, only turn on 1 gun (red)
+				BEQ.S	@iAllThree					; if it's a color monitor (0), all 3 guns are active
+			ELSE
+				BRA.S	@iAllThree				; for the prototype always turn all 3 guns on
+			ENDIF
+			MOVE.L	#0,(A3)						; write black (off) to red
+			MOVE.L	#0,(A3)						; write black (off) to green 
+			MOVE.L	D2,(A3)						; write blue to CLUT data register
+			BRA.S	@iJustBlue
+			
+@iAllThree	
+			MOVE.L	D2,(A3)						; write red to CLUT data register
+			LSR.L	#8,D2						; get green CLUT data in low byte of D2
+			MOVE.L	D2,(A3)						; write green to CLUT data register
+			LSR.L	#8,D2						; get blue CLUT data in low byte of D2
+			MOVE.L	D2,(A3)						; write blue to CLUT data register
+			
+@iJustBlue	DBRA	D3,IndexWrite				; do for all (remember CLUT address autoincrements after blue)
+			BRA.S	SEDone						; all done with index mode so exit
+			
+SeqWrite	MOVE.L	D7,CLUTAddrReg-CLUTDataReg(A3)		; write the start addr to be modified to CLUT addr register
+
+@b			MOVE.L	(SP)+,D2					; get a stack table reformatted colorSpec
+			LSR.L	#8,D2						; since sequence mode doesn't care about value field, flush byte
+			BTST	#MonoFlag,D5				; If it's a monochrome monitor, only turn on 1 gun (red)
+			BEQ.S	@allThree					; if it's a color monitor (0), all 3 guns are active
+			MOVE.L	#0,(A3)						; write black (off) to red
+			MOVE.L	#0,(A3)						; write black (off) to green
+			MOVE.L	D2,(A3)						; write blue to CLUT data register
+			BRA.S	@JustBlue
+			
+@allThree	
+			MOVE.L	D2,(A3)						; write red to CLUT data register
+			LSR.L	#8,D2						; get green CLUT data in low byte of D2
+			MOVE.L	D2,(A3)						; write green to CLUT data register
+			LSR.L	#8,D2						; get blue CLUT data in low byte of D2
+			MOVE.L	D2,(A3)						; write blue to CLUT data register
+
+@JustBlue	DBRA	D3,@b						; do for all (remember CLUT address autoincrements after blue)
+
+; All done!
+
+SEDone			
+			MOVE	D1,D0						; restore past addr mode in D0
+			_SwapMMUMode						; swap from 32 bit to 24 bit addressing
+			MOVE	D6,SR						; restore status register
+			MOVE.L	(SP)+,SP					; restore stack pointer
+			MOVEM.L	(SP)+,A4-A6/D4-D7			; restore registers
+			BRA		CtlGood						; return O-Tay!
+			
+BadExit		MOVEM.L	(SP)+,A4-A6/D4-D7			; restore registers
+			BRA		CtlBad						; return an error code
+	
+			
+GetGammaCSpec
+*******************************************************************
+*
+*  GetGammaCSpec takes a Color Manager format colorSpec (see IM-V), performs weighted luminance 
+*  mapping to gray scales if necessary, performs gamma correction and returns in D2 a reformatted
+*  colorSpec in the form BBGGRRVV where:
+*  
+*       BB = gamma corrected blue CLUT data
+*       GG = gamma corrected green CLUT data
+*       RR = gamma corrected red CLUT data
+*       VV = 8 bit colorSpec value data (CLUT address for RGB triplet only used in index mode)
+*
+*  GetGammaCSpec is broken up into 4 main steps:
+*
+*       1.  Get the raw 16 bit values from the Mac OS color model and put into working registers
+*       2.  Perform luminance mapping if gray mode is set (R=30%, G=59%, B=11%)
+*       3.  Convert 16 bit format to 8 bit format to play with our hardware.  The value field is
+*           right justified in a word, and R,G,B fields are left justified. (See IM-V137)
+*       4.  Perform gamma correction by indexing into appropriate R,G, or B gamma table, and pack
+*			reformatted colorSpec into a 32 bit register, D2, in the form BBGGRRVV.
+*
+*  Called by:
+*		
+*		SetEntries
+*
+*  Traps and Utilities called:
+*
+*		None.
+*
+*  Register usage:
+*
+*       Input:
+*
+*			D5 - GFlags word where MSB identifies state of grayflag
+*			D7 - contains width of CLUT channel
+*
+*           A3 - points to colorSpec table 
+*			A4 - points to red gamma correction table
+*			A5 - points to green gamma correction table
+*           A6 - points to blue gamma correction table
+*
+*  		Output
+*
+*			D2 - reformatted colorSpec in the form BBGGRRVV
+*			A3 - incremented to point to next entry in colorSpec table
+*
+*		Locally used
+*
+*			D0 - to hold 16 bit red data from raw colorSpec
+*			D1 - to hold 16 bit green data from raw colorSpec
+*			D2 - to hold 16 bit blue data from raw colorSpec
+*			D3 - to hold 16 bit value data from raw colorSpec (restored since it holds csCount) 
+*
+*******************************************************************
+			MOVE.L	D3,-(SP)
+			
+			MOVE.W	(A3)+,D3					; get value
+			MOVE.W	(A3)+,D0					; get red
+			MOVE.W	(A3)+,D1					; get green
+			MOVE.W	(A3)+,D2					; get blue
+
+			TST		D5							; test hi bit of the flags
+			BPL.S	NoGray						; if not set, don't luminence map
+			BTST	#DirectModeFlag,D5			; test for direct mode flag
+			BNE.S	NoGray						; never luminance map if we're direct
+
+; we're luminence mapping here
+
+			MULU	#$4CCC,D0					; multiply by red weight
+			MULU	#$970A,D1					; multiply by green weight
+			MULU	#$1C29,D2					; multiply by blue weight
+			ADD.L	D1,D0						; sum red and green
+			ADD.L	D2,D0						; blue also
+			BFEXTU	D0{0:D7},D1					; get gChanWidth bits for gamma table lookup
+			MOVE.W	D1,D0						; copy into red register
+			MOVE.W	D1,D2						; copy into blue register
+
+			BRA.S	WriteSP						; go on and write it in the stack buffer
+			
+NoGray
+
+			BFEXTU	D0{16:D7},D0				; get gChanWidth bits of red
+			BFEXTU	D1{16:D7},D1				; get gChanWidth bits of green
+			BFEXTU	D2{16:D7},D2				; get gChanWidth bits of blue
+
+WriteSP
+			MOVE.B	(A6,D2),D2					; get gamma corrected blue (D2 = xxxxxxBB)
+			LSL.L	#8,D2						; reposition blue (D2 = xxxxBBxx)
+			MOVE.B	(A5,D1),D2					; get gamma corrected green (D2 = xxxxBBGG)
+			LSL.L	#8,D2						; reposition blue/green (D2 = xxBBGGxx)
+			MOVE.B	(A4,D0),D2					; get gamma corrected red (D2 = xxBBGGRR)
+			LSL.L	#8,D2						; reposition blue/green/red (D2 = BBGGRRxx)
+			MOVE.B	D3,D2						; put value byte into D2 (D2 = BBGGRRVV)
+			
+			MOVE.L	(SP)+,D3
+			RTS
+			
+
+
+*******************************************************************
+*
+*  SetGamma sets the gamma table.  This call copies the supplied gTable so the 
+*  caller does not have to put the source on the system heap.  It
+*  tests if the gamma table is exactly a match to the currently
+*  connected monitor, or always allows it if the monitor number in
+*  the FormulaData is -1.  Note that since the CLUT response curve of the AC/DC
+*  chip is so close to the response of DAC's used on previous Apple cards,
+*  that we let TFB tables thru too (GType=0), but only for the standard monitor!.
+*
+*  SetGamma is broken up into 4 main steps:
+*
+*		1. if we're passed a nil table, then setup a linear one and skip to step 4.
+*       2. Get the gamma table and see if it's for us 
+*		3. Copy the new gamma table.
+*		4. If we're operating as a direct device, then also set up the CLUT directly.
+*
+*  Called by:
+*		
+*		Control Call Handler
+*
+*  Traps and Utilities called:
+*
+*		_DisposPtr, _NewPtr, _SwapMMUMode
+*
+*  Register usage:
+*
+*       Input:
+*			A1 - pointer to the AuxDCE
+*			A2 - pointer to the csParams
+*						csGTable -> pointer to gamma table
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0 - error code
+*
+*		Locally used:
+*			D0 - scratch
+*			D1 - used to create linear clut data index
+*			D2 - scratch
+*			D7 - scratch
+*
+*			A0 - holds pointer to current gamma table
+*			A4 - pointer to gamma red table (direct mode only)
+*			A5 - pointer to gamma red table (direct mode only)
+*			A6 - pointer to gamma red table (direct mode only)
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+SetGamma
+			
+; get new gamma table and check that we know how to handle it
+			
+			MOVE.L	csGTable(A2),D0					; test for a NIL pointer
+			BEQ		LinearTab						; if so, then set a linear gamma table
+			MOVE.L	D0,A2							; get pointer to new gamma table
+			
+			TST.W	GVersion(A2)					; version = 0?
+			BNE		CtlBad							; => no, return error
+			
+			CMP.W	#Standard,saveMonSense(A3)		; allow tfb table only for standard monitor
+			BNE.S	@chkHWMatch						; if not standard then it must be exact match	
+			TST.W	GType(A2)						; test the hardware ID			
+			BEQ.S	ChangeTable						; if 0, then accept a TFB table
+
+@chkHWMatch			
+			CMP.W	#drHwJMFB,GType(A2)				; type = Bob the card?
+			BNE		CtlBad							; => no, return error
+			TST.W	gFormulaSize(A2)				; if gType=JMFB, then check for monID in gFormulaData
+			BEQ.S	ChangeTable						; if zero, then generic, so continue
+			
+			MOVE.W	gFormulaData(A2),D0				; get the monitor ID this table was intended for
+			CMP.W	saveID(A3),D0					; is this the monitor? 
+			BEQ.S	ChangeTable						; yes, so do it
+			ADDQ	#1,D0							; was it -1?
+			BNE 	CtlBad							; nope, so must be wrong monitor
+			
+; if new table is different size, reallocate memory
+
+ChangeTable			
+			MOVE.L	saveGammaPtr(A3),A0				; get current gamma in A0
+			MOVE	GFormulaSize(A2),D0				; get size of formula in new
+			CMP		GFormulaSize(A0),D0				; same as current gamma table
+			BNE.S	@GetNew							; =>no, resize pointer
+			MOVE	GChanCnt(A2),D0					; get number of tables in new
+			CMP		GChanCnt(A0),D0					; same as current gamma table?
+			BEQ.S	@SizeOK							; => yes, data size ok
+			BGT.S	@GetNew							; => new one is bigger, save old one
+@NewSize	Move.l	saveGammaPtrHead(A3),A0			; if new one smaller, 
+			_DisposPtr								; 	dispose old one
+			CLR.L	saveGammaPtrHead(A3)			; flag it's been disposed
+			
+@GetNew		MOVE	GDataCnt(A2),D0					; get number of entries
+			MULU	GChanCnt(A2),D0					; multiply by number of tables
+			ADD		GFormulaSize(A2),D0				; add size of formula data
+			ADD		#GFormulaData,D0				; add gamma table header size
+			_NewPtr ,Sys							; and allocate a new pointer
+			BNE		CtlBad							; => unable to allocate storage
+			
+			MOVE.L	saveGammaPtrHead(A3),D0			; get old gamma table
+			MOVE.L	A0,saveGammaPtr(A3)				; save new gamma table
+			TST.L	D0								; was there an old one?
+			BEQ.S	@SizeOK							; => no, already disposed
+			MOVE.L	D0,A0							; else get old table
+			_DisposPtr								; and dispose of old gamma table
+			
+			MOVE.L	saveGammaPtr(A3),A0				; get new gamma table back
+			Move.l	A0,saveGammaPtrHead(A3)			; save it for disposal
+						
+; copy the gamma table header
+			
+@SizeOK		MOVE	GChanCnt(A2),D0					; get number of tables
+			MOVE	GFormulaSize(A2),D1				; get size of formula data
+			MOVE	gDataCnt(A2),D2					; get number of entries
+			MOVE.L	(A2)+,(A0)+						; copy gamma header
+			MOVE.L	(A2)+,(A0)+						; which is
+			MOVE.L	(A2)+,(A0)+						; 12 bytes long
+			
+; copy the data
+			
+			MULU	D0,D2							; multiply by number of tables
+			ADD		D1,D2							; add in size of formula data
+			SUBQ	#1,D2							; get count - 1
+@NxtByte	MOVE.B	(A2)+,D0						; get a byte
+			MOVE.B	D0,(A0)+						; move a byte
+			DBRA	D2,@NxtByte						; => repeat for all bytes
+
+			BRA.S	GammaDone						; check to see if it's a direct device
+			
+; set up a linear gamma table.  To prevent memory thrash, build this new one
+;	the same size as the existing one (one or three channel)
+;
+
+LinearTab
+			MOVE.L	saveGammaPtr(A3),A0				; get current gamma in A0
+			MOVE.W	GFormulaSize(A0),D0				; get size of formula in new
+			MOVE.W	GChanCnt(A0),D2					; get the number of tables
+			SUBQ	#1,D2							; zero based, of course
+			ADDA	#GFormulaData,A0				; point to tables
+			ADDA	D0,A0							; point past monID, if present
+@ChanLoop	MOVE.W	#255,D0							; loop count within each channel
+@entryLoop	MOVE.B	D0,(A0)							; write value
+			NOT.B	(A0)+							; invert it to make table ramp properly
+			DBRA	D0,@entryLoop					; for each entry in channel
+			DBRA	D2,@ChanLoop					; and each channel
+
+GammaDone
+			BTST	#DirectModeFlag,GFlags(A3)		; If the mode is not direct, then all done 
+			BEQ		CtlGood							; direct = 1, indexed = 0
+			
+			MOVE.L	saveGammaPtr(A3),A0				; get pointer to gamma table data structures
+			LEA		GFormulaData(A0),A4				; get a pointer to the first gammatable
+			ADDA	GFormulaSize(A0),A4				; 
+			
+			MOVE.L	A4,A5							; get default pointer to green data (assuming gChanCnt=1)
+			MOVE.L	A4,A6							; get default pointer to blue data  (assuming gChanCnt=1)
+			
+			MOVE	GDataWidth(A0),D7				; get width of each entry in bits to be used later
+			
+			CMP		#1,GChanCnt(A0)					; if only only one table, we're set
+			BEQ.S	OnlyOneTbl						; => just one table
+												
+			MOVE	GDataCnt(A0),D0					; get # entries in table
+			MOVE	D7,D1							; copy it to goof around
+			ADD		#7,D1							; round to nearest byte
+			LSR		#3,D1							; get bytes per entry
+			MULU	D1,D0							; get size of table in bytes
+
+			ADDA	D0,A5							; calc base of green (red base + D0)
+			ADDA	D0,A6							; calc base of blue
+			ADDA	D0,A6							; calc base of blue  (red base + D0 + D0)
+
+OnlyOneTbl											; in direct modes we want a gamma corrected linear CLUT
+			
+			MOVE.L	saveHardBase(A3),A0				; get base addr of card
+			ADD.L	#CLUT+CLUTDataReg,A0			; point to data reg of clut
+			MOVEQ	#true32b,D0						; swap to 32 bit addr mode
+			_SwapMMUMode
+			MOVE	D0,-(SP)						; save past addr mode for later
+
+			MOVE.W	SR,-(SP)					; get the current interrupt level
+			MOVEQ.L	#7,D0						; setup to get interrupt level
+			AND.B	(SP),D0						; D0 now holds current interrupt level
+			SUBQ	#2,D0						;
+			BGE.S	@itsOK						; if >= 2 then intr level is ok
+			ORI.W	#$0200,SR					; if <2 then raise intr level to at least 2
+			ANDI.W	#$FAFF,SR					; may have to drop it to 2
+@itsOK
+			BSR		WaitVSync
+
+			MOVE.L	#0,CLUTAddrReg-CLUTDataReg(A0)	; start at index 0
+			
+			MOVE.W	#$FF,D0							; set up for 256 rgb triplets
+			MOVEQ	#0,D1							; d1 is used as the data index
+@1			MOVE.B	(A4,D1),D2						; temp move to d2 
+			MOVE.L	D2,(A0)							; write red (all Trident hw writes must be longs!)
+			MOVE.B	(A5,D1),D2
+			MOVE.L	D2,(A0)							; write green (all Trident hw writes must be longs!)
+			MOVE.B	(A6,D1),D2
+			MOVE.L	D2,(A0)							; write blue (all Trident hw writes must be longs!)
+			ADDQ	#1,D1							; increment data index by 1
+			DBRA	D0,@1							; decrement loop counter and branch
+			MOVE	(SP)+,SR
+			MOVE	(SP)+,D0						; restore past addr mode in D0
+			_SwapMMUMode
+			BRA		CtlGood
+			
+*******************************************************************
+*
+*  GrayPage clears the specified page in the current mode to gray.  If we
+*  are operating on a direct device, GrayPage is also responsible for
+*  setting up the CLUT directly (with linear and gamma corrected ramps).
+*
+*  GrayPage is broken up into 4 main steps:
+*
+*       1. Check the requested mode against allowable modes and exit if bad.  
+*		2. Check the requested page number against max pages and exit if bad.
+*		3. Call the GrayScreen utility
+*		4. If we're operating as a direct device, then also set up the CLUT directly.
+*
+*  Called by:
+*		
+*		Control Call Handler
+*
+*  Traps and Utilities called:
+*
+*		GrayScreen, _SwapMMUMode, ChkMode, ChkPage
+*
+*  Register usage:
+*
+*       Input:
+*			A1 - pointer to the AuxDCE
+*			A2 - pointer to the csParams
+*						csPage -> page number to gray
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0 - error code 
+*
+*		Locally used:
+*			D0 - used to pass requested page to ChkPage
+*			D1 - used to pass requested mode to ChkMode (comes back as depth)
+*			D7 - scratch
+*
+*			A0 - holds pointer to current gamma table
+*			A4 - pointer to gamma red table (direct mode only)
+*			A5 - pointer to gamma red table (direct mode only)
+*			A6 - pointer to gamma red table (direct mode only)
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+GrayPage											
+			
+			MOVE	saveMode(A3),D1					; D1 = mode
+			MOVE	D1,csMode(A2)					; force current mode, just in case for ChkPage
+			BSR		ChkMode							; convert mode to depth in D1
+			BNE		CtlBad							; => not a valid depth
+			
+			MOVE	csPage(A2),D0					; D0 = page
+			BSR		ChkPage							; check page
+			BNE 	CtlBad							; => not a valid page
+
+			BSR		GrayScreen						; paint the screen gray
+
+			BTST	#DirectModeFlag,GFlags(A3)		; If the mode is not direct, then all done 
+			BEQ		CtlGood							; direct = 1, indexed = 0
+			
+			MOVE.L	saveGammaPtr(A3),A0				; get pointer to gamma table data structures
+			LEA		GFormulaData(A0),A4				; get a pointer to the first gammatable
+			ADDA	GFormulaSize(A0),A4				; 
+			
+			MOVE.L	A4,A5							; get default pointer to green data (assuming gChanCnt=1)
+			MOVE.L	A4,A6							; get default pointer to blue data  (assuming gChanCnt=1)
+			
+			MOVE	GDataWidth(A0),D7				; get width of each entry in bits to be used later
+			
+			CMP		#1,GChanCnt(A0)					; if only only one table, we're set
+			BEQ.S	Only1Tbl						; => just one table
+												
+			MOVE	GDataCnt(A0),D0					; get # entries in table
+			MOVE	D7,D1							; copy it to goof around
+			ADD		#7,D1							; round to nearest byte
+			LSR		#3,D1							; get bytes per entry
+			MULU	D1,D0							; get size of table in bytes
+
+			ADDA	D0,A5							; calc base of green (red base + D0)
+			ADDA	D0,A6							; calc base of blue
+			ADDA	D0,A6							; calc base of blue  (red base + D0 + D0)
+
+Only1Tbl											; in direct modes we want a gamma corrected linear CLUT
+			
+			MOVE.L	saveHardBase(A3),A0
+			ADD.L	#CLUT+CLUTDataReg,A0
+			MOVEQ	#true32b,D0
+			_SwapMMUMode
+			MOVE	D0,-(SP)						; save past addr mode for later
+			
+			MOVE.W	SR,-(SP)					; get the current interrupt level
+			MOVEQ.L	#7,D0						; setup to get interrupt level
+			AND.B	(SP),D0						; D0 now holds current interrupt level
+			SUBQ	#2,D0						;
+			BGE.S	@itsOK						; if >= 2 then intr level is ok
+			ORI.W	#$0200,SR					; if <2 then raise intr level to at least 2
+			ANDI.W	#$FAFF,SR					; may have to drop it to 2
+@itsOK
+			BSR		WaitVSync
+			MOVE.L	#0,CLUTAddrReg-CLUTDataReg(A0)
+			
+			MOVE.W	#$FF,D0
+			MOVEQ	#0,D1
+@1			MOVE.B	(A4,D1),D2
+			MOVE.L	D2,(A0)
+			MOVE.B	(A5,D1),D2
+			MOVE.L	D2,(A0)
+			MOVE.B	(A6,D1),D2
+			MOVE.L	D2,(A0)
+			ADDQ	#1,D1
+			DBRA	D0,@1
+			MOVE	(SP)+,SR
+			MOVE	(SP)+,D0						; restore past addr mode in D0
+			_SwapMMUMode
+
+			BRA		CtlGood							; => return no error
+
+
+*******************************************************************
+*
+*  SetGray sets luminance mapping on (csMode = 1) or off (csMode = 0)
+*
+*  When luminance mapping is on, RGB values passed to setEntries are mapped
+*  to grayscale equivalents before they are written to the CLUT.
+*
+*  SetGray is broken up into 2 main steps:
+*
+*       1. If the monitor is monochrome always luminance map. 
+*		2. Set GrayFlag in private storage based on requested mode.
+*
+*  Called by:
+*		
+*		Control Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		SetIntCom
+*
+*  Register usage:
+*
+*       Input:
+*			A1 - pointer to the AuxDCE
+*			A2 - pointer to the csParams
+*						csmode -> gray or color mode
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0 - error code
+*
+*		Locally used:
+*			D1 - used as the bit position of grayFlag bit in GFlags word
+*
+*  Miscellaneous:
+*
+*		SetGray should always be followed by a SetEntries/GrayScreen call.
+*
+*******************************************************************
+SetGray
+			
+			BTST	#MonoFlag,GFlags(A3)			; is this a mono-only monitor?
+			BEQ.S	@1								; if not, then go ahead
+			MOVE.B	#1,csMode(A2)					; always turn on for mono devices
+@1			MOVEQ	#(15-GrayFlag),D1				; set up for BFEXTU to point to GrayFlag
+			BSR.S	SetIntCom						; call common code
+			BRA		CtlGood							; all done
+			
+;
+; this shared routine setup up a flag in GFlags.  It takes a pointer to 
+;	private storage in A3, and the bit field start location in D1
+;
+			
+SetIntCom											
+			MOVE.B	csMode(A2),D0					; get boolean
+			BFINS	D0,GFlags(A3){D1:1}				; set flag bit
+			RTS										; and return
+
+
+*******************************************************************
+*
+*  SetInterrupt enables (csMode = 0) or disable (csMode = 1) VBL interrupts
+*
+*  As a future performance enhancement, interrupts on the card can be
+*  disabled or enabled from software. For instance, if the cursor is
+*  not on a screen, and there is nothing in the Slot Interrupt Queue
+*  for that device, interrupts may be disabled reducing interrupt 
+*  overhead for the system.
+*
+*  SetInterrupt is broken up into 3 main steps:
+*
+*       1. Set the IntDisFlag in private storage based on csMode 
+*		2. If enable, then call EnableVGuts and save SaveSQElPtr in privates
+*		3. If disable, then call DisableVGuts
+*
+*  Called by:
+*		
+*		Control Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		SetIntCom, EnableVGuts, DisableVGuts
+*
+*  Register usage:
+*
+*       Input:
+*			A1 - pointer to the AuxDCE
+*			A2 - pointer to the csParams
+*						csmode -> 0 enables, 1 disables
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0 - error code 
+*
+*		Locally used:
+*			D1 - used as the bit position of IntDisFlag bit in GFlags word
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+SetInterrupt
+
+		WITH	VDPageInfo,SlotIntQElement
+			
+			MOVEQ	#(15-IntDisFlag),D1				; set up for BFEXTU to point to IntDisFlag
+			BSR.S 	SetIntCom						; call common code
+			BNE.S	DisableThem						; if zero, then enable
+
+;
+; this code enables interrupts and installs the interrupt handler
+;
+
+			BSR.S	EnableVGuts						; call common code
+			BNE		CtlBad							; error, flag problem
+			BRA		CtlGood							; and go home
+			
+;
+; this code disables VBL interrupts, then removes the interrupt handler
+;
+
+DisableThem	
+			BSR.S	DisableVGuts					; jump to the disabling utility
+			BRA		CtlGood							; all done
+			
+;
+; the following two routines are common code shared between the Open call
+;	and the SetInterrupt control call
+;
+
+DisableVGuts
+
+; gotta be in 32 bit mode prior to calling WaitVSync
+
+			MOVEQ	#true32b,D0						; change to 32 bit addressing to get
+			_SwapMMUMode							; at hardware
+			MOVE	D0,D3							; save past addr mode for later (not using stack here)
+			
+			MOVE.W	SR,-(SP)					; get the current interrupt level
+			MOVEQ.L	#7,D0						; setup to get interrupt level
+			AND.B	(SP),D0						; D0 now holds current interrupt level
+			SUBQ	#2,D0						;
+			BGE.S	@itsOK						; if >= 2 then intr level is ok
+			ORI.W	#$0200,SR					; if <2 then raise intr level to at least 2
+			ANDI.W	#$FAFF,SR					; may have to drop it to 2
+@itsOK
+
+;+++			BSR		WaitVSync						; to be safe, wait for the next VBL
+			CLR		D0								; clear D0.W
+			MOVE.B	dctlSlot(A1),D0					; setup slot # for _SIntRemove
+			MOVE.L	saveHardBase(A3),A0				; get the device base
+			ADD.L	#StopWatch+SWICReg,A0			; point to StopWatch Interrupt and control register
+			MOVE.L	#7,(A0)							; disable both interrupts, but don't reset stowpwatch ???
+	
+			MOVE	D3,D0							; restore past addr mode in D0
+			_SwapMMUMode							
+
+			MOVE.L	saveSQElPtr(A3),A0				; get the SQ element pointer
+			_SIntRemove								; remove the interrupt handler
+
+			MOVE.W	(SP)+,SR						; restore the interrupt level
+			RTS
+	
+EnableVGuts			
+			MOVE.L	saveSQElPtr(A3),A0				; dispose of the VBL queue element
+			LEA		BeginIH,A2						; save Pointer to interrupt handler
+			MOVE.L	A2,D0
+			_StripAddress
+			MOVE.L	D0,A2
+
+			MOVE.W	#SIQType,SQType(A0)				; setup queue ID
+			MOVE.L	A2,SQAddr(A0)					; setup int routine address
+			MOVE.L	saveHardBase(A3),A2				; get slot base addr
+			ADD.L	#StopWatch+SWClrVInt,A2			; point to the Stopwatch interrupt clear register
+			MOVE.L	A2,SQParm(A0)					; pass this as the parameter
+			MOVEQ.L	#0,D0							; parameter size to SInstall is not byte sized so clr whole long
+			MOVE.B	dctlSlot(A1),D0					; 
+			_SIntInstall							; and do install
+			BNE.S 	IntBad
+						
+			ADD.L	#SWICReg-SWClrVInt,A2			; point back to the Stopwatch Interrupt and Control Register
+
+			MOVEQ	#true32b,D0						; change to 32 bit addressing to get
+			_SwapMMUMode							; at hardware
+			
+			MOVE.L	#5,(A2)							; no line interrupts, enable Vert Interrupts (and keep SRST = 1)
+			
+			_SwapMMUMode							; swap to previous mode (d0 still valid)						
+			
+			CMP.W	D1,D1							; set Z-bit for good result
+
+			RTS										; return home						
+
+;
+; in the event there is a problem, return Z-flag off
+;
+
+IntBad
+			MOVEQ	#1,D0							; clear Z bit
+			RTS
+			
+	ENDWITH
+
+*******************************************************************
+*
+*  The DirectSetEntries control call will allow color table animation in direct modes.
+*  The code will be almost identical to the indexed modes SetEntries.
+*  Note it will be the applications responsibility to restore the linear
+*  ramps in all three CLUT channels upon completion of color table
+*  animation.
+*
+*  This call shares common code with SetEntries.
+*
+*  DirectSetEntries is broken up into ***x*** main steps:
+*
+*       1. If there is no requested color table or if mode is indexed, then exit.  
+*		2. Go and execute the SetEntries common code.
+*
+*  Called by:
+*		
+*		Control Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		Refer to SetEntries header.
+*
+*  Register usage:
+*
+*		Refer to SetEntries header.
+*
+*  Miscellaneous:
+*
+*		Refer to SetEntries header.
+*
+*******************************************************************
+DirectSetEntries
+			
+			MOVE.L	csTable(A2),D0				; Check for a nil pointer
+			BEQ 	CtlBad
+			
+			BTST	#DirectModeFlag,GFlags(A3)	; DirectSetEntries is not allowed for indexed devices
+			BEQ		CtlBad						; Indexed Mode (0) and Direct Mode (1)
+			
+			BRA		SetEntCom					
+
+*******************************************************************
+*
+*  SetDefaultMode writes the requested card default mode into slot pRAM.
+*
+*  This routine is called by Monitors when somebody selects an alternate
+*  video mode family in the Options-Option dialog.  Upon restart, PrimaryInit
+*  will detect a change to the new sRsrc ID and set the card up for that
+*  mode.  The Trident card uses multiple members of video mode families
+*  in the interlaced modes (RS170 and PAL) only.  
+*
+*  SetDefaultMode is broken up into 2 main steps:
+*
+*       1. Get the current PRAM record for the card. 
+*		2. Modify the saved sRsrc ID and write out the record to PRAM.
+*
+*  Called by:
+*		
+*		Control Call Handler (call is initiated only by Monitors cdev)
+*
+*  Traps and Utilities called:
+*
+*		_sReadPRAMRec, _sPutPRAMRec
+*
+*  Register usage:
+*
+*       Input:
+*			A1 - pointer to the AuxDCE
+*			A2 - pointer to the csParams
+*						csmode -> new spID to be put into PRAM
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			None.
+*
+*		Locally used:
+*			A0 - used to point to slot parameter block
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+SetDefaultMode
+
+				WITH 	spBlock
+
+;
+; set up a slot parameter block on the stack
+;
+	
+				SUBA	#spBlockSize,SP					; make an slot parameter block on stack
+				MOVE.L	SP,A0							; get pointer to parm block now
+				MOVE.B	dCtlSlot(A1),spSlot(A0)			; put slot in pBlock
+				CLR.B	spExtDev(A0)					; external device = 0
+
+
+;
+; read the slot pRAM to determine what the currently saved mode is.  The first
+;	word is the board ID, followed by the default mode. Trident uses the vendoruse2
+;	field to save the Monitor type.
+;
+;+++ vendoruse2 should really be the savedsRsrcID, check/change all occurances
+;
+				
+			SUBA		#SizesPRAMRec,SP				; allocate block for pRAM record
+			MOVE.L		SP,spResult(A0)					; point to it
+			_sReadPRAMRec								; read it
+
+			MOVE.B		csMode(A2),savedSRsrcID(SP)		; return the result
+			
+			MOVE.L		SP,spsPointer(A0)				; set up param block
+			_sPutPRAMRec
+			ADDA		#SizesPRAMRec+spBlockSize,SP	; deallocate buffer
+			BRA			CtlGood				
+				
+				
+*******************************************************************
+*
+*  VideoClose releases the device's private storage and removes the 
+*  interrupt handler.
+*
+*  VideoClose is broken up into 4 main steps:
+*
+*       1. Clean up DCE pointer as it's used in 32 bit mode later 
+*		2. Get a pointer to the driver private storage to release 
+*		3. Call DisableVGuts to turn off interrupts, etc.
+*		4. Dispose of private storage memory.
+*
+*  Called by:
+*		
+*		A/UX (I'm not aware of the Mac OS ever calling Close for video drivers)
+*
+*  Traps and Utilities called:
+*
+*		_StripAddress, DisableVGuts, _DisposPtr, _DisposHandle
+*
+*  Register usage:
+*
+*       Input:
+*			A0 - parameter block pointer
+*			A1 - pointer to the AuxDCE
+*
+*  		Output:
+*			D0 - always returns no error.
+*
+*		Locally used:
+*			D0 - scratch
+*			A3 - pointer to private storage
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+
+VideoClose	
+			
+			MOVE.L	A1,D0						; need to clean up the pointer to the DCE
+			_StripAddress						;  because it is used in 32 bit mode later
+			MOVE.L	D0,A1						;  in DisableVGuts
+
+			MOVE.L	dCtlStorage(A1),A3
+			MOVE.L	(A3),D0						; get pointer to private storage
+			_StripAddress						; strip hi byte for 32 bit addressing in DisableVGuts
+			MOVE.L	D0,A3						; put back into A3
+
+			BSR		DisableVGuts				; call utility to deactivate interrupts
+
+			MOVE.L	saveGammaPtrHead(A3),A0		; get pointer to the head of gamma table 
+			_DisposPtr							; and dispose it
+			
+			MOVE.L	dCtlStorage(A1),A0			; Dispose of the private storage
+			_DisposHandle						;
+
+			MOVE.L	saveSQElPtr(A3),A0				; dispose of the VBL queue element
+			_DisposPtr								; release it
+
+			MOVEQ	#0,D0						; no error
+			RTS									; and return
+
+
+*******************************************************************
+*
+*  Video Driver Status Call Handler.  There are eight valid calls. No
+*  new status calls have been introduced since Bob, although they 
+*  have been modified.
+*
+*	(0)  Error
+*	(1)  Error
+*	(2)	 GetMode
+*	(3)  GetEntries
+*	(4)	 GetPage
+*	(5)	 GetPageBase
+*	(6)  GetGray
+*	(7)	 GetInterrupt
+*	(8)	 GetGamma
+*	(9)  GetDefault
+*
+*  The Control Call Handler is broken up into 4 main steps:
+*
+*       1. Note : A1 (DCE pointer) is not StripAddressed for status calls! 
+*		2. Get the pointer to private storage in A3 and strip the upper byte.
+*		3. Get the pointer to the csParams in A2.
+*		4. Get the csCode and dispatch the call to the right status call.
+*
+*  Called by:
+*		
+*		Device Manager
+*
+*  Traps and Utilities called:
+*
+*		_StripAddress, appropriate control call
+*
+*  Register usage:
+*
+*       Input:
+*			A0 		= param block pointer
+*			A1 		= DCE pointer
+*
+*  		Output:
+*			D0	  	= error code
+*
+*		Locally used:
+*			D0 		= scratch, then returns error code as output
+*
+*			A2		= cs parameters (ie. A2 <- csParam(A0))  (must be preserved)
+*			A3 		= ptr to private storage (passed to all control calls) 
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+
+VideoStatus	
+
+			MOVE.L	A0,-(SP)					; save a register
+			MOVE.L	dCtlStorage(A1),A3
+			MOVE.L	(A3),D0						; get pointer to private storage
+			_StripAddress						; strip hi byte for 32 bit addressing
+			MOVE.L	D0,A3						; put back in A3
+
+			MOVE.W	csCode(A0),D0				; get the opCode
+			MOVE.L	csParam(A0),A2				; A2 <- Ptr to control parameters
+			CMP.W	#9,D0						;IF csCode NOT IN [0..9] THEN
+			BHI.S	StatBad						;  Error, csCode out of bounds.
+			LSL.W	#1,D0						;Adjust csCode to be an index into the table.
+			MOVE.W	StatJumpTbl(PC,D0.W),D0		;Get the relative offset to the routine.
+			JMP		StatJumpTbl(PC,D0.W)		;GOTO the proper routine.
+				
+StatJumpTbl	DC.W	StatBad-StatJumpTbl			;$00 => Error
+			DC.W	StatBad-StatJumpTbl			;$01 => Error
+			DC.W	GetMode-StatJumpTbl			;$02 => GetMode
+			DC.W	GetEntries-StatJumpTbl		;$03 => GetEntries
+			DC.W	GetPage-StatJumpTbl			;$04 => GetPage
+			DC.W	GetPageBase-StatJumpTbl		;$05 => GetPageBase
+			DC.W	GetGray-StatJumpTbl			;$06 => GetGray
+			DC.W	GetInterrupt-StatJumpTbl	;$07 => GetInterrupt
+			DC.W	GetGamma-StatJumpTbl		;$08 => GetGamma
+			DC.W	GetDefaultMode-StatJumpTbl	;$09 => GetDefaultMode
+			
+StatBad		MOVEQ	#statusErr,D0				; else say we don't do this one
+			BRA.S	StatDone					; and return
+			
+StatGood	MOVEQ	#noErr,D0					; return no error
+
+StatDone	MOVE.L	(SP)+,A0					; restore registers.
+			BRA		ExitDrvr
+
+
+*******************************************************************
+*
+*  GetMode returns the current operating mode in csMode, the current
+*  display page in csPage, and the base address of the frame buffer
+*  in csBaseAddr.
+*
+*  GetMode is broken up into 3 main steps:
+*
+*       1. Copy the current saved mode into csMode(A2). 
+*		2. Copy the current saved page into csPage(A2).
+*		3. Copy the current saved baseaddr into csBaseAddr(A2).
+*
+*  Called by:
+*		
+*		Status Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		None.
+*
+*  Register usage:
+*
+*       Input:
+*			A1 - pointer to the AuxDCE
+*			A2 - pointer to the csParams
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0 - error code. 
+*
+*		Locally used:
+*			None.
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+GetMode
+
+			MOVE.W	saveMode(A3),csMode(A2)			; return the mode
+			MOVE.W	savePage(A3),csPage(A2)			; return the page number
+			MOVE.L	saveBaseAddr(A3),csBaseAddr(A2)	; and the base address
+			
+			BRA.S	StatGood						; => return no error
+			
+
+*******************************************************************
+*
+*  GetEntries reads the current contents of the CLUT.
+*
+*  GetEntries is broken up into 4 main steps:
+*
+*       1. Get the pointer to the output table and strip upper byte.  
+*		2. Range check the requested index count.
+*		3. If index mode write all value fields to table.
+*		4. Read the CLUT data registers and write data (components) to table.
+*
+*  Called by:
+*		
+*		Status Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		_StripAddress, _SwapMMUMode
+*
+*  Register usage:
+*
+*       Input:
+*			A1 - pointer to the AuxDCE
+*			A2 - pointer to the csParams
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0 - error code
+*
+*		Locally used:
+*			D0 - scratch
+*			D1 - scratch and loop counter
+*			D2 - used to hold the value index in indexed modes
+*			D3 - holds max number of valid entries in current depth mode
+*			D4 - loop counter for CLUT reads
+*
+*			A0 - pointer to output table 
+*
+*  Miscellaneous:
+*
+*		Note that due to gamma correction, the data in the CLUT will probably
+*		not be the data that you wrote with SetEntries or DirectSetEntries (unless
+*		the gamma table was a linear one).
+*
+*******************************************************************
+GetEntries
+
+			MOVE.L	csTable(A2),D0				; Check for a nil pointer
+			BEQ.S	StatBad
+			_StripAddress						; strip hi byte prior to 32 bit addressing
+			MOVE.L	D0,A0						; A0 <- pointer to table
+			
+; calculate the index range in D3
+
+			MOVE.W	saveMode(A3),D1				; get the current video mode
+			SUB.W	#FirstVidMode,D1			; convert to index
+			LEA		CountTbl,A3					; point to little table of counts
+			MOVEQ	#0,D3						; clear the long (only need word size tho!)
+			MOVE.B	(A3,D1),D3					; pick the zero-based byte
+			
+			MOVE.W	csCount(A2),D4				; get the count
+			TST.W	D4
+			BMI.S	StatBad
+			CMP.W	D3,D4						; D4-D3 > 0 (req count > max count) then bad
+			BHI.S	StatBad
+			MOVE.W	D4,D2						; make a copy of the count
+			
+			CMP.W	#-1,csStart(A2)				; is it index or sequence mode?
+			BEQ.S	GECom						; if index, then continue
+			
+			MOVE.W	D4,D1						; copy count into another loop counter
+			ADD.W	csStart(A2),D2				; get last index
+@1
+			MOVE.W	D2,value(A0,D1*8)			; write the index into the table
+			SUBQ	#1,D2						; decrease index
+			DBRA	D1,@1						; for all indices
+
+GECom			
+			MOVE.L	dCtlStorage(A1),A3
+			MOVE.L	(A3),D0						; get pointer to private storage
+			_StripAddress						; strip hi byte prior to 32 bit addressing
+			MOVE.L	D0,A3						; put back into A3
+			MOVE.L	saveHardBase(A3),A3			; A3 <- base address of device
+			ADD.L	#CLUT+CLUTDataReg,A3		; Add offset to CLUT read register 
+			
+			MOVEQ	#true32b,D0
+			_SwapMMUMode
+			
+@Repeat		MOVE.W	value(A0),D1				; get the next position in D1
+			CMP.W	D3,D1						; Is this request in range?
+			BHI.S	@Until						; if hi, then no, the request is invalid
+			
+			MOVE.L	D1,CLUTAddrReg-CLUTDataReg(A3)	; set the CLUT to read from this address
+			
+			MOVE.L	(A3),D1						; get red
+			MOVE.B	D1,rgb+red(A0)				; write hi byte
+			MOVE.B	D1,rgb+red+1(A0)			; write lo byte
+			
+			MOVE.L	(A3),D1						; get green
+			MOVE.B	D1,rgb+green(A0)			; write hi byte
+			MOVE.B	D1,rgb+green+1(A0)			; write lo byte
+			
+			MOVE.L	(A3),D1						; get blue
+			MOVE.B	D1,rgb+blue(A0)				; write hi byte
+			MOVE.B	D1,rgb+blue+1(A0)			; write lo byte
+			
+@Until		ADDQ.L	#colorSpecSize,A0			; advance A0 to the next color table element
+			DBRA	D4,@Repeat					; and loop until done
+
+			_SwapMMUMode
+			
+			BRA		StatGood					; => return no error
+
+
+*******************************************************************
+*
+*  GetPage returs the number of pages in the specified mode.
+*  Note that this routine is the only one that deals with non-zero
+*  based page counts.  All of the other ones, including the equates
+*  are zero based!
+*
+*  GetPage is broken up into 2 main steps:
+*
+*       1. Call ChkMode to see if mode is a valid one.
+*		2. Get the number of pages from the misc. param. table as a f(memorysize)
+*
+*  Called by:
+*		
+*		Status Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		ChkMode
+*
+*  Register usage:
+*
+*       Input:
+*			A1 - pointer to the AuxDCE
+*			A2 - pointer to the csParams
+*					csMode - screen depth
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0 - error code.
+*			
+*			csPage(A2)	- number of pages for current mode and memorysize
+*
+*		Locally used:
+*			D1 - scratch
+*			D2 - holds mode and used to index into misc. param. table
+*
+*			A0 - points to the active hw video parameters
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+GetPage
+			
+			MOVE	csMode(A2),D1			; get the mode
+			MOVE	D1,D2					; keep a copy
+			BSR		ChkMode					; is this mode OK?
+			BNE		StatBad					; => not a valid mode
+			
+			SUB		#FirstVidMode,D2		; mode, zero-based
+			MOVE.L	saveVidParms(A3),A0		; get pointer to vid parameters
+			BTST	#RAM512KFlag,GFlags(A3)	; how much RAM? 
+			BNE.S	@1						; if TRUE, then 512K of RAM
+			MOVE.B	(D_Pages1024,A0,D2),D1	; get the number of video pages
+			EXT.W	D1						; extend to word sized (especially important for -1 invalid case)
+			BRA.S	@2						;
+@1			MOVE.B	(D_Pages512,A0,D2),D1	; 
+			EXT.W	D1						; extend to word sized (especially important for -1 invalid case)
+@2			ADDQ.W	#1,D1					; convert 0 based page count to non 0 based
+			MOVE.W	D1,csPage(A2)			; return page count (high byte zero from ChkMode)
+			BRA		StatGood				; => return no error
+			
+			
+GetPageBase
+*******************************************************************
+*
+*  GetPageBase returns the base address for the specified page 
+*  in the current mode
+*
+*  GetPageBase is broken up into 6 main steps:
+*
+*       1. Call ChkMode to see if mode is a valid one.
+*		2. Call ChkPage to see if page is a valid one.
+*		3. Get the rowbytes and screenrows from the misc. param. table 
+*		4. Calculate base address (page num * rowbytes * screenrows)
+*		5. Call GetBaseOffset to get additional offset if any and add.
+*		6. Add to slot space of the card (Fs000000).
+*
+*  Called by:
+*		
+*		Status Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		ChkMode, ChkPage, GetBaseOffset
+*
+*  Register usage:
+*
+*       Input:
+*			A1 - pointer to the AuxDCE
+*			A2 - pointer to the csParams
+*					csPage - display page number
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0 - error code
+*
+*			csBaseAddr(A2) - base address
+*
+*		Locally used:
+*			D0 - used to pass page number to ChkPage
+*			   - later used to return base offset from GetBaseOffset
+*			D1 - used to pass mode to ChkMode and returns with depth mode
+*			   - later used to index into misc. parameters
+*			   - later used to pass to save interim calc
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+			
+			MOVE	saveMode(A3),D1				; get the current mode
+			MOVE	D1,csMode(A2)				; force current mode, just in case for ChkPage
+			BSR 	ChkMode						; convert to depth in D1 
+												; (assume current mode ok - we set it, after all)
+			MOVE.W	csPage(A2),D0				; get the requested page
+			BSR 	ChkPage						; is the page valid?
+			BNE		StatBad						; => no, just return
+						
+			MOVE	saveMode(A3),D1				; get the current "real" mode
+			SUB		#FirstVidMode,D1			; make it 0 based
+			MOVE.L	saveVidParms(A3),A0			; point to data table
+			MULU	(D_RowBytes,A0,D1*2),D0		; calc page * rowBytes
+			MULU	D_Height(A0),D0				; calc page * rowBytes * height
+			MOVE.L	D0,D1						; move page pass to D1 since GetBaseOffset returns D0
+			BSR		GetBaseOffset				; get appropriate base address in D0
+			ADD.L	D1,D0						; add together into D0
+			ADD.L	saveHardBase(A3),D0			; add base address for card
+
+			BTST	#sRsrc32Bit,GFlags(A3)		; check for 32 bit sRsrc (base address = Fsxx xxxx)
+			BNE.S	@saveIt						; if it is 32 bit sRsrc page base address is setup right					
+			BFEXTU	D0{4,4},D1					; else it's 24 bit (Fssx xxxx) so get slot number 
+			BFINS	D1,D0{8,4}					; and insert it into D0 to form Fssx xxxx
+			
+@saveit		MOVE.L	D0,csBaseAddr(A2)			; return the base address
+			
+			BRA 	StatGood					; => return no error
+			
+
+*******************************************************************
+*
+*  GetGray returns a boolean, set true if luminance mapping is on
+*
+*  GetGray is broken up into 1 main steps:
+*
+*       1. Get the GrayFlag state from private storage and put in csMode.
+*
+*  Called by:
+*		
+*		Status Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		None.
+*
+*  Register usage:
+*
+*       Input:
+*			A2 - pointer to the csParams
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0 - always returns good error code
+*
+*			csMode(A2) - boolean indicating flag state
+*
+*		Locally used:
+*			D0 - scratch
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+GetGray
+
+			MOVEQ	#(15-GrayFlag),D1			; set up for BFEXTU
+GetFlagCom	BFEXTU	GFlags(A3){D1:1},D0			; get the state of flag 
+			MOVE.B	D0,csMode(A2)				; return value
+			BRA		StatGood					; => and return
+		
+			
+*******************************************************************
+*
+*  GetInterrupt returns a boolean, set true if interrupts are disabled.
+*
+*  GetInterrupt is broken up into 1 main steps:
+*
+*       1. Get the IntDisFlag state from private storage and put in csMode.
+*
+*  Called by:
+*		
+*		Status Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		None.
+*
+*  Register usage:
+*
+*       Input:
+*			A2 - pointer to the csParams
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0 - always returns good error code
+*
+*			csMode(A2) - boolean indicating flag state
+*
+*		Locally used:
+*			D0 - scratch
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+GetInterrupt
+
+			MOVEQ	#(15-IntDisFlag),D1			; set up BFEXTU to point at IntDisFlag
+			BRA.S	GetFlagCom					; and use common code			
+
+
+*******************************************************************
+*
+*  GetGamma returns the pointer to the current gamma table
+*
+*  GetGamma is broken up into 1 main steps:
+*
+*       1. Retrieve the gamma pointer from privates and put in csGTable.
+*
+*  Called by:
+*		
+*		Status Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		None.
+*
+*  Register usage:
+*
+*       Input:
+*			A2 - pointer to the csParams
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			D0 - always returns good error code
+*
+*		Locally used:
+*			None.
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+GetGamma
+
+			MOVE.L	saveGammaPtr(A3),csGTable(A2)	; return the pointer to the structure
+			BRA		StatGood						; and return a good result
+			
+			
+*******************************************************************
+*
+*  GetDefaultMode reads the card default mode from slot pRAM.
+*
+*  GetDefaultMode is broken up into 2 main steps:
+*
+*       1. Read the PRAM record.
+*		2. Return the result in csMode
+*
+*  Called by:
+*		
+*		Status Call Handler.
+*
+*  Traps and Utilities called:
+*
+*		_sReadPRAMRec
+*
+*  Register usage:
+*
+*       Input:
+*			A1 - pointer to the AuxDCE
+*			A2 - pointer to the csParams
+*
+*  		Output:
+*			D0 - always returns good status
+*
+*		Locally used:
+*			A0 - pointer to slot parameter block
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+GetDefaultMode
+
+				WITH 	spBlock
+
+;
+; set up a slot parameter block on the stack
+;
+	
+				SUBA	#spBlockSize,SP					; make an slot parameter block on stack
+				MOVE.L	SP,A0							; get pointer to parm block now
+				MOVE.B	dCtlSlot(A1),spSlot(A0)			; put slot in pBlock
+				CLR.B	spExtDev(A0)					; external device = 0
+
+;
+; read the slot pRAM to determine what the currently saved mode is.  The first
+;	byte is the board ID, followed by the default mode.  
+;
+				
+			SUBA		#SizesPRAMRec,SP				; allocate block for pRAM record
+			MOVE.L		SP,spResult(A0)					; point to it
+			_sReadPRAMRec								; read it
+
+			MOVE.B		savedSRsrcID(SP),csMode(A2)		; return the result 
+			ADDA		#SizesPRAMRec+spBlockSize,SP	; release buffer
+			BRA			StatGood							;
+
+			ENDWITH
+										
+*******************************************************************
+*
+*	Exit from control or Status.
+*
+*******************************************************************
+
+ExitDrvr	BTST	#NoQueueBit,ioTrap(A0)		; no queue bit set?
+			BEQ.S	GoIODone					; => no, not immediate
+			RTS 								; otherwise, it was an immediate call
+
+GoIODone	MOVE.L	JIODone,A0					; get the IODone address
+			JMP 	(A0)						; invoke it
+
+
+
+
+*=====================================================================
+*
+*	Utilities
+*
+*=====================================================================
+
+*******************************************************************
+*
+*	GetXtndSense reads the extended sense code from the sense lines.
+*	In this driver, we are looking for the Sarnoff breakout box, which
+*	has the sense lines assigned as 010100.  Note that the returned sense
+*	is of the format bc ac ab, where the first two bits are read when a 
+*	is set high, the second two bits are read when b is set high, and the
+*	third two bits are read when c is set high.  a, b, and c correspond to 
+*	sense lines 2, 1, and 0 where 2 is the msb.
+*
+*  Called by:
+*		
+*		PrimaryInit, VideoOpen
+*
+*  Traps and Utilities called:
+*
+*		None.
+*
+*  Register usage:
+*
+*       Input:
+*
+*			A1 - card base address
+*			D1 - offset to JMFB CSR (contains sense lines)
+*
+*  		Output:
+*			D0 - returns the extended sense. 
+*
+*		Locally used:
+*			D2 - scratch (saved and restored)
+*			D3 - scratch (used to hold the sense line to be output to the CSR
+*				 (i.e. 100, 010, or 001)
+*			D4 - scratch used to build up the data to be output to the CSR
+*			D5 - holds the number of bits to shift to get the sense code in the right place
+*				 (can't use immediate since max valid shift count is only 8 and we need 9)
+*
+*  Miscellaneous:
+*
+*	1.  Must be called in 32 bit addressing mode.
+*
+*******************************************************************
+GetXtndSense
+
+				MOVEM.L	D2-D6,-(SP)			; save D2 working register
+				CLR		D0					; initialize the return value
+				MOVE.L	#9,D5				; initialize the number of bits to shift due to byte swapping
+				MOVE.L	#readBC,D3			; set up 1 bit to be output
+				
+				
+				LSL		D5,D3				; shift up due to byte swapping
+				MOVE.L	(A1,D1.L),D4		; get current state of the JMFB CSR
+				ANDI.W	#MaskSenseLine,D4	; Ensure sense lines will be written out as 000
+				OR.L	D3,D4				; write out
+				MOVE.L	D4,(A1,D1.L)
+;+++				BFINS	D3,(A1,D1.L){20:3}	; set a in sense reg high  (This doesn't work to the card!)
+
+				BFEXTU	(A1,D1.L){20:3},D2	; read the sense register a,b,c
+				MOVE.B	D2,D0				; move into return register
+				LSL.B	#2,D0				; move over 2 bits for next one
+
+				MOVE.L	#readAC,D3			; set up 1 bit to be output
+				
+				LSL		D5,D3				; shift up due to byte swapping
+				MOVE.L	(A1,D1.L),D4		; get current state of the JMFB CSR
+				ANDI.W	#MaskSenseLine,D4	; Ensure sense lines will be written out as 000
+				OR.L	D3,D4				; write out
+				MOVE.L	D4,(A1,D1.L)
+;+++				BFINS	D3,(A1,D1.L){20:3}	; set b in sense reg high  (This doesn't work to the card!)
+
+				BFEXTU	(A1,D1.L){20:3},D2	; read the sense register a,b,c
+				MOVE.B	D2,D6				; save bit c
+				ANDI.B	#1,D6				; and only bit c
+				LSR.B	#1,D2				; move bit a over 1 to form 2 bit code
+				OR.B	D6,D2				; form it
+				OR.B	D2,D0				; move into return register
+				LSL.B	#2,D0				; move over 2 bits for next one
+
+				MOVE.L	#readAB,D3				; set up 1 bit to be output
+				
+				LSL.L	D5,D3				; shift up due to byte swapping
+				MOVE.L	(A1,D1.L),D4		; get current state of the JMFB CSR
+				ANDI.W	#MaskSenseLine,D4	; Ensure sense lines will be written out as 000
+				OR.L	D3,D4				; write out
+				MOVE.L	D4,(A1,D1.L)
+;+++				BFINS	D3,(A1,D1.L){20:3}	; set c in sense reg high  (This doesn't work to the card!)
+
+				BFEXTU	(A1,D1.L){20:3},D2	; read the sense register a,b,c
+				LSR.L	#1,D2				; shift a,b into lo 2 bits
+				OR.B	D2,D0				; move into return register
+				
+				MOVEM.L	(SP)+,D2-D6			; restore D2 				
+				
+				RTS										
+
+*******************************************************************
+*
+*  ChkMode maps the mode to a depth (1, 2, 4, 8, or 16 (really 24 BPP)), and then
+*  determines if this request is a valid one as a function of memory 
+*  configuration and connected monitor type.  This routine is also responsible
+*  for controlling the state of the DirectModeFlag.  It is set for 24 BPP and 
+*  clear for all other modes.
+*
+*  ChkMode is broken up into 3 main steps:
+*
+*       1. Make the mode request zero-based and range check, exit if bad. 
+*		2. Convert mode request to depth.
+*		3. Determine if valid mode based on the table below.
+*
+*  Called by:
+*		
+*		SetVidMode, GrayPage, GetPage, GetPageBase
+*
+*  Traps and Utilities called:
+*
+*		None.
+*
+*  Register usage:
+*
+*       Input:
+*			D1 - Mode (in spID form)
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			Equal flag is set if mode is ok.
+*
+*		Locally used:
+*			D0 - scratch (trashed)
+*
+*  Miscellaneous:
+*
+*	1.	This routine implements the valid mode table in the Elmer Fudd 
+*		software ERS, and is repeated here.
+*
+*				640x480		640x870		1152x870	640x480 (NTSC oscan)	768x576 (PAL oscan)
+*				512x384								512x384 (NTSC uscan)	616x460 (PAL uscan)
+*				A     B		A     B		A      B	A     B					A     B	
+*
+*	 	1BPP NI Y     Y		Y     Y		Y      Y	-     -					-     -
+*		     I	-     -     -     -    	-      -	Y     N					Y     N
+*		     IC	-     - 	-     -		-      -    N     Y					N     Y
+*		--------------------------------------------------------------------------------
+*		2BPP NI	Y     Y		Y     Y		Y      Y	-     -					-     -
+*			 I	-     -     -     -     -      -    Y     N					Y     N
+* 	     	 IC -     -     -     -     -      -    N     Y					N     Y
+* 	 	--------------------------------------------------------------------------------
+*		4BPP NI	Y     Y		Y     Y		Y      Y	-     -					-     -
+*		     I	-     -     -     -     -      -    Y     N					Y     N
+* 	      	 IC -     -     -     -     -      -    N     Y					N     Y
+* 	  	--------------------------------------------------------------------------------
+*		8BPP NI	Y     Y		N     Y		N      Y	-     -					-     -
+*		     I	-     -     -     -     -      -    Y     N		(uscan only!)Y     N
+*			 IC -     -     -     -     -      -    N     Y					N     Y
+*		--------------------------------------------------------------------------------
+*	  24BPP NI	N     Y		-     -		-      -	-     -					-     -
+*		     I	-     -     -     -     -      -    N     Y					N     Y (uscan only!)
+*	         IC -     -     -     -     -      -    -     -					-     -
+*		--------------------------------------------------------------------------------
+*
+*		Legend: NI - NonInterlaced, I - Interlaced, IC - Interlaced with Convolution
+*				A  - 512K vRAM,     B - 1024K vRAM
+*
+*   	        Y - Mode Valid, N - Mode Invalid, '-' - Not Applicable (Mode Invalid)
+*
+*	2.	The mode that is passed in to this routine (in D1) is the sResource list parameter
+*		ID number and has a range between FirstVidMode and FifthVidMode ($80-$84).  To
+*		generate a screen depth from this parameter, it is desirable to make it 0 based.
+*		The process is summarized by:
+*
+*			parameter ID						0 based							Depth
+*
+*			 $80 (1BPP)							0 (1BPP)						1 (1BPP)						
+*			 $81 (2BPP)							1 (2BPP)						2 (2BPP)
+*			 $82 (4BPP)	== Make it 0 based =>	2 (4BPP)	== Form Depth =>	4 (4BPP)
+*			 $83 (8BPP)							3 (8BPP)						8 (8BPP)
+*			 $84 (24BPP)						4 (24BPP)					   16 (24BPP)**
+*
+*		** Note that the returned depth for 24 BPP is really 16 not 24 or 32 as expected!
+*
+*	3.	Certain modes are only allowed for certain monitors.  For instance, 24 bpp is only 
+*		allowed on the small screens (and not in PAL oscan mode).  The local variable 
+*		BigScreen is used in this routine.
+*
+*******************************************************************
+ChkMode		
+			SUB		#FirstVidMode,D1			; make it 0 based
+			BMI.S	ModeBad						; =>bad mode, return
+			
+			CMP		#Mode24BPP,D1				; range check the mode parameter
+			BGT.S	ModeBad						; exit with error if too big
+			
+			BCLR	#DirectModeFlag,GFlags(A3)	; anticipate that it's not 24 BPP
+			
+			MOVEQ	#Depth1BPP,D0				; convert mode request into depth
+			LSL		D1,D0
+			MOVE	D0,D1
+			
+			CMP.W	#Depth4BPP,D1				; all 1,2,4 BPP modes are OK for all monitors with 512K
+			BLE.S	ModeOK
+			
+			BTST 	#RAM512KFlag,GFlags(A3)		; check to see if card has 512K (1) or 1024K (0)
+			BNE.S	@512K						; branch to the 512K section
+			
+			CMP.W	#Depth8BPP,D1				; 8 BPP mode is OK for all monitors with 1024K 
+			BEQ.S	ModeOK
+			
+			BTST	#BigScreen,GFlags(A3)		; is it a small screen (0) or larger screen (1)
+			BNE.S	ModeBad						; 24 BPP mode is only allowed on the small screen
+			BTST	#sRsrc32Bit,GFlags(A3)		; make sure that we're an sRsrc that supports 24 bpp
+			BEQ.S	ModeBad						; if 0 then we're 24 bit sRsrc and no 24 bpp!
+			BTST	#PALFlag,moreGFlags(A3)		; check for PAL since 24 bpp is not supported in overscan mode
+			BEQ.S	@notPAL						; if it's not PAL, then 24 bpp mode request is ok
+			BTST	#underScanFlag,moreGFlags(A3)	; if it is PAL, check to see if it's underscan 
+			BEQ.S	ModeBad						; if it is not underscan then the mode request is bad
+@notPAL
+			BSET	#DirectModeFlag,GFlags(A3)	; must be 24 BPP and the 640x480 small screen
+			BRA.S	ModeOK				; 
+			
+@512K		BTST	#BigScreen,GFlags(A3)		; is it a small screen (0) or larger screen (1)
+			BNE.S	ModeBad						; depths > 4 BPP are only supported on small screen
+			BTST	#PALFlag,moreGFlags(A3)		; special case for PAL oScan as it only supports 1,2,4 bpp with 1 bank
+			BEQ.S	@cont512K					; if it's not PAL, then don't do next check
+			BTST	#UnderScanFlag,moreGFlags(A3)	; check to see if we're overscanning
+			BEQ.S	ModeBad						; if we are then bad news so get out with error.
+
+@cont512K	CMP.W	#Depth8BPP,D1				; 8 BPP is the max for small screen with 512K vRAM
+			BNE.S	ModeBad				
+			
+ModeOK		CMP.W	D1,D1
+			BRA.S	EndCM
+ModeBad		ST		D1							; set if error
+			TST.B	D1							; and test condition
+EndCM		RTS
+			
+*******************************************************************
+*
+*  ChkPage checks to see if the page number in D0 is valid for the depth in D1, 
+*  given the amount of RAM on the card.
+*
+*  ChkPage is broken up into 2 main steps:
+*
+*       1. Get the max number of pages allowed in current mode  
+*		2. Compare with request and return EQ if valid
+*
+*  Called by:
+*		
+*		SetVidMode, GrayPage, GetPageBase
+*
+*  Traps and Utilities called:
+*
+*		None.
+*
+*  Register usage:
+*
+*       Input:
+*			D0 - page
+*
+*			A2 - pointer to the csParams
+*			A3 - pointer to the private storage
+*
+*			csMode(A2) - current mode
+*
+*  		Output:
+*			Set equal flag in SR if valid
+*
+*		Locally used:
+*			D2 - used to form mode and zero based mode and indexes into misc params.
+*			D3 - used to hold the max number of valid pages
+*			A1 - pointer to the hw setup parameters
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+
+ChkPage		MOVEM.L	D2-D3/A0-A1,-(SP)			; save work registers
+			TST.W	D0						; check for bad value (negative)
+			BMI.S	PageBad
+			MOVEQ	#0,D3					; clear D3 (at least word size)
+			MOVE.W	csMode(A2),D2			; get offset to page data
+			SUB.W	#FirstVidMode,D2		; zero-based offset in D2
+			MOVE.L	saveVidParms(A3),A1		; get pointer to data tables
+			BTST	#RAM512KFlag,GFlags(A3)	; 512K (0) or 1024K (1)
+			BNE.S	@1						; if <> 0, then 1024K
+			MOVE.B	(D_Pages1024,A1,D2),D3	; get max number of pages
+			EXT.W	D3
+			CMP.W	D3,D0					; is it a valid page?
+			BRA.S	@2
+@1			MOVE.B	(D_Pages512,A1,D2),D3	; get max number of pages
+			EXT.W	D3
+			CMP.W	D3,D0					;
+@2
+			SGT		D2						; set flag if too big
+			TST.B	D2						; and test condition
+			BRA.S	EndCP
+PageBad		ST		D2
+			TST.B	D2
+EndCP		MOVEM.L	(SP)+,D2-D3/A0-A1			; restore work registers
+			RTS			
+			
+
+
+*******************************************************************
+*
+*  WaitVSync waits for vertical blanking.
+*
+*  Called by:
+*		
+*		SetVidMode, SetEntries, DisableVGuts, JMFBSetDepth.
+*
+*  Traps and Utilities called:
+*
+*		None.
+*
+*  Register usage:
+*
+*       Input:
+*			A1 - pointer to the AuxDCE
+*			A2 - pointer to the csParams
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			None.
+*
+*		Locally used:
+*			D0 - working register to hold the VSP~ state (saved)
+*			A0 - used to point to the stopwatch status register (saved)
+*
+*  Miscellaneous:
+*
+*	1.  The VSP~ state is obtained by reading 1 bit in the StopWatch
+*		Status Register.  This bit is in bit position 2 
+* 		of the least signifcant byte when viewed from the 68020 world.
+*		If you're looking here, you've probably already figured out
+*		the byte swapping mess!  Refer to the JMFB Spec to see the
+*		address mapping requirement.
+*
+*		IMPORTANT ... The sensing of the VSP~ register from Stopwatch is
+*		inverted (from that defined in the spec) due to NuBus, so when a 
+*		vertical state is entered, we will read a 1, not a 0 !!!!
+*
+*	2.	The BFEXTU instruction is used to extract the VSP~ state into
+*		a working register.  The offset is 29 bits into the register
+*		(bit 0 is MSB of the long word, so bit 29 is bit 2 of the 
+*		least significant byte of the long word).  The data width of
+*		VSP~ is 1 bit.
+*
+*	3.	The first loop waits for the VSP~ state to transition from 0
+*		to 1 (inverted from 1 -> 0) signifying that the vertical sync 
+*		pulse state was just entered.  When VSP goes zero, we know that
+*		the state is now vertical back porch.
+*
+*	4.	The second loop waits for the VSP~ state to transition 
+*		to 0 (nverted 1) indicating that the vertical sync pulse state 
+*		has been exited.
+*
+*	5.	The last loop waits for the VSP~ state to transition from 0
+*		to 1 again (inverted from 1 -> 0), insuring that we have delayed
+*		for at least 1 vertical blanking period and that we are now at 
+*		the start of the next one.
+*
+*	6.	IMPORTANT - 32 bit addressing must be in effect prior to calling
+*		this utility subroutine!
+*
+*******************************************************************
+
+WaitVSync	
+
+
+			MOVEM.L	A0/D0,-(SP)					; save work registers
+
+			MOVE.W	SR,-(SP)					; get the current interrupt level
+			MOVEQ.L	#7,D0						; setup to get interrupt level
+			AND.B	(SP),D0						; D0 now holds current interrupt level
+			SUBQ	#2,D0						;
+			BGE.S	@itsOK						; if >= 2 then intr level is ok
+			ORI.W	#$0200,SR					; if <2 then raise intr level to at least 2
+			ANDI.W	#$FAFF,SR					; may have to drop it to 2
+@itsOK
+			
+			MOVE.L	saveHardBase(A3),A0						; A0 <- slot base addr
+			ADD.L	#StopWatch+SWStatusReg,A0	; point to stapwatch status register
+			
+; detect the 1 -> 0 transition of VSP~ signifying we've entered the vertical sync pulse state
+
+@0			BFEXTU	(A0){29:1},D0								
+			CMP.B	#1,D0						
+			BNE.S	@0							
+
+; detect the 0 -> 1 transition of VSP~ signifying we've exited the vertical sync pulse state
+			
+@1			BFEXTU	(A0){29:1},D0				
+			CMP.B	#0,D0						
+			BNE.S	@1							
+
+; detect the 1 -> 0 transition of VSP~ again ensuring that we've delayed at least 1 vertical blanking
+;  period and it is now at the beginning of the next one!
+
+@2			BFEXTU	(A0){29:1},D0				
+			CMP.B	#1,D0						
+			BNE.S	@2							
+			
+
+			MOVE.W	(SP)+,SR					; restore interrupt state
+			MOVEM.L	(SP)+,A0/D0					; restore work registers
+			RTS
+
+
+*******************************************************************
+*
+*  JMFBSetDepth sets the JMFB up for the requested depth mode.  The setup
+*  is identical to primaryinit with the following exception, the clock
+*  generation chip is not set up here for all modes except NTSC mode because
+*  the setup would be redundant.  In addition it is only necessary to change
+*  the clock generation chip’s timing in modes that support convolution, since
+*  that is the only mode where more than one dot clock may be necessary.
+*  The dot clock for interlaced ops is 12.27 MHz and convolution ops is 4*12.27 MHz.
+*
+*  The depth has already been range checked before getting here and
+*  the requested mode should have already been saved!!
+*
+*  JMFBSetDepth is broken up into 8 main steps:
+*
+*       1. Range check the requested mode (should have been checked previously). 
+*		2. Get a pointer to the right setup parameters as a f(depth)
+*		3. Setup CLUT.
+*		4. Setup clock generator chip if NTSC and convolved mode.
+*		5. Reset JMFB.
+*		6. Setup Stopwatch (timing generation).
+*		7. Start VRAM refresh.
+*		8. Start video transfers
+*
+*  Called by:
+*		
+*		VidReset, SetVidMode
+*
+*  Traps and Utilities called:
+*
+*		_SwapMMUMode, GetClockType
+*
+*  Register usage:
+*
+*       Input:
+*			D1 - depth mode, later used for other things
+*			A3 - pointer to private storage, later used for other things
+*
+*  		Output:
+*			None.
+*
+*		Locally used:
+*			D0 - scratch
+*			D1 - scratch
+*			D2 - used to fix A0 if we're NTSC convolved. (only mode that still has Natl)
+*			A0 - pointer to hw setup parameters for requested mode.
+*			A1 - pointer to hw control registers
+*			A2 - pointer to the JMFB base (JMFB CSR)
+*			A3 - holds a copy of the pointer to slot base addr
+*
+*  Miscellaneous:
+*
+*		1.	Note it is important that A3 be the pointer to driver private storage
+*			prior to calling WaitVSync.
+*
+*		2.	Since most monitor types have the same dot clock requirements across
+*			all modes, it is redundant to resetup the clock each time that a mode
+*			change occurs.  The exception to this are the NTSC modes that are doing
+*			convolution.  In this mode a 49.08 MHz clock is used in 1,2,4, and 8 bit 
+*			modes, however a 12.27 MHz clock is used in 24 bpp mode (since we will
+*			gracefully default to normal interlaced ops in that mode).  To take
+*			advantage of this space saving opportunity (~500 bytes), we must live 
+*			with 2 hardships.  First we must fix the pointer to the hw setup params
+*			if we're in the mode that has the extra data (convolution), since all
+*			data blocks are assumed to be fixed in size and equal to the blocks that
+*			don't have the National (or Endeavor) parameters.  Second, we must 
+*			special case this mode out in the setup section, so we can adapt to the
+*			different size hw setup blocks.  
+*
+*******************************************************************
+JMFBSetDepth	
+			MOVEM.L	D0-D2/A0-A4,-(SP)		; save regs we are using
+			CMP		#Depth24BPP,D1			; depth too big?
+			BGT		NoDepth					; =>yes, just exit
+
+			MOVE.W	csMode(A2),saveMode(A3) ; save mode number
+
+			MOVE.L	saveVidParms(A3),A0		; get pointer to parms for this mode
+
+			CMP		#Depth1BPP,D1			; test for 1 BPP mode
+			BEQ.S	@DoIt
+			CMP		#Depth2BPP,D1			; test for 2 BPP mode
+			BEQ.S	@2BPP
+			CMP		#Depth4BPP,D1			; test for 4 BPP mode
+			BEQ.S	@4BPP					
+			CMP		#Depth8BPP,D1			; test for 8 BPP mode
+			BEQ.S	@8BPP
+			ADD.L	#D_TFBP,A0				; use 24 BPP parameters
+			BRA.S	@DoIt
+@8BPP		ADD.L	#D_EBP,A0				; use  8 BPP parameters
+			BRA.S	@DoIt
+@4BPP		ADD.L	#D_FBP,A0				; use  4 BPP parameters
+			BRA.S	@DoIt
+@2BPP		ADD.L	#D_TBP,A0				; use  2 BPP parameters
+
+;
+; Initialize the hardware.
+;
+
+@DoIt
+			MOVEQ	#true32b,D0				; change to 32 bit addressing to get
+			_SwapMMUMode					; at hardware
+			MOVE	D0,-(SP)				; save past addr mode for later
+
+			MOVE.W	SR,-(SP)				; get the current interrupt level
+			MOVEQ.L	#7,D0					; setup to get interrupt level
+			AND.B	(SP),D0					; D0 now holds current interrupt level
+			SUBQ	#2,D0					;
+			BGE.S	@itsOK					; if >= 2 then intr level is ok
+			ORI.W	#$0200,SR				; if <2 then raise intr level to at least 2
+			ANDI.W	#$FAFF,SR				; may have to drop it to 2
+@itsOK
+			BSR		WaitVSync				; wait for vertical blanking
+
+			BTST	#ConvOnFlag,moreGFlags(A3)	; test to see if we're convoling or not
+			BEQ.S	@noKludge				; if we're not conv, then hw param size is ok
+			MOVE.W	saveMode(A3),D2			; otherwise, adjust for additional clock params
+			SUB		#FirstVidMode,D2		; make zero based
+			MULU	#D_ClockParams,D2		; we are now using a universal ROM for Endeavor and Natl so use common param size
+			ADD.L	D2,A0					; add to pointer to get to right table
+@noKludge					
+
+			MOVE.L	saveHardBase(A3),A1		; A1 <- slot base addr
+			MOVE.W	moreGFlags(A3),D2		; save GFlags
+			MOVE.L	A3,A4					; must save since it is passed to WaitVSync later
+
+			MOVE.L	A1,A3					; A3 <- slot base addr
+			ADD.L	#CLUT+CLUTPBCR,A1		; point to the CLUT Pixel Bus Control Register
+				
+			CLR.L	D0						; to ensure that the upper 2 bytes are 0
+			MOVE.W	(A0)+,D0				; setup the CLUT PBCR (data table field is word sized)
+			MOVE.L	D0,(A1)					; make a long write to hw always for this card
+
+			MOVE.L	A3,A1					; get back to the slot base addr
+			ADD.L	#JMFB,A1				; point to the base of the JMFB Registers
+			MOVE.L	A1,A2					; save for later
+			MOVE.W	#2,D1					; setup the 4 JMFB registers (the first one will be done outside the loop)
+
+			CLR.L	D0						; to ensure that the upper 2 bytes are 0
+			MOVE.W	(A0)+,D0
+			BTST	#NationalFlag,moreGFlags(A4) ; all parameters are setup for National use so...
+			BNE.S	@writeOne					; if it's Natl, no need to do anything special
+			ORI.W	#PIXSEL1,D0					; else it's Endeavor and we don't want to Reset (PIXSEL1=1)
+@writeOne	MOVE.L	D0,(A1)+
+@part1		MOVE.W	(A0)+,D0				; do it (data table field is word sized)
+			MOVE.L	D0,(A1)+				; make a long write to hw always for this card
+			DBRA	D1,@part1						
+			
+			MOVE.L	A3,A1					; get back to the slot base addr
+			ADD.L	#Endeavor,A1			; point to the base of the Endeavor Registers
+			
+			BTST	#ConvOnFlag,D2			; test to see if we're convoling or not
+			BEQ.S	@skipPart2
+			
+			BTST	#NationalFlag,moreGFlags(A4)
+			BNE.S	@NatlSetup
+				MOVE.W	#2,D1				; setup the 3 Endeavor registers
+					
+				CLR.L	D0					; to ensure that the upper 2 bytes are 0
+@part2			MOVE.W	(A0)+,D0			; do it (data table field is word sized)
+				MOVE.L	D0,(A1)+			; make a long write to hw always for this card
+				DBRA	D1,@part2
+				ADD.L	#D_Natl,A0
+				BRA.S	@skipPart2
+			
+@NatlSetup		ADD.L	#D_Endeavor,A0
+				MOVE.W	#15,D1				; setup the 16 National registers
+					
+				CLR.L	D0					; to ensure that the upper 3 bytes are 0
+@part2a			MOVE.B	(A0)+,D0			; do it (data table field is byte sized)
+				MOVE.L	D0,(A1)+			; make a long write to hw always for this card
+				DBRA	D1,@part2a
+				
+				
+@skipPart2			
+			ADD.L	#JMFBCSR,A2				; point to JMFB CSR
+			BTST	#NationalFlag,moreGFlags(A4)	; Are we National or Endeavor
+			BNE.S	@InitDelay					; if National, no need to reset Endeavor
+				MOVE.L	(A2),D1
+				ANDI.W	#MaskSenseLine,D1		; Ensure sense lines will be written out as 000
+				ORI.W	#PIXSEL1,D1				; set PIXSEL1 line to start Endeavor
+				MOVE.L	D1,(A2)
+				
+@InitDelay	MOVE.W	#ShortDelay,D1			; setup delay loop count
+@delayLoop		
+			DBRA	D1,@delayLoop			; wait for stable clock from Endeavor
+				
+			MOVE.L	(A2),D1
+			ANDI.W	#MaskSenseLine,D1		; Ensure sense lines will be written out as 000
+			ORI.W	#VRSTB,D1				; set VRSTB to start JMFB
+			MOVE.L	D1,(A2)
+				
+			MOVE.L	A3,A1					; get back to the slot base addr
+			ADD.L	#Stopwatch,A1			; point to the base of the Stopwatch Registers
+			MOVE.W	#14,D1					; setup next 15 registers (Stopwatch)
+
+			CLR.L	D0						; to ensure that the upper 2 bytes are 0
+@part3		MOVE.W	(A0)+,D0				; do it (data table field is word sized)
+			MOVE.L	D0,(A1)+				; make a long write to hw always for this card
+			DBRA	D1,@part3
+
+			MOVE.L	#$04,(A1)				; Always do a stopwatch soft reset				
+			MOVE.L	#$05,(A1)				; Line interrupts off, Vertical Interrupts enabled and no soft reset				
+				
+			MOVE.L	(A2),D1
+			ANDI.W	#MaskSenseLine,D1		; Ensure sense lines will be written out as 000
+			ORI.W	#REFEN,D1				; set REFEN line to start VRAM refresh
+			MOVE.L	D1,(A2)
+
+			MOVE.L	A4,A3					; restore A3 prior to calling WaitVSync
+			BSR		WaitVSync				; wait for one vertical blanking interval
+				
+			MOVE.L	(A2),D1
+			ANDI.W	#MaskSenseLine,D1		; Ensure sense lines will be written out as 000
+			ORI.W	#VIDGO,D1				; set VRSTB line to start video transfer cycle
+			MOVE.L	D1,(A2)
+				
+			MOVE.W	(SP)+,SR				; restore the interrupt level
+			MOVE	(SP)+,D0				; restore past addr mode in D0
+			_SwapMMUMode	
+			
+NoDepth		MOVEM.L	(SP)+,D0-D2/A0-A4		; restore all regs
+			RTS								; return
+			
+				
+				
+*******************************************************************
+*
+*  JMFBSetPage calculates the display base address from the mode and 
+*  page number.
+*
+*  The base of a page is at saveHardBase(A3) + defmBaseOffset + (page * RowBytes * height)
+*
+*  See the Miscellaneous section for special convolution and interlaced processing.
+*
+*  JMFBSetPage is broken up into 6 main steps:
+*
+*		1. Get the rowbytes and screenrows from the misc. param. table 
+*		2. Calculate base address (page num * rowbytes * screenrows)
+*		3. Call GetBaseOffset to get additional offset if any and add.
+*		4. If convolution blacken the phantom line (n-1)
+*		5. Fix the base address if we're a 24 bit sRsrc.
+*		6. Write to JMFB base address register.
+*
+*  Called by:
+*		
+*		VidReset, SetVidMode
+*
+*  Traps and Utilities called:
+*
+*		SwapMMUMode
+*
+*  Register usage:
+*
+*       Input:
+*			D1 - mode number
+*			D4 - page number (zero based)
+*			A1 - pointer to the AuxDCE
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			None. 
+*
+*		Locally used:
+*			D2 - used to save rowbytes for mode
+*			D3 - scratch
+*			D4 - used to form the hardware base address for the JMFB CSR
+*			D5 - used to hold the screen base address to go into privates
+*
+*  Miscellaneous:
+*
+*		There are three cases that require special consideration in the interlaced 
+*		modes.  The first is when we are convolving and are in the underscan mode 
+*		(512x384).  In this case we don't want to display the first active half
+*		line in the active area.  To do this we must place the qd base address 
+*		farther into the active area of the frame buffer as defined by the JMFB
+*		base address.  Specifically, we put the qd base address at $2000 (rowbytes
+*		in interlaced mode always = $400), so the qd base address is 8 lines in 
+*		from the card base.  Also, the JMFB base address must always be located
+*		at the third row of a 4 row block due to hw design constraints for convolution
+*		to work correctly (That means it can be a $c00, $1c00, $2c00, etc.).  By
+*		placing the qd base address at $2000 and the JMFB base addr at $c00, we
+*		can eliminate the top half line artifact displayed in the active area of
+*		the underscan mode.... confused yet...I almost am again and I wrote it!
+*		Anyway, one last twist is that we'll blacken the entire frame buffer up
+*		to the start of the screen base so we won't get any undesired artifacts
+*		due to the 1:2:1 convolution kernal, at least not any unexpected artifacts!
+*		The second case is a little more subtle since it is really done from the 
+*		GetBaseOffset utility.  In 24 bpp we also want to get rid of the half line at
+*		the top.  There is a special base offset for 24 bpp ntsc that is #2560 (one
+*		line into the frame buffer).  By offseting qd 1 line past the JMFB base, se
+*		should get rid of the half line in 24 bpp too!.  The third case is similar
+*		tho the 24 bpp case, but applies to indexed modes when there is only one
+*		bank of vram and we are not convolving.  In that case, the JMFB base addr
+*		will be exactly 1 line (1024 bytes) behind qd.  In this case and all indexed
+*		cases, black is $FF.  In 24 bpp (direct mode) black is $00.
+*
+*******************************************************************
+JMFBSetPage
+
+			MOVEM.L	D0-D5/A0,-(SP)				; save all registers
+
+			MOVE	D4,savePage(A3)				; save the page
+			MOVE	saveMode(A3),D1				; get the current "real" mode
+			SUB		#FirstVidMode,D1			; make it 0 based
+			MOVE.L	saveVidParms(A3),A0			; point to data table
+			MOVE.W	(D_RowBytes,A0,D1*2),D2		; get and save rowBytes
+			MULU	D2,D4						; calc page * rowBytes
+			MULU	D_Height(A0),D4				; calc page * rowBytes * height
+			
+			BSR		GetBaseOffset				; returns base offset in D0
+			ADD.L	D0,D4						; add the base offset to the page base
+			MOVE.L	D4,D5						; save screen base offset for later to save in savebaseaddr
+			
+			MOVEQ	#true32b,D0					; change to 32 bit addressing to get
+			_SwapMMUMode						; at hardware
+
+; the following section gets pretty messy for ntsc modes to blacken the top of the fb and calc the JMFB baddr
+;	- case1 : indexed mode and convolving > qdBAddr = $2000, JMFB BAddr = $0C00, black = $FF
+;	- case2 : indexed mode and noConvolve > qdBAddr = $2000, JMFB BAddr = $1C00, black = $FF
+;	- case3 : 24 bpp                      > qdBAddr = #2560, JMFB BAddr = $0000, black = $00
+;
+; what a mess!
+
+			BTST	#Interlaced,gFlags(A3)		; check for interlaced mode (1) for special processing
+			BEQ.S	@Continue					; use normal noninterlaced base offset value
+			BTST	#RAM512KFlag,gFlags(A3)		; check for 2nd bank of memory (0)
+			BEQ.S	@ConvOn						; can't do convolution w/o the 2nd bank
+			SUB.L	#OBM12CRB,D4				; we're indexed and we can do this since all rowbytes are the same!
+			BRA.S	@BlackTop					; do the common blacktop stuff for indexed modes
+			
+@ConvOn		CMP.B	#Mode8BPP,D1				; test if mode is > 8 BPP
+			BGT.S	@ntsc24						; can't do convolution in 24 BPP mode
+			SUB.L	#convBOfix,D4				; form the magic JMFB base address (always $1400 less than screen base)
+
+@BlackTop	MOVE.L	saveHardBase(A3),A0			; add the card base so we are now pointing to the line
+			ADD.W	#defmBaseOffset12,D2		; get the number of bytes to blacken (from start of frame buffer to 
+												;	start of screen.
+			LSR		#2,D2						; convert rowbytes to rowlongs
+			SUBQ	#1,D2						; make it 0 based for the DBRA
+@NxtLong	MOVE.L	#$FFFFFFFF,(A0)+			; write black for the entire phantom line
+			DBF		D2,@NxtLong
+			BRA.S	@Continue
+			
+@ntsc24
+			SUB.L	#TFBM12CRB,D4				; JMFB base address is 1 line behind qd for 24 bpp
+			MOVE.L	saveHardBase(A3),A0
+			ADD.W	#specBaseOffset12,D2
+			LSR		#2,D2
+			SUBQ	#1,D2
+@aNxtLong	MOVE.L	#$00000000,(A0)+			; write black for the entire phantom line ($00 for 24 bpp, $FF for indexed)
+			DBF		D2,@aNxtLong
+
+
+@Continue		
+			ADD.L	saveHardBase(A3),D5			; add base address for card
+			
+			BTST	#sRsrc32Bit,GFlags(A3)		; check for 32 bit sRsrc (base address = Fsxx xxxx)
+			BNE.S	@saveIt						; if it is 32 bit sRsrc page base address is setup right					
+			BFEXTU	D5{4,4},D3					; else it's 24 bit (Fssx xxxx) so get slot number 
+			BFINS	D3,D5{8,4}					; and insert it into D5 to form Fssx xxxx
+			
+@saveit		MOVE.L	D5,saveBaseAddr(A3)			; return the base address
+
+;  Now set the hardware by writing the offset in longs to the proper registers.
+
+			MOVE.L	saveHardBase(A3),A0			; get the card base addr
+			ADD.L	#JMFB,A0					; point to JMFB Control Space
+			ADD.L	#JMFBVideoBase,A0			; point to the Video Base register
+			CMP.B	#Mode8BPP,D1				; test if mode is > 8 BPP.
+			BLE.S	@indexMode					; if 1,2,4, or 8 bpp we're all done so skip next instruction
+			ASR.L	#2,D4						; it's 24 bpp, first /4 for pixel twist
+			MULU.L	#3,D4						; multiply by 3 to finish the 3/4 pixel twist
+			LSR.L	#1,D4						; one more /2 for interleaving
+
+@indexMode			
+			LSR.L	#5,D4						; strip lower 5 bits (bits 0:4 are implied 0)
+			MOVE.L	D4,(A0)						; base offset is the first register
+			
+			_SwapMMUMode	
+
+			MOVEM.L	(SP)+,D0-D5/A0				; restore all registers
+			RTS									; and return
+
+*******************************************************************
+*
+*	GetBaseOffset returns the appropriate base address as a function of monitor and mode.  There
+*	are currently three alternatives:
+*		
+*		- defmBaseOffset   - used for standard, and Rubik
+*		- defmBaseOffsetBS - used for the Big Screens (Kong and Portrait) due to VRAM bank crossing
+*		- defmBaseOffset12 - used for all overscan interlaced and convolved NTSC modes except 24 bpp.
+*		- specBaseOffset12 - used in ntsc 24 bpp modes.
+*
+*  GetBaseOffset is broken up into 3 main steps:
+*
+*       1. If small screen use defmBaseOffset  
+*		2. If big screen use defmBaseOffsetBS
+*		3. If Interlaced use defmBaseOffset12
+*
+*  Called by:
+*		
+*		GetPageBase, JMFBSetPage
+*
+*  Traps and Utilities called:
+*
+*		None.
+*
+*  Register usage:
+*
+*       Input:
+*			A3 - dCtlStorage pointer used to get at SaveMode, BigScreen, and Interlaced
+*
+*  		Output:
+;			D0 - returns the base offset value
+*
+*		Locally used:
+;			None.
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+GetBaseOffset
+
+			BTST	#Interlaced,gFlags(A3)		; determine if it's NTSC or not
+			BNE.S	@Interlaced					; if it is branch and do the Interlaced modes
+			
+			BTST	#BigScreen,gFlags(A3)		; determine if it's a Big Screen (Kong or Portrait)
+			BEQ.S	@SmallScreen				; if it is not then get the small screen base offset
+			MOVE.L	#defmBaseOffsetBS,D0		; it's the Big Screen, so use defBaseOffsetBS
+			BRA.S	GBODone						; all done so get out
+			
+@SmallScreen
+			MOVE.L	#defmBaseOffset,D0			; it's the Small Screen, so use defBaseOffset
+			BRA.S	GBODone						; all done so get out
+			
+@Interlaced
+			CMP.W	#FourthVidMode,saveMode(A3)		; check to see if we're greater than 8 bpp
+			BGT.S	@ntsc24bpp					; if > 8 bpp, we must be 24 so branch
+			MOVE.L	#defmBaseOffset12,D0		; use the overscan NTSC base offset
+			BRA.S	GBODone						; all done so get out
+						
+@ntsc24bpp
+			MOVE.L	#specBaseOffset12,D0			; use a base offset that works for 24 bpp modes
+			
+GBODone
+			RTS
+			
+*******************************************************************
+*
+*  GrayScreen writes a 50% gray dither pattern to the frame buffer.
+*  The pattern used and the memory that is grayed is a f(mode).
+*
+*  GrayScreen is broken up into 3 main steps:
+*
+*       1. Get the mode, the pattern, and the page size 
+*		2. Form a 32 bit address in the fb pointer.
+*		3. Draw the screen (different code is used for 24 bpp than for indexed modes).
+*
+*  Called by:
+*		
+*		VidReset, GrayPage
+*
+*  Traps and Utilities called:
+*
+*		_SwapMMUMode
+*
+*  Register usage:
+*
+*       Input:
+*			A3 - pointer to the private storage
+*
+*  		Output:
+*			None.
+*
+*		Locally used:
+*			D1 - scratch
+*			D2 - used to hold rowlongs-1
+*			D3 - used to hold screenrows
+*			D4 - used to hold rowbytes
+*			D5 - 50% gray dither pattern (it's a f(mode))
+*
+*			A0 - points to the fb during writes
+*			A1 - points to hw misc params
+*			   - later points to fb row starting addresses
+*
+*  Miscellaneous:
+*
+*		None.
+*
+*******************************************************************
+GrayScreen
+
+			MOVEM.L	D0-D6/A0-A1,-(SP)			; save all registers
+			MOVE	saveMode(A3),D1				; get the mode
+			SUB		#FirstVidMode,D1			; make it 0 based
+			MOVE.W	D1,D3						; make a copy of it
+			LEA		Pats,A1						; get a pointer to the pattern table
+			MOVE.L	(A1,D3*4),D5				; D5 = the proper pattern
+			MOVE.L	saveVidParms(A3),A1			; point to data table
+			MOVE	(D_RowBytes,A1,D1*2),D4		; D4 = rowbytes for the screen
+			MOVE	D_Height(A1),D3				; D3 = screen height
+			SUBQ	#1,D3						; make it 0 based
+			
+
+			MOVE.L	saveBaseAddr(A3),A1			; point to the current page
+			BTST	#sRsrc32Bit,GFlags(A3)		; Check to see if 
+			BNE.S	@NoMask						; 32 bit address=1, 24 bit address=0
+			MOVE.L	A1,D0						; move into data register so we can and it
+			ANDI.L	#$FF0FFFFF,D0				; Fssxxxxx -> Fs0xxxxx (since we always write in 32 bit addressing)
+			MOVE.L	D0,A1						; move it back
+@NoMask			
+			
+			MOVEQ	#true32b,D0					; draw in 32 bit mode
+			_SwapMMUMode
+
+			CMP.B	#Mode24BPP,D1				; check for 24 BPP mode
+			BEQ.S	gScrn24						; do 24 bit gray screen in 24 BPP
+			
+
+; 1,2,4, and 8 BPP gray screen code
+
+NxtRow1		MOVE.L	A1,A0						; get next row
+			MOVE.W	D4,D2						; get bytes per row
+			LSR		#2,D2						; get longs per row
+			MOVE.W	D2,D7						; save longs per row for later
+			SUBQ	#1,D2						; make count 0 based
+NxtLong1	MOVE.L	D5,(A0)+					; write gray
+			DBF		D2,NxtLong1					; for entire width of row
+			NOT.L	D5							; get inverse gray for next row
+			ADD.W	D4,A1						; bump to next row
+			DBF		D3,NxtRow1					; until no more rows
+			
+			BTST	#Interlaced,GFlags(A3)		; check to see if we're doing interlaced
+			BEQ.S	GSDone						; if we're not then all done
+			BTST	#UnderScanFlag,moreGFlags(A3)	; since we're doing interlaced, check for uScan
+			BEQ.S	GSDone						; if we're not uScan, then we're oScan and all done
+
+			MOVE.W	D7,D2						; get longs per row
+			BTST	#PALFlag,moreGFlags(A3)
+			BNE.S	@PAL
+			MULU.W	#50,D2						; multiply by scan lines +1
+			BRA.S	@continue
+@PAL		MULU.W	#58,D2
+@continue	SUBQ	#1,D2						; make D2 0 based for dbra
+			
+@BlackBot	MOVE.L	#-1,(A0)+					; black out the bottom section
+			DBRA	D2,@BlackBot
+
+			BRA.S	GSDone
+
+; 24 BPP gray screen code
+
+gScrn24		
+
+NxtRow24	
+			MOVE.L	A1,A0						; get next row
+			MOVE.W	D4,D2						; get bytes per row
+			LSR		#2,D2						; get longs per row
+			MOVE.W	D2,D7						; save longs per row for later
+			SUBQ	#1,D2						; make count 0 based
+NxtLong24	MOVE.L	D5,(A0)+					; write gray
+			NOT.L	D5							; invert next pixel for 24 BPP
+			DBF		D2,NxtLong24				; for entire width of row
+			NOT.L	D5							; invert for next row
+			ADD.W	D4,A1						; bump to next row
+			DBF		D3,NxtRow24					; until no more rows
+
+			BTST	#Interlaced,GFlags(A3)		; check to see if we're doing interlaced
+			BEQ.S	GSDone						; if we're not then all done
+			BTST	#UnderScanFlag,moreGFlags(A3)	; since we're doing interlaced, check for uScan
+			BEQ.S	GSDone						; if we're not uScan, then we're oScan and all done
+
+			MOVE.W	D7,D2						; get longs per row
+			BTST	#PALFlag,moreGFlags(A3)
+			BNE.S	@PAL
+			MULU.W	#50,D2						; multiply by scan lines +1
+			BRA.S	@continue
+@PAL		MULU.W	#58,D2
+@continue	SUBQ	#1,D2						; make D2 0 based for dbra
+			
+@BotBlack	CLR.L	(A0)+						; black out the bottom section
+			DBRA	D2,@BotBlack
+GSDone
+			_SwapMMUMode						; swap back to previous addr mode (do is still valid)						
+			MOVEM.L	(SP)+,D0-D6/A0-A1			; restore registers
+			RTS									; and return
+			
+Pats		DC.L	OneBitGray,TwoBitGray,FourBitGray,EightBitGray,TwentyFourBitGray
+
+;-------------------------------------------------------------
+;	The Interrupt handler for Trident card
+;-------------------------------------------------------------
+; The interrupt Handler
+; On entry A1 contains the pointer to the vsync clear register
+; Note that the interrupt handler preserves D0-D3 and A0-A3.
+
+BeginIH		
+
+			MOVEM.L	D1-D2/A0-A1,-(SP)		; save registers myself
+						
+			MOVEQ	#true32b,D0				; force to 32 bit addressing mode
+
+			MOVE.L	JSwapMMU,A0				; call SwapMMUMode
+			JSR		(A0)
+			MOVEM.L	(SP)+,D1-D2/A0-A1		; restore all registers
+			
+			MOVE.L	D1,-(SP)				; save working register
+@waitNoVFP
+			MOVE.L	SWStatusReg-SWICReg(A1),D1		; read the Stopwatch Status Register
+			ANDI	#$8,D1					; wait for the Front Porch state to exit
+			BNE.S	@waitNoVFP				; continue to poll until we exit VFP (~90 usec)
+			
+			MOVE.L	(SP)+,D1
+			
+			MOVE.L	#1,(A1)					; clear interrupt from card
+
+			MOVEM.L	D1-D2/A0-A1,-(SP)		; save registers
+			MOVE.L	JSwapMMU,A0				; call SwapMMUMode
+			JSR		(A0)
+			MOVEM.L	(SP)+,D1-D2/A0-A1		; restore all registers
+
+			MOVE.L	A1,D0					; copy base addr into data register
+			
+											; D0 = $Fssxxxxx
+			ROL.L	#8,D0					; D0 <- $sxxxxxFs	Convert the address into 
+			AND		#$0F,D0					; D0 <- $sxxx000s	the slot number.
+
+			MOVE.L	JVBLTask,A0				; call the VBL task manager
+			JSR		(A0)					; with slot # in D0
+
+			MOVEQ	#1,D0					; signal that int was serviced				
+			RTS								; and return to caller
+
+;-------------------------------------------------------------
+;	TERROR ROM Support (for loading at GetDriver time)
+;-------------------------------------------------------------
+			If ForRom Then
+			Export	JMFBDrvrSize
+JMFBDrvrEnd
+JMFBDrvrSize
+			Dc.l	JMFBDrvrEnd-JMFBDrvr
+			EndP
+			Endif
+			End

@@ -1,0 +1,158 @@
+;__________________________________________________________________________________________________
+;
+;	File:		BrightnessPatches.a
+;
+;	Contains:	This routine will patch the .Screen driver on the Classic to return an
+;			error to the caller when a status "GetScreenState" call is made.  These
+;			codes were supposed to return the state of the video. See XOScreenDriver.a
+;			ON or OFF.  This hardware feature was never implemented on the Classic.
+;			The Backlight driver issues this call and since the driver does not return
+;			an error, the Backlit driver makes assumptions based on the call succeeding.
+;
+;	Written by:	Gus Andrade & Gayle Wiesner
+;
+;	Copyright:	© 1991 by Apple Computer, Inc., All rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <1>	10/24/91	SAM	Rolled in Regatta file.
+;		 <0>	 7/17/91	SAM		(GAA & GW) First checked in..
+;	To Do:
+;__________________________________________________________________________________________________
+
+		STRING	PASCAL
+		print	OFF, NOGEN
+
+		load	'StandardEqu.d'
+		include	'LinkedPatchMacros.a'
+		include	'HardwarePrivateEqu.a'
+		include	'ATalkEqu.a'
+		include	'Traps.a'
+
+		print	ON
+		
+		
+
+;----------------------------
+; 		Entry:		None
+;		Exit:		Patches the Status calls to return an error on "GetScreenState" call.
+;		Uses:		A0-A2, D0-D1.
+;
+
+JMPInst			equ	$4ef9			; jmp.abs.l instruction
+StatScrnOnOff	equ	$5302			; Status code to return screen on/off state
+Regs			reg	A0-A2/D1
+	
+
+ClassicBrightPatch	InstallProc	(SE)
+				IMPORT		csCodeCheck
+				IMPORT		OldStatusPatch
+
+;
+;	The following record is taken from the ScreenDriverEqu.a file.
+;	Any changes to the record need to be reflected in both locations.
+;
+
+ScreenDrvrGlobs		RECORD		0,increment
+setValue			ds.w		1			; current brightness value
+StatusPatch			ds.w		3			; allow patching Status here
+ControlPatch		ds.w		3			; allow patching Control here
+ScreenGlobSize		EQU		*
+					ENDR
+
+
+				WITH		ScreenDrvrGlobs
+
+;
+;	Open the .Screen driver
+;
+@openDrvr
+		movem.l		Regs,-(SP)				; Save work registers
+		sub.w		#ioQElSize,SP			; Allocate IO stack frame
+		lea			#'.Screen',A1			; load pointer to driver name
+
+		move.l		sp,a0					; set a0 to point to the pb
+		move.l		a1,ioVNPtr(A0)			; load pointer to name
+		move.b		#fsCurPerm,ioPermssn(A0)	; set permission (not used)
+		_Open
+
+		tst.w		ioResult(a0)			; check for Open Success
+		bne.s		@OpenFailed
+;
+;	Point to device control entry for the .Screen driver
+;
+		move.w		ioRefNum(a0),d1			; form the unit table entry number
+		addq.w		#1,d1
+		neg.w		d1
+		lsl.w		#2,d1					; calculate index into unit table
+		movea.l		utablebase,a1			; get unit table address
+		move.l		(a1,d1.w),a1			; point to dce for screen driver
+		movea.l		(a1),a1					; dereference handle
+;
+;	Install the patch into the Screen driver's StatusPatch area
+;	(save the old StatusPatch into our code)
+;
+		movea.l		dctlStorage(a1),a1			; point to driver's private storage
+		lea			OldStatusPatch, a2			; point to patch save area		<7/17/91 GW>
+		move.w		StatusPatch(a1),(a2)+		; save the first word			<7/17/91 GW>
+		move.l		StatusPatch+2(a1),(a2)		; save the next longword		<7/17/91 GW>
+		move.w		#JMPInst,StatusPatch(a1)	; put a jmp instruction in first wd of patch area
+		leaResident	csCodeCheck,a2				; get the address of our patch routine
+		move.l		a2,StatusPatch+2(a1)		; put it into the patch area
+
+@OpenFailed
+		add.w		#ioQElSize,SP				; Release stack frame
+		movem.l		(SP)+,Regs
+		rts										; Sucess returned in status
+
+		ENDWITH
+
+		ENDP
+		
+
+;_______________________________________________________________________
+;
+;  Routine:	csCodeCheck
+;  Inputs:	a0 - pointer to I/O ParamBlock
+;		a1 - pointer to Device Control Entry (DCE)
+;
+;  Outputs:	d0 - Result Code
+;
+;  Destroys:	none
+;
+;  Called by:	Screen Driver ScreenStatus routine
+;
+;  Function:	Checks for csCode of StatScrnOnOff.  
+;
+;		If equal, returns StatusErr and exits through jIODone.  
+;		This removes support for Brightness Driver
+;		status call to get state (on/off) of the screen, which is not 
+;		supported in the Classic hardware platform.
+;
+;		If not equal, executes whatever code was copied by our InstallProc
+;		from the Screen Driver's StatusPatch area.  This will either
+;		link to the next patch, or rts (the default).
+;_______________________________________________________________________
+
+csCodeCheck	PROC		EXPORT
+			
+		EXPORT		OldStatusPatch
+		
+		cmpi.w		#StatScrnOnOff,csCode(a0)	; if StatScrnOnOff, return an error
+		beq		errReturn				
+		
+OldStatusPatch	nop						; our installproc saved the old patch	<7/17/91 GW>
+		nop								; here; if everyone plays by the 	<7/17/91 GW>
+		nop								; rules, this should be either rts or	<7/17/91 GW>
+										; a jmp to the next patch		<7/17/91 GW>
+							
+		rts								; Just in case the previous patch JSRed instead of JMP
+
+errReturn	
+		move.w		#StatusErr,d0
+		move.l		jIODone,(sp)		; replace jsr return with IODone routine address
+		rts
+
+		ENDP
+		
+		END.

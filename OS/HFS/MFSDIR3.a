@@ -1,0 +1,368 @@
+;
+;	File:		MFSDIR3.a
+;
+;	Contains:	This file contains routines using file names to specify file.
+;
+;	Copyright:	© 1982-1991 by Apple Computer, Inc., all rights reserved.
+;
+;	Change History (most recent first):
+;
+;		 <2>	 9/12/91	JSM		Add a header.
+;	   <1.1>	11/10/88	CCH		Fixed Header.
+;	   <1.0>	 11/9/88	CCH		Adding to EASE.
+;	   <1.0>	 2/11/88	BBM		Adding file for the first time into EASEÉ
+;				 9/24/86	BB		Updated to use new MPW equates.
+;				 11/1/85	PWD		Fixed bug in GetCatInfo for MFS volume (MOVE.L vs. MOVE.W)
+;				10/20/85	LAK		Flush control cache on exit of SetMFlType, SetMFlInfo,
+;									ChgMFlLock.
+;				10/16/85	PWD		Fixed SetFilTyp bug (used FilTyp instead of FlTyp).
+;				 10/1/85	LAK		Adjusted for MFS use of TFS cache.
+;				 9/25/85	PWD		Fixed bug in 'GetCatInfo' lookalike code in GetFileInfo (cleared
+;									32 bytes)
+;				  9/6/85	LAK		Courtesy clear of IORefNum before calling CkFileBusy for
+;									GetFileInfo.
+;				  5/1/85	PWD		Changed GetMFlInfo to clear ioDirFlg bit in ioFlAttrib field.
+;				 3/13/85	PWD		Split off from SetFilTyp.
+;				 2/28/85	PWD		Split off from FSDir3, leaving only MFS-specific code.
+;				  9/1/83	LAK		Changed BPL to BCC in file name transfer to support file names >
+;									127 chars in GetFileInfo.
+;				 8/31/83	LAK		Changed GetFileInfo to return current file info for opened files
+;									(from FCB information).
+;				  6/6/83	LAK		Added changes to support ext fs, offline volumes.
+;				 5/25/83	LAK		Adapted FndFilNam to new CmpString interface.
+;				 1/16/83	LAK		Final pass changes . . . added SetFilLock,RstFilLock,SetFilType.
+;				12/14/82	LAK		Undelete removal changes
+;				12/13/82	LAK		Reworked all files for new file system data structures.
+;				 1/12/82	LAK		Made string compare proc an OS call; code is in IOCore.
+;
+
+;_______________________________________________________________________
+;
+; External Routines:	GetMFSFlInfo,SetMFlInfo
+;
+; Internal Routines:	FindMFSFile
+;
+;_______________________________________________________________________
+
+;_______________________________________________________________________
+;
+; Routine:		  SetMFlType
+; Arguments:		A0.L (input)  -- I/O Parameter block for call
+;					A1.L (input)  -- pointer to vol. buffer(from FndFilNam)
+;					A2.L (input)  -- VCB ptr
+;					D0.W (output) -- error code
+;					A5.L (output) -- ptr to dir. entry (from FndFilNam)
+;					Clobbers:
+;					Preserves:
+; Called By:	  SetFilType
+; Function: 	  SetMflInfo sets the file type for MFS files in the directory
+;				  block pointed to by A1, at the entry pointed to by A5.
+;
+; Modification history:
+;	13-Mar-85  PWD	Split off from SetFilTyp.
+;_______________________________________________________________________
+
+
+			BLANKS		ON
+			STRING		ASIS
+
+SetMFlType	MOVE.B	IONewType(A0),FlTyp(A5) ; Ring in the new						<PWD 16Oct85>
+			BRA.S	SRMFXit1				; And leave, clearing D0
+											; (Marks vol. buffer block dirty)
+
+;_______________________________________________________________________
+;
+; Routine:		  ChgMFlLock
+;
+; (c) 1983 Apple Computer, Inc.
+;
+; Arguments:	  A0.L (input)	-- pointer to I/O parameter block, uses
+;									IOFileName,IOFileType,IODrvNum
+;				  D0.W (output) -- 0 if file was found and set correctly.
+; Calls:
+; Called by:	SetFilLock/ResFilLock
+; Function: 	Set or reset the file lock bit for MFS files.
+;
+; Modification History:
+;  16 Jan 83  LAK  New today.
+;  06 Jun 83  LAK  Broke out CkFilMod as a subroutine.
+;  13 Mar 85  PWD  Split off from main entry (Set/Rst FilLock)
+;
+; Note: if the file is locked after it has already been opened with write
+;	permission, the lock will not affect that opened file.	If the lock bit
+;	is not changed by this command, the directory buffer is not marked dirty
+;	(allows quick lock/unlocking of a group of file, regardless of their current
+;	status).
+;_______________________________________________________________________
+
+ChgMFlLock	TST.B	FLckUnlck
+			BEQ.S	@1					; br if we want to unlock it
+			BSET	#FlWrtFlag,FlFlags(A5) ; lock it
+			BNE.S	SRMFXit2		   ; br if already locked
+			BRA.S	SRMFXit1			; otherwise, it's been modified
+
+@1			BCLR	#FlWrtFlag,FlFlags(A5) ; unlock it
+			BEQ.S	SRMFXit2			; br if already unlocked
+
+SRMFXit1	MOVE.L	A1,A0				; (also setfilinfo exit)				<01Oct85>
+			JSR 	MarkBlock			; mark buffer modified					<01Oct85>
+			BSR 	MFSCtlFlush 		; flush control cache if it's too full  <20Oct85>
+SRMFXit2	MOVEQ	#0,D0
+SRMFXit3	BRA 	CmdDone
+
+;_______________________________________________________________________
+;
+; Routine:		SetMFlInfo
+;
+; (c) 1983 Apple Computer, Inc.
+;
+; Arguments:	  A0.L (input)	-- pointer to File Info I/O parameter block, uses
+;									IOFileName,IOFlAttrib,IOFlUsrWds
+;				  D0.W (output) -- 0 if entry was found, error code otherwise
+;				  File's entry is modified to reflect changes
+; Calls:		FndFilNam
+; Function: 	Sets the user-definable fields in a file's directory entry.
+;				The caller specifies the filename and type, and the eight
+;				user-defined words.  The file lock bit does not inhibit this
+;				command.
+;
+; Modification History:
+;  13 Dec 82  LAK  Modified for new file system data structures.
+;  17 Jan 83  LAK  Latest changes: no longer used to change lock, type fields;
+;					there are now 16 user-defined bytes.
+;  06 Jun 83  LAK  Adapted to new offline, ext fs problems. Uses CkFilMod
+;					and SRFLXit1 to save code.
+;  09 Jul 84  GSS  Patched to write out creation and modification date info
+;  13 Mar 85  PWD  Separated MFS-specific code out from FSDir3
+;_______________________________________________________________________
+
+SetMFlInfo
+			MOVEM.L IOFlUsrWds(A0),D1-D4 ; get 16 user words
+			MOVEM.L D1-D4,FlUsrWds(A5)	; transfer 16 user-defined bytes
+
+			MOVEM.L IOFlCrDat(A0),D1-D2 ; get IOFlCrDat, IOFlMdDat
+			MOVEM.L D1-D2,FlCrDat(A5)	; and store in FlCrDat, FlMdDat
+
+			BRA.S	SRMFXit1			; exit ok, marking buffer modified
+
+;_______________________________________________________________________
+;
+; Routine:		FndMFSFile,FndMFSFN2
+;
+; (c) 1983 Apple Computer, Inc.
+;
+; Arguments:	  A0.L (input)	-- pointer to I/O parameter block, uses:
+;									IOFileName,IOFileType,IODrvNum
+;				  D0.W (output) -- 0 if file was found, error code otherwise.
+;				  D2.W (output) -- name length excluding any volume prefix
+;				  A1.L (output) -- points to volume buffer (if name found)
+;				  A2.L (output) -- pointer to appropriate VCB
+;				  A4.L (output) -- pointer to input file name. If a volume was
+;									specified will point to the colon, thereby
+;									always pointing one byte ahead of the true
+;									file name.
+;				  A5.L (output) -- pointer to file directory entry in buffer.
+;				  Preserves: D1,D5,A0
+;				  Clobbers: all other registers (D3,D4,D6,D7,A3,A6)
+;				  Note that the routine will return to one level above
+;				   caller during the asynchronous reads.
+;				  FndFN2 entry point for Rename (alternate volume may be used)
+; Calls:		MyReadDB(via Rd1stDB and RdNxtDB)
+; Called By:	Create,Delete,FileOpen,Rename,GetFileInfo,SetFileInfo
+; Function: 	Locate a filename within the directory on a diskette
+;				Search algorithm: if dir blk there, search it first;
+;				if not found, start from beginning, skipping searched blk.
+;
+; Modification History:
+;  08 Dec 82  LAK  Added FndFilNam entry point.
+;  13 Dec 82  LAK  Rewrote. Removed index search mode.
+;  14 Dec 82  LAK  Removed check for delete file.
+;  17 Jan 83  LAK  Changes for last data structure mods: now checks for both
+;					filename and filetype match.
+;  05 Jun 83  LAK  Added checks for offline volume, external file system vols
+;  28 Sep 84  GSS  Inserted patch for setting ReqstVol in ExtOffLinCk
+;					(from CDHook in MSFileFix)
+;  28-Feb-85  PWD  Split off from FndFilName to just handle only MFS volumes.
+;  20-Sep-85  PWD  Added explicit check for zero-length files before launching
+;					into search (used to be checked by FndFilNam already)
+;_______________________________________________________________________
+
+FndMFSFile	MOVE.L	(SP)+,A3			; get the caller's addr
+			TST.B	D2					; Check file name length -				<20Sep85>
+			BNE.S	@1					; If >0, it's OK                        <20Sep85>
+			MOVEQ	#BdNamErr,D0		; Otherwise, complain					<20Sep85>
+			BRA.S	MFFNExit			;										<20Sep85>
+
+@1			MOVE.W	VCBNmFls(A2),D7 	; number of files on this volume
+			BEQ.S	MFNFound			; if none, can't find this one.
+
+			BSR 	MFSRd1stDB			; go for the first one					<01Oct85>
+mfFNLoop	BEQ.S	scn4MNam			; br if ok
+			CMP.W	#DirFulErr,D0		; reached end of directory?
+			BNE.S	mfFNExit			; then file not found
+mfNFound	MOVEQ	#FNFErr,D0			; file not found!
+			BRA.S	mfFNExit
+
+; have a block at (A5) - look for the file in this dir block
+
+scn4MNam	MOVEQ	#0,D0				; clear for index
+			MOVE.L	A4,A1				; requested string
+
+@1			MOVE.W	D0,D4				; save D0
+			TST.B	FlFlags(A5,D4)		; flags=0 means end of entries this blk
+			BEQ.S	@3					; br if no more entries this block
+			MOVE.B	FlTyp(A5,D4),D6 	; check for type match
+			CMP.B	IOFileType(A0),D6	;
+			BNE.S	@2					; br if no match
+
+			MOVE.L	A0,-(SP)			; preserve A0
+			LEA 	FlNam(A5,D4),A0 	; directory string
+			MOVEQ	#0,D0
+			MOVE.B	(A0)+,D0			; first string length
+			SWAP	D0
+			MOVE.W	D2,D0				; second string length
+			_CmpString					; do they match?
+			MOVE.L	(SP)+,A0
+			BEQ.S	@4					; br if so
+
+@2			SUBQ.W	#1,D7				; decr # files we checked
+			BEQ.S	MFNFound			; exit if we checked them all . . .
+			MOVE.W	D4,D0				; restore D0
+			BSR 	GtNxEntry			; (A5,D0) point to next entry, D6 trashed
+			BCS.S	@1					; br if not finished with this block
+
+@3			BSR 	MFSRdNxtDB			; read next directory block 			<01Oct85>
+			BRA.S	MFFNLoop
+
+; we have our man . . .
+
+@4			MOVE.L	A5,A1				; A1 = buffer pointer
+			LEA 	0(A5,D4),A5 		; A5 = entry ptr, D0 = 0 here
+mfFNExit	JMP 	(A3)
+
+;_______________________________________________________________________
+;
+; Routine:		GetMFlInfo
+;
+; (c) 1983 Apple Computer, Inc.
+;
+; Arguments:	  A0.L (input)	-- pointer to File Info I/O parameter block, uses
+;									all fields?
+;				  D0.W (output) -- 0 if info was found, error code otherwise
+; Calls:		FndFilNam(if searching by name)
+; Function: 	Get information about a specific file from the file directory.
+;				User can specify search by either filename or by index,
+;				where the index specifies the file's offset from the beginning
+;				of the directory.
+;
+;				An index of zero means search by filename and type.
+;
+; Modification History:
+;  10 Dec 82  LAK  Modified for new file system data structures.
+;  13 Dec 82  LAK  Removed delete file support.
+;  17 Jan 83  LAK  Another passover.
+;  06 Jun 83  LAK  Added changes to detect offline volumes, ext fs calls.
+;  01 Sep 83  LAK  Changed BPL to BCC in file name transfer to support file
+;					names > 127 chars.
+;  10 Mar 85  PWD  Changed to search catalog for TFS volumes
+;  25-Sep-85  PWD  Fixed bug in 'GetCatInfo' lookalike code (cleared 32 bytes)
+;  <27Oct85>  PWD  Changed to re-join TFS code for FCB scan
+;  <01Nov85>  PWD  Fixed bug in GetCatInfo for MFS volume (MOVE.L vs. MOVE.W)
+;_______________________________________________________________________
+
+GtMFlIBI	CMP.W	VCBNmFls(A2),D1 	; requesting an index larger than exists?
+			BHI.S	GMFINFErr			; return file not found error?
+
+; we are searching by index here: it's a bit tricky since we want to try
+; to continue where we left off, if possible . . .
+
+			MOVE.W	VCBBlLn(A2),D5		; len in blocks of dir
+			MOVE.W	VCBDirSt(A2),D3 	; assume start from the beginning
+			ADD.W	D3,D5				; max blk num + 1
+
+			MOVE.W	VCBDirIndex(A2),D7	; useful file index, blk number pair
+			BEQ.S	@0					; br if set back to zero
+
+			CMP.W	D7,D1				; is our index >= this?
+			BCS.S	@0					; br if not . . .
+			MOVE.W	VCBDirBlk(A2),D3	; block number for this index
+			BRA.S	@1
+
+@0			MOVEQ	#1,D7				; index of first file this block
+
+; at this point, D7=index of first file in current block
+;				 D3=current block
+;				 D5=max blk number + 1
+;				 D1=requested index
+
+@1			CMP.W	D5,D3				; have we reached max yet?
+			BCC.S	GMFINFErr			; br if so
+			MOVE.W	D3,VCBDirBlk(A2)	; form index,block pair to help next
+			MOVE.W	D7,VCBDirIndex(A2)	;  GetFileInfo indexed search
+			BSR 	MFSDirRead			; get the block 						<01Oct85>
+			BNE.S	GMFINFErr
+			MOVEQ	#0,D0				; index into block
+
+@2			MOVEQ	#0,D6
+			TST.B	FlFlags(A5,D0)		; valid entry?
+			BEQ.S	@3					; br if no more entries
+			CMP.W	D7,D1				; is it the requested one?
+			BEQ.S	GotMIndFile
+			ADDQ.W	#1,D7				; increment file index
+			BSR 	GtNxEntry
+			BCS.S	@2					; br if haven't reached end of block
+
+@3			ADDQ.W	#1,D3				; try next block
+			BRA.S	@1
+
+GMFINFErr	MOVEQ	#FNFErr,D0			; file not found . . . hmmmm
+GMFIExit	BRA 	CmdDone
+
+GotMIndFile LEA 	0(A5,D0),A5 		; get pointer to entry . . .
+
+; searched by index, so return the name . . .
+
+			LEA 	FlNam(A5),A3		; file entry name ptr
+			MOVE.L	IOFileName(A0),D0	; parameter block filename ptr
+			BEQ.S	XferMFInfo			; skip it if it's zero
+			MOVE.L	D0,A4
+
+			MOVE.B	(A3),D0 			; name length
+@1			MOVE.B	(A3)+,(A4)+ 		; name length, then name, byte by byte
+			SUBQ.B	#1,D0
+			BCC.S	@1
+
+; The TFS trap entry point enters here for MFS volumes not searched by directory
+; index, immediately following a call to FndFilNam:
+
+GetMFlInfo
+
+XferMFInfo
+			LEA 	IOFlAttrib(A0),A4	; info destination
+			MOVEQ	#(IOFQElSize-IOFlAttrib)/2-1,D0 ; number of words to copy - 1
+			LEA 	FlFlags(A5),A3		; start of regular info to transfer
+@1			MOVE.W	(A3)+,(A4)+ 		; move byte by byte
+			DBRA	D0,@1
+
+; Clear the directory flag for file information:
+
+			BCLR	#ioDirFlg,ioFlAttrib(A0) ; 0 = file info returned
+
+; Pure hack (=cut for code space):
+; Make some of the additional TFS fields non-garbage, even for MFS:
+
+			BTST	#HFSReq,HFSFlags	; Is this really a _GetCatInfo request?
+			BEQ.S	@3					; Nah, don't be silly...
+			MOVE.L	#FSRtDirID,ioFlParID(A0) ; 'Parent directory' is root...	<01Nov85>
+			CLR.L	ioFlBkDat(A0)		; Never been backed up...
+
+			MOVE.L	A0,-(SP)			; Create a scratch register
+			LEA 	ioFlxFndrInfo(A0),A0 ; Point to finder info					<24Sep86>
+			MOVEQ	#3,D0				; Set up to clear 3+1 longwords 		<25Sep85>
+@2			CLR.L	(A0)+				; Zero finder info bytes
+			DBRA	D0,@2				;
+			MOVE.L	(SP)+,A0			; Restore 'scratch' register
+
+@3			BRA 	CkFilStatus 		; Re-join TFS code for FCB scan 		<27Oct85>
+
+
